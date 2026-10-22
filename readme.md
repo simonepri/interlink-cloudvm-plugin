@@ -141,7 +141,7 @@ flowchart LR
    - Reaches cluster-ready status in **~33 seconds**.
 2. **Container Mode (Optimized for CPU & Custom Workloads)**:
    - Uses standard Docker/Containerd execution for CPU pipelines, data transformations, or custom application containers.
-   - Ideal for Ray Data pipelines, genomics tools, and custom microservices.
+   - Ideal for Ray Data pipelines, ETL jobs, and batch CPU processing.
 
 ```mermaid
 flowchart TD
