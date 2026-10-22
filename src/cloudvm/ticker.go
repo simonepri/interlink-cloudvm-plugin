@@ -149,26 +149,21 @@ func (t *SpotPriceTicker) Start(ctx context.Context) {
 	}
 }
 
-// GetPrice returns the latest known spot price for a region and instance type across all AZs.
+// GetPrice returns the cheapest known spot price for a region and instance type across all AZs.
 func (t *SpotPriceTicker) GetPrice(region, instanceType string) (*SpotPriceEntry, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	// Check for exact AZ-agnostic key first
-	if entry, ok := t.prices[tickerKey(region, "", instanceType)]; ok {
-		return entry, true
-	}
-
-	var latest *SpotPriceEntry
+	var cheapest *SpotPriceEntry
 	for _, entry := range t.prices {
 		if entry.Region == region && entry.InstanceType == instanceType {
-			if latest == nil || entry.Timestamp.After(latest.Timestamp) {
-				latest = entry
+			if cheapest == nil || entry.SpotPriceUSD < cheapest.SpotPriceUSD {
+				cheapest = entry
 			}
 		}
 	}
-	if latest != nil {
-		return latest, true
+	if cheapest != nil {
+		return cheapest, true
 	}
 	return nil, false
 }
@@ -203,6 +198,8 @@ func (t *SpotPriceTicker) Routes() http.Handler {
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = fmt.Fprintln(w, "# HELP cloudvm_spot_price_usd_per_hour Current spot price in USD per hour")
+		_, _ = fmt.Fprintln(w, "# TYPE cloudvm_spot_price_usd_per_hour gauge")
 		for _, entry := range t.AllPrices() {
 			if entry.AvailabilityZone != "" {
 				_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %.4f\n",

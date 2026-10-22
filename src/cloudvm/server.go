@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,14 @@ import (
 	"sync"
 	"time"
 )
+
+func generateToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "cloudvm-secret-token"
+	}
+	return hex.EncodeToString(b)
+}
 
 // EgressRateToBandwidth converts an hourly budget in USD/hr to an equivalent network rate string (e.g. "22mbit").
 // Uses provider baseline egress rates ($0.09/GB for AWS, $0.085/GB for GCP).
@@ -428,6 +438,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[cloudvm] Bin-pack miss. Launching new VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
 		spec.PodNamespace, spec.PodName, spec.InstanceType, spec.NumGPUs, spec.Region)
 
+	spec.RunnerAuthToken = generateToken()
+	var preAssignedGPUs []int
+	for i := 0; i < spec.NumGPUs; i++ {
+		preAssignedGPUs = append(preAssignedGPUs, i)
+	}
+	spec.AssignedGPUs = preAssignedGPUs
+
 	inst, err := prov.Launch(r.Context(), spec)
 	if err != nil {
 		log.Printf("[cloudvm] Failed to launch VM for %s: %v", spec.PodName, err)
@@ -452,6 +469,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	newNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, nodeCapacity)
 	newNode.Namespace = spec.PodNamespace
+	newNode.RunnerAuthToken = spec.RunnerAuthToken
 	newNode.Spot = spec.MarketType != "on-demand"
 	gpus, tpus := s.nodePool.RegisterAndAllocate(newNode, reqVec, spec.PodUID, spec.PodNamespace, spec.PodName)
 
@@ -681,9 +699,33 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					Message: fmt.Sprintf("Provisioning cloud VM %s in %s...", inst.ID, inst.Region),
 				}
 			case StateRunning:
-				status.Ready = true
-				status.State.Running = &ContainerRunningState{
-					StartedAt: inst.CreatedAt,
+				runnerChecked := false
+				if s.runner != nil && uid != "" {
+					if node, _, found := s.nodePool.FindPodNode(uid); found && node != nil {
+						if cResult, err := s.runner.GetStatus(r.Context(), node, uid); err == nil && cResult != nil {
+							runnerChecked = true
+							if cResult.Running {
+								status.Ready = true
+								status.State.Running = &ContainerRunningState{
+									StartedAt: cResult.StartedAt,
+								}
+							} else {
+								status.Ready = false
+								status.State.Terminated = &ContainerTerminatedState{
+									ExitCode:   cResult.ExitCode,
+									Reason:     cResult.Reason,
+									Message:    cResult.Message,
+									FinishedAt: cResult.FinishedAt,
+								}
+							}
+						}
+					}
+				}
+				if !runnerChecked {
+					status.Ready = true
+					status.State.Running = &ContainerRunningState{
+						StartedAt: inst.CreatedAt,
+					}
 				}
 			case StateTerminating:
 				status.State.Terminated = &ContainerTerminatedState{
@@ -768,6 +810,17 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		recNode.Namespace = ns
 		recNode.Cordoned = true
 		s.nodePool.RegisterAndAllocate(recNode, defaultVec, podUID, ns, podName)
+
+		if s.runner != nil {
+			if containers, err := s.runner.ListContainers(ctx, recNode); err == nil {
+				for _, c := range containers {
+					if c.PodUID != "" && c.PodUID != podUID {
+						s.instances[c.PodUID] = inst
+						s.nodePool.RegisterAndAllocate(recNode, defaultVec, c.PodUID, ns, c.PodUID)
+					}
+				}
+			}
+		}
 		cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
 		cleanKey := strings.ReplaceAll(strings.ReplaceAll(key, "\n", ""), "\r", "")
 		log.Printf("[cloudvm] Recovered existing cloud VM %s for pod %s", cleanID, cleanKey)

@@ -193,8 +193,8 @@ func TestSpotPriceTicker_AZKeyingAndTimestampOrdering(t *testing.T) {
 		t.Fatalf("expected price 0.3800 for us-east-1b, got %+v", entry1b)
 	}
 
-	latest, ok := ticker.GetPrice("us-east-1", "g5.2xlarge")
-	if !ok || latest.SpotPriceUSD != 0.4200 {
-		t.Fatalf("expected latest price 0.4200 across region, got %+v", latest)
+	cheapest, ok := ticker.GetPrice("us-east-1", "g5.2xlarge")
+	if !ok || cheapest.SpotPriceUSD != 0.3800 {
+		t.Fatalf("expected cheapest price 0.3800 across region, got %+v", cheapest)
 	}
 }

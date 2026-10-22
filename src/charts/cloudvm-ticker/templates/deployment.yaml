@@ -29,6 +29,10 @@ spec:
               value: "{{ .Values.service.port }}"
             - name: SCRAPE_INTERVAL_SECONDS
               value: "{{ .Values.ticker.scrapeIntervalSeconds }}"
+            - name: TICKER_REGIONS
+              value: "{{ join "," .Values.ticker.regions }}"
+            - name: TICKER_INSTANCE_TYPES
+              value: "{{ join "," .Values.ticker.instanceTypes }}"
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

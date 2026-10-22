@@ -98,6 +98,10 @@ type InstanceSpec struct {
 	SecurityGroupIDs []string `json:"securityGroupIDs,omitempty"`
 	// ClusterTag identifies the resource owner for automated garbage collection.
 	ClusterTag string `json:"clusterTag,omitempty"`
+	// RunnerAuthToken is the shared bearer secret for the in-VM micro-runner daemon.
+	RunnerAuthToken string `json:"runnerAuthToken,omitempty"`
+	// AssignedGPUs are the discrete GPU device indices allocated for the pod.
+	AssignedGPUs []int `json:"assignedGPUs,omitempty"`
 }
 
 // Instance represents an active or terminating cloud VM instance.

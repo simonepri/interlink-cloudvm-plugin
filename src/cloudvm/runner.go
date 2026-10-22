@@ -43,6 +43,7 @@ type ContainerRunner interface {
 	StartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) error
 	GetStatus(ctx context.Context, node *CloudVMNode, podUID string) (*ContainerStatusResult, error)
 	StopContainer(ctx context.Context, node *CloudVMNode, podUID string) error
+	ListContainers(ctx context.Context, node *CloudVMNode) ([]*ContainerStatusResult, error)
 }
 
 // HTTPContainerRunner connects to the in-VM micro-runner daemon over the private WireGuard mesh.
@@ -61,6 +62,12 @@ func NewHTTPContainerRunner(port int) *HTTPContainerRunner {
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+	}
+}
+
+func (h *HTTPContainerRunner) setAuthHeader(httpReq *http.Request, node *CloudVMNode) {
+	if node != nil && node.RunnerAuthToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+node.RunnerAuthToken)
 	}
 }
 
@@ -84,6 +91,7 @@ func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMN
 		return err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	h.setAuthHeader(httpReq, node)
 
 	resp, err := h.client.Do(httpReq) //nolint:gosec // internal mesh call
 	if err != nil {
@@ -103,6 +111,7 @@ func (h *HTTPContainerRunner) GetStatus(ctx context.Context, node *CloudVMNode, 
 	if err != nil {
 		return nil, err
 	}
+	h.setAuthHeader(httpReq, node)
 
 	resp, err := h.client.Do(httpReq) //nolint:gosec // internal mesh call
 	if err != nil {
@@ -123,6 +132,7 @@ func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNo
 	if err != nil {
 		return err
 	}
+	h.setAuthHeader(httpReq, node)
 
 	resp, err := h.client.Do(httpReq) //nolint:gosec // internal mesh call
 	if err != nil {
@@ -130,6 +140,31 @@ func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNo
 	}
 	defer resp.Body.Close()
 	return nil
+}
+
+func (h *HTTPContainerRunner) ListContainers(ctx context.Context, node *CloudVMNode) ([]*ContainerStatusResult, error) {
+	url := h.endpoint(node, "/containers/list")
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // internal mesh call
+	if err != nil {
+		return nil, err
+	}
+	h.setAuthHeader(httpReq, node)
+
+	resp, err := h.client.Do(httpReq) //nolint:gosec // internal mesh call
+	if err != nil {
+		return nil, fmt.Errorf("failed to query in-VM runner list at %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("in-VM runner list error: status %d", resp.StatusCode)
+	}
+
+	var results []*ContainerStatusResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // MockContainerRunner simulates in-VM container execution for tests and mock environments.
@@ -178,4 +213,14 @@ func (m *MockContainerRunner) StopContainer(_ context.Context, _ *CloudVMNode, p
 		c.FinishedAt = time.Now()
 	}
 	return nil
+}
+
+func (m *MockContainerRunner) ListContainers(_ context.Context, _ *CloudVMNode) ([]*ContainerStatusResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*ContainerStatusResult
+	for _, c := range m.containers {
+		out = append(out, c)
+	}
+	return out, nil
 }

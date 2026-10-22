@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -163,14 +164,19 @@ func TestCloudInitGeneration(t *testing.T) {
 }
 
 func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
+	testToken := fmt.Sprintf("auth-token-%d", time.Now().UnixNano())
 	cfg := &CloudInitConfig{
 		PodName:              "multi-tenant-pod",
 		PodNamespace:         "ai-workloads",
 		PodUID:               "pod-uid-456",
+		RunnerAuthToken:      testToken,
 		TargetContainerImage: "ghcr.io/org/worker:v1",
 		Command:              []string{"python3", "worker.py"},
 		UseNativeDLAMI:       false,
 		NumGPUs:              2,
+		AssignedGPUs:         []int{0, 1},
+		CPUMillicores:        4000,
+		MemoryBytes:          16 * 1024 * 1024 * 1024,
 		Region:               "us-east-1",
 		InstanceType:         "g5.12xlarge",
 	}
@@ -180,11 +186,23 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 		t.Fatalf("GenerateCloudInit failed: %v", err)
 	}
 
-	if !bytes.Contains([]byte(script), []byte("PORT = 9090")) {
-		t.Errorf("cloud-init missing in-VM runner port 9090 configuration")
+	if bytes.Contains([]byte(script), []byte("cloudvm-workload")) {
+		t.Errorf("cloud-init contains stale reference to cloudvm-workload")
 	}
-	if !bytes.Contains([]byte(script), []byte("/usr/local/bin/cloudvm-runner.py")) {
-		t.Errorf("cloud-init missing in-VM runner daemon installation")
+	if bytes.Contains([]byte(script), []byte("shell=True")) {
+		t.Errorf("cloud-init runner must not execute commands with shell=True")
+	}
+	if bytes.Contains([]byte(script), []byte("--pid=host")) || bytes.Contains([]byte(script), []byte("--ipc=host")) {
+		t.Errorf("cloud-init containers must not share pid or ipc namespace with host")
+	}
+	if !bytes.Contains([]byte(script), []byte(fmt.Sprintf(`AUTH_TOKEN = "%s"`, testToken))) {
+		t.Errorf("cloud-init missing runner auth token configuration")
+	}
+	if !bytes.Contains([]byte(script), []byte("ThreadingHTTPServer")) {
+		t.Errorf("cloud-init runner should use ThreadingHTTPServer for concurrent requests")
+	}
+	if !bytes.Contains([]byte(script), []byte("--gpus device=0,1")) {
+		t.Errorf("cloud-init missing discrete device slicing flags")
 	}
 	if !bytes.Contains([]byte(script), []byte(`docker run -d --name="cloudvm-pod-uid-456"`)) {
 		t.Errorf("cloud-init missing detached initial container launch with pod UID name, got script:\n%s", script)

@@ -342,6 +342,8 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		Region:               spec.Region,
 		InstanceType:         spec.InstanceType,
 		NumGPUs:              spec.NumGPUs,
+		AssignedGPUs:         spec.AssignedGPUs,
+		RunnerAuthToken:      spec.RunnerAuthToken,
 		UseNativeDLAMI:       spec.AMIMode == "dlami",
 		RayHeadAddress:       spec.RayHeadAddress,
 		RayVersion:           spec.RayVersion,

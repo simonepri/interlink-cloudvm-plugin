@@ -13,6 +13,16 @@ import (
 	"time"
 )
 
+func parseCommaList(val string) []string {
+	var out []string
+	for _, item := range strings.Split(val, ",") {
+		if t := strings.TrimSpace(item); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -54,7 +64,8 @@ func main() {
 				interval = time.Duration(s) * time.Second
 			}
 		}
-		spotTicker := NewSpotPriceTicker(tickerRegions, nil, interval)
+		tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
+		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval)
 		go spotTicker.Start(ctx)
 		log.Printf("[cloudvm-ticker] Running standalone spot ticker on port %s for %d regions", port, len(tickerRegions)) //nolint:gosec // length safe
 
@@ -99,6 +110,9 @@ func main() {
 	server.RegisterProvider(ProviderAWS, awsProv)
 	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
 	server.RegisterProvider(ProviderMock, mockProv)
+	if providerType == "aws" || providerType == "gcp" {
+		server.SetContainerRunner(NewHTTPContainerRunner(9090))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -115,7 +129,8 @@ func main() {
 				interval = time.Duration(s) * time.Second
 			}
 		}
-		spotTicker := NewSpotPriceTicker(tickerRegions, nil, interval)
+		tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
+		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval)
 		go spotTicker.Start(ctx)
 		server.SetSpotTicker(spotTicker)
 		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(tickerRegions)) //nolint:gosec // log length is safe
