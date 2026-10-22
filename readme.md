@@ -42,6 +42,20 @@
 
 ---
 
+## Feature Status & Implementation Roadmap
+
+| Subsystem / Capability | Status | Scope & Behavior |
+| :--- | :---: | :--- |
+| **AWS EC2 Fleet Engine** | **Implemented** | Instant weighted fleet requests, price-capacity-optimized allocation, collision-proof client tokens. |
+| **GCP Compute Engine Engine** | **Implemented** | `bulkInsert` multi-zone placement, spot preemption trap, cloud-init user-data injection. |
+| **Spend Rate Governors (Compute & Egress)** | **Implemented** | `cloudvm.vk.io/max-price` cap & `cloudvm.vk.io/max-egress-rate` token-bucket priority shaping. |
+| **In-VM Ephemeral Bootstrap & Watchdog** | **Implemented** | Fast DLAMI launch, 300s startup watchdog, 60s post-startup dead-man's switch, `terminate` on poweroff. |
+| **Spot Pricing Catalog Ticker** | **Standalone Chart** | Embedded mode with randomized jitter, or central `cloudvm-ticker` deployment with OTEL metrics. |
+| **OpenCost FinOps Attribution** | **Architected** | Cloud billing tags (`ManagedBy`, `ClusterTag`, `PodName`, `Namespace`) mapped to CUR / BigQuery exports. |
+| **Kueue Multi-Flavor Backpressure** | **Pattern** | Paired with Kueue `AdmissionCheck` / `ProvisioningRequest` for pre-binding capacity fallback. |
+
+---
+
 ## 1. High-Level Concept
 
 `interlink-provider-cloudvm` is an open-source provider plugin for **[CNCF InterLink](https://github.com/interlink-hq/interLink)**. 
@@ -393,6 +407,50 @@ Cloud spot GPU instances occasionally experience hardware degradation (e.g. unco
 To maintain the **~33-second cold-start**, daemons can be packaged in two ways:
 1. **Pre-baked Golden AMI (Recommended for Production)**: Tools (Parca, Falco, Dragonfly) are pre-installed into custom AMIs via Packer. The VM boots with all binaries and kernel eBPF probes already on disk—zero network downloads at runtime.
 2. **Cloud-Init Systemd Hooks**: Lightweight binaries or systemd units are launched dynamically at boot through cloud-init user-data scripts.
+
+
+---
+
+### F. Pricing Catalog & Central Ticker Architecture
+
+To evaluate cross-cloud spot arbitrage without risking cloud API rate limits (`pricing:GetProducts` has a strict 5 req/s quota), `interlink-provider-cloudvm` decouples pricing into two tiers:
+
+```mermaid
+flowchart TD
+    classDef central fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
+    classDef cell fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
+    classDef otel fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
+
+    subgraph Central["Central Management Cluster (ctrl)"]
+        Ticker["cloudvm-ticker (Standalone Chart)
+Polls AWS & GCP APIs every 10m (6 req/hr total)"]:::central
+        Ticker --> HTTP["HTTP Catalog Endpoint
+(GET /v1/catalog)"]:::central
+        Ticker --> Metrics["Prometheus Metrics (/metrics)
+cloudvm_spot_price_usd_per_hour"]:::central
+    end
+
+    Metrics --> OTEL["OTEL Collector / Prometheus"]:::otel
+    OTEL --> Dash["Grafana / SigNoz Cost Dashboard
+(Real-Time Spot Arbitrage & Savings Tracker)"]:::otel
+
+    subgraph Cells["Distributed Worker Cells"]
+        HTTP -->|Private WireGuard Mesh| Cell1["Cell 1 Provider
+(--ticker-url=http://...)"]:::cell
+        HTTP -->|Private WireGuard Mesh| Cell2["Cell 2 Provider
+(--ticker-url=http://...)"]:::cell
+    end
+```
+
+#### Two Deployment Modes:
+1. **Embedded Ticker (Single-Cluster Default)**:
+   - When running as a standalone cluster without a central control plane, the provider runs an internal in-process ticker with randomized jitter (`10m ± 2m`).
+   - Completely self-contained with **zero external service dependencies**.
+2. **Central Ticker Service (`cloudvm-ticker` Chart)**:
+   - In multi-cell enterprise fleets, deploy the standalone `cloudvm-ticker` chart once in the central cluster (`ctrl`).
+   - All worker cells set `provider.tickerURL: "http://cloudvm-ticker.ctrl.svc:8080/v1/catalog"`.
+   - **Zero Rate Limits**: Cloud APIs see exactly 6 requests per hour for the entire company, regardless of cell count.
+   - **OTEL Observability**: The ticker exports multidimensional Prometheus metrics (`cloudvm_spot_price_usd_per_hour`, `cloudvm_spot_discount_ratio`), enabling real-time Grafana/SigNoz spot arbitrage heatmaps and savings tracking.
 
 ### OpenCost & FinOps Cost Allocation (Outside Kubernetes)
 

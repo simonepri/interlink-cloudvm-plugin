@@ -54,6 +54,8 @@ type FleetRequest struct {
 	AllocationStrategy FleetAllocationStrategy `json:"allocationStrategy"`
 	ClusterTag         string                  `json:"clusterTag"`
 	PodName            string                  `json:"podName"`
+	PodNamespace       string                  `json:"podNamespace"`
+	PodUID             string                  `json:"podUID,omitempty"`
 	MarketType         string                  `json:"marketType,omitempty"`
 	MaxPrice           string                  `json:"maxPrice,omitempty"`
 	PricePolicy        string                  `json:"pricePolicy,omitempty"`
@@ -134,7 +136,11 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		}
 	}
 
-	clientToken := fmt.Sprintf("%s-%s", req.ClusterTag, req.PodName)
+	tokenBase := fmt.Sprintf("%s-%s-%s-%s", req.ClusterTag, req.PodNamespace, req.PodName, req.PodUID)
+	if len(tokenBase) > 64 {
+		tokenBase = tokenBase[:64]
+	}
+	clientToken := tokenBase
 	input := &ec2.CreateFleetInput{
 		Type:        ec2types.FleetTypeInstant,
 		ClientToken: aws.String(clientToken),
@@ -160,6 +166,7 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 					{Key: aws.String("ManagedBy"), Value: aws.String("interlink-provider-cloudvm")},
 					{Key: aws.String("ClusterTag"), Value: aws.String(req.ClusterTag)},
 					{Key: aws.String("PodName"), Value: aws.String(req.PodName)},
+					{Key: aws.String("Namespace"), Value: aws.String(req.PodNamespace)},
 				},
 			},
 		},
@@ -267,6 +274,8 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		SubnetIDs:          spec.SubnetIDs,
 		ClusterTag:         spec.ClusterTag,
 		PodName:            spec.PodName,
+		PodNamespace:       spec.PodNamespace,
+		PodUID:             spec.PodUID,
 		MarketType:         spec.MarketType,
 		MaxPrice:           spec.MaxPrice,
 		PricePolicy:        spec.PricePolicy,

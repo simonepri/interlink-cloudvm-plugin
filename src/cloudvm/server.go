@@ -37,7 +37,7 @@ type Server struct {
 	mu          sync.RWMutex
 	providers   map[ProviderType]Provider
 	defaultProv Provider
-	instances   map[string]*Instance // key: podName -> *Instance
+	instances   map[string]*Instance // key: namespace/podName -> *Instance
 	clusterTag  string
 	reconciler  *Reconciler
 }
@@ -90,6 +90,10 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		ns = "default"
 	}
 	name := pod.Metadata.Name
+	uid := pod.Metadata.UID
+	if uid == "" {
+		uid = pod.Metadata.Annotations["kubernetes.io/pod-uid"]
+	}
 
 	// 1. Region
 	region := pod.Metadata.Annotations["cloudvm.vk.io/region"]
@@ -207,6 +211,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 	return &InstanceSpec{
 		PodName:              name,
 		PodNamespace:         ns,
+		PodUID:               uid,
 		Region:               region,
 		CandidateRegions:     candidateRegions,
 		InstanceType:         instanceType,
@@ -272,7 +277,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.instances[spec.PodName] = inst
+	key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
+	s.instances[key] = inst
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
@@ -298,8 +304,17 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	podName := pod.Metadata.Name
+	ns := pod.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	key := fmt.Sprintf("%s/%s", ns, podName)
 	s.mu.Lock()
-	inst, exists := s.instances[podName]
+	inst, exists := s.instances[key]
+	if !exists {
+		inst, exists = s.instances[podName] // fallback for legacy keys
+	}
+	delete(s.instances, key)
 	delete(s.instances, podName)
 	s.mu.Unlock()
 
@@ -345,7 +360,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, pod := range pods {
 		name := pod.Metadata.Name
 		ns := pod.Metadata.Namespace
-		inst, exists := s.instances[name]
+		if ns == "" {
+			ns = "default"
+		}
+		key := fmt.Sprintf("%s/%s", ns, name)
+		inst, exists := s.instances[key]
+		if !exists {
+			inst, exists = s.instances[name] // fallback
+		}
 
 		status := ContainerStatus{
 			Name: "worker",
@@ -422,7 +444,18 @@ func (s *Server) MarkPodFailed(_ context.Context, podName string, _ string) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if inst, ok := s.instances[podName]; ok {
+	inst, ok := s.instances[podName]
+	if !ok {
+		// Search by pod name suffix in keys
+		for k, v := range s.instances {
+			if strings.HasSuffix(k, "/"+podName) || k == podName {
+				inst = v
+				ok = true
+				break
+			}
+		}
+	}
+	if ok {
 		inst.State = StateFailed
 	}
 	return nil

@@ -32,6 +32,10 @@ type InstanceSpec struct {
 	PodName string `json:"podName"`
 	// PodNamespace is the namespace of the Kubernetes pod.
 	PodNamespace string `json:"podNamespace"`
+	// PodUID is the unique identifier of the Kubernetes pod.
+	PodUID string `json:"podUID,omitempty"`
+	// TickerURL is the optional URL of a central cloudvm-ticker service.
+	TickerURL string `json:"tickerURL,omitempty"`
 	// Region is the target cloud region (e.g. us-east-1, us-west-2).
 	Region string `json:"region"`
 	// CandidateRegions lists allowable regions for cross-region spot arbitrage.
