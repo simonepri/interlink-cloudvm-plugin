@@ -1,0 +1,9 @@
+apiVersion: v2
+name: cloudvm-ticker
+description: Standalone central spot price ticker and Prometheus exporter for InterLink CloudVM
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+maintainers:
+  - name: Simone Primarosa
+    url: https://github.com/simonepri

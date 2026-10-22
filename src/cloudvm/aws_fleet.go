@@ -1,4 +1,4 @@
-// Package main implements the interlink-provider-cloudvm daemon.
+// Package cloudvm provides the AWS EC2 Fleet engine for launching opportunistic spot and on-demand GPU instances.
 package main
 
 import (
@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
-// FleetAllocationStrategy defines the bidding and placement strategy.
+// FleetAllocationStrategy specifies the spot allocation behavior.
 type FleetAllocationStrategy string
 
 const (
@@ -23,14 +23,42 @@ const (
 	StrategyLowestPrice            FleetAllocationStrategy = "lowest-price"
 )
 
-// GPUCountForInstanceType returns the number of physical GPUs for an instance type.
+// GPUCountForInstanceType returns the number of physical GPUs/accelerators for an AWS instance type.
+// CPU instance families (such as c6i, m6i, r6i) return 0.
 func GPUCountForInstanceType(itype string) int {
 	switch {
-	case strings.Contains(itype, "p5.") || strings.Contains(itype, "p4d.") || strings.HasSuffix(itype, ".48xlarge") || strings.HasSuffix(itype, ".metal"):
+	// 8-GPU accelerators
+	case strings.HasPrefix(itype, "p5.") || strings.HasPrefix(itype, "p5e."):
 		return 8
-	case strings.HasSuffix(itype, ".12xlarge") || strings.HasSuffix(itype, ".24xlarge"):
+	case strings.HasPrefix(itype, "p4d.") || strings.HasPrefix(itype, "p4de."):
+		return 8
+	case strings.HasPrefix(itype, "p3.16xlarge") || strings.HasPrefix(itype, "p3dn.24xlarge"):
+		return 8
+	case strings.HasPrefix(itype, "g5.48xlarge") || strings.HasPrefix(itype, "g6.48xlarge") || strings.HasPrefix(itype, "g6e.48xlarge"):
+		return 8
+	case itype == "g4dn.metal":
+		return 8
+	// 4-GPU accelerators
+	case strings.HasPrefix(itype, "p3.8xlarge"):
 		return 4
-	case strings.HasPrefix(itype, "g4dn.") || strings.HasPrefix(itype, "g5.") || strings.HasPrefix(itype, "g6.") || strings.HasPrefix(itype, "g6e."):
+	case strings.HasPrefix(itype, "g5.12xlarge") || strings.HasPrefix(itype, "g5.24xlarge"):
+		return 4
+	case strings.HasPrefix(itype, "g6.12xlarge") || strings.HasPrefix(itype, "g6.24xlarge"):
+		return 4
+	case strings.HasPrefix(itype, "g6e.12xlarge") || strings.HasPrefix(itype, "g6e.24xlarge"):
+		return 4
+	case strings.HasPrefix(itype, "g4dn.12xlarge"):
+		return 4
+	// 1-GPU accelerators
+	case strings.HasPrefix(itype, "p3.2xlarge"):
+		return 1
+	case strings.HasPrefix(itype, "g5."):
+		return 1
+	case strings.HasPrefix(itype, "g6."):
+		return 1
+	case strings.HasPrefix(itype, "g6e."):
+		return 1
+	case strings.HasPrefix(itype, "g4dn."):
 		return 1
 	default:
 		return 0
@@ -44,24 +72,29 @@ type FleetOverride struct {
 	WeightedCapacity float64 `json:"weightedCapacity"`
 }
 
-// FleetRequest represents a bulk spot request across multiple instance types and AZs.
+// FleetRequest represents a spot or on-demand request across multiple instance types and AZs.
 type FleetRequest struct {
 	Region             string                  `json:"region"`
 	TargetCapacity     int                     `json:"targetCapacity"`
+	AllocationStrategy FleetAllocationStrategy `json:"allocationStrategy"`
 	InstanceTypes      []string                `json:"instanceTypes"`
 	SubnetIDs          []string                `json:"subnetIds,omitempty"`
-	LaunchTemplateID   string                  `json:"launchTemplateId,omitempty"`
-	AllocationStrategy FleetAllocationStrategy `json:"allocationStrategy"`
+	SecurityGroupIDs   []string                `json:"securityGroupIds,omitempty"`
 	ClusterTag         string                  `json:"clusterTag"`
 	PodName            string                  `json:"podName"`
 	PodNamespace       string                  `json:"podNamespace"`
-	PodUID             string                  `json:"podUID,omitempty"`
+	PodUID             string                  `json:"podUid"`
+	CostCenter         string                  `json:"costCenter,omitempty"`
+	JobID              string                  `json:"jobId,omitempty"`
+	UserData           string                  `json:"userData,omitempty"`
+	LaunchTemplateID   string                  `json:"launchTemplateId,omitempty"`
+	LaunchTemplateName string                  `json:"launchTemplateName,omitempty"`
 	MarketType         string                  `json:"marketType,omitempty"`
 	MaxPrice           string                  `json:"maxPrice,omitempty"`
 	PricePolicy        string                  `json:"pricePolicy,omitempty"`
 }
 
-// FleetResponse represents the result of a bulk fleet launch.
+// FleetResponse represents the result of a fleet launch.
 type FleetResponse struct {
 	FleetID       string      `json:"fleetId"`
 	Region        string      `json:"region"`
@@ -79,7 +112,8 @@ type EC2FleetClient interface {
 	TerminateInstances(ctx context.Context, params *ec2.TerminateInstancesInput, optFns ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error)
 }
 
-// BuildFleetOverrides constructs the weighted launch template overrides for EC2 Fleet.
+// BuildFleetOverrides constructs the launch template overrides for EC2 Fleet.
+// In 1 Pod = 1 VM architecture, candidate shapes represent equivalent alternative VM configurations.
 func BuildFleetOverrides(instanceTypes []string, subnetIDs []string) []ec2types.FleetLaunchTemplateOverridesRequest {
 	var overrides []ec2types.FleetLaunchTemplateOverridesRequest
 	subnets := subnetIDs
@@ -88,16 +122,10 @@ func BuildFleetOverrides(instanceTypes []string, subnetIDs []string) []ec2types.
 	}
 
 	for _, itype := range instanceTypes {
-		gpus := GPUCountForInstanceType(itype)
-		weight := float64(gpus)
-		if weight <= 0 {
-			weight = 1.0
-		}
-
 		for _, subnet := range subnets {
 			ov := ec2types.FleetLaunchTemplateOverridesRequest{
 				InstanceType:     ec2types.InstanceType(itype),
-				WeightedCapacity: aws.Float64(weight),
+				WeightedCapacity: aws.Float64(1.0),
 			}
 			if subnet != "" {
 				ov.SubnetId = aws.String(subnet)
@@ -110,6 +138,10 @@ func BuildFleetOverrides(instanceTypes []string, subnetIDs []string) []ec2types.
 
 // LaunchFleetWithClient invokes AWS CreateFleet using a custom client.
 func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *FleetRequest, overrides []ec2types.FleetLaunchTemplateOverridesRequest) (*FleetResponse, error) {
+	if req.PodUID == "" {
+		return nil, fmt.Errorf("pod UID is required for idempotent fleet creation")
+	}
+
 	strategy := req.AllocationStrategy
 	if strategy == "" {
 		strategy = StrategyPriceCapacityOptimized
@@ -136,50 +168,75 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		}
 	}
 
-	// Put UID first so truncation never cuts off uniqueness
-	uid := req.PodUID
-	if uid == "" {
-		uid = fmt.Sprintf("%x", time.Now().UnixNano())
-	}
-	tokenBase := fmt.Sprintf("cvm-%s-%s-%s", uid, req.PodNamespace, req.PodName)
+	// Put UID first so truncation never cuts off uniqueness.
+	tokenBase := fmt.Sprintf("cvm-%s-%s-%s", req.PodUID, req.PodNamespace, req.PodName)
 	if len(tokenBase) > 64 {
 		tokenBase = tokenBase[:64]
 	}
 	clientToken := tokenBase
+
+	// Target capacity is 1 instance (1 pod = 1 VM)
+	targetCapacity := int32(1)
+
+	ltSpec := &ec2types.FleetLaunchTemplateSpecificationRequest{
+		Version: aws.String("$Latest"),
+	}
+	switch {
+	case req.LaunchTemplateID != "":
+		ltSpec.LaunchTemplateId = aws.String(req.LaunchTemplateID)
+	case req.LaunchTemplateName != "":
+		ltSpec.LaunchTemplateName = aws.String(req.LaunchTemplateName)
+	default:
+		ltSpec.LaunchTemplateName = aws.String("interlink-cloudvm-worker")
+	}
+	if req.UserData != "" {
+		ltSpec.LaunchTemplateSpecificationUserData = aws.String(req.UserData)
+	}
+
+	tags := []ec2types.Tag{
+		{Key: aws.String("ManagedBy"), Value: aws.String("interlink-provider-cloudvm")},
+		{Key: aws.String("ClusterTag"), Value: aws.String(req.ClusterTag)},
+		{Key: aws.String("PodName"), Value: aws.String(req.PodName)},
+		{Key: aws.String("Namespace"), Value: aws.String(req.PodNamespace)},
+		{Key: aws.String("PodUID"), Value: aws.String(req.PodUID)},
+	}
+	if req.CostCenter != "" {
+		tags = append(tags, ec2types.Tag{Key: aws.String("CostCenter"), Value: aws.String(req.CostCenter)})
+	}
+	if req.JobID != "" {
+		tags = append(tags, ec2types.Tag{Key: aws.String("JobID"), Value: aws.String(req.JobID)})
+	}
+
 	input := &ec2.CreateFleetInput{
 		Type:        ec2types.FleetTypeInstant,
 		ClientToken: aws.String(clientToken),
 		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{
-			TotalTargetCapacity:       aws.Int32(int32(req.TargetCapacity & 0x7fffffff)),
+			TotalTargetCapacity:       aws.Int32(targetCapacity),
 			DefaultTargetCapacityType: targetCapType,
 		},
 		SpotOptions:     spotOpts,
 		OnDemandOptions: onDemandOpts,
 		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{
 			{
-				LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{
-					LaunchTemplateId: aws.String(req.LaunchTemplateID),
-					Version:          aws.String("$Latest"),
-				},
-				Overrides: overrides,
+				LaunchTemplateSpecification: ltSpec,
+				Overrides:                   overrides,
 			},
 		},
 		TagSpecifications: []ec2types.TagSpecification{
 			{
 				ResourceType: ec2types.ResourceTypeInstance,
-				Tags: []ec2types.Tag{
-					{Key: aws.String("ManagedBy"), Value: aws.String("interlink-provider-cloudvm")},
-					{Key: aws.String("ClusterTag"), Value: aws.String(req.ClusterTag)},
-					{Key: aws.String("PodName"), Value: aws.String(req.PodName)},
-					{Key: aws.String("Namespace"), Value: aws.String(req.PodNamespace)},
-				},
+				Tags:         tags,
+			},
+			{
+				ResourceType: ec2types.ResourceTypeVolume,
+				Tags:         tags,
 			},
 		},
 	}
 
 	out, err := client.CreateFleet(ctx, input)
 	if err != nil {
-		return nil, fmt.Errorf("CreateFleet failed in %s: %w", req.Region, err)
+		return nil, fmt.Errorf("ec2:CreateFleet call failed: %w", err)
 	}
 
 	resp := &FleetResponse{
@@ -188,67 +245,80 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		TargetGPU: req.TargetCapacity,
 	}
 
-	for _, inst := range out.Instances {
-		for _, id := range inst.InstanceIds {
-			resp.InstanceIDs = append(resp.InstanceIDs, id)
+	for _, errItem := range out.Errors {
+		resp.Errors = append(resp.Errors, fmt.Sprintf("%s: %s",
+			aws.ToString(errItem.ErrorCode), aws.ToString(errItem.ErrorMessage)))
+	}
+
+	for _, instItem := range out.Instances {
+		for _, instID := range instItem.InstanceIds {
+			resp.InstanceIDs = append(resp.InstanceIDs, instID)
+			itype := string(instItem.InstanceType)
+			resp.ActiveWorkers++
 			resp.Instances = append(resp.Instances, &Instance{
-				ID:           id,
+				ID:           instID,
 				Provider:     ProviderAWS,
 				Region:       req.Region,
-				InstanceType: string(inst.InstanceType),
+				InstanceType: itype,
 				State:        StateRunning,
 				CreatedAt:    time.Now(),
+				Metadata: map[string]string{
+					"fleetId":   resp.FleetID,
+					"podName":   req.PodName,
+					"namespace": req.PodNamespace,
+					"podUID":    req.PodUID,
+				},
 			})
 		}
 	}
 
-	for _, fleetErr := range out.Errors {
-		resp.Errors = append(resp.Errors, fmt.Sprintf("%s: %s", aws.ToString(fleetErr.ErrorCode), aws.ToString(fleetErr.ErrorMessage)))
-	}
-
-	resp.ActiveWorkers = len(resp.InstanceIDs)
 	return resp, nil
 }
 
-// AWSProvider implements Provider and CloudInventory for AWS EC2 Fleets.
+// AWSProvider implements Provider for AWS EC2 Fleet.
 type AWSProvider struct {
 	Region string
-	Client EC2FleetClient
+	client EC2FleetClient
 }
 
-// NewAWSProvider creates an AWS provider initialized with default SDK v2 config.
+// NewAWSProvider creates an AWS provider instance.
 func NewAWSProvider(region string) *AWSProvider {
 	return &AWSProvider{
 		Region: region,
 	}
 }
 
+// SetClient overrides the internal EC2 client (used for testing).
+func (p *AWSProvider) SetClient(c EC2FleetClient) {
+	p.client = c
+}
+
 func (p *AWSProvider) getClient(ctx context.Context) (EC2FleetClient, error) {
-	if p.Client != nil {
-		return p.Client, nil
+	if p.client != nil {
+		return p.client, nil
 	}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(p.Region))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(p.Region))
 	if err != nil {
-		return nil, fmt.Errorf("unable to load AWS config for %s: %w", p.Region, err)
+		return nil, fmt.Errorf("failed to load AWS config for %s: %w", p.Region, err)
 	}
-	return ec2.NewFromConfig(cfg), nil
+	p.client = ec2.NewFromConfig(cfg)
+	return p.client, nil
 }
 
 func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
-	cloudInit, err := GenerateCloudInit(&CloudInitConfig{
+	cloudInit, err := RenderCloudInit(&CloudInitConfig{
 		PodName:              spec.PodName,
-		PodNamespace:         spec.PodNamespace,
+		Region:               spec.Region,
+		InstanceType:         spec.InstanceType,
+		NumGPUs:              spec.NumGPUs,
+		UseNativeDLAMI:       spec.AMIMode == "dlami",
 		RayHeadAddress:       spec.RayHeadAddress,
 		RayVersion:           spec.RayVersion,
+		MeshAuthKey:          spec.MeshAuthKey,
 		TargetContainerImage: spec.TargetContainerImage,
 		Command:              spec.Command,
 		Args:                 spec.Args,
 		Env:                  spec.Env,
-		UseNativeDLAMI:       spec.AMIMode == "dlami",
-		NumGPUs:              spec.NumGPUs,
-		MeshAuthKey:          spec.MeshAuthKey,
-		Region:               spec.Region,
-		InstanceType:         spec.InstanceType,
 		EgressBandwidth:      spec.EgressBandwidth,
 		EgressBurst:          spec.EgressBurst,
 	})
@@ -261,26 +331,34 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		return nil, err
 	}
 
-	// When running against live AWS with no LaunchTemplate configured, create single instance
 	instanceTypes := []string{spec.InstanceType}
 	if len(instanceTypes) == 0 || instanceTypes[0] == "" {
-		instanceTypes = []string{"g5.xlarge", "g6.xlarge", "g4dn.xlarge"}
+		switch {
+		case spec.NumGPUs >= 8:
+			instanceTypes = []string{"p5.48xlarge", "p4de.24xlarge", "g5.48xlarge"}
+		case spec.NumGPUs >= 4:
+			instanceTypes = []string{"g5.12xlarge", "g5.24xlarge", "g6.12xlarge"}
+		default:
+			instanceTypes = []string{"g5.xlarge", "g6.xlarge", "g4dn.xlarge"}
+		}
 	}
 
-	targetCap := spec.NumGPUs
-	if targetCap <= 0 {
-		targetCap = 1
-	}
+	encodedUserData := base64.StdEncoding.EncodeToString([]byte(cloudInit))
 
 	req := &FleetRequest{
 		Region:             spec.Region,
-		TargetCapacity:     targetCap,
+		TargetCapacity:     1,
 		InstanceTypes:      instanceTypes,
 		SubnetIDs:          spec.SubnetIDs,
 		ClusterTag:         spec.ClusterTag,
 		PodName:            spec.PodName,
 		PodNamespace:       spec.PodNamespace,
 		PodUID:             spec.PodUID,
+		CostCenter:         spec.CostCenter,
+		JobID:              spec.JobID,
+		UserData:           encodedUserData,
+		LaunchTemplateID:   spec.LaunchTemplateID,
+		LaunchTemplateName: spec.LaunchTemplateName,
 		MarketType:         spec.MarketType,
 		MaxPrice:           spec.MaxPrice,
 		PricePolicy:        spec.PricePolicy,
@@ -288,9 +366,6 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}
 
 	overrides := BuildFleetOverrides(req.InstanceTypes, req.SubnetIDs)
-
-	// If LaunchTemplate is configured, use Fleet; otherwise fallback to direct RunInstances
-	_ = base64.StdEncoding.EncodeToString([]byte(cloudInit))
 
 	resp, err := LaunchFleetWithClient(ctx, client, req, overrides)
 	if err != nil {
@@ -301,10 +376,6 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}
 
 	inst := resp.Instances[0]
-	inst.Metadata = map[string]string{
-		"fleetId": resp.FleetID,
-		"podName": spec.PodName,
-	}
 	return inst, nil
 }
 
@@ -389,9 +460,18 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 	for _, res := range out.Reservations {
 		for _, inst := range res.Instances {
 			podName := ""
+			podNamespace := "default"
+			podUID := ""
 			for _, tag := range inst.Tags {
-				if aws.ToString(tag.Key) == "PodName" {
-					podName = aws.ToString(tag.Value)
+				k := aws.ToString(tag.Key)
+				v := aws.ToString(tag.Value)
+				switch k {
+				case "PodName":
+					podName = v
+				case "Namespace":
+					podNamespace = v
+				case "PodUID":
+					podUID = v
 				}
 			}
 			instances = append(instances, &Instance{
@@ -403,7 +483,9 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 				State:        StateRunning,
 				CreatedAt:    aws.ToTime(inst.LaunchTime),
 				Metadata: map[string]string{
-					"podName": podName,
+					"podName":   podName,
+					"namespace": podNamespace,
+					"podUID":    podUID,
 				},
 			})
 		}

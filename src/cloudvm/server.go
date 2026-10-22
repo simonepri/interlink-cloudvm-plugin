@@ -95,6 +95,12 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		uid = pod.Metadata.Annotations["kubernetes.io/pod-uid"]
 	}
 
+	// 0. Cloud Provider selection
+	prov := pod.Metadata.Annotations["cloudvm.vk.io/provider"]
+	if prov == "" {
+		prov = pod.Spec.NodeSelector["cloudvm.vk.io/provider"]
+	}
+
 	// 1. Region
 	region := pod.Metadata.Annotations["cloudvm.vk.io/region"]
 	if region == "" {
@@ -104,10 +110,9 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		region = "us-east-1"
 	}
 
-	// Candidate regions for multi-region spot arbitrage
 	var candidateRegions []string
-	if regionsStr := pod.Metadata.Annotations["cloudvm.vk.io/regions"]; regionsStr != "" {
-		for _, r := range strings.Split(regionsStr, ",") {
+	if cand := pod.Metadata.Annotations["cloudvm.vk.io/candidate-regions"]; cand != "" {
+		for _, r := range strings.Split(cand, ",") {
 			r = strings.TrimSpace(r)
 			if r != "" {
 				candidateRegions = append(candidateRegions, r)
@@ -121,7 +126,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		instanceType = pod.Spec.NodeSelector["node.kubernetes.io/instance-type"]
 	}
 	if instanceType == "" {
-		instanceType = "g5.xlarge"
+		instanceType = "g5.2xlarge"
 	}
 
 	// 3. Market / Capacity Type (spot vs on-demand)
@@ -152,6 +157,12 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		pricePolicy = "fail-fast"
 	}
 
+	// Cost allocation & tags
+	costCenter := pod.Metadata.Annotations["cloudvm.vk.io/cost-center"]
+	jobID := pod.Metadata.Annotations["cloudvm.vk.io/job-id"]
+	launchTemplateID := pod.Metadata.Annotations["cloudvm.vk.io/aws-launch-template"]
+	launchTemplateName := pod.Metadata.Annotations["cloudvm.vk.io/aws-launch-template-name"]
+
 	// 6. Network Egress Rate Limiting (Token Bucket Filter via rate or dollar/hr spend)
 	maxEgressRate := pod.Metadata.Annotations["cloudvm.vk.io/max-egress-rate"]
 	egressBandwidth := pod.Metadata.Annotations["cloudvm.vk.io/egress-bandwidth"]
@@ -164,7 +175,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 	if maxEgressRate != "" && egressBandwidth == "" {
 		clean := strings.TrimPrefix(strings.TrimSpace(maxEgressRate), "$")
 		if rateVal, err := strconv.ParseFloat(clean, 64); err == nil && rateVal > 0 {
-			egressBandwidth = EgressRateToBandwidth(rateVal, "aws")
+			egressBandwidth = EgressRateToBandwidth(rateVal, prov)
 			if egressBurst == "" {
 				egressBurst = "100mb" // generous burst allowance for checkpoints
 			}
@@ -212,6 +223,11 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		PodName:              name,
 		PodNamespace:         ns,
 		PodUID:               uid,
+		Provider:             prov,
+		CostCenter:           costCenter,
+		JobID:                jobID,
+		LaunchTemplateID:     launchTemplateID,
+		LaunchTemplateName:   launchTemplateName,
 		Region:               region,
 		CandidateRegions:     candidateRegions,
 		InstanceType:         instanceType,
@@ -239,8 +255,10 @@ func (s *Server) selectProvider(spec *InstanceSpec) Provider {
 	defer s.mu.RUnlock()
 
 	// Check explicit annotation override
-	if p, ok := s.providers[ProviderType(spec.MarketType)]; ok {
-		return p
+	if spec != nil && spec.Provider != "" {
+		if p, ok := s.providers[ProviderType(strings.ToLower(spec.Provider))]; ok {
+			return p
+		}
 	}
 	return s.defaultProv
 }
@@ -318,12 +336,18 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	delete(s.instances, podName)
 	s.mu.Unlock()
 
-	if !exists {
+	if !exists || inst == nil {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	prov := s.selectProvider(&InstanceSpec{})
+	prov := s.defaultProv
+	s.mu.RLock()
+	if p, ok := s.providers[inst.Provider]; ok {
+		prov = p
+	}
+	s.mu.RUnlock()
+
 	if err := prov.Terminate(r.Context(), inst.ID); err != nil {
 		log.Printf("[cloudvm] Error terminating instance %s: %v", inst.ID, err)
 	}
@@ -374,10 +398,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !exists {
-			status.State.Terminated = &ContainerTerminatedState{
-				ExitCode:   0,
-				Reason:     "Completed",
-				FinishedAt: time.Now(),
+			// Do NOT report Completed with ExitCode 0 if pod is unknown.
+			// Virtual-kubelet interprets ExitCode 0 as successful workload completion.
+			// Report Waiting state with ContainerCreating to signal pending discovery.
+			status.State.Waiting = &ContainerWaitingState{
+				Reason:  "ContainerCreating",
+				Message: fmt.Sprintf("Instance for %s is pending discovery or provisioning", key),
 			}
 		} else {
 			switch inst.State {
@@ -391,10 +417,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				status.State.Running = &ContainerRunningState{
 					StartedAt: inst.CreatedAt,
 				}
-			case StateTerminating, StateTerminated:
+			case StateTerminating:
 				status.State.Terminated = &ContainerTerminatedState{
 					ExitCode:   0,
-					Reason:     "Terminated",
+					Reason:     "Terminating",
+					FinishedAt: time.Now(),
+				}
+			case StateTerminated:
+				status.State.Terminated = &ContainerTerminatedState{
+					ExitCode:   0,
+					Reason:     "Completed",
 					FinishedAt: time.Now(),
 				}
 			case StateFailed:
@@ -408,55 +440,61 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 
 		responses = append(responses, PodStatusResponse{
-			PodUID:     pod.Metadata.UID,
-			Name:       name,
-			Namespace:  ns,
-			Containers: []ContainerStatus{status},
+			PodUID:    pod.Metadata.UID,
+			Name:      name,
+			Namespace: ns,
+			Containers: []ContainerStatus{
+				status,
+			},
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(responses)
 }
 
 func (s *Server) handleGetLogs(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("InterLink CloudVM log streaming active.\n"))
+	_, _ = w.Write([]byte("[cloudvm] Logs streamed directly via cluster logging stack or cloudwatch.\n"))
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("OK"))
+	_, _ = w.Write([]byte("ok"))
 }
 
+// ActiveInstances returns a snapshot of known active instances.
+func (s *Server) ActiveInstances() map[string]*Instance {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]*Instance, len(s.instances))
+	for k, v := range s.instances {
+		out[k] = v
+	}
+	return out
+}
+
+// GetActivePods returns a map of active pod keys known to the server.
 func (s *Server) GetActivePods(_ context.Context) (map[string]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	active := make(map[string]string)
-	for podName, inst := range s.instances {
-		active[podName] = inst.ID
+	res := make(map[string]string)
+	for k, inst := range s.instances {
+		res[k] = inst.ID
 	}
-	return active, nil
+	return res, nil
 }
 
-func (s *Server) MarkPodFailed(_ context.Context, podName string, _ string) error {
+// MarkPodFailed marks a pod instance state as failed.
+func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	inst, ok := s.instances[podName]
-	if !ok {
-		// Search by pod name suffix in keys
-		for k, v := range s.instances {
-			if strings.HasSuffix(k, "/"+podName) || k == podName {
-				inst = v
-				ok = true
-				break
-			}
-		}
-	}
-	if ok {
+	if inst, ok := s.instances[podKey]; ok {
 		inst.State = StateFailed
+		if inst.Metadata == nil {
+			inst.Metadata = make(map[string]string)
+		}
+		inst.Metadata["failureReason"] = reason
 	}
 	return nil
 }

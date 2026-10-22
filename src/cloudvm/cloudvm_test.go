@@ -92,17 +92,42 @@ func TestFleetOverridesWeightedCapacity(t *testing.T) {
 		t.Fatalf("expected 3 overrides, got %d", len(overrides))
 	}
 
-	expectedWeights := map[string]float64{
-		"g5.xlarge":    1.0,
-		"g5.12xlarge":  4.0,
-		"p4d.24xlarge": 8.0,
-	}
-
+	// In 1 Pod = 1 Dedicated VM model, every candidate shape carries weight 1.0
 	for _, ov := range overrides {
 		itype := string(ov.InstanceType)
-		expected := expectedWeights[itype]
-		if ov.WeightedCapacity == nil || *ov.WeightedCapacity != expected {
-			t.Errorf("expected weight %.1f for %s, got %v", expected, itype, ov.WeightedCapacity)
+		if ov.WeightedCapacity == nil || *ov.WeightedCapacity != 1.0 {
+			t.Errorf("expected weight 1.0 for %s in 1:1 pod VM model, got %v", itype, ov.WeightedCapacity)
+		}
+	}
+}
+
+func TestGPUCountForInstanceType(t *testing.T) {
+	cases := []struct {
+		itype    string
+		expected int
+	}{
+		{"p5.48xlarge", 8},
+		{"p4d.24xlarge", 8},
+		{"g5.48xlarge", 8},
+		{"g4dn.metal", 8},
+		{"g5.12xlarge", 4},
+		{"g6.24xlarge", 4},
+		{"p3.8xlarge", 4},
+		{"g5.xlarge", 1},
+		{"g6.2xlarge", 1},
+		{"g4dn.xlarge", 1},
+		// CPU types must strictly return 0
+		{"c6i.48xlarge", 0},
+		{"c6i.24xlarge", 0},
+		{"m6i.12xlarge", 0},
+		{"r6i.32xlarge", 0},
+		{"t3.medium", 0},
+	}
+
+	for _, tc := range cases {
+		got := GPUCountForInstanceType(tc.itype)
+		if got != tc.expected {
+			t.Errorf("GPUCountForInstanceType(%q) = %d; expected %d", tc.itype, got, tc.expected)
 		}
 	}
 }
@@ -151,7 +176,7 @@ func TestReconcilerZombieDetection(t *testing.T) {
 	}
 
 	// Create reconciler with zero graceTTL so it triggers immediately
-	reconciler := NewReconciler(mock, server, "test-cluster", 1*time.Millisecond)
+	reconciler := NewReconciler(mock, server, mock, "test-cluster", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
 
 	res, err := reconciler.ReconcileOnce(ctx)

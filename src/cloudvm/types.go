@@ -1,4 +1,4 @@
-// Package main implements the interlink-provider-cloudvm daemon.
+// Package cloudvm provides core structures and interfaces for InterLink CloudVM Provider.
 package main
 
 import (
@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// ProviderType identifies the underlying cloud or mock provider.
+// ProviderType represents supported cloud providers.
 type ProviderType string
 
 const (
@@ -34,8 +34,18 @@ type InstanceSpec struct {
 	PodNamespace string `json:"podNamespace"`
 	// PodUID is the unique identifier of the Kubernetes pod.
 	PodUID string `json:"podUID,omitempty"`
+	// Provider explicitly overrides provider ("aws", "gcp").
+	Provider string `json:"provider,omitempty"`
 	// TickerURL is the optional URL of a central cloudvm-ticker service.
 	TickerURL string `json:"tickerURL,omitempty"`
+	// CostCenter is the FinOps cost allocation tag value.
+	CostCenter string `json:"costCenter,omitempty"`
+	// JobID is the high-level workload or Ray job identifier tag.
+	JobID string `json:"jobId,omitempty"`
+	// LaunchTemplateID specifies an AWS EC2 Launch Template ID.
+	LaunchTemplateID string `json:"launchTemplateId,omitempty"`
+	// LaunchTemplateName specifies an AWS EC2 Launch Template Name.
+	LaunchTemplateName string `json:"launchTemplateName,omitempty"`
 	// Region is the target cloud region (e.g. us-east-1, us-west-2).
 	Region string `json:"region"`
 	// CandidateRegions lists allowable regions for cross-region spot arbitrage.

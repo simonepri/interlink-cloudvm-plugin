@@ -15,8 +15,13 @@ provider:
   type: "mock"  # "aws" | "gcp" | "mock"
   clusterTag: "interlink-cloudvm"
   awsRegion: "us-east-1"
+  awsLaunchTemplateId: ""
+  awsLaunchTemplateName: ""
+  awsSubnetId: ""
+  awsSecurityGroupId: ""
   gcpProject: ""
   gcpZone: "us-central1-a"
+  tickerURL: ""
   reconcileIntervalSeconds: 60
 
 service:

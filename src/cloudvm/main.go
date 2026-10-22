@@ -65,12 +65,16 @@ func main() {
 	if inv, ok := defaultProvider.(CloudInventory); ok {
 		inventory = inv
 	}
+	var terminator InstanceTerminator
+	if term, ok := defaultProvider.(InstanceTerminator); ok {
+		terminator = term
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if inventory != nil {
-		reconciler := NewReconciler(inventory, server, clusterTag, 5*time.Minute)
+		reconciler := NewReconciler(inventory, server, terminator, clusterTag, 10*time.Minute)
 		server.SetReconciler(reconciler)
 
 		go func() {

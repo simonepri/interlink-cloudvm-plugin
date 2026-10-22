@@ -47,11 +47,23 @@ fi
 # Phase 2: Post-startup dead-man's switch (terminates VM if workload process terminates)
 while true; do
   sleep 60
-  if ! pgrep -f "ray" >/dev/null 2>&1 && ! pgrep -f "docker" >/dev/null 2>&1 && ! pgrep -f "python" >/dev/null 2>&1; then
-    echo "[cloudvm-bootstrap] Workload process exited. Terminating VM..."
-    echo "CLOUDVM_STATUS: {\"status\": \"WORKLOAD_EXITED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
-    shutdown -h now || poweroff
-    exit 0
+  if [ -f /tmp/workload-ready ]; then
+    WORKLOAD_ALIVE=false
+    {{if .UseNativeDLAMI}}
+    if pgrep -f "ray" >/dev/null 2>&1 || pgrep -f "python" >/dev/null 2>&1; then
+      WORKLOAD_ALIVE=true
+    fi
+    {{else}}
+    if docker inspect -f '{{print "{{"}}.State.Running{{print "}}"}}' cloudvm-workload 2>/dev/null | grep -q "true"; then
+      WORKLOAD_ALIVE=true
+    fi
+    {{end}}
+    if [ "$WORKLOAD_ALIVE" = "false" ]; then
+      echo "[cloudvm-bootstrap] Workload process exited. Terminating VM..."
+      echo "CLOUDVM_STATUS: {\"status\": \"WORKLOAD_EXITED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+      shutdown -h now || poweroff
+      exit 0
+    fi
   fi
 done
 EOF
@@ -73,8 +85,7 @@ if [ -n "{{.MeshAuthKey}}" ]; then
   fi
   tailscale up --authkey="{{.MeshAuthKey}}" \
     --hostname="cloudvm-{{.PodName}}" \
-    --accept-routes \
-    --ssh
+    --accept-routes
   echo "[cloudvm-bootstrap] Connected to mesh. Assigned IP: $(tailscale ip -4)"
 fi
 
@@ -127,13 +138,22 @@ nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
 
 # 4. Asynchronous Readiness Watcher
 (
-  for i in $(seq 1 90); do
+  for i in $(seq 1 300); do
+    {{if .UseNativeDLAMI}}
     if [ -f /tmp/workload-ready ] || (command -v ray >/dev/null 2>&1 && ray status >/dev/null 2>&1); then
       touch /tmp/workload-ready
       echo "[cloudvm-bootstrap] Workload verified healthy!"
       echo "CLOUDVM_STATUS: {\"status\": \"RUNNING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\"}" > /dev/console 2>/dev/null || true
       break
     fi
+    {{else}}
+    if docker inspect -f '{{print "{{"}}.State.Running{{print "}}"}}' cloudvm-workload 2>/dev/null | grep -q "true"; then
+      touch /tmp/workload-ready
+      echo "[cloudvm-bootstrap] Container workload running and ready!"
+      echo "CLOUDVM_STATUS: {\"status\": \"RUNNING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\"}" > /dev/console 2>/dev/null || true
+      break
+    fi
+    {{end}}
     sleep 2
   done
 ) &
@@ -153,7 +173,7 @@ PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/n
 {{else}}
 {{range $k, $v := .Env}}export {{$k}}="{{$v}}"
 {{end}}
-( sleep 2 && touch /tmp/workload-ready ) &
+( sleep 5 && touch /tmp/workload-ready ) &
 {{.RenderCommand}}
 {{end}}
 
@@ -165,15 +185,6 @@ GPU_FLAGS=""
 GPU_FLAGS="--gpus all"
 {{end}}
 
-(
-  for i in $(seq 1 30); do
-    if docker ps 2>/dev/null | grep -q "cloudvm-workload"; then
-      touch /tmp/workload-ready
-      break
-    fi
-    sleep 1
-  done
-) &
 docker run --rm --name=cloudvm-workload \
   --net=host \
   --ipc=host \
@@ -215,21 +226,22 @@ func (c *CloudInitConfig) RenderContainerCommand() string {
 	return strings.Join(parts, " ")
 }
 
-// GenerateCloudInit renders the bash/cloud-init user-data payload for a cloud VM worker.
-func GenerateCloudInit(cfg *CloudInitConfig) (string, error) {
-	if cfg.TargetContainerImage == "" && !cfg.UseNativeDLAMI {
-		cfg.TargetContainerImage = "ubuntu:24.04"
-	}
-	if cfg.RayVersion == "" {
-		cfg.RayVersion = "2.44.0"
-	}
+// RenderCloudInit fills the template with runtime parameters.
+func RenderCloudInit(cfg *CloudInitConfig) (string, error) {
 	tmpl, err := template.New("cloudinit").Parse(cloudInitTemplate)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse cloud-init template: %w", err)
 	}
+
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, cfg); err != nil {
 		return "", fmt.Errorf("failed to execute cloud-init template: %w", err)
 	}
+
 	return buf.String(), nil
+}
+
+// GenerateCloudInit renders the bootstrap cloud-init script (alias for RenderCloudInit).
+func GenerateCloudInit(cfg *CloudInitConfig) (string, error) {
+	return RenderCloudInit(cfg)
 }

@@ -1,0 +1,55 @@
+image:
+  repository: ghcr.io/simonepri/cloudvm-ticker
+  pullPolicy: IfNotPresent
+  tag: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+ticker:
+  port: 8080
+  scrapeIntervalSeconds: 600
+  regions:
+    - us-east-1
+    - us-west-2
+    - eu-west-1
+  instanceTypes:
+    - g5.xlarge
+    - g5.2xlarge
+    - g5.4xlarge
+    - g5.12xlarge
+    - g5.24xlarge
+    - g6.xlarge
+    - g6.2xlarge
+    - g6.4xlarge
+    - g6.12xlarge
+    - g6.24xlarge
+    - p4d.24xlarge
+    - p5.48xlarge
+
+service:
+  type: ClusterIP
+  port: 8080
+
+serviceMonitor:
+  enabled: false
+  interval: 60s
+  scrapeTimeout: 10s
+  labels: {}
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

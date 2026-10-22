@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -14,10 +15,16 @@ type PodStateTracker interface {
 	MarkPodFailed(ctx context.Context, podName string, reason string) error
 }
 
+// InstanceTerminator abstracts VM termination for the reconciler.
+type InstanceTerminator interface {
+	Terminate(ctx context.Context, instanceID string) error
+}
+
 // Reconciler handles background garbage collection for opportunistic VMs.
 type Reconciler struct {
 	inventory  CloudInventory
 	tracker    PodStateTracker
+	terminator InstanceTerminator
 	clusterTag string
 	graceTTL   time.Duration
 }
@@ -29,13 +36,14 @@ type ReconcileResult struct {
 }
 
 // NewReconciler creates a background garbage collector.
-func NewReconciler(inventory CloudInventory, tracker PodStateTracker, clusterTag string, graceTTL time.Duration) *Reconciler {
-	if graceTTL == 0 {
-		graceTTL = 5 * time.Minute
+func NewReconciler(inventory CloudInventory, tracker PodStateTracker, terminator InstanceTerminator, clusterTag string, graceTTL time.Duration) *Reconciler {
+	if graceTTL <= 0 {
+		graceTTL = 10 * time.Minute
 	}
 	return &Reconciler{
 		inventory:  inventory,
 		tracker:    tracker,
+		terminator: terminator,
 		clusterTag: clusterTag,
 		graceTTL:   graceTTL,
 	}
@@ -79,9 +87,15 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 
 		if !existsFull && !existsBare {
 			if now.Sub(inst.CreatedAt) > r.graceTTL {
-				log.Printf("[reconciler] Detected zombie instance for vanished pod. Terminating...")
+				cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
+				cleanKey := strings.ReplaceAll(strings.ReplaceAll(fullKey, "\n", ""), "\r", "")
+				log.Printf("[reconciler] Detected zombie instance %s for vanished pod %s. Terminating...", cleanID, cleanKey)
 				result.TerminatedZombies = append(result.TerminatedZombies, inst.ID)
-				// In live provider: r.inventory or provider terminates
+				if r.terminator != nil {
+					if err := r.terminator.Terminate(ctx, inst.ID); err != nil {
+						log.Printf("[reconciler] Error terminating zombie instance %s: %v", cleanID, err)
+					}
+				}
 			}
 		}
 	}

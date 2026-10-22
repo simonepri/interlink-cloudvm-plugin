@@ -37,6 +37,12 @@ spec:
               value: "{{ .Values.provider.gcpZone }}"
             - name: RECONCILE_INTERVAL_SECONDS
               value: "{{ .Values.provider.reconcileIntervalSeconds }}"
+            - name: TICKER_URL
+              value: "{{ .Values.provider.tickerURL }}"
+            - name: AWS_LAUNCH_TEMPLATE_ID
+              value: "{{ .Values.provider.awsLaunchTemplateId }}"
+            - name: AWS_LAUNCH_TEMPLATE_NAME
+              value: "{{ .Values.provider.awsLaunchTemplateName }}"
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
