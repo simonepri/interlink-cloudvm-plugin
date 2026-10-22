@@ -218,7 +218,7 @@ func TestCloudInit_EgressRateLimiting(t *testing.T) {
 		t.Fatalf("GenerateCloudInit failed: %v", err)
 	}
 
-	if !bytes.Contains([]byte(script), []byte("tc qdisc add dev \"$DEV\" root tbf rate 250Mbps burst 20MB latency 50ms")) {
+	if !bytes.Contains([]byte(script), []byte("tc qdisc add dev \"$DEV\" parent 1:2 handle 20: tbf rate 250Mbps burst 20MB latency 50ms")) {
 		t.Errorf("cloud-init missing expected tc rate limiting command, got:\n%s", script)
 	}
 }

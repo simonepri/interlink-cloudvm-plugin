@@ -132,8 +132,12 @@ flowchart LR
 | `p4d.24xlarge` / `p5.48xlarge` | 8 | **8.0** | Provisions 1 VM (1 × 8 = 8 GPUs) |
 
 #### Multi-Cloud Placement Strategies
-- **`price-capacity-optimized` (AWS EC2 Fleet)**: Filters for spot pools with the deepest available inventory (lowest preemption risk), then allocates the lowest-priced pool among them. Delivers 70–90% cost savings with industry-leading spot stability.
+- **`price-capacity-optimized` (AWS EC2 Fleet)**: Filters for spot pools with the deepest available inventory (lowest preemption risk), then allocates the lowest-priced pool among them. Delivers 70–90% cost savings with spot stability.
 - **`locationPolicy: ANY_SINGLE_ZONE` (GCP Compute Engine)**: Automatically places distributed worker batches in whichever single availability zone has enough spot capacity to host the entire group, eliminating cross-zone egress latency and inter-zone networking fees.
+
+#### Request Idempotency & Hardware Pinning
+- **Idempotent Launches**: Every EC2 Fleet request passes a unique `ClientToken: <cluster>-<pod>` derived from the Pod UID and Cluster Tag. Retries triggered by network timeouts or controller restarts are idempotent and cannot spin up duplicate duplicate instances.
+- **Hardware Family Pinning**: When specific accelerator architectures are required (e.g. NVIDIA H100 vs A10G), users specify `cloudvm.vk.io/instance-type: "p4d.24xlarge"` or restrict candidate instance families. The solver only diversifies across user-approved families, preventing cheaper but incompatible GPUs from being selected.
 
 ---
 
@@ -201,8 +205,12 @@ metadata:
    The Token Bucket Filter is configured with a generous burst capacity (`100mb`). When a workload uploads periodic checkpoints or model weights, packets transfer at full **10 Gbps line speed** without penalty until tokens are depleted.
 3. **Pacing Sustained Streams**:
    If an uncompressed dataset stream or rogue process attempts continuous high-speed egress, the kernel smoothly paces the traffic down to the authorized hourly spend rate. Compute is never killed, work is preserved, and your cloud bill is protected.
-4. **Selective Interface Shaping**:
-   Shaping is bound strictly to the primary cloud interface (`eth0`). Internal cluster mesh traffic (`wg0` / `tailscale0`) has zero dollar cost and remains completely unthrottled at full physical wire speed.
+4. **Two-Band Priority Queue (Mesh Exemption)**:
+   Linux Traffic Control (`tc`) configures a two-band priority scheduler (`prio bands 2`) on `eth0`:
+   - **Band 1 (Unthrottled Priority)**: Kernel filters classify encapsulated WireGuard (`UDP 51820`) and Tailscale (`UDP 41641`) mesh packets directly into Band 1, allowing inter-node distributed training, Ray GCS communication, and P2P layer caching to operate at full wire speed.
+   - **Band 2 (Spend Governed)**: All other outbound public internet packets flow through Band 2, governed by the Token Bucket Filter.
+   > [!NOTE]
+   > Encapsulated mesh packets that leave the VM to cross cloud regions or the public internet still incur standard cloud inter-region data transfer fees ($0.01–$0.02/GB). To eliminate mesh transfer fees entirely, place communicating workers in the same availability zone or VPC peering domain.
 
 #### Comparison with SkyPilot Egress Handling:
 SkyPilot addresses egress primarily via **smart placement** (co-locating compute in the region where data storage lives) and **application-level flags** (passing `--bwlimit` to `rsync` or `rclone`). SkyPilot does not provide host-level token bucket filters or dollar-based egress rate governance. `interlink-provider-cloudvm` combines native Kubernetes annotation compatibility with kernel-level traffic control.
@@ -251,10 +259,16 @@ flowchart TD
     Native -->|"Task Completed"| Terminate
 ```
 
-#### Watchdogs & Telemetry
-- **2-Minute Preemption Monitor**: Continuously polls AWS IMDSv2 metadata (`/latest/meta-data/spot/instance-action`) and GCP metadata (`/computeMetadata/v1/instance/preempted`) to cleanly drain workers and checkpoint state prior to eviction.
-- **300s Fail-Safe Self-Destruct**: Shuts down the machine if workload initialization fails within 5 minutes, preventing budget leaks from orphaned instances.
-- **Serial Console Telemetry**: Emits structured heartbeats to `/dev/console` (read via cloud serial port APIs), enabling `kubectl logs` without open SSH ports or credentials.
+#### Watchdogs, Shutdown Guarantee & Dead-Man's Switch
+- **Multi-Cloud Preemption Monitors**:
+  - **AWS (120s window)**: Continuously polls IMDSv2 (`/latest/meta-data/spot/instance-action`) with token refresh. Triggers graceful drain 2 minutes before hypervisor termination.
+  - **GCP (30s window)**: Polls metadata (`/computeMetadata/v1/instance/preempted`). Initiates fast checkpointing within the 30-second ACPI grace window.
+- **Two-Phase Watchdog & Dead-Man's Switch**:
+  - **Startup Watchdog (300s)**: Automatically terminates the instance if the workload container/script fails to verify healthy (`/tmp/workload-ready`) within 5 minutes.
+  - **Post-Startup Dead-Man's Switch**: After becoming ready, the background monitor polls workload process liveness every 60s. If the target process exits or crashes without a clean shutdown, the VM immediately terminates itself, preventing zombie idle billing.
+- **Guaranteed $0 Idle Cost (`InstanceInitiatedShutdownBehavior=terminate`)**:
+  - On AWS, instances are explicitly configured with `instance-initiated-shutdown-behavior: terminate`. When the workload completes and runs `poweroff`, the instance transitions directly to `terminated`, completely releasing root EBS volumes and elastic IPs to prevent dangling storage costs.
+- **Serial Console Telemetry**: Emits structured JSON state transitions (`BOOTING`, `RUNNING`, `SPOT_INTERRUPTION`, `HARDWARE_FAULT`) to `/dev/console` for auditability without requiring open SSH ports or credentials.
 
 ---
 
@@ -426,7 +440,33 @@ On a multi-tenant Kubernetes worker node, a compromised container sharing the no
 - Falco and Parca monitor the dedicated kernel with zero interference from other tenants.
 - When the task completes, the VM and its file systems are permanently deleted.
 
-## 5. Usage Examples
+
+---
+
+## 4. Operational Boundaries: When NOT to Use This
+
+While `interlink-provider-cloudvm` is optimized for GPU-accelerated computing and large-scale batch processing, it is not suitable for every workload:
+
+| Workload Characteristic | Why CloudVM is NOT Suitable | Recommended Alternative |
+| :--- | :--- | :--- |
+| **Microservices & Sub-Core Tasks** (e.g. 0.25 CPU, 512MB RAM) | 1 Pod = 1 Dedicated Cloud VM. Running tiny microservices on dedicated VMs wastes compute and incurs a 60-second cloud billing minimum. | Traditional Kubernetes worker nodes with **Karpenter** multi-tenant bin-packing. |
+| **Short-Lived Tasks (< 60 seconds)** | AWS and GCP bill cloud instances with a **60-second minimum charge**. A 15-second task incurs 60 seconds of compute billing. | In-cluster warm pod pools or serverless functions (Knative / AWS Lambda). |
+| **ReadWriteMany (RWX) Shared Block Storage** | Cloud VMs run in isolated VPCs and cannot attach traditional Kubernetes CSI block volumes across the virtual boundary. | Cloud-native object storage (S3 / GCS) via direct SDKs or `rclone` FUSE mounts. |
+
+---
+
+## 5. Failure Modes & Resilience Matrix
+
+| Failure Event | Detection Mechanism | Automated Reaction | System State & Recovery |
+| :--- | :--- | :--- | :--- |
+| **Spot Market Preemption** | In-VM metadata monitor (IMDSv2 on AWS, metadata on GCP) | Workload captures notice (120s AWS, 30s GCP), flushes checkpoints, and powers off. | Reconciler detects instance exit; Pod marked `Failed` (Reason: `SpotInterruption`); Kueue re-queues. |
+| **Cloud Capacity Pool Exhaustion** | Cloud API returns `InsufficientInstanceCapacity` / 429 | `/create` sets Pod condition `PodScheduled=False (CapacityExhausted)`. | Upstream orchestrator (Kueue) triggers fallback to On-Demand flavor or exponential queue backoff. |
+| **Workload Initialization Failure** | In-VM 300s startup watchdog | Watchdog triggers `poweroff` after 300s without `/tmp/workload-ready`. | VM terminates; Reconciler evicts pod; prevents zombie idle billing. |
+| **Workload Process Crash** | In-VM 60s dead-man's switch | Background monitor detects process vanished; executes `poweroff`. | Instance terminates immediately; Pod status updated to `Failed`. |
+| **GPU Hardware / ECC Fault** | NVML background watcher polling Xid / uncorrected ECC | Emits `HARDWARE_FAULT` to `/dev/console`; triggers termination. | Reconciler flags hardware failure; scheduler avoids re-scheduling on faulty hardware. |
+| **Control Plane Network Partition** | Background reconciler tracking instance timestamps | If pod object vanishes from K8s API for longer than grace TTL (default 10m), reconciler terminates cloud VM. | Prevents orphaned VMs from running indefinitely during network splits. |
+
+## 6. Usage Examples
 
 ### Example 1: Spot GPU ML Worker (Fast-Boot)
 
@@ -486,7 +526,7 @@ spec:
 
 ---
 
-## 6. Installation via Helm
+## 7. Installation via Helm
 
 ```bash
 helm upgrade --install interlink-provider-cloudvm \
@@ -499,7 +539,7 @@ helm upgrade --install interlink-provider-cloudvm \
 
 ---
 
-## 7. Development
+## 8. Development
 
 ```bash
 # Install toolchain

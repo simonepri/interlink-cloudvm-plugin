@@ -134,8 +134,10 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		}
 	}
 
+	clientToken := fmt.Sprintf("%s-%s", req.ClusterTag, req.PodName)
 	input := &ec2.CreateFleetInput{
-		Type: ec2types.FleetTypeInstant,
+		Type:        ec2types.FleetTypeInstant,
+		ClientToken: aws.String(clientToken),
 		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{
 			TotalTargetCapacity:       aws.Int32(int32(req.TargetCapacity & 0x7fffffff)),
 			DefaultTargetCapacityType: targetCapType,

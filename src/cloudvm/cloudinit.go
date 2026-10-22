@@ -32,18 +32,38 @@ exec > /var/log/cloudvm-bootstrap.log 2>&1
 echo "=== INTERLINK CLOUDVM BOOTSTRAP: $(date) ==="
 echo "CLOUDVM_STATUS: {\"status\": \"BOOTING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\", \"type\": \"{{.InstanceType}}\"}" > /dev/console 2>/dev/null || true
 
-# 1. Arm Self-Destruct Watchdog (Terminates VM if workload fails to verify ready within 300s)
+# 1. Arm Self-Destruct Watchdog & Post-Startup Dead-Man's Switch
 cat << 'EOF' > /usr/local/bin/bootstrap-watchdog.sh
 #!/usr/bin/env bash
+# Phase 1: Startup watchdog (terminates VM if workload fails to reach ready within 300s)
 sleep 300
 if [ ! -f /tmp/workload-ready ]; then
   echo "[cloudvm-bootstrap] FAIL-SAFE: Workload failed to verify ready within 300s. Terminating VM to prevent zombie billing..."
   echo "CLOUDVM_STATUS: {\"status\": \"WATCHDOG_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
   shutdown -h now || poweroff
+  exit 0
 fi
+
+# Phase 2: Post-startup dead-man's switch (terminates VM if workload process terminates)
+while true; do
+  sleep 60
+  if ! pgrep -f "ray" >/dev/null 2>&1 && ! pgrep -f "docker" >/dev/null 2>&1 && ! pgrep -f "python" >/dev/null 2>&1; then
+    echo "[cloudvm-bootstrap] Workload process exited. Terminating VM..."
+    echo "CLOUDVM_STATUS: {\"status\": \"WORKLOAD_EXITED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+    shutdown -h now || poweroff
+    exit 0
+  fi
+done
 EOF
 chmod +x /usr/local/bin/bootstrap-watchdog.sh
 nohup /usr/local/bin/bootstrap-watchdog.sh > /var/log/bootstrap-watchdog.log 2>&1 &
+
+# Ensure AWS instance terminates on poweroff to prevent zombie storage billing
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
+if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
+  aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --instance-initiated-shutdown-behavior terminate --region "{{.Region}}" 2>/dev/null || true
+fi
 
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
@@ -59,13 +79,18 @@ if [ -n "{{.MeshAuthKey}}" ]; then
 fi
 
 {{if .EgressBandwidth}}
-# Network Egress Rate Limiting (Token Bucket Filter via Linux TC)
-echo "[cloudvm-bootstrap] Configuring network egress rate limit: {{.EgressBandwidth}} (burst: {{if .EgressBurst}}{{.EgressBurst}}{{else}}10mb{{end}})..."
+# Network Egress Spend Governor (Selective Token Bucket Filter via Linux TC)
+echo "[cloudvm-bootstrap] Configuring network egress spend governor: {{.EgressBandwidth}} (burst: {{if .EgressBurst}}{{.EgressBurst}}{{else}}100mb{{end}})..."
 DEV=$(ip -4 route show default 2>/dev/null | awk '{print $5}' || echo "eth0")
 if [ -n "$DEV" ] && command -v tc >/dev/null 2>&1; then
   tc qdisc del dev "$DEV" root 2>/dev/null || true
-  tc qdisc add dev "$DEV" root tbf rate {{.EgressBandwidth}} burst {{if .EgressBurst}}{{.EgressBurst}}{{else}}10mb{{end}} latency 50ms || true
-  echo "[cloudvm-bootstrap] Egress rate limiting applied to $DEV"
+  # Create a 2-band priority queue: Band 1 unthrottled for mesh UDP traffic, Band 2 rate-limited for public internet egress
+  tc qdisc add dev "$DEV" root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 2>/dev/null || true
+  tc qdisc add dev "$DEV" parent 1:2 handle 20: tbf rate {{.EgressBandwidth}} burst {{if .EgressBurst}}{{.EgressBurst}}{{else}}100mb{{end}} latency 50ms 2>/dev/null || true
+  # Classify WireGuard (UDP 51820) and Tailscale (UDP 41641) into unthrottled Band 1
+  tc filter add dev "$DEV" protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip dport 41641 0xffff flowid 1:1 2>/dev/null || true
+  tc filter add dev "$DEV" protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff match ip dport 51820 0xffff flowid 1:1 2>/dev/null || true
+  echo "[cloudvm-bootstrap] Egress spend governor applied to $DEV (mesh UDP traffic classified to unthrottled band)"
 fi
 {{end}}
 
@@ -87,7 +112,7 @@ while true; do
   # Check GCP preempted notice
   GCP_PREEMPTED=$(curl -s -f -H "Metadata-Flavor: Google" --connect-timeout 1 "http://metadata.google.internal/computeMetadata/v1/instance/preempted" 2>/dev/null || echo "FALSE")
   if [ "$GCP_PREEMPTED" = "TRUE" ]; then
-    echo "[cloudvm-bootstrap] GCP SPOT PREEMPTION NOTICE! Draining workload..."
+    echo "[cloudvm-bootstrap] GCP SPOT PREEMPTION NOTICE (30s window)! Draining workload..."
     echo "CLOUDVM_STATUS: {\"status\": \"SPOT_INTERRUPTION\", \"provider\": \"gcp\"}" > /dev/console 2>/dev/null || true
     if command -v ray >/dev/null 2>&1; then ray stop --grace-period 25 || true; fi
     shutdown -h now || poweroff
