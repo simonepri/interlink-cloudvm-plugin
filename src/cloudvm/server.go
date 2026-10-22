@@ -1470,8 +1470,15 @@ func (s *Server) AdoptInstance(ctx context.Context, inst *Instance) bool {
 
 	// Gather containers outside s.mu lock to avoid stalling HTTP handlers on unreachable nodes
 	var containers []*ContainerStatusResult
+	var listErr error
 	if s.runner != nil && recNode != nil {
-		containers, _ = s.runner.ListContainers(ctx, recNode)
+		containers, listErr = s.runner.ListContainers(ctx, recNode)
+		if listErr != nil {
+			recNode.UnknownCoTenants = true
+			recNode.UnknownSince = time.Now()
+			cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
+			log.Printf("[cloudvm] Warning: failed to list containers on adopted VM %s: %v. Flagged with UnknownCoTenants.", cleanID, listErr) //nolint:gosec // cleanID sanitized
+		}
 	}
 
 	s.mu.Lock()
@@ -1596,6 +1603,7 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 				}
 			} else {
 				recNode.UnknownCoTenants = true
+				recNode.UnknownSince = time.Now()
 				cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
 				log.Printf("[cloudvm] Warning: failed to list containers on recovered VM %s: %v. Flagged with UnknownCoTenants.", cleanID, err) //nolint:gosec // cleanID sanitized
 			}

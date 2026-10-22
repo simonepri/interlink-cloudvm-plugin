@@ -3194,3 +3194,114 @@ func TestNodePool_UnknownCoTenantsExceededRetriesClearedForGC(t *testing.T) {
 		t.Fatalf("expected VM %s terminated as zombie after retry limit exceeded, got: %v", inst.ID, res.TerminatedZombies)
 	}
 }
+
+func TestNodePool_AdoptedVMWithRunnerUnreachableFlagsUnknownCoTenantsAndProtectsCoTenants(t *testing.T) {
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "test-cluster")
+
+	failingRunner := &failingContainerRunner{
+		shouldFail: true, // Runner unreachable during adoption
+		containers: []*ContainerStatusResult{
+			{PodUID: "uid-u1", Running: true, Status: "running"},
+			{PodUID: "uid-u2", Running: true, Status: "running"},
+		},
+	}
+	srv.SetContainerRunner(failingRunner)
+
+	inst := &Instance{
+		ID:           "i-adopted-shared",
+		Provider:     ProviderMock,
+		Region:       "us-east-1",
+		InstanceType: "g5.12xlarge",
+		IP:           "10.0.1.60",
+		State:        StateRunning,
+		CreatedAt:    time.Now().Add(-5 * time.Minute),
+		Metadata: map[string]string{
+			"podUID":     "uid-u1",
+			"podName":    "u1",
+			"namespace":  "default",
+			"marketType": "on-demand",
+			"clusterTag": "test-cluster",
+		},
+	}
+	// Track instance in mock provider
+	mock.mu.Lock()
+	mock.instances["i-adopted-shared"] = inst
+	mock.mu.Unlock()
+
+	// 1. InterLink sends /status for u1 (providing active evidence)
+	statusBody := `[{"pod":{"metadata":{"name":"u1","namespace":"default","uid":"uid-u1"}}}]`
+	reqStatus := httptest.NewRequest(http.MethodPost, "/status", bytes.NewBufferString(statusBody))
+	srv.handleStatus(httptest.NewRecorder(), reqStatus)
+
+	// 2. Adopt instance while runner is unreachable
+	ctx := context.Background()
+	adopted := srv.AdoptInstance(ctx, inst)
+	if !adopted {
+		t.Fatalf("expected AdoptInstance to succeed")
+	}
+
+	// CRITICAL CHECK: adopted node must be marked with UnknownCoTenants
+	if !srv.nodePool.HasUnknownCoTenants("i-adopted-shared") {
+		t.Fatalf("CRITICAL: adopted node must be flagged with UnknownCoTenants when runner listing fails")
+	}
+
+	// 3. Delete u1 while UnknownCoTenants is true
+	pod1JSON := `{"metadata":{"name":"u1","namespace":"default","uid":"uid-u1"}}`
+	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod1JSON))
+	srv.handleDelete(httptest.NewRecorder(), delReq)
+
+	// Verify VM is NOT terminated by /delete
+	activeVMs, err := mock.ListActiveInstances(ctx, "test-cluster")
+	if err != nil || len(activeVMs) != 1 || activeVMs[0].ID != "i-adopted-shared" {
+		t.Fatalf("CRITICAL BUG: adopted shared VM was killed by /delete while UnknownCoTenants was true!")
+	}
+
+	// 4. Verify idle collector does NOT kill it
+	expired := srv.nodePool.CollectExpiredIdleNodes()
+	if len(expired) != 0 {
+		t.Fatalf("CRITICAL BUG: idle collector killed adopted node while UnknownCoTenants was true!")
+	}
+
+	// 5. Verify reconciler does NOT kill it as a zombie
+	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
+	res, err := reconciler.ReconcileOnce(ctx)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if len(res.TerminatedZombies) != 0 {
+		t.Fatalf("CRITICAL BUG: reconciler killed adopted VM as a zombie while UnknownCoTenants was true: %v", res.TerminatedZombies)
+	}
+
+	// 6. Runner comes back up
+	failingRunner.mu.Lock()
+	failingRunner.shouldFail = false
+	failingRunner.mu.Unlock()
+
+	// 7. Background reconciler runs and discovers u2
+	_, err = reconciler.ReconcileOnce(ctx)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	if srv.nodePool.HasUnknownCoTenants("i-adopted-shared") {
+		t.Fatalf("expected UnknownCoTenants cleared after runner reconnected")
+	}
+	if _, _, found := srv.nodePool.FindPodNode("uid-u2"); !found {
+		t.Fatalf("expected co-tenant pod uid-u2 registered in nodePool after reconciliation")
+	}
+
+	// 8. Delete remaining pod u2 -> VM should now terminate cleanly
+	pod2JSON := `{"metadata":{"name":"u2","namespace":"default","uid":"uid-u2"}}`
+	delReq2 := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod2JSON))
+	srv.handleDelete(httptest.NewRecorder(), delReq2)
+
+	activeAfterAll, err := mock.ListActiveInstances(ctx, "test-cluster")
+	if err != nil || len(activeAfterAll) != 0 {
+		t.Fatalf("expected VM terminated after last co-tenant was deleted, got: %v", activeAfterAll)
+	}
+}

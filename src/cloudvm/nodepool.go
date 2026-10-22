@@ -39,6 +39,7 @@ type CloudVMNode struct {
 	Cordoned                bool           `json:"cordoned,omitempty"`
 	UnknownCoTenants        bool           `json:"unknownCoTenants,omitempty"`
 	UnknownCoTenantsRetries int            `json:"unknownCoTenantsRetries,omitempty"`
+	UnknownSince            time.Time      `json:"unknownSince,omitempty"`
 	RunnerAuthToken         string         `json:"runnerAuthToken,omitempty"`
 
 	// Discrete device maps: Slot Index -> PodUID
@@ -388,7 +389,7 @@ func (np *NodePool) IncrementUnknownCoTenantRetries(instanceID string, maxRetrie
 	defer np.mu.Unlock()
 	if node, ok := np.nodes[instanceID]; ok {
 		node.UnknownCoTenantsRetries++
-		if node.UnknownCoTenantsRetries >= maxRetries {
+		if node.UnknownCoTenantsRetries >= maxRetries || (!node.UnknownSince.IsZero() && time.Since(node.UnknownSince) > 30*time.Minute) {
 			node.UnknownCoTenants = false
 			return node.UnknownCoTenantsRetries, true
 		}
