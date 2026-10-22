@@ -208,7 +208,7 @@ flowchart TD
 
 ---
 
-## 4. Running Node Daemons on Ephemeral VMs (OTEL, Falco, Parca, Dragonfly)
+## 4. Running Node Daemons on Ephemeral VMs
 
 In traditional Kubernetes, infrastructure tools run as cluster-wide **DaemonSets**. Because `interlink-provider-cloudvm` provisions pure 1:1 cloud instances without a local Kubelet, DaemonSets do not schedule on ephemeral VMs.
 
