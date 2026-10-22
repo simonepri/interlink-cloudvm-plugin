@@ -45,7 +45,7 @@ func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance,
 		},
 	}
 	m.instances[id] = inst
-	return inst, nil
+	return cloneInstance(inst), nil
 }
 
 func (m *MockProvider) Terminate(_ context.Context, instanceID string) error {
@@ -70,7 +70,7 @@ func (m *MockProvider) Status(_ context.Context, instanceID string) (*Instance, 
 	if !exists {
 		return nil, fmt.Errorf("instance not found: %s", instanceID)
 	}
-	return inst, nil
+	return cloneInstance(inst), nil
 }
 
 func (m *MockProvider) ListActiveInstances(_ context.Context, clusterTag string) ([]*Instance, error) {
@@ -93,4 +93,18 @@ func (m *MockProvider) LaunchCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.counter
+}
+
+func cloneInstance(inst *Instance) *Instance {
+	if inst == nil {
+		return nil
+	}
+	cp := *inst
+	if inst.Metadata != nil {
+		cp.Metadata = make(map[string]string, len(inst.Metadata))
+		for k, v := range inst.Metadata {
+			cp.Metadata[k] = v
+		}
+	}
+	return &cp
 }

@@ -1316,16 +1316,60 @@ func (s *Server) GetActivePods(_ context.Context) (map[string]string, error) {
 	return res, nil
 }
 
-// MarkPodFailed marks a pod instance state as failed.
+// MarkPodFailed marks a pod instance state as failed and commits terminal execution telemetry.
 func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if inst, ok := s.instances[podKey]; ok {
+
+	var uid string
+	var jid string
+	var inst *Instance
+	if i, ok := s.instances[podKey]; ok {
+		inst = i
+		if inst.Metadata != nil {
+			uid = inst.Metadata["podUID"]
+		}
+	}
+	if uid == "" {
+		uid = podKey
+	}
+	if inst != nil {
 		inst.State = StateFailed
 		if inst.Metadata == nil {
 			inst.Metadata = make(map[string]string)
 		}
 		inst.Metadata["failureReason"] = reason
+		jid = fmt.Sprintf("%s:%s", inst.ID, uid)
+	} else {
+		jid = fmt.Sprintf("cvm-%s", uid)
+	}
+
+	exitCode := int32(137)
+	finAt := time.Now()
+	term := &ContainerTerminatedState{
+		ExitCode:   exitCode,
+		Reason:     reason,
+		Message:    fmt.Sprintf("Underlying cloud VM terminated (%s)", reason),
+		FinishedAt: finAt,
+	}
+	s.completedPods[uid] = term
+	s.completedPods[podKey] = term
+
+	if s.nodePool != nil {
+		s.nodePool.MarkPodCompleted(uid, exitCode, reason, term.Message, finAt)
+		if inst != nil {
+			s.nodePool.UnregisterNode(inst.ID)
+		}
+	}
+	if s.completedStore != nil {
+		_ = s.completedStore.Set(uid, &CompletedPodRecord{
+			PodUID:     uid,
+			PodJID:     jid,
+			ExitCode:   exitCode,
+			Reason:     reason,
+			Message:    term.Message,
+			FinishedAt: finAt,
+		})
 	}
 	return nil
 }

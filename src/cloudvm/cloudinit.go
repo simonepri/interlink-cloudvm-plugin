@@ -155,6 +155,14 @@ fi
 # Prevent non-root container workloads from accessing cloud metadata services (IMDS)
 iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
 
+# Configure ECR credential helper if available in AMI
+if command -v docker-credential-ecr-login >/dev/null 2>&1; then
+  mkdir -p /root/.docker
+  if [ ! -f /root/.docker/config.json ]; then
+    echo '{"credsStore":"ecr-login"}' > /root/.docker/config.json
+  fi
+fi
+
 # Runner port 9090 dedicated firewall chain inserted at head of INPUT
 iptables -N CLOUDVM_RUNNER 2>/dev/null || true
 iptables -F CLOUDVM_RUNNER 2>/dev/null || true
@@ -468,8 +476,6 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 with plock:
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
-                with pod_locks_guard:
-                    pod_locks.pop(pod_uid, None)
                 subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
             self.send_response(200)
             self.end_headers()
@@ -558,6 +564,17 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             if mem_bytes and mem_bytes > 0:
                 shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
                 shm_flag = f"--shm-size={shm_bytes}"
+            else:
+                try:
+                    with open('/proc/meminfo') as mf:
+                        for line in mf:
+                            if line.startswith('MemTotal:'):
+                                total_kb = int(line.split()[1])
+                                host_shm = min(total_kb * 1024 // 4, 16 * 1024 * 1024 * 1024)
+                                shm_flag = f"--shm-size={host_shm}"
+                                break
+                except Exception:
+                    shm_flag = '--shm-size=16g'
 
             if user_val is not None:
                 grp = group_val if group_val is not None else user_val

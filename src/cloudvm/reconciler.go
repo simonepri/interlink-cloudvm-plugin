@@ -69,6 +69,32 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		return nil, fmt.Errorf("failed to query active pods: %w", err)
 	}
 
+	cloudInstances := make(map[string]*Instance, len(activeInstances))
+	for _, inst := range activeInstances {
+		if inst != nil {
+			cloudInstances[inst.ID] = inst
+		}
+	}
+
+	// 1. Forward check: detect pods whose cloud VM vanished or terminated
+	for podKey, instID := range activePods {
+		if instID == "" {
+			continue
+		}
+		inst, alive := cloudInstances[instID]
+		if !alive || (inst != nil && (inst.State == StateTerminated || inst.State == StateFailed)) {
+			cleanKey := strings.ReplaceAll(strings.ReplaceAll(podKey, "\n", ""), "\r", "")
+			cleanID := strings.ReplaceAll(strings.ReplaceAll(instID, "\n", ""), "\r", "")
+			log.Printf("[reconciler] Detected vanished/interrupted cloud VM %s for pod %s. Marking pod failed...", cleanID, cleanKey)
+			if err := r.tracker.MarkPodFailed(ctx, podKey, "SpotInterruption"); err != nil {
+				log.Printf("[reconciler] Error marking pod %s failed: %v", cleanKey, err)
+			} else {
+				result.EvictedPods = append(result.EvictedPods, podKey)
+			}
+		}
+	}
+
+	// 2. Reverse check: detect zombie VMs whose pods vanished from tracker
 	activeInstanceIDs := make(map[string]bool, len(activePods))
 	for _, id := range activePods {
 		if id != "" {

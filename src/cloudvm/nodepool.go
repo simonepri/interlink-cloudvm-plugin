@@ -310,16 +310,15 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 
 // MarkPodCompleted records a pod container as finished, frees its compute resources,
 // and returns true if the pod was found and marked.
-func (np *NodePool) MarkPodCompleted(podUID string, exitCode int32, reason, message string, finishedAt time.Time) bool {
+func (np *NodePool) MarkPodCompleted(podUID string, exitCode int32, reason, message string, finishedAt time.Time) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 
 	for _, node := range np.nodes {
 		if node.MarkPodCompleted(podUID, exitCode, reason, message, finishedAt) {
-			return true
+			return
 		}
 	}
-	return false
 }
 
 // Release frees resources held by podUID across any active node in the pool and returns the remaining active pod count on that node.

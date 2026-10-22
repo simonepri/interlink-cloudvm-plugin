@@ -84,6 +84,9 @@ func (cs *CompletedStore) load() error {
 		_ = os.Rename(cleanPath, corruptPath)
 		return fmt.Errorf("corrupt completed store data moved to %s: %w", corruptPath, err)
 	}
+	if loaded == nil {
+		loaded = make(map[string]*CompletedPodRecord)
+	}
 
 	cs.records = loaded
 	return nil
@@ -95,18 +98,52 @@ func (cs *CompletedStore) saveLocked() error {
 	if err != nil {
 		return err
 	}
+	return atomicSaveWithFsync(cs.filePath, data, 0600)
+}
 
-	cleanPath := filepath.Clean(cs.filePath)
+// atomicSaveWithFsync safely persists data to disk using a tempfile, fsync, and atomic rename.
+func atomicSaveWithFsync(path string, data []byte, perm os.FileMode) error {
+	cleanPath := filepath.Clean(path)
 	dir := filepath.Dir(cleanPath)
 	if err := os.MkdirAll(dir, 0700); err != nil { // #nosec G301,G703
 		return err
 	}
 
 	tmpFile := cleanPath + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0600); err != nil { // #nosec G304,G703
+	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm) // #nosec G304,G703
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpFile, cleanPath) // #nosec G703
+
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile) // #nosec G703
+		return err
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile) // #nosec G703
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpFile) // #nosec G703
+		return err
+	}
+
+	if err := os.Rename(tmpFile, cleanPath); err != nil { // #nosec G703
+		_ = os.Remove(tmpFile) // #nosec G703
+		return err
+	}
+
+	// Fsync parent directory to ensure metadata is flushed
+	if df, err := os.Open(dir); err == nil { // #nosec G304,G703
+		_ = df.Sync()
+		_ = df.Close()
+	}
+
+	return nil
 }
 
 // Get returns the terminal record for a given podUID, or nil if not found.

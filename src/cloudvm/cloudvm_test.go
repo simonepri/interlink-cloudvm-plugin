@@ -1511,3 +1511,122 @@ type mockCloudInventory struct {
 func (m *mockCloudInventory) ListActiveInstances(_ context.Context, _ string) ([]*Instance, error) {
 	return m.instances, nil
 }
+
+func TestTokenStore_NullFileDoesNotPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "tokens-null.json")
+
+	if err := os.WriteFile(storePath, []byte("null"), 0600); err != nil {
+		t.Fatalf("failed to write null file: %v", err)
+	}
+
+	ts, err := NewTokenStore(storePath)
+	if err != nil {
+		t.Fatalf("unexpected error loading null token store: %v", err)
+	}
+
+	// Must not panic with assignment to entry in nil map
+	if err := ts.Set("inst-null", "tok-null"); err != nil {
+		t.Fatalf("failed to set token on previously null store: %v", err)
+	}
+	if tok := ts.Get("inst-null"); tok != "tok-null" {
+		t.Fatalf("expected tok-null, got %s", tok)
+	}
+}
+
+func TestCompletedStore_NullFileDoesNotPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "completed-null.json")
+
+	if err := os.WriteFile(storePath, []byte("null"), 0600); err != nil {
+		t.Fatalf("failed to write null file: %v", err)
+	}
+
+	cs, err := NewCompletedStore(storePath)
+	if err != nil {
+		t.Fatalf("unexpected error loading null completed store: %v", err)
+	}
+
+	// Must not panic with assignment to entry in nil map
+	rec := &CompletedPodRecord{PodUID: "uid-null", ExitCode: 0}
+	if err := cs.Set("uid-null", rec); err != nil {
+		t.Fatalf("failed to set completed record on previously null store: %v", err)
+	}
+	if got := cs.Get("uid-null"); got == nil || got.PodUID != "uid-null" {
+		t.Fatalf("expected record to be retrievable from previously null store")
+	}
+}
+
+func TestReconciler_SpotInterruptionMarksPodFailed(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-spot")
+
+	pod := &Pod{
+		Metadata: PodMeta{Name: "spot-worker", Namespace: "default", UID: "uid-spot-1"},
+		Spec: PodSpecWrapper{
+			Containers: []ContainerSpec{
+				{Name: "main", Image: "alpine"},
+			},
+		},
+	}
+	body, _ := json.Marshal(pod)
+
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleCreate(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from create, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var res CreateStruct
+	_ = json.NewDecoder(w.Body).Decode(&res)
+	parts := strings.Split(res.PodJID, ":")
+	instID := parts[0]
+
+	// Terminate the instance out-of-band in cloud inventory (simulating spot reclamation)
+	if err := mock.Terminate(context.Background(), instID); err != nil {
+		t.Fatalf("failed to terminate mock instance: %v", err)
+	}
+
+	// Run Reconciler
+	reconciler := NewReconciler(mock, srv, mock, "cluster-spot", 10*time.Minute)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+
+	if len(result.EvictedPods) == 0 {
+		t.Fatalf("expected reconciler to evict pod on vanished VM, got none")
+	}
+
+	// Now check /status
+	statusReq := httptest.NewRequest(http.MethodPost, "/status", bytes.NewReader(body))
+	statusW := httptest.NewRecorder()
+	srv.handleStatus(statusW, statusReq)
+
+	if statusW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from status, got %d", statusW.Code)
+	}
+
+	var responses []PodStatusResponse
+	_ = json.NewDecoder(statusW.Body).Decode(&responses)
+
+	if len(responses) == 0 || len(responses[0].Containers) == 0 {
+		t.Fatalf("expected valid status response, got %+v", responses)
+	}
+
+	cStatus := responses[0].Containers[0]
+	if cStatus.State.Terminated == nil {
+		t.Fatalf("expected container to be Terminated after spot preemption, got: %+v", cStatus.State)
+	}
+	if cStatus.State.Terminated.Reason != "SpotInterruption" {
+		t.Fatalf("expected Terminated reason SpotInterruption, got %s", cStatus.State.Terminated.Reason)
+	}
+	if cStatus.State.Terminated.ExitCode != 137 {
+		t.Fatalf("expected exit code 137, got %d", cStatus.State.Terminated.ExitCode)
+	}
+}

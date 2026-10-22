@@ -50,6 +50,9 @@ func (ts *TokenStore) load() error {
 		_ = os.Rename(cleanPath, corruptPath)
 		return fmt.Errorf("corrupt token store data moved to %s: %w", corruptPath, err)
 	}
+	if loaded == nil {
+		loaded = make(map[string]string)
+	}
 	ts.tokens = loaded
 	return nil
 }
@@ -59,18 +62,7 @@ func (ts *TokenStore) saveLocked() error {
 	if err != nil {
 		return err
 	}
-
-	cleanPath := filepath.Clean(ts.filePath)
-	dir := filepath.Dir(cleanPath)
-	if err := os.MkdirAll(dir, 0700); err != nil { // #nosec G301,G703
-		return err
-	}
-
-	tmpFile := cleanPath + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0600); err != nil { // #nosec G304,G703
-		return err
-	}
-	return os.Rename(tmpFile, cleanPath) // #nosec G703
+	return atomicSaveWithFsync(ts.filePath, data, 0600)
 }
 
 // Get returns the runner token for the specified instance ID, or empty string if not found.
