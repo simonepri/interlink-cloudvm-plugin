@@ -73,11 +73,12 @@ func (c *CloudInitConfig) InitialContainerJSON() string {
 		Args:          c.Args,
 		Env:           c.Env,
 		AssignedGPUs:  c.AssignedGPUs,
+		CPUMillicores: c.CPUMillicores,
 		MemoryBytes:   c.MemoryBytes,
 		RunAsUser:     c.RunAsUser,
 		RunAsGroup:    c.RunAsGroup,
 	}
-	if c.CPULimit() != "" {
+	if req.CPUMillicores <= 0 && c.CPULimit() != "" {
 		if q, err := resource.ParseQuantity(c.CPULimit()); err == nil {
 			req.CPUMillicores = q.MilliValue()
 		}
@@ -159,11 +160,12 @@ if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
 fi
 
 # Prevent non-root container workloads from accessing cloud metadata services (IMDS)
-iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
+iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
 
 # Runner port 9090 dedicated firewall chain inserted at head of INPUT
-iptables -N CLOUDVM_RUNNER 2>/dev/null || iptables -F CLOUDVM_RUNNER
-iptables -I INPUT 1 -p tcp --dport 9090 -j CLOUDVM_RUNNER 2>/dev/null || true
+iptables -N CLOUDVM_RUNNER 2>/dev/null || true
+iptables -F CLOUDVM_RUNNER 2>/dev/null || true
+iptables -C INPUT -p tcp --dport 9090 -j CLOUDVM_RUNNER 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 9090 -j CLOUDVM_RUNNER 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -i lo -j ACCEPT 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -i tailscale0 -j ACCEPT 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -s 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
@@ -172,19 +174,34 @@ iptables -A CLOUDVM_RUNNER -s 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -j DROP 2>/dev/null || true
 
+if command -v iptables-save >/dev/null 2>&1; then
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+fi
+
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
   echo "[cloudvm-bootstrap] Connecting to private mesh network..."
   if ! command -v tailscale >/dev/null 2>&1; then
-    mkdir -p --mode=0755 /usr/share/keyrings
-    curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null 2>&1 || true
-    curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list 2>/dev/null || true
-    apt-get update -y && apt-get install -y tailscale || curl -fsSL https://tailscale.com/install.sh | sh
+    if command -v apt-get >/dev/null 2>&1; then
+      mkdir -p --mode=0755 /usr/share/keyrings
+      curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg -o /usr/share/keyrings/tailscale-archive-keyring.gpg 2>/dev/null || true
+      curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list -o /etc/apt/sources.list.d/tailscale.list 2>/dev/null || true
+      apt-get update -y && apt-get install -y tailscale || echo "[cloudvm-bootstrap] apt install tailscale failed" >&2
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y yum-utils 2>/dev/null || true
+      yum-config-manager --add-repo https://pkgs.tailscale.com/stable/amazon-linux/2/tailscale.repo 2>/dev/null || true
+      yum install -y tailscale || echo "[cloudvm-bootstrap] yum install tailscale failed" >&2
+    fi
   fi
-  tailscale up --authkey="{{.MeshAuthKey}}" \
-    --hostname="cloudvm-{{.PodName}}" \
-    --accept-routes
-  echo "[cloudvm-bootstrap] Connected to mesh. Assigned IP: $(tailscale ip -4)"
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale up --authkey="{{.MeshAuthKey}}" \
+      --hostname="cloudvm-{{.PodName}}" \
+      --accept-routes
+    echo "[cloudvm-bootstrap] Connected to mesh. Assigned IP: $(tailscale ip -4 2>/dev/null || echo \x27unknown\x27)"
+  else
+    echo "[cloudvm-bootstrap] Warning: tailscale package not found; mesh join skipped" >&2
+  fi
 fi
 
 {{if .EgressBandwidth}}
@@ -281,6 +298,7 @@ shutdown -h now || poweroff
 echo "[cloudvm-bootstrap] Starting in-VM micro-runner daemon on port 9090..."
 
 cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
+import datetime
 import hmac
 import http.server
 import json
@@ -292,9 +310,16 @@ import urllib.parse
 PORT = 9090
 AUTH_TOKEN = "{{.RunnerAuthToken}}"
 
-start_lock = threading.Lock()
+pod_locks = {}
+pod_locks_guard = threading.Lock()
 starting_pods = set()
 start_failures = {}
+
+def get_pod_lock(uid):
+    with pod_locks_guard:
+        if uid not in pod_locks:
+            pod_locks[uid] = threading.Lock()
+        return pod_locks[uid]
 
 def record_heartbeat():
     try:
@@ -372,6 +397,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     status_str = state.get('Status', '')
                     running = state.get('Running', False)
                     exit_code = state.get('ExitCode', 0)
+                    started_at = state.get('StartedAt', '')
+                    finished_at = state.get('FinishedAt', '')
                     reason = "Running" if running else (
                         "ContainerCreating" if status_str in ("created", "starting") else (
                             ("Completed" if exit_code == 0 else "Error") if status_str in ("exited", "dead") else status_str.capitalize()
@@ -383,6 +410,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "status": status_str,
                         "exitCode": exit_code,
                         "reason": reason,
+                        "startedAt": started_at,
+                        "finishedAt": finished_at,
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -392,7 +421,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            with start_lock:
+            plock = get_pod_lock(pod_uid)
+            with plock:
                 if pod_uid in start_failures:
                     reason_val, err_val = start_failures[pod_uid]
                     resp = {
@@ -402,6 +432,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "exitCode": 1,
                         "reason": reason_val,
                         "message": err_val,
+                        "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -439,7 +470,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(parsed.query)
             pod_uid = params.get('podUID', [''])[0]
             if pod_uid:
-                with start_lock:
+                plock = get_pod_lock(pod_uid)
+                with plock:
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
                 subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
@@ -460,7 +492,25 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             pod_uid = str(req.get('podUID', 'unknown'))
             container_name = f"cloudvm-{pod_uid}"
 
-            with start_lock:
+            run_as_user = req.get('runAsUser')
+            run_as_group = req.get('runAsGroup')
+
+            if run_as_user is not None and int(run_as_user) == 0:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"error":"runAsUser 0 is forbidden on host network"}')
+                return
+
+            if run_as_group is not None and int(run_as_group) == 0:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"error":"runAsGroup 0 is forbidden on host network"}')
+                return
+
+            plock = get_pod_lock(pod_uid)
+            with plock:
                 if pod_uid in starting_pods:
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -486,8 +536,6 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             args = req.get('args', [])
             cpu_milli = req.get('cpuMillicores', 0)
             mem_bytes = req.get('memoryBytes', 0)
-            run_as_user = req.get('runAsUser')
-            run_as_group = req.get('runAsGroup')
 
             shm_flag = '--shm-size=16g'
             if mem_bytes and mem_bytes > 0:
@@ -495,8 +543,10 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 shm_flag = f"--shm-size={shm_bytes}"
 
             if run_as_user is not None:
-                grp = run_as_group if run_as_group is not None else run_as_user
-                user_flag = f"--user={run_as_user}:{grp}"
+                if run_as_group is not None:
+                    user_flag = f"--user={int(run_as_user)}:{int(run_as_group)}"
+                else:
+                    user_flag = f"--user={int(run_as_user)}"
             else:
                 user_flag = "--user=65532:65532"
 
@@ -526,20 +576,25 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(args, list):
                 docker_cmd.extend(args)
 
-            def run_async(uid, c):
+            def run_async(uid, img, c):
+                # 1. Pull container image first
+                pull_res = subprocess.run(['docker', 'pull', img], capture_output=True, text=True)
+                if pull_res.returncode != 0:
+                    err_msg = pull_res.stderr.strip() or pull_res.stdout.strip() or "image pull failed"
+                    with get_pod_lock(uid):
+                        starting_pods.discard(uid)
+                        start_failures[uid] = ("ErrImagePull", err_msg)
+                    return
+
+                # 2. Run container
                 res = subprocess.run(c, capture_output=True, text=True)
-                with start_lock:
+                with get_pod_lock(uid):
                     starting_pods.discard(uid)
                     if res.returncode != 0:
-                        err_msg = res.stderr.strip() or "container start failed"
-                        low = err_msg.lower()
-                        if "pull" in low or "not found" in low or "manifest" in low or "repository does not exist" in low:
-                            reason = "ErrImagePull"
-                        else:
-                            reason = "StartError"
-                        start_failures[uid] = (reason, err_msg)
+                        err_msg = res.stderr.strip() or res.stdout.strip() or "container start failed"
+                        start_failures[uid] = ("StartError", err_msg)
 
-            threading.Thread(target=run_async, args=(pod_uid, docker_cmd), daemon=True).start()
+            threading.Thread(target=run_async, args=(pod_uid, image, docker_cmd), daemon=True).start()
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')

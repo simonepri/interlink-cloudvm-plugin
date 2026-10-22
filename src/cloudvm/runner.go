@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -83,6 +85,14 @@ func (h *HTTPContainerRunner) endpoint(node *CloudVMNode, path string) string {
 }
 
 func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) error {
+	if req != nil {
+		if req.RunAsUser != nil && *req.RunAsUser == 0 {
+			return fmt.Errorf("cloudvm provider enforces non-root containers; runAsUser 0 is forbidden on host network")
+		}
+		if req.RunAsGroup != nil && *req.RunAsGroup == 0 {
+			return fmt.Errorf("cloudvm provider enforces non-root containers; runAsGroup 0 is forbidden on host network")
+		}
+	}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -103,7 +113,8 @@ func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMN
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("in-VM runner error: status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("in-VM runner error (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }

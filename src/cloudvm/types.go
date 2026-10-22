@@ -64,6 +64,10 @@ type InstanceSpec struct {
 	RunAsUser *int64 `json:"runAsUser,omitempty"`
 	// RunAsGroup specifies GID for container execution.
 	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+	// CPUMillicores specifies the CPU limit in millicores.
+	CPUMillicores int64 `json:"cpuMillicores,omitempty"`
+	// MemoryBytes specifies the memory limit in bytes.
+	MemoryBytes int64 `json:"memoryBytes,omitempty"`
 	// MaxPrice defines maximum spot or hourly price cap in USD/hr.
 	MaxPrice string `json:"maxPrice,omitempty"`
 	// MaxSpotPrice is an alias for MaxPrice.

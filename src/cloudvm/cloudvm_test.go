@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -269,7 +270,10 @@ func TestPodToInstanceSpec_PriceCapAndEgress(t *testing.T) {
 		},
 	}
 
-	spec := PodToInstanceSpec(pod, "cluster-1")
+	spec, err := PodToInstanceSpec(pod, "cluster-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if spec.MarketType != "on-demand" {
 		t.Errorf("expected marketType on-demand, got %s", spec.MarketType)
 	}
@@ -341,7 +345,10 @@ func TestPodToInstanceSpec_MaxEgressRateDollarConversion(t *testing.T) {
 		},
 	}
 
-	spec := PodToInstanceSpec(pod, "cluster-1")
+	spec, err := PodToInstanceSpec(pod, "cluster-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if spec.MaxEgressRate != "$0.90" {
 		t.Errorf("expected MaxEgressRate $0.90, got %s", spec.MaxEgressRate)
 	}
@@ -993,7 +1000,7 @@ func TestServer_ConcurrentCreateSingleFlight(t *testing.T) {
 
 func TestCompletedStore_PersistenceAcrossReload(t *testing.T) {
 	tmpFile := filepath.Join(t.TempDir(), "completed-test.json")
-	store1 := NewCompletedStore(tmpFile)
+	store1, _ := NewCompletedStore(tmpFile)
 
 	rec := &CompletedPodRecord{
 		PodUID:     "uid-persist-1",
@@ -1008,7 +1015,7 @@ func TestCompletedStore_PersistenceAcrossReload(t *testing.T) {
 	}
 
 	// Verify second store reloads the record from disk
-	store2 := NewCompletedStore(tmpFile)
+	store2, _ := NewCompletedStore(tmpFile)
 	loaded := store2.Get("uid-persist-1")
 	if loaded == nil {
 		t.Fatalf("expected record to survive reload from disk")
@@ -1022,7 +1029,7 @@ func TestCompletedStore_PersistenceAcrossReload(t *testing.T) {
 		t.Fatalf("failed to delete record: %v", err)
 	}
 
-	store3 := NewCompletedStore(tmpFile)
+	store3, _ := NewCompletedStore(tmpFile)
 	if store3.Get("uid-persist-1") != nil {
 		t.Fatalf("expected record to remain deleted after reload")
 	}
@@ -1258,5 +1265,119 @@ func TestServer_FirstCallerCancelDoesNotFailDuplicate(t *testing.T) {
 
 	if mock.LaunchCount() != 1 {
 		t.Fatalf("expected exactly 1 launch, got %d", mock.LaunchCount())
+	}
+}
+
+func TestPodToInstanceSpec_RootUIDRejected(t *testing.T) {
+	rootUID := int64(0)
+	pod := &Pod{
+		Metadata: PodMeta{Name: "root-pod", Namespace: "default"},
+		Spec: PodSpecWrapper{
+			SecurityContext: &PodSecurityContext{
+				RunAsUser: &rootUID,
+			},
+			Containers: []ContainerSpec{
+				{Name: "main", Image: "alpine"},
+			},
+		},
+	}
+
+	_, err := PodToInstanceSpec(pod, "test-cluster")
+	if err == nil {
+		t.Fatal("expected error when pod specifies runAsUser: 0, got nil")
+	}
+
+	nonRootUID := int64(1000)
+	pod.Spec.SecurityContext.RunAsUser = &nonRootUID
+	pod.Spec.Containers[0].SecurityContext = &SecurityContext{
+		RunAsUser: &rootUID,
+	}
+
+	_, err = PodToInstanceSpec(pod, "test-cluster")
+	if err == nil {
+		t.Fatal("expected error when container specifies runAsUser: 0, got nil")
+	}
+}
+
+func TestCompletedStore_CorruptFilePreserved(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "completed.json")
+
+	// Write corrupt JSON
+	if err := os.WriteFile(storePath, []byte(`{"corrupt": [truncated...`), 0600); err != nil {
+		t.Fatalf("failed to write corrupt file: %v", err)
+	}
+
+	store, err := NewCompletedStore(storePath)
+	if err == nil {
+		t.Fatal("expected error loading corrupt store, got nil")
+	}
+
+	// Verify a .corrupt file was created
+	files, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+	var corruptFileFound bool
+	for _, f := range files {
+		if strings.Contains(f.Name(), ".corrupt.") {
+			corruptFileFound = true
+			data, _ := os.ReadFile(filepath.Join(tmpDir, f.Name()))
+			if !strings.Contains(string(data), "truncated") {
+				t.Fatalf("corrupt file preserved incorrect data: %s", string(data))
+			}
+		}
+	}
+	if !corruptFileFound {
+		t.Fatal("expected .corrupt file backup to be created")
+	}
+
+	// Write a new record to verify store can continue functioning
+	if err := store.Set("uid-new", &CompletedPodRecord{PodUID: "uid-new", ExitCode: 0}); err != nil {
+		t.Fatalf("failed to set record in new store: %v", err)
+	}
+
+	// Verify the original corrupt backup is still present and was not clobbered
+	filesAfter, _ := os.ReadDir(tmpDir)
+	var backupStillPresent bool
+	for _, f := range filesAfter {
+		if strings.Contains(f.Name(), ".corrupt.") {
+			backupStillPresent = true
+		}
+	}
+	if !backupStillPresent {
+		t.Fatal("corrupt backup was clobbered by subsequent Set")
+	}
+}
+
+func TestServer_LaunchTokenPreSavedToTokenStore(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-test")
+
+	pod := &Pod{
+		Metadata: PodMeta{Name: "pod-tok-1", Namespace: "default", UID: "uid-tok-1"},
+		Spec: PodSpecWrapper{
+			Containers: []ContainerSpec{
+				{Name: "main", Image: "alpine"},
+			},
+		},
+	}
+	body, _ := json.Marshal(pod)
+
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.handleCreate(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Token must be stored under pod UID in tokenStore
+	savedToken := srv.tokenStore.Get("uid-tok-1")
+	if savedToken == "" {
+		t.Fatal("expected token to be saved under pod UID in tokenStore, but was empty")
 	}
 }

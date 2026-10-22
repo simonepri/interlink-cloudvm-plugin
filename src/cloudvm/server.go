@@ -83,6 +83,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	if completedPath == "" {
 		completedPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-completed-pods-%s.json", clusterTag))
 	}
+	compStore, _ := NewCompletedStore(completedPath)
 	return &Server{
 		providers:       make(map[ProviderType]Provider),
 		defaultProv:     defaultProvider,
@@ -92,7 +93,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		nodePool:        NewNodePool(60 * time.Second),
 		runner:          NewMockContainerRunner(),
 		tokenStore:      NewTokenStore(tokenPath),
-		completedStore:  NewCompletedStore(completedPath),
+		completedStore:  compStore,
 		launchTokens:    make(map[string]string),
 		completedPods:   make(map[string]*ContainerTerminatedState),
 		inFlightCreates: make(map[string]*inFlightCreate),
@@ -240,7 +241,26 @@ func (s *Server) Routes() http.Handler {
 }
 
 // PodToInstanceSpec converts an incoming InterLink Pod into an InstanceSpec.
-func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...string) *InstanceSpec {
+func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...string) (*InstanceSpec, error) {
+	// Enforce non-root containers on host network: reject runAsUser 0 or runAsGroup 0
+	for _, c := range pod.Spec.Containers {
+		if c.SecurityContext != nil {
+			if c.SecurityContext.RunAsUser != nil && *c.SecurityContext.RunAsUser == 0 {
+				return nil, fmt.Errorf("cloudvm provider enforces non-root containers; container %q specifies runAsUser 0 which is forbidden on host network", c.Name)
+			}
+			if c.SecurityContext.RunAsGroup != nil && *c.SecurityContext.RunAsGroup == 0 {
+				return nil, fmt.Errorf("cloudvm provider enforces non-root containers; container %q specifies runAsGroup 0 which is forbidden on host network", c.Name)
+			}
+		}
+	}
+	if pod.Spec.SecurityContext != nil {
+		if pod.Spec.SecurityContext.RunAsUser != nil && *pod.Spec.SecurityContext.RunAsUser == 0 {
+			return nil, fmt.Errorf("cloudvm provider enforces non-root containers; pod securityContext specifies runAsUser 0 which is forbidden on host network")
+		}
+		if pod.Spec.SecurityContext.RunAsGroup != nil && *pod.Spec.SecurityContext.RunAsGroup == 0 {
+			return nil, fmt.Errorf("cloudvm provider enforces non-root containers; pod securityContext specifies runAsGroup 0 which is forbidden on host network")
+		}
+	}
 	ns := pod.Metadata.Namespace
 	if ns == "" {
 		ns = "default"
@@ -392,6 +412,30 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		runAsGroup = pod.Spec.SecurityContext.RunAsGroup
 	}
 
+	var cpuMillicores int64
+	var memoryBytes int64
+	if len(pod.Spec.Containers) > 0 {
+		c := pod.Spec.Containers[0]
+		if cpuLimit, exists := c.Resources.Limits["cpu"]; exists {
+			if q, err := resource.ParseQuantity(cpuLimit); err == nil {
+				cpuMillicores = q.MilliValue()
+			}
+		} else if cpuReq, exists := c.Resources.Requests["cpu"]; exists {
+			if q, err := resource.ParseQuantity(cpuReq); err == nil {
+				cpuMillicores = q.MilliValue()
+			}
+		}
+		if memLimit, exists := c.Resources.Limits["memory"]; exists {
+			if q, err := resource.ParseQuantity(memLimit); err == nil {
+				memoryBytes = q.Value()
+			}
+		} else if memReq, exists := c.Resources.Requests["memory"]; exists {
+			if q, err := resource.ParseQuantity(memReq); err == nil {
+				memoryBytes = q.Value()
+			}
+		}
+	}
+
 	if rayHeadAddress == "" {
 		rayHeadAddress = pod.Metadata.Annotations["ray.io/head-address"]
 	}
@@ -425,8 +469,10 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		MeshAuthKey:          meshAuthKey,
 		RunAsUser:            runAsUser,
 		RunAsGroup:           runAsGroup,
+		CPUMillicores:        cpuMillicores,
+		MemoryBytes:          memoryBytes,
 		ClusterTag:           defaultClusterTag,
-	}
+	}, nil
 }
 
 func (s *Server) selectProvider(spec *InstanceSpec) Provider {
@@ -477,11 +523,16 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spec := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
-
 	var flight *inFlightCreate
 	var finalResp *CreateStruct
 	var finalErr error
+
+	spec, err := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
+	if err != nil {
+		finalErr = err
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// Single-flight in-flight create check and idempotency under lock
 	s.mu.Lock()
@@ -651,7 +702,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	tok := ""
-	if spec.PodUID != "" {
+	if spec.PodUID != "" && s.tokenStore != nil {
+		tok = s.tokenStore.Get(spec.PodUID)
+	}
+	if tok == "" && spec.PodUID != "" {
 		tok = s.launchTokens[spec.PodUID]
 	}
 	if tok == "" {
@@ -665,6 +719,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		if spec.PodUID != "" {
 			s.launchTokens[spec.PodUID] = tok
+			if s.tokenStore != nil {
+				_ = s.tokenStore.Set(spec.PodUID, tok)
+			}
 		}
 	}
 	if flight != nil {
@@ -804,6 +861,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		delete(s.instances, pod.Metadata.UID)
 		delete(s.completedPods, pod.Metadata.UID)
 		delete(s.launchTokens, pod.Metadata.UID)
+		if s.tokenStore != nil {
+			_ = s.tokenStore.Delete(pod.Metadata.UID)
+		}
 		if s.completedStore != nil {
 			_ = s.completedStore.Delete(pod.Metadata.UID)
 		}
@@ -1061,14 +1121,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								}
 							case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || cResult.Reason == "ErrImagePull" || cResult.Reason == "StartError" || (cResult.ExitCode != 0 && !cResult.Running):
 								status.Ready = false
+								finAt := cResult.FinishedAt
+								if finAt.IsZero() {
+									finAt = time.Now()
+								}
 								term := &ContainerTerminatedState{
 									ExitCode:   cResult.ExitCode,
 									Reason:     cResult.Reason,
 									Message:    cResult.Message,
-									FinishedAt: cResult.FinishedAt,
+									FinishedAt: finAt,
 								}
 								status.State.Terminated = term
-								s.nodePool.MarkPodCompleted(tgt.uid, cResult.ExitCode, cResult.Reason, cResult.Message, cResult.FinishedAt)
+								s.nodePool.MarkPodCompleted(tgt.uid, cResult.ExitCode, cResult.Reason, cResult.Message, finAt)
 								s.mu.Lock()
 								if tgt.uid != "" {
 									s.completedPods[tgt.uid] = term
@@ -1081,7 +1145,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 										ExitCode:   cResult.ExitCode,
 										Reason:     cResult.Reason,
 										Message:    cResult.Message,
-										FinishedAt: cResult.FinishedAt,
+										FinishedAt: finAt,
 									})
 								}
 							default:

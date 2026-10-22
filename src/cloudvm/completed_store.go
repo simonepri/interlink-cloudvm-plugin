@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// CompletedRecordTTL defines the duration to retain finished pod telemetry before garbage collection.
-const CompletedRecordTTL = 24 * time.Hour
+// MaxCompletedRecords prevents unbounded store growth across millions of pods.
+const MaxCompletedRecords = 10000
 
 // CompletedPodRecord stores the terminal execution telemetry of a finished pod.
 type CompletedPodRecord struct {
@@ -31,7 +31,7 @@ type CompletedStore struct {
 }
 
 // NewCompletedStore initializes a CompletedStore with the given file path.
-func NewCompletedStore(filePath string) *CompletedStore {
+func NewCompletedStore(filePath string) (*CompletedStore, error) {
 	if filePath == "" {
 		filePath = filepath.Join(os.TempDir(), "cloudvm-completed-pods.json")
 	}
@@ -40,16 +40,28 @@ func NewCompletedStore(filePath string) *CompletedStore {
 		filePath: filePath,
 		records:  make(map[string]*CompletedPodRecord),
 	}
-	_ = cs.load()
-	return cs
+	err := cs.load()
+	return cs, err
 }
 
 func (cs *CompletedStore) pruneLocked() {
-	now := time.Now()
+	if len(cs.records) <= MaxCompletedRecords {
+		return
+	}
+	var oldestUID string
+	var oldestTime time.Time
 	for uid, rec := range cs.records {
-		if rec != nil && !rec.FinishedAt.IsZero() && now.Sub(rec.FinishedAt) > CompletedRecordTTL {
+		if rec == nil {
 			delete(cs.records, uid)
+			continue
 		}
+		if oldestTime.IsZero() || rec.FinishedAt.Before(oldestTime) {
+			oldestTime = rec.FinishedAt
+			oldestUID = uid
+		}
+	}
+	if oldestUID != "" {
+		delete(cs.records, oldestUID)
 	}
 }
 
@@ -68,11 +80,12 @@ func (cs *CompletedStore) load() error {
 
 	var loaded map[string]*CompletedPodRecord
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		return fmt.Errorf("corrupt completed store data: %w", err)
+		corruptPath := fmt.Sprintf("%s.corrupt.%d", cleanPath, time.Now().UnixNano())
+		_ = os.Rename(cleanPath, corruptPath)
+		return fmt.Errorf("corrupt completed store data moved to %s: %w", corruptPath, err)
 	}
 
 	cs.records = loaded
-	cs.pruneLocked()
 	return nil
 }
 

@@ -355,6 +355,10 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		Env:                  spec.Env,
 		EgressBandwidth:      spec.EgressBandwidth,
 		EgressBurst:          spec.EgressBurst,
+		CPUMillicores:        spec.CPUMillicores,
+		MemoryBytes:          spec.MemoryBytes,
+		RunAsUser:            spec.RunAsUser,
+		RunAsGroup:           spec.RunAsGroup,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate cloud-init: %w", err)
