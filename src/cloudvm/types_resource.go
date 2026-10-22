@@ -163,6 +163,9 @@ func (r ResourceVector) String() string {
 
 // CapacityForInstanceType returns the hardware capacity vector (CPU, Memory, GPUs, TPUs) for a given cloud instance type.
 func CapacityForInstanceType(itype string, fallback ResourceVector) ResourceVector {
+	if gcpVec, ok := GCPCapacityForMachineType(itype, fallback); ok {
+		return gcpVec
+	}
 	gpus := GPUCountForInstanceType(itype)
 	var cpuStr, memStr string
 
