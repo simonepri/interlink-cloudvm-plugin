@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -280,22 +283,81 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 
 // AWSProvider implements Provider for AWS EC2 Fleet.
 type AWSProvider struct {
-	Region          string
-	mu              sync.RWMutex
-	clients         map[string]EC2FleetClient
-	instanceRegions map[string]string
-	client          EC2FleetClient
+	Region            string
+	configuredRegions []string
+	clients           map[string]EC2FleetClient
+	regionStore       *RegionStore
+	instanceRegions   map[string]string
+	client            EC2FleetClient
+	mu                sync.RWMutex
 }
 
 // NewAWSProvider creates an AWS provider instance.
-func NewAWSProvider(region string) *AWSProvider {
+func NewAWSProvider(region string, additionalRegions ...string) *AWSProvider {
 	if region == "" {
 		region = "us-east-1"
 	}
+	storePath := os.Getenv("REGION_STORE_PATH")
+	if storePath == "" {
+		storePath = "/data/instance-regions.json"
+	}
+	regStore, err := NewRegionStore(storePath)
+	if err != nil {
+		cleanStorePath := filepath.Clean(storePath)
+		log.Printf("[aws] Warning: failed to initialize region store at %s: %v, falling back to temp file", cleanStorePath, err) //nolint:gosec // local config path
+		regStore, _ = NewRegionStore("")
+	}
+
+	initialRegions := make(map[string]string)
+	if regStore != nil {
+		initialRegions = regStore.GetAll()
+	}
+
+	var confRegions []string
+	seen := make(map[string]bool)
+	confRegions = append(confRegions, region)
+	seen[region] = true
+	for _, r := range additionalRegions {
+		r = strings.TrimSpace(r)
+		if r != "" && !seen[r] {
+			confRegions = append(confRegions, r)
+			seen[r] = true
+		}
+	}
+
 	return &AWSProvider{
-		Region:          region,
-		clients:         make(map[string]EC2FleetClient),
-		instanceRegions: make(map[string]string),
+		Region:            region,
+		configuredRegions: confRegions,
+		clients:           make(map[string]EC2FleetClient),
+		regionStore:       regStore,
+		instanceRegions:   initialRegions,
+	}
+}
+
+// SetRegionStore overrides the region store for instance-to-region mapping persistence.
+func (p *AWSProvider) SetRegionStore(rs *RegionStore) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.regionStore = rs
+	if rs != nil {
+		p.instanceRegions = rs.GetAll()
+	}
+}
+
+// AddConfiguredRegions adds additional regions to be queried during multi-region inventory scans.
+func (p *AWSProvider) AddConfiguredRegions(regions ...string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen := make(map[string]bool, len(p.configuredRegions))
+	for _, r := range p.configuredRegions {
+		seen[r] = true
+	}
+	for _, r := range regions {
+		r = strings.TrimSpace(r)
+		if r != "" && !seen[r] {
+			p.configuredRegions = append(p.configuredRegions, r)
+			seen[r] = true
+		}
 	}
 }
 
@@ -304,18 +366,29 @@ func (p *AWSProvider) SetClient(c EC2FleetClient) {
 	p.client = c
 }
 
-func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetClient, error) {
-	if p.client != nil {
-		return p.client, nil
+// SetRegionClient overrides the EC2 client for a specific region (used for testing multi-region scenarios).
+func (p *AWSProvider) SetRegionClient(region string, c EC2FleetClient) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.clients == nil {
+		p.clients = make(map[string]EC2FleetClient)
 	}
+	p.clients[region] = c
+}
+
+func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetClient, error) {
 	if region == "" {
 		region = p.Region
 	}
 	p.mu.RLock()
-	c, ok := p.clients[region]
-	p.mu.RUnlock()
-	if ok {
+	if c, ok := p.clients[region]; ok {
+		p.mu.RUnlock()
 		return c, nil
+	}
+	p.mu.RUnlock()
+
+	if p.client != nil {
+		return p.client, nil
 	}
 
 	p.mu.Lock()
@@ -428,6 +501,9 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}
 	p.instanceRegions[inst.ID] = spec.Region
 	p.mu.Unlock()
+	if p.regionStore != nil {
+		_ = p.regionStore.Set(inst.ID, spec.Region)
+	}
 	return inst, nil
 }
 
@@ -446,6 +522,14 @@ func (p *AWSProvider) Terminate(ctx context.Context, instanceID string) error {
 	_, err = client.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
 		InstanceIds: []string{instanceID},
 	})
+	if err == nil {
+		p.mu.Lock()
+		delete(p.instanceRegions, instanceID)
+		p.mu.Unlock()
+		if p.regionStore != nil {
+			_ = p.regionStore.Delete(instanceID)
+		}
+	}
 	return err
 }
 
@@ -507,6 +591,11 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 	if p.Region != "" {
 		regionsMap[p.Region] = true
 	}
+	for _, reg := range p.configuredRegions {
+		if reg != "" {
+			regionsMap[reg] = true
+		}
+	}
 	for _, reg := range p.instanceRegions {
 		if reg != "" {
 			regionsMap[reg] = true
@@ -515,12 +604,10 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 	p.mu.RUnlock()
 
 	var instances []*Instance
-	var lastErr error
 	for reg := range regionsMap {
 		client, err := p.getClient(ctx, reg)
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, fmt.Errorf("failed to get AWS client for region %s: %w", reg, err)
 		}
 		out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 			Filters: []ec2types.Filter{
@@ -535,8 +622,7 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 			},
 		})
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, fmt.Errorf("failed to describe instances in region %s: %w", reg, err)
 		}
 
 		for _, res := range out.Reservations {
@@ -566,6 +652,9 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 				}
 				p.instanceRegions[instID] = reg
 				p.mu.Unlock()
+				if p.regionStore != nil {
+					_ = p.regionStore.Set(instID, reg)
+				}
 
 				instances = append(instances, &Instance{
 					ID:           instID,
@@ -585,9 +674,6 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 				})
 			}
 		}
-	}
-	if len(instances) == 0 && lastErr != nil {
-		return nil, lastErr
 	}
 	return instances, nil
 }

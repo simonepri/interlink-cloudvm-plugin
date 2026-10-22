@@ -33,6 +33,12 @@ spec:
               value: "{{ .Values.provider.clusterTag }}"
             - name: AWS_REGION
               value: "{{ .Values.provider.awsRegion }}"
+            - name: AWS_REGIONS
+              value: "{{ join "," .Values.provider.awsRegions | default .Values.provider.awsRegion }}"
+            - name: RECONCILE_LAUNCH_GRACE_SECONDS
+              value: "{{ .Values.provider.reconcileLaunchGraceSeconds | default 120 }}"
+            - name: REGION_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/instance-regions.json"
             - name: GCP_PROJECT
               value: "{{ .Values.provider.gcpProject }}"
             - name: GCP_ZONE

@@ -15,6 +15,11 @@ type PodStateTracker interface {
 	MarkPodFailed(ctx context.Context, podName string, reason string) error
 }
 
+// PodCreationTracker provides launch timestamps to protect recently created VMs from eventual consistency eviction.
+type PodCreationTracker interface {
+	GetPodCreatedAt(ctx context.Context, podKey string) (time.Time, bool)
+}
+
 // InstanceTerminator abstracts VM termination for the reconciler.
 type InstanceTerminator interface {
 	Terminate(ctx context.Context, instanceID string) error
@@ -22,17 +27,24 @@ type InstanceTerminator interface {
 
 // Reconciler handles background garbage collection for opportunistic VMs.
 type Reconciler struct {
-	inventory   CloudInventory
-	tracker     PodStateTracker
-	terminator  InstanceTerminator
-	clusterTag  string
-	graceTTL    time.Duration
-	onTerminate func(instanceID string)
+	inventory         CloudInventory
+	tracker           PodStateTracker
+	terminator        InstanceTerminator
+	clusterTag        string
+	graceTTL          time.Duration
+	launchGracePeriod time.Duration
+	onTerminate       func(instanceID string)
 }
 
 // SetOnTerminated registers a callback invoked when a zombie instance is terminated.
 func (r *Reconciler) SetOnTerminated(fn func(instanceID string)) {
 	r.onTerminate = fn
+}
+
+// SetLaunchGracePeriod configures the minimum age a cloud VM must have before being declared vanished.
+// This prevents premature pod eviction caused by EC2 DescribeInstances eventual consistency.
+func (r *Reconciler) SetLaunchGracePeriod(d time.Duration) {
+	r.launchGracePeriod = d
 }
 
 // ReconcileResult summarizes the actions taken by one reconciliation pass.
@@ -47,11 +59,12 @@ func NewReconciler(inventory CloudInventory, tracker PodStateTracker, terminator
 		graceTTL = 10 * time.Minute
 	}
 	return &Reconciler{
-		inventory:  inventory,
-		tracker:    tracker,
-		terminator: terminator,
-		clusterTag: clusterTag,
-		graceTTL:   graceTTL,
+		inventory:         inventory,
+		tracker:           tracker,
+		terminator:        terminator,
+		clusterTag:        clusterTag,
+		graceTTL:          graceTTL,
+		launchGracePeriod: 2 * time.Minute,
 	}
 }
 
@@ -82,9 +95,24 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 			continue
 		}
 		inst, alive := cloudInstances[instID]
+		cleanKey := strings.ReplaceAll(strings.ReplaceAll(podKey, "\n", ""), "\r", "")
+		cleanID := strings.ReplaceAll(strings.ReplaceAll(instID, "\n", ""), "\r", "")
+
+		if !alive {
+			// Check if instance was recently launched and may not yet be indexed by cloud inventory
+			if r.launchGracePeriod > 0 {
+				if pt, ok := r.tracker.(PodCreationTracker); ok {
+					if createdAt, ok := pt.GetPodCreatedAt(ctx, podKey); ok && !createdAt.IsZero() {
+						if time.Since(createdAt) < r.launchGracePeriod {
+							log.Printf("[reconciler] Skipping recently launched VM %s for pod %s (age %v < launch grace %v)", cleanID, cleanKey, time.Since(createdAt).Round(time.Second), r.launchGracePeriod) //nolint:gosec // cleanID and cleanKey sanitized
+							continue
+						}
+					}
+				}
+			}
+		}
+
 		if !alive || (inst != nil && (inst.State == StateTerminated || inst.State == StateFailed)) {
-			cleanKey := strings.ReplaceAll(strings.ReplaceAll(podKey, "\n", ""), "\r", "")
-			cleanID := strings.ReplaceAll(strings.ReplaceAll(instID, "\n", ""), "\r", "")
 			log.Printf("[reconciler] Detected vanished/interrupted cloud VM %s for pod %s. Marking pod failed...", cleanID, cleanKey)
 			if err := r.tracker.MarkPodFailed(ctx, podKey, "SpotInterruption"); err != nil {
 				log.Printf("[reconciler] Error marking pod %s failed: %v", cleanKey, err)

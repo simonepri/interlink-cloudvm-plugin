@@ -47,7 +47,16 @@ func main() {
 	if awsRegion == "" {
 		awsRegion = "us-east-1"
 	}
-	awsProv := NewAWSProvider(awsRegion)
+	var additionalRegions []string
+	if raw := os.Getenv("AWS_REGIONS"); raw != "" {
+		for _, r := range strings.Split(raw, ",") {
+			r = strings.TrimSpace(r)
+			if r != "" {
+				additionalRegions = append(additionalRegions, r)
+			}
+		}
+	}
+	awsProv := NewAWSProvider(awsRegion, additionalRegions...)
 
 	// Standalone spot price ticker microservice mode
 	if os.Getenv("SERVICE_MODE") == "ticker" {
@@ -159,6 +168,13 @@ func main() {
 		}
 
 		reconciler := NewReconciler(inventory, server, terminator, clusterTag, 10*time.Minute)
+		launchGrace := 2 * time.Minute
+		if sec := os.Getenv("RECONCILE_LAUNCH_GRACE_SECONDS"); sec != "" {
+			if s, err := strconv.Atoi(sec); err == nil && s >= 0 {
+				launchGrace = time.Duration(s) * time.Second
+			}
+		}
+		reconciler.SetLaunchGracePeriod(launchGrace)
 		server.SetReconciler(reconciler)
 
 		go func() {

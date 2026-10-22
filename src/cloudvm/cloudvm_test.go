@@ -15,6 +15,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
 func TestServerCreateAndDelete(t *testing.T) {
@@ -1594,6 +1598,7 @@ func TestReconciler_SpotInterruptionMarksPodFailed(t *testing.T) {
 
 	// Run Reconciler
 	reconciler := NewReconciler(mock, srv, mock, "cluster-spot", 10*time.Minute)
+	reconciler.SetLaunchGracePeriod(0)
 	result, err := reconciler.ReconcileOnce(context.Background())
 	if err != nil {
 		t.Fatalf("reconciler failed: %v", err)
@@ -1695,6 +1700,7 @@ func TestReconciler_CompletedCotenantNotOverwritten(t *testing.T) {
 
 	// Run ReconcileOnce
 	reconciler := NewReconciler(mock, srv, mock, "cluster-cotenant", 10*time.Minute)
+	reconciler.SetLaunchGracePeriod(0)
 	result, err := reconciler.ReconcileOnce(context.Background())
 	if err != nil {
 		t.Fatalf("reconciler failed: %v", err)
@@ -1726,5 +1732,351 @@ func TestReconciler_CompletedCotenantNotOverwritten(t *testing.T) {
 	}
 	if len(result2.EvictedPods) != 0 {
 		t.Fatalf("second reconcile pass re-evicted pods: %v", result2.EvictedPods)
+	}
+}
+
+type mockEC2FleetClient struct {
+	createFleetFn           func(ctx context.Context, params *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error)
+	describeInstancesFn     func(ctx context.Context, params *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error)
+	terminateInstancesFn    func(ctx context.Context, params *ec2.TerminateInstancesInput) (*ec2.TerminateInstancesOutput, error)
+	describeInstanceTypesFn func(ctx context.Context, params *ec2.DescribeInstanceTypesInput) (*ec2.DescribeInstanceTypesOutput, error)
+}
+
+func (m *mockEC2FleetClient) CreateFleet(ctx context.Context, params *ec2.CreateFleetInput, _ ...func(*ec2.Options)) (*ec2.CreateFleetOutput, error) {
+	if m.createFleetFn != nil {
+		return m.createFleetFn(ctx, params)
+	}
+	return &ec2.CreateFleetOutput{}, nil
+}
+
+func (m *mockEC2FleetClient) DescribeInstances(ctx context.Context, params *ec2.DescribeInstancesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+	if m.describeInstancesFn != nil {
+		return m.describeInstancesFn(ctx, params)
+	}
+	return &ec2.DescribeInstancesOutput{}, nil
+}
+
+func (m *mockEC2FleetClient) TerminateInstances(ctx context.Context, params *ec2.TerminateInstancesInput, _ ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error) {
+	if m.terminateInstancesFn != nil {
+		return m.terminateInstancesFn(ctx, params)
+	}
+	return &ec2.TerminateInstancesOutput{}, nil
+}
+
+func (m *mockEC2FleetClient) DescribeInstanceTypes(ctx context.Context, params *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	if m.describeInstanceTypesFn != nil {
+		return m.describeInstanceTypesFn(ctx, params)
+	}
+	return &ec2.DescribeInstanceTypesOutput{}, nil
+}
+
+func TestReconciler_LaunchGracePeriodPreventsPrematureEviction(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-grace")
+
+	podJSON := `{
+		"metadata": {
+			"name": "pod-grace-1",
+			"namespace": "default",
+			"uid": "uid-grace-1",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.xlarge",
+				"cloudvm.vk.io/capacity-type": "spot"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "alpine"}]
+		}
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(podJSON)))
+	w := httptest.NewRecorder()
+	srv.handleCreate(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create failed with %d: %s", w.Code, w.Body.String())
+	}
+
+	var res CreateStruct
+	_ = json.NewDecoder(w.Body).Decode(&res)
+	instID := strings.Split(res.PodJID, ":")[0]
+
+	// Simulate EC2 eventual consistency: instance exists on server tracker but is not yet returned in DescribeInstances
+	_ = mock.Terminate(context.Background(), instID)
+
+	// Reconciler with default 2m launch grace period
+	reconciler := NewReconciler(mock, srv, mock, "cluster-grace", 10*time.Minute)
+	result1, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile pass 1 failed: %v", err)
+	}
+	if len(result1.EvictedPods) != 0 {
+		t.Fatalf("expected 0 evicted pods during launch grace period, got %v", result1.EvictedPods)
+	}
+
+	// Now disable launch grace period to simulate aged instance
+	reconciler.SetLaunchGracePeriod(0)
+	result2, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile pass 2 failed: %v", err)
+	}
+	if len(result2.EvictedPods) != 1 || result2.EvictedPods[0] != "uid-grace-1" {
+		t.Fatalf("expected pod uid-grace-1 evicted after grace period elapsed, got %v", result2.EvictedPods)
+	}
+}
+
+func TestAWSProvider_ListActiveInstances_PartialRegionFailureAbortsReconcile(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+
+	awsProv := NewAWSProvider("us-east-1", "us-west-2")
+
+	// us-east-1 returns 1 healthy running instance
+	eastClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return &ec2.DescribeInstancesOutput{
+				Reservations: []ec2types.Reservation{
+					{
+						Instances: []ec2types.Instance{
+							{
+								InstanceId:   aws.String("i-east-1"),
+								InstanceType: ec2types.InstanceTypeG5Xlarge,
+								State: &ec2types.InstanceState{
+									Name: ec2types.InstanceStateNameRunning,
+								},
+								PrivateIpAddress: aws.String("10.0.1.10"),
+								LaunchTime:       aws.Time(time.Now()),
+								Tags: []ec2types.Tag{
+									{Key: aws.String("ClusterTag"), Value: aws.String("test-cluster")},
+									{Key: aws.String("PodUID"), Value: aws.String("uid-east-1")},
+									{Key: aws.String("PodName"), Value: aws.String("pod-east-1")},
+									{Key: aws.String("Namespace"), Value: aws.String("default")},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+	awsProv.SetRegionClient("us-east-1", eastClient)
+
+	// us-west-2 returns throttling error (RequestLimitExceeded)
+	westClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return nil, fmt.Errorf("RequestLimitExceeded: EC2 API rate limit exceeded")
+		},
+	}
+	awsProv.SetRegionClient("us-west-2", westClient)
+
+	// Direct ListActiveInstances check: must fail immediately without returning partial list
+	instances, err := awsProv.ListActiveInstances(context.Background(), "test-cluster")
+	if err == nil {
+		t.Fatalf("expected error from partial region failure, got nil with %d instances", len(instances))
+	}
+	if instances != nil {
+		t.Fatalf("expected nil instances on partial failure, got %v", instances)
+	}
+
+	// Reconciler test: partial failure must abort and NOT evict healthy pods
+	mockTracker := &mockTrackerWrapper{
+		activePods: map[string]string{
+			"uid-east-1": "i-east-1",
+		},
+	}
+	reconciler := NewReconciler(awsProv, mockTracker, nil, "test-cluster", 10*time.Minute)
+	reconciler.SetLaunchGracePeriod(0)
+	_, recErr := reconciler.ReconcileOnce(context.Background())
+	if recErr == nil {
+		t.Fatalf("expected reconciler to return error on partial cloud inventory failure")
+	}
+	if len(mockTracker.failedCalls) > 0 {
+		t.Fatalf("reconciler falsely evicted pods on partial inventory failure: %v", mockTracker.failedCalls)
+	}
+}
+
+type mockTrackerWrapper struct {
+	activePods  map[string]string
+	failedCalls []string
+}
+
+func (m *mockTrackerWrapper) GetActivePods(_ context.Context) (map[string]string, error) {
+	return m.activePods, nil
+}
+
+func (m *mockTrackerWrapper) MarkPodFailed(_ context.Context, podName string, _ string) error {
+	m.failedCalls = append(m.failedCalls, podName)
+	return nil
+}
+
+func TestAWSProvider_RegionPersistenceAcrossReload(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "instance-regions.json")
+	t.Setenv("REGION_STORE_PATH", storePath)
+
+	p1 := NewAWSProvider("us-east-1")
+	regStore, err := NewRegionStore(storePath)
+	if err != nil {
+		t.Fatalf("failed to create region store: %v", err)
+	}
+	p1.SetRegionStore(regStore)
+
+	// Save instance region mapping
+	if err := p1.regionStore.Set("i-west-persist", "us-west-2"); err != nil {
+		t.Fatalf("failed to set region: %v", err)
+	}
+
+	// Recreate provider from scratch (simulating daemon restart)
+	p2 := NewAWSProvider("us-east-1")
+	if reg := p2.instanceRegions["i-west-persist"]; reg != "us-west-2" {
+		t.Fatalf("expected restored region us-west-2, got %s", reg)
+	}
+
+	// Terminate should remove from store
+	westClient := &mockEC2FleetClient{
+		terminateInstancesFn: func(_ context.Context, _ *ec2.TerminateInstancesInput) (*ec2.TerminateInstancesOutput, error) {
+			return &ec2.TerminateInstancesOutput{}, nil
+		},
+	}
+	p2.SetRegionClient("us-west-2", westClient)
+	if err := p2.Terminate(context.Background(), "i-west-persist"); err != nil {
+		t.Fatalf("terminate failed: %v", err)
+	}
+
+	p3 := NewAWSProvider("us-east-1")
+	if reg := p3.instanceRegions["i-west-persist"]; reg != "" {
+		t.Fatalf("expected empty region after termination reload, got %s", reg)
+	}
+}
+
+func TestServer_WarmNodeCotenantMetadataAndOnDemandNodeLost(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-ondemand")
+
+	// Pod 1: on-demand
+	pod1JSON := `{
+		"metadata": {
+			"name": "pod-od-1",
+			"namespace": "default",
+			"uid": "uid-od-1",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "on-demand",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req1 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(pod1JSON)))
+	w1 := httptest.NewRecorder()
+	srv.handleCreate(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("pod 1 create failed: %d: %s", w1.Code, w1.Body.String())
+	}
+	var res1 CreateStruct
+	_ = json.NewDecoder(w1.Body).Decode(&res1)
+	instID := strings.Split(res1.PodJID, ":")[0]
+
+	// Pod 2: on-demand co-tenant bin-packing onto same warm node
+	pod2JSON := `{
+		"metadata": {
+			"name": "pod-od-2",
+			"namespace": "default",
+			"uid": "uid-od-2",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "on-demand",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req2 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(pod2JSON)))
+	w2 := httptest.NewRecorder()
+	srv.handleCreate(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("pod 2 create failed: %d: %s", w2.Code, w2.Body.String())
+	}
+	var res2 CreateStruct
+	_ = json.NewDecoder(w2.Body).Decode(&res2)
+	instID2 := strings.Split(res2.PodJID, ":")[0]
+
+	if instID != instID2 {
+		t.Fatalf("expected pod 2 to bin-pack on warm node %s, got %s", instID, instID2)
+	}
+
+	// Verify co-tenant instance metadata is fully populated
+	srv.mu.RLock()
+	inst2 := srv.instances["uid-od-2"]
+	srv.mu.RUnlock()
+	if inst2 == nil {
+		t.Fatalf("expected instance entry for uid-od-2")
+	}
+	if inst2.Metadata["marketType"] != "on-demand" {
+		t.Fatalf("expected marketType on-demand, got %s", inst2.Metadata["marketType"])
+	}
+	if inst2.Metadata["podUID"] != "uid-od-2" {
+		t.Fatalf("expected podUID uid-od-2, got %s", inst2.Metadata["podUID"])
+	}
+	if inst2.Metadata["podName"] != "pod-od-2" {
+		t.Fatalf("expected podName pod-od-2, got %s", inst2.Metadata["podName"])
+	}
+
+	// Verify GetActivePods does NOT produce duplicate namespace keys
+	activePods, err := srv.GetActivePods(context.Background())
+	if err != nil {
+		t.Fatalf("GetActivePods failed: %v", err)
+	}
+	if _, hasJunkKey := activePods["default/pod-od-2"]; hasJunkKey {
+		t.Fatalf("GetActivePods contained duplicate namespace key default/pod-od-2")
+	}
+	if activePods["uid-od-1"] != instID || activePods["uid-od-2"] != instID {
+		t.Fatalf("unexpected activePods mapping: %+v", activePods)
+	}
+
+	// Terminate VM in cloud inventory (simulating lost on-demand VM)
+	_ = mock.Terminate(context.Background(), instID)
+
+	reconciler := NewReconciler(mock, srv, mock, "cluster-ondemand", 10*time.Minute)
+	reconciler.SetLaunchGracePeriod(0)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if len(result.EvictedPods) != 2 {
+		t.Fatalf("expected 2 evicted pods, got %d: %v", len(result.EvictedPods), result.EvictedPods)
+	}
+
+	// Verify both pods were recorded with reason NodeLost (NOT SpotInterruption)
+	rec1 := srv.completedStore.Get("uid-od-1")
+	if rec1 == nil || rec1.Reason != "NodeLost" {
+		t.Fatalf("expected pod 1 reason NodeLost, got %+v", rec1)
+	}
+	rec2 := srv.completedStore.Get("uid-od-2")
+	if rec2 == nil || rec2.Reason != "NodeLost" {
+		t.Fatalf("expected pod 2 reason NodeLost, got %+v", rec2)
+	}
+
+	// Verify no junk record was written under namespace key
+	if junk := srv.completedStore.Get("default/pod-od-2"); junk != nil {
+		t.Fatalf("junk record found under namespace key: %+v", junk)
+	}
+
+	// Idempotent second pass
+	result2, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("second reconcile failed: %v", err)
+	}
+	if len(result2.EvictedPods) != 0 {
+		t.Fatalf("expected 0 evicted pods on second pass, got %d", len(result2.EvictedPods))
 	}
 }

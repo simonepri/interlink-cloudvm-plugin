@@ -663,6 +663,15 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			RunAsGroup:    spec.RunAsGroup,
 		})
 
+		marketType := spec.MarketType
+		if marketType == "" {
+			if warmNode.Spot {
+				marketType = "spot"
+			} else {
+				marketType = "on-demand"
+			}
+		}
+
 		s.mu.Lock()
 		inst := &Instance{
 			ID:        warmNode.InstanceID,
@@ -670,7 +679,15 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			Region:    warmNode.Region,
 			IP:        warmNode.MeshIP,
 			State:     StateRunning,
-			CreatedAt: time.Now(),
+			CreatedAt: warmNode.CreatedAt,
+			Metadata: map[string]string{
+				"podUID":      spec.PodUID,
+				"podName":     spec.PodName,
+				"namespace":   spec.PodNamespace,
+				"marketType":  marketType,
+				"clusterTag":  s.clusterTag,
+				"runnerToken": warmNode.RunnerAuthToken,
+			},
 		}
 		key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
 		s.instances[key] = inst
@@ -1309,6 +1326,17 @@ func (s *Server) ActiveInstances() map[string]*Instance {
 	return out
 }
 
+// GetPodCreatedAt returns the creation timestamp of the instance associated with podKey.
+func (s *Server) GetPodCreatedAt(_ context.Context, podKey string) (time.Time, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	inst, ok := s.instances[podKey]
+	if !ok || inst == nil {
+		return time.Time{}, false
+	}
+	return inst.CreatedAt, true
+}
+
 // GetActivePods returns a map of genuinely active (running/pending) pod UIDs to their cloud instance IDs.
 func (s *Server) GetActivePods(_ context.Context) (map[string]string, error) {
 	s.mu.RLock()
@@ -1404,7 +1432,9 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 	if s.nodePool != nil {
 		s.nodePool.MarkPodCompleted(uid, exitCode, reason, term.Message, finAt)
 		if inst != nil {
-			s.nodePool.UnregisterNode(inst.ID)
+			if node, _, found := s.nodePool.FindPodNode(uid); !found || node.ActivePodCount() == 0 {
+				s.nodePool.UnregisterNode(inst.ID)
+			}
 		}
 	}
 	if s.completedStore != nil {

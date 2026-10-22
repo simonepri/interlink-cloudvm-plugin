@@ -15,6 +15,7 @@ provider:
   type: "mock"  # "aws" | "gcp" | "mock"
   clusterTag: "interlink-cloudvm"
   awsRegion: "us-east-1"
+  awsRegions: []
   awsLaunchTemplateId: ""
   awsLaunchTemplateName: ""
   awsSubnetId: ""
@@ -23,6 +24,7 @@ provider:
   gcpZone: "us-central1-a"
   tickerURL: ""
   reconcileIntervalSeconds: 60
+  reconcileLaunchGraceSeconds: 120
 
 service:
   type: ClusterIP
