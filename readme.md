@@ -60,7 +60,7 @@ virtual-node"| B["2. interlink-provider-cloudvm
 
 ### Extending Kubernetes: In-Cluster vs. Global Burst
 
-`interlink-provider-cloudvm` does not replace Kubernetes or in-cluster node autoscalers like Karpenter—it **extends** them. A common production pattern is a hybrid topology:
+`interlink-provider-cloudvm` does not replace Kubernetes or in-cluster node autoscalers like Karpenter; it **extends** them. A common production pattern is a hybrid topology:
 - **In-Cluster Nodes (Karpenter)**: Manages local persistent infrastructure (Ray head, Kueue queues, databases, web ingress, intra-VPC low latency services).
 - **Virtual Burst Nodes (`interlink-provider-cloudvm`)**: Absorbs elastic, large-scale GPU/TPU batch computing across spot markets globally whenever local capacity is constrained.
 
