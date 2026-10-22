@@ -23,6 +23,8 @@ type CloudVMNode struct {
 	InstanceID string         `json:"instanceId"`
 	Provider   ProviderType   `json:"provider"`
 	Region     string         `json:"region"`
+	Namespace  string         `json:"namespace,omitempty"`
+	Spot       bool           `json:"spot"`
 	Zone       string         `json:"zone,omitempty"`
 	MeshIP     string         `json:"meshIp"`
 	Capacity   ResourceVector `json:"capacity"`
@@ -216,6 +218,9 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 		if region != "" && node.Region != region {
 			continue
 		}
+		if node.Namespace != "" && namespace != "" && node.Namespace != namespace {
+			continue
+		}
 
 		fits, gpus, tpus, score := node.FitsAndScores(req)
 		if fits && score > highestScore {
@@ -293,4 +298,27 @@ func (np *NodePool) ActiveNodeCount() int {
 	np.mu.RLock()
 	defer np.mu.RUnlock()
 	return len(np.nodes)
+}
+
+// RegisterAndAllocate atomically registers a newly launched node and allocates the first pod onto it.
+func (np *NodePool) RegisterAndAllocate(node *CloudVMNode, req ResourceVector, podUID, namespace, podName string) ([]int, []int) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+
+	if node.Namespace == "" {
+		node.Namespace = namespace
+	}
+	np.nodes[node.InstanceID] = node
+	_, gpus, tpus, _ := node.FitsAndScores(req)
+	alloc := &PodAllocation{
+		PodUID:       podUID,
+		PodNamespace: namespace,
+		PodName:      podName,
+		Allocated:    req,
+		AssignedGPUs: gpus,
+		AssignedTPUs: tpus,
+		StartedAt:    time.Now(),
+	}
+	node.AssignPod(alloc)
+	return gpus, tpus
 }

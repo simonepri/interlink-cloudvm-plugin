@@ -65,15 +65,15 @@ Most setups run both side-by-side:
 - **Burst Virtual Nodes (`interlink-provider-cloudvm`)**: Run stateless GPU/CPU batch jobs across external regions and spot pools when local capacity is full or too expensive.
 
 | Capability | In-Cluster Autoscaler (Karpenter) | `interlink-provider-cloudvm` |
-| :--- | :---: | :---: |
+| :--- | :--- | :--- |
 | **Primary Role** | Local steady-state & stateful services | Multi-region & multi-cloud batch burst |
-| **Geographic Scope** | ❌ Single VPC & region | ✅ Any region or cloud via WireGuard |
-| **Spot Pool Access** | ❌ Local AZs only | ✅ Cross-region price & capacity arbitrage |
-| **Node Bootstrap** | ⚠️ Kubelet join + CNI + DaemonSets | ✅ Boots straight into workload |
-| **Cluster Overhead** | ⚠️ `Node` object in etcd + VPC IPs | ✅ Single static virtual node, 0 VPC IPs |
-| **Packing & Isolation** | ⚠️ Shared host kernel across pods | ✅ 1:1 dedicated VM or N:1 GPU/CPU bin-packing |
-| **Persistent Volumes (CSI)** | ✅ Native EBS / CSI mounts | ❌ S3 / GCS / FUSE mounts only |
-| **Idle Cost** | Consolidation & scale-down cooldown | **`$0`** (VM powers off on process exit) |
+| **Geographic Scope** | Single VPC & region | Any region or cloud via WireGuard |
+| **Spot Pool Access** | Local AZs only | Cross-region price & capacity arbitrage |
+| **Node Bootstrap** | Kubelet join + CNI + DaemonSets | Boots straight into workload |
+| **Cluster Overhead** | `Node` object in etcd + VPC IPs | Single static virtual node, 0 VPC IPs |
+| **Packing & Isolation** | Shared host kernel across pods | 1:1 dedicated VM or same-namespace N:1 bin-packing |
+| **Persistent Volumes (CSI)** | Native EBS / CSI mounts | S3 / GCS / FUSE mounts only |
+| **Idle Cost** | Consolidation & scale-down cooldown | `$0` when last pod on VM exits |
 
 ---
 
@@ -102,46 +102,38 @@ The provider consists of five main components:
 
 ### 1. Spot Fleet Bidding & Multi-Pod Bin-Packing (N Pods to 1 VM)
 
-When a pod schedules onto the virtual node, the provider first checks its `NodePool` for an active VM in the target region with enough free CPU, memory, and discrete accelerator slots (`NodeResourcesMostAllocated` scoring):
+When a pod schedules onto the virtual node, the provider first checks `NodePool` for an active VM in the same namespace and region that has enough free CPU, memory, and discrete GPU/TPU slots (`NodeResourcesMostAllocated` scoring):
 
-- **Bin-Pack Hit (< 1s)**: If a previous 4-GPU pod triggered an 8-GPU spot instance (for example, when 4-GPU spot pools were empty and an 8-GPU `g5.48xlarge` was allocated), the provider assigns the free GPU slots (`NVIDIA_VISIBLE_DEVICES=4,5,6,7`) and starts the second pod on the same warm VM immediately.
-- **Bin-Pack Miss**: If no warm VM can fit the pod, the solver builds a list of compatible shapes and calls the cloud API for a `price-capacity-optimized` allocation (`TotalTargetCapacity = 1`).
-- **Co-Tenant Lifecycle**: Deleting one pod on a shared VM releases its GPU/CPU slots while keeping the VM alive for remaining co-tenants. The VM only terminates when the last pod on it exits (or after the 60s idle grace window).
+- **Bin-Pack Hit**: If an active VM has free capacity (for example, an 8-GPU `g5.48xlarge` currently running a single 4-GPU pod on GPUs `[0..3]`), the provider assigns the remaining GPU slots (`[4..7]`) and dispatches the second pod onto that warm VM without calling EC2/GCE.
+- **Bin-Pack Miss**: If no active VM can fit the request, the solver builds a list of candidate instance types and requests a new VM (`price-capacity-optimized` on AWS EC2 Fleet, `bulkInsert` on GCP).
+- **Co-Tenant Lifecycle**: Deleting one pod on a shared VM releases its GPU/CPU slots while keeping the VM running for remaining pods. The cloud VM is only terminated once its last active pod finishes.
 
 ```mermaid
 flowchart LR
     classDef req fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
+    classDef pool fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
     classDef solver fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
     classDef cloud fill:#0C4A6E,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
 
-    Req["Pod Spec
-(1 GPU requested)"]:::req --> Solver["Spot Solver"]:::solver
-
-    subgraph Portfolio["Candidate Shapes (Weight: 1.0)"]
-        direction TB
-        W1["g5.xlarge (1x A10G)"]
-        W2["g6.xlarge (1x L4)"]
-        W3["g4dn.xlarge (1x T4)"]
-    end
-    Solver --> Portfolio
-
-    Portfolio --> AWS["AWS EC2 Fleet API
-(TargetCapacity = 1)"]:::cloud
-    Portfolio --> GCP["GCP Compute Engine
-(bulkInsert)"]:::cloud
+    Req["Incoming Pod
+(CPU, Mem, GPUs)"]:::req --> Check{"NodePool
+FitsAndScores?"}:::pool
+    Check -->|"Hit (Free Slots)"| Warm["Slice Warm VM
+Assign GPU Slots [k..m]"]:::pool
+    Check -->|"Miss"| Solver["Spot Portfolio Solver"]:::solver
+    Solver --> Cloud["Launch New VM
+(AWS Fleet / GCP Bulk)"]:::cloud
 ```
 
-| Pod Request | Fleet Target | Candidate Shapes | Result |
-| :--- | :---: | :--- | :--- |
-| **1 GPU** | 1 VM | `g5.xlarge`, `g6.xlarge`, `g4dn.xlarge` | 1 VM with 1 GPU |
-| **4 GPUs** | 1 VM | `g5.12xlarge`, `g5.24xlarge`, `g6.12xlarge` | 1 VM with 4 GPUs |
-| **8 GPUs** | 1 VM | `p5.48xlarge`, `p4de.24xlarge`, `g5.48xlarge` | 1 VM with 8 GPUs |
+| Scenario | Pod Request | Provisioned VM Shape | NodePool Allocation |
+| :--- | :--- | :--- | :--- |
+| **Exact 1:1 Fit** | 1 GPU (`16Gi` RAM) | `g5.xlarge` (`1` GPU, `16Gi`) | Pod 1 gets GPU `[0]` (VM 100% full) |
+| **Oversized Spot VM (Pod 1)** | 4 GPUs (`64Gi` RAM) | `g5.48xlarge` (`8` GPUs, `768Gi`) | Launches 1 VM; Pod 1 gets GPUs `[0,1,2,3]` |
+| **Oversized Spot VM (Pod 2)** | 4 GPUs (`64Gi` RAM) | *Reuses warm `g5.48xlarge`* | **0 VMs launched**; Pod 2 gets GPUs `[4,5,6,7]` |
+| **CPU Batch Slicing** | 4 Pods x `8` vCPU | `c6i.8xlarge` (`32` vCPU, `64Gi`) | All 4 pods pack onto 1 shared VM |
 
-> [!NOTE]
-> Multi-node jobs (distributed PyTorch, Ray clusters) run as multiple Kubernetes pods. Each worker pod binds to the virtual node and gets its own VM.
-
-- **Idempotency**: Every AWS `CreateFleet` call sets a deterministic `ClientToken` (`cvm-<uid>-<namespace>-<pod>`) with the Pod UID first. Network retries will not launch duplicate VMs.
-- **Hardware Pinning**: If a workload requires a specific GPU architecture, set `cloudvm.vk.io/instance-type: "p4d.24xlarge"` on the pod.
+- **Idempotency**: Every AWS `CreateFleet` call sets a deterministic `ClientToken` (`cvm-<uid>-<namespace>-<pod>`) with the Pod UID first so network retries never launch duplicate VMs.
+- **Hardware Pinning**: To require a specific instance shape, set `cloudvm.vk.io/instance-type: "p4d.24xlarge"` on the pod.
 
 ---
 

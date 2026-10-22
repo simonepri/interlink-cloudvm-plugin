@@ -63,8 +63,19 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		return nil, fmt.Errorf("failed to query active pods: %w", err)
 	}
 
+	activeInstanceIDs := make(map[string]bool, len(activePods))
+	for _, id := range activePods {
+		if id != "" {
+			activeInstanceIDs[id] = true
+		}
+	}
+
 	now := time.Now()
 	for _, inst := range activeInstances {
+		if activeInstanceIDs[inst.ID] {
+			continue
+		}
+
 		podName := inst.Metadata["podName"]
 		if podName == "" {
 			podName = inst.Metadata["PodName"]

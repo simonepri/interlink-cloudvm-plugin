@@ -245,6 +245,16 @@ func TestEndToEnd_Two4GPUPodsBinPackIntoOne8GPUVM(t *testing.T) {
 		t.Fatalf("deleting co-tenant Pod 1 must NOT terminate shared VM while Pod 2 is still running; active VMs: %d", len(activeVMsAfterDel1))
 	}
 
+	// 3b. Run ReconcileOnce after Pod 1 was deleted while Pod 2 is still running -> VM must NOT be treated as a zombie
+	reconciler := NewReconciler(mock, server, mock, "test-cluster", 0)
+	res, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+	if len(res.TerminatedZombies) != 0 {
+		t.Fatalf("reconciler erroneously killed shared VM while Pod 2 was still running: %v", res.TerminatedZombies)
+	}
+
 	// 4. Delete Pod 2 -> Last pod on VM finishes -> VM is terminated
 	recDel2 := httptest.NewRecorder()
 	handler.ServeHTTP(recDel2, httptest.NewRequest(http.MethodPost, "/delete", bytes.NewReader(pod2Body)))

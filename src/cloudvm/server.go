@@ -412,8 +412,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	nodeCapacity := CapacityForInstanceType(itype, reqVec)
 
 	newNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, nodeCapacity)
-	s.nodePool.RegisterNode(newNode)
-	_, gpus, tpus, _ := s.nodePool.Allocate(reqVec, spec.Region, spec.PodUID, spec.PodNamespace, spec.PodName)
+	newNode.Namespace = spec.PodNamespace
+	newNode.Spot = spec.MarketType != "on-demand"
+	gpus, tpus := s.nodePool.RegisterAndAllocate(newNode, reqVec, spec.PodUID, spec.PodNamespace, spec.PodName)
 
 	cName := "worker"
 	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
@@ -526,10 +527,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	s.nodePool.UnregisterNode(inst.ID)
 	if err := prov.Terminate(r.Context(), inst.ID); err != nil {
 		log.Printf("[cloudvm] Error terminating instance %s: %v", inst.ID, err)
 	}
-	s.nodePool.UnregisterNode(inst.ID)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -716,6 +717,17 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		}
 		key := fmt.Sprintf("%s/%s", ns, podName)
 		s.instances[key] = inst
+		podUID := inst.Metadata["podUID"]
+		if podUID == "" {
+			podUID = key
+		} else {
+			s.instances[podUID] = inst
+		}
+		defaultVec, _ := NewResourceVector("2", "4Gi", 0, 0)
+		capVec := CapacityForInstanceType(inst.InstanceType, defaultVec)
+		recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
+		recNode.Namespace = ns
+		s.nodePool.RegisterAndAllocate(recNode, defaultVec, podUID, ns, podName)
 		cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
 		cleanKey := strings.ReplaceAll(strings.ReplaceAll(key, "\n", ""), "\r", "")
 		log.Printf("[cloudvm] Recovered existing cloud VM %s for pod %s", cleanID, cleanKey)
