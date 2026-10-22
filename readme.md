@@ -302,11 +302,13 @@ flowchart TD
         
         subgraph Agents["In-VM Daemons (Pre-baked AMI / Cloud-Init)"]
             direction TB
-            OTEL["OTEL Host Agent\n(Host & GPU Metrics)"]:::daemon
+            OTEL["OTEL / DCGM Agent\n(Host & GPU SM/VRAM Metrics)"]:::daemon
             OBI["OBI (OpenTelemetry eBPF)\n(L4 Socket & Network Flows)"]:::daemon
+            NPD["Hardware / Xid Monitor\n(NVIDIA GPU ECC / Memory Faults)"]:::daemon
             Parca["Parca Agent\n(Kernel eBPF Continuous Profiling)"]:::daemon
             Falco["Falco Modern eBPF\n(Runtime Security & Syscall Audit)"]:::daemon
             Dragonfly["Dragonfly dfdaemon\n(P2P Image & Artifact Proxy)"]:::daemon
+            Storage["Dataset & Compiler Cache\n(FUSE Mounts / TorchInductor Cache)"]:::daemon
         end
     end
 
@@ -337,6 +339,38 @@ flowchart TD
 | **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP $\\to$ central `falcosidekick`. |
 | **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs $\\to$ avoids registry rate-limits. |
 | **OpenCost / Kubecost** | cAdvisor / NodeExporter DaemonSet | Cloud resource tagging + CUR billing reconciliation + Virtual-Kubelet status pricing | Tags instances with `PodName`/`Namespace` $\\to$ OpenCost attributes out-of-cluster cloud bills to K8s workloads. |
+| **NVIDIA DCGM Exporter** (`gpu_operator`) | DCGM Exporter DaemonSet | Bundled in DLAMI or host OTEL collector scraping NVML | Pushes GPU SM utilization, Tensor core activity, and VRAM over mesh $\\to$ central Prometheus / SigNoz. |
+| **Node Problem Detector (NPD)** | Node Problem Detector DaemonSet | In-VM watchdog polling `dmesg` and NVML for GPU Xid / ECC errors | Emits structured `HARDWARE_FAULT` logs to serial console $\\to$ provider evicts/reschedules pod. |
+| **Storage FUSE Driver** (`csi_rclone`) | CSI Node Driver DaemonSet | In-VM `cloud-init` FUSE mount (`rclone mount` / `s3fs` / `gcsfuse`) | Mounts object storage buckets directly to `/mnt/data` before workload container boots. |
+| **Torch Compile Cache** | Shared NFS or PVC compiler cache | S3/Dragonfly cache or pre-warmed Triton/Inductor kernel cache in Golden AMI | Eliminates 5–15 min CUDA compilation delays on every cold spot boot. |
+
+
+
+### Storage, Compiler Caching & Hardware Health Deep Dive
+
+Beyond telemetry and security, machine learning pipelines rely on three critical node-level primitives:
+
+#### 1. Dataset & Model Weight Mounting (`csi_rclone` / FUSE)
+Because Kubernetes CSI drivers cannot mount storage volumes onto virtual nodes across the off-cluster boundary, datasets and checkpoints are mounted at the hypervisor/host level during VM bootstrap:
+- **Direct Object Storage Mounts**: `cloud-init` uses `rclone mount`, `s3fs`, or `gcsfuse` to expose remote buckets at `/mnt/data` or `/mnt/models` with multi-threaded read-ahead and local SSD kernel caching (`vfs-cache-mode: full`).
+- **P2P Layer Distribution via Dragonfly**: Model weights and large binaries are pulled through the local `dfdaemon` proxy, taking advantage of P2P cache hits across the running fleet without slamming S3/GCS rate limits.
+
+#### 2. PyTorch Compiler Cache (`torch_compile_cache`)
+Modern PyTorch workflows using `torch.compile(mode="max-autotune")` compile dynamic CUDA kernels via Triton and PyTorch Inductor. Without cache sharing, newly booted spot instances incur a **5–15 minute CUDA kernel compilation penalty** before processing their first batch.
+- **Golden AMI Pre-warming**: Standard foundation model kernels are compiled ahead-of-time (AOT) and saved to `/var/cache/torch/inductor` inside the Golden AMI.
+- **Remote Artifact Sync**: Workloads configure `TORCHINDUCTOR_CACHE_DIR=/mnt/cache/inductor` pointing to a shared S3 gateway or local NVMe cache synchronized at boot.
+
+#### 3. Hardware & GPU Problem Detection (`node_problem_detector`)
+Cloud spot GPU instances occasionally experience hardware degradation (e.g. uncorrected ECC memory errors, NVLink failures, or GPU fall-off-bus with NVIDIA Xid errors 31, 45, or 79):
+- The in-VM `spot-monitor.sh` background watcher continuously polls NVML:
+  ```bash
+  nvidia-smi --query-gpu=pstate,temperature.gpu,ecc.errors.uncorrected.volatile.total --format=csv,noheader
+  ```
+- If an uncorrected memory error or kernel Xid is detected, the watcher immediately sends:
+  ```json
+  CLOUDVM_STATUS: {"status": "HARDWARE_FAULT", "reason": "GPU_ECC_ERROR"}
+  ```
+  to `/dev/console`. The provider captures this via the cloud serial stream, marks the pod as `Failed` (Reason: `HardwareFault`), and re-queues the workload on a fresh instance without hanging indefinitely.
 
 ### Golden AMI vs. Dynamic Cloud-Init Injection
 
