@@ -31,6 +31,7 @@ type CloudVMNode struct {
 	Allocated  ResourceVector `json:"allocated"`
 	CreatedAt  time.Time      `json:"createdAt"`
 	IdleSince  *time.Time     `json:"idleSince,omitempty"`
+	Cordoned   bool           `json:"cordoned,omitempty"`
 
 	// Discrete device maps: Slot Index -> PodUID
 	GPUSlots map[int]string `json:"gpuSlots"`
@@ -215,6 +216,9 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 	var highestScore int64 = -1
 
 	for _, node := range np.nodes {
+		if node.Cordoned {
+			continue
+		}
 		if region != "" && node.Region != region {
 			continue
 		}

@@ -43,6 +43,7 @@ type Server struct {
 	reconciler    *Reconciler
 	nodePool      *NodePool
 	runner        ContainerRunner
+	spotTicker    *SpotPriceTicker
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -63,6 +64,13 @@ func (s *Server) SetContainerRunner(r ContainerRunner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.runner = r
+}
+
+// SetSpotTicker binds the live spot price ticker to export /prices and /metrics.
+func (s *Server) SetSpotTicker(t *SpotPriceTicker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spotTicker = t
 }
 
 // NodePool returns the underlying multi-cloud node pool.
@@ -107,6 +115,29 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/pods/create", s.handleCreate)
 	mux.HandleFunc("/pods/delete", s.handleDelete)
 	mux.HandleFunc("/pods/status", s.handleStatus)
+
+	// Spot price ticker endpoints (when ticker is enabled)
+	mux.HandleFunc("/prices", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.RLock()
+		ticker := s.spotTicker
+		s.mu.RUnlock()
+		if ticker == nil {
+			http.Error(w, "spot ticker not enabled", http.StatusNotFound)
+			return
+		}
+		ticker.Routes().ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.RLock()
+		ticker := s.spotTicker
+		s.mu.RUnlock()
+		if ticker == nil {
+			http.Error(w, "spot ticker not enabled", http.StatusNotFound)
+			return
+		}
+		ticker.Routes().ServeHTTP(w, r)
+	})
+
 	return mux
 }
 
@@ -735,6 +766,7 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		capVec := CapacityForInstanceType(inst.InstanceType, defaultVec)
 		recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
 		recNode.Namespace = ns
+		recNode.Cordoned = true
 		s.nodePool.RegisterAndAllocate(recNode, defaultVec, podUID, ns, podName)
 		cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
 		cleanKey := strings.ReplaceAll(strings.ReplaceAll(key, "\n", ""), "\r", "")

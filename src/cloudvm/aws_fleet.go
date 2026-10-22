@@ -337,6 +337,8 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
 	cloudInit, err := RenderCloudInit(&CloudInitConfig{
 		PodName:              spec.PodName,
+		PodNamespace:         spec.PodNamespace,
+		PodUID:               spec.PodUID,
 		Region:               spec.Region,
 		InstanceType:         spec.InstanceType,
 		NumGPUs:              spec.NumGPUs,

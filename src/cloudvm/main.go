@@ -39,6 +39,50 @@ func main() {
 	}
 	awsProv := NewAWSProvider(awsRegion)
 
+	// Standalone spot price ticker microservice mode
+	if os.Getenv("SERVICE_MODE") == "ticker" {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		tickerRegions := strings.Split(os.Getenv("TICKER_REGIONS"), ",")
+		if len(tickerRegions) == 1 && tickerRegions[0] == "" {
+			tickerRegions = []string{awsRegion}
+		}
+		interval := 10 * time.Minute
+		if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
+			if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
+				interval = time.Duration(s) * time.Second
+			}
+		}
+		spotTicker := NewSpotPriceTicker(tickerRegions, nil, interval)
+		go spotTicker.Start(ctx)
+		log.Printf("[cloudvm-ticker] Running standalone spot ticker on port %s for %d regions", port, len(tickerRegions)) //nolint:gosec // length safe
+
+		tickerServer := &http.Server{
+			Addr:         ":" + port,
+			Handler:      spotTicker.Routes(),
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+		}
+
+		stopChan := make(chan os.Signal, 1)
+		signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
+
+		go func() {
+			if err := tickerServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("[cloudvm-ticker] Server failed: %v", err)
+			}
+		}()
+
+		<-stopChan
+		log.Printf("[cloudvm-ticker] Shutting down gracefully...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = tickerServer.Shutdown(shutdownCtx)
+		shutdownCancel()
+		log.Printf("[cloudvm-ticker] Server stopped.")
+		return
+	}
+
 	switch providerType {
 	case "aws":
 		defaultProvider = awsProv
@@ -59,15 +103,22 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Standalone or embedded spot price ticker
-	if os.Getenv("ENABLE_TICKER") == "true" || os.Getenv("SERVICE_MODE") == "ticker" {
+	// Embedded spot price ticker
+	if os.Getenv("ENABLE_TICKER") == "true" {
 		tickerRegions := strings.Split(os.Getenv("TICKER_REGIONS"), ",")
 		if len(tickerRegions) == 1 && tickerRegions[0] == "" {
 			tickerRegions = []string{awsRegion}
 		}
-		spotTicker := NewSpotPriceTicker(tickerRegions, nil, 10*time.Minute)
+		interval := 10 * time.Minute
+		if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
+			if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
+				interval = time.Duration(s) * time.Second
+			}
+		}
+		spotTicker := NewSpotPriceTicker(tickerRegions, nil, interval)
 		go spotTicker.Start(ctx)
-		log.Printf("[cloudvm-ticker] Spot price poller started for %d regions", len(tickerRegions)) //nolint:gosec // log length is safe
+		server.SetSpotTicker(spotTicker)
+		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(tickerRegions)) //nolint:gosec // log length is safe
 	}
 
 	// Background reconciler

@@ -99,8 +99,6 @@ func (c *HardwareCatalog) ResolveCapacity(ctx context.Context, client InstanceTy
 		}
 	}
 
-	// Fallback to static catalog table
-	resolved := CapacityForInstanceType(itype, fallback)
-	c.Put(itype, resolved)
-	return resolved
+	// Fallback to static catalog table without poisoning the cache on transient cloud API failure
+	return CapacityForInstanceType(itype, fallback)
 }

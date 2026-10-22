@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -47,6 +48,14 @@ func (m *mockDescriber) DescribeInstanceTypes(_ context.Context, params *ec2.Des
 	}
 }
 
+type errorMockDescriber struct {
+	err error
+}
+
+func (m *errorMockDescriber) DescribeInstanceTypes(_ context.Context, _ *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	return nil, m.err
+}
+
 func TestHardwareCatalog_ResolveCapacity(t *testing.T) {
 	cat := NewHardwareCatalog()
 	ctx := context.Background()
@@ -69,6 +78,33 @@ func TestHardwareCatalog_ResolveCapacity(t *testing.T) {
 	cached, ok := cat.Get("g5.48xlarge")
 	if !ok || cached.GPUs != 8 {
 		t.Errorf("expected cached capacity with 8 GPUs")
+	}
+}
+
+func TestHardwareCatalog_TransientErrorDoesNotPoisonCache(t *testing.T) {
+	cat := NewHardwareCatalog()
+	ctx := context.Background()
+	errMock := &errorMockDescriber{err: fmt.Errorf("ec2 rate limit exceeded")}
+
+	fallback, _ := NewResourceVector("2", "4Gi", 0, 0)
+	// First call errors - should return static fallback without caching
+	res1 := cat.ResolveCapacity(ctx, errMock, "g5.48xlarge", fallback)
+	if res1.GPUs != 8 { // static table for g5.48xlarge has 8
+		t.Errorf("expected fallback resolution, got %d GPUs", res1.GPUs)
+	}
+
+	if _, ok := cat.Get("g5.48xlarge"); ok {
+		t.Errorf("expected catalog cache NOT to be poisoned on transient error")
+	}
+
+	// Subsequent call with working mock populates cache
+	mock := &mockDescriber{}
+	res2 := cat.ResolveCapacity(ctx, mock, "g5.48xlarge", fallback)
+	if res2.GPUs != 8 {
+		t.Errorf("expected successful resolution, got %d GPUs", res2.GPUs)
+	}
+	if _, ok := cat.Get("g5.48xlarge"); !ok {
+		t.Errorf("expected catalog cache to be populated after successful API call")
 	}
 }
 
@@ -106,5 +142,59 @@ func TestSpotPriceTicker_PollAndMetrics(t *testing.T) {
 	expected := "cloudvm_spot_price_usd_per_hour{region=\"us-east-1\",instance_type=\"g5.xlarge\"} 0.3018"
 	if !bytes.Contains(rec.Body.Bytes(), []byte(expected)) {
 		t.Errorf("metrics response missing expected gauge: %s", rec.Body.String())
+	}
+}
+
+type mockMultiAZSpotFetcher struct{}
+
+func (m *mockMultiAZSpotFetcher) DescribeSpotPriceHistory(_ context.Context, _ *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
+	t1 := time.Now().Add(-10 * time.Minute)
+	t2 := time.Now().Add(-5 * time.Minute)
+	t3 := time.Now()
+	return &ec2.DescribeSpotPriceHistoryOutput{
+		SpotPriceHistory: []ec2types.SpotPrice{
+			{
+				InstanceType:     ec2types.InstanceType("g5.2xlarge"),
+				AvailabilityZone: aws.String("us-east-1a"),
+				SpotPrice:        aws.String("0.4500"),
+				Timestamp:        aws.Time(t1),
+			},
+			{
+				InstanceType:     ec2types.InstanceType("g5.2xlarge"),
+				AvailabilityZone: aws.String("us-east-1b"),
+				SpotPrice:        aws.String("0.3800"),
+				Timestamp:        aws.Time(t2),
+			},
+			{
+				InstanceType:     ec2types.InstanceType("g5.2xlarge"),
+				AvailabilityZone: aws.String("us-east-1a"),
+				SpotPrice:        aws.String("0.4200"),
+				Timestamp:        aws.Time(t3),
+			},
+		},
+	}, nil
+}
+
+func TestSpotPriceTicker_AZKeyingAndTimestampOrdering(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"g5.2xlarge"}, 10*time.Minute)
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) {
+		return &mockMultiAZSpotFetcher{}, nil
+	})
+
+	ticker.PollOnce(context.Background())
+
+	entry1a, ok := ticker.GetPriceAZ("us-east-1", "us-east-1a", "g5.2xlarge")
+	if !ok || entry1a.SpotPriceUSD != 0.4200 {
+		t.Fatalf("expected newer price 0.4200 for us-east-1a, got %+v", entry1a)
+	}
+
+	entry1b, ok := ticker.GetPriceAZ("us-east-1", "us-east-1b", "g5.2xlarge")
+	if !ok || entry1b.SpotPriceUSD != 0.3800 {
+		t.Fatalf("expected price 0.3800 for us-east-1b, got %+v", entry1b)
+	}
+
+	latest, ok := ticker.GetPrice("us-east-1", "g5.2xlarge")
+	if !ok || latest.SpotPriceUSD != 0.4200 {
+		t.Fatalf("expected latest price 0.4200 across region, got %+v", latest)
 	}
 }

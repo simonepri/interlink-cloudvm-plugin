@@ -12,6 +12,7 @@ import (
 type CloudInitConfig struct {
 	PodName              string
 	PodNamespace         string
+	PodUID               string
 	RayHeadAddress       string
 	RayVersion           string
 	TargetContainerImage string
@@ -147,7 +148,7 @@ nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
       break
     fi
     {{else}}
-    if docker inspect -f '{{print "{{"}}.State.Running{{print "}}"}}' cloudvm-workload 2>/dev/null | grep -q "true"; then
+    if docker ps -q --filter "name=cloudvm" 2>/dev/null | grep -q .; then
       touch /tmp/workload-ready
       echo "[cloudvm-bootstrap] Container workload running and ready!"
       echo "CLOUDVM_STATUS: {\"status\": \"RUNNING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\"}" > /dev/console 2>/dev/null || true
@@ -177,29 +178,174 @@ PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/n
 {{.RenderCommand}}
 {{end}}
 
-{{else}}
-# 5. Container Execution Mode (Docker / Containerd)
-echo "[cloudvm-bootstrap] Launching containerized workload..."
-GPU_FLAGS=""
-{{if gt .NumGPUs 0}}
-GPU_FLAGS="--gpus all"
-{{end}}
-
-docker run --rm --name=cloudvm-workload \
-  --net=host \
-  --ipc=host \
-  --pid=host \
-  $GPU_FLAGS \
-{{range $k, $v := .Env}}  -e {{$k}}="{{$v}}" \
-{{end}}  "{{.TargetContainerImage}}" \
-  {{.RenderContainerCommand}} || true
-{{end}}
-
-# 6. Clean self-shutdown on normal process exit
+# Clean self-shutdown on normal process exit for native DLAMI mode
 echo "[cloudvm-bootstrap] Workload process completed. Shutting down VM..."
 echo "CLOUDVM_STATUS: {\"status\": \"COMPLETED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
 shutdown -h now || poweroff
+
+{{else}}
+# 5. Container Execution Mode with In-VM Micro-Runner Daemon (:9090)
+echo "[cloudvm-bootstrap] Starting in-VM micro-runner daemon on port 9090..."
+
+cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
+import http.server
+import json
+import subprocess
+import urllib.parse
+
+PORT = 9090
+
+class RunnerHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/healthz':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
+        if parsed.path == '/containers/status':
+            params = urllib.parse.parse_qs(parsed.query)
+            pod_uid = params.get('podUID', [''])[0]
+            container_name = f"cloudvm-{pod_uid}"
+            res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
+            if res.returncode == 0:
+                try:
+                    data = json.loads(res.stdout)[0]
+                    state = data.get('State', {})
+                    running = state.get('Running', False)
+                    exit_code = state.get('ExitCode', 0)
+                    resp = {
+                        "podUID": pod_uid,
+                        "running": running,
+                        "exitCode": exit_code,
+                        "reason": "Running" if running else ("Completed" if exit_code == 0 else "Error"),
+                    }
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode('utf-8'))
+                    return
+                except Exception:
+                    pass
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/containers/stop':
+            params = urllib.parse.parse_qs(parsed.query)
+            pod_uid = params.get('podUID', [''])[0]
+            if pod_uid:
+                subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
+            self.send_response(200)
+            self.end_headers()
+            return
+
+        if parsed.path == '/containers/start':
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            try:
+                req = json.loads(body.decode('utf-8'))
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            pod_uid = req.get('podUID', 'unknown')
+            image = req.get('image', '')
+            gpus = req.get('assignedGPUs', [])
+            env = req.get('env', {})
+            cmd = req.get('command', [])
+            args = req.get('args', [])
+
+            container_name = f"cloudvm-{pod_uid}"
+            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host', '--ipc=host', '--pid=host']
+            if gpus:
+                gpu_devs = ','.join(str(g) for g in gpus)
+                docker_cmd.extend(['--gpus', f"\"device={gpu_devs}\""])
+            for k, v in env.items():
+                docker_cmd.extend(['-e', f"{k}={v}"])
+            docker_cmd.append(image)
+            docker_cmd.extend(cmd)
+            docker_cmd.extend(args)
+
+            cmd_str = ' '.join(docker_cmd)
+            res = subprocess.run(cmd_str, shell=True, capture_output=True, text=True)
+            if res.returncode == 0:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status":"started"}')
+            else:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(res.stderr.encode('utf-8'))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+if __name__ == '__main__':
+    server = http.server.HTTPServer(('0.0.0.0', PORT), RunnerHandler)
+    server.serve_forever()
+RUNNER_EOF
+chmod +x /usr/local/bin/cloudvm-runner.py
+if command -v python3 >/dev/null 2>&1; then
+  nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
+fi
+
+# Launch initial container workload if image is provided
+if [ -n "{{.TargetContainerImage}}" ]; then
+  echo "[cloudvm-bootstrap] Launching initial container workload..."
+  GPU_FLAGS=""
+  {{if gt .NumGPUs 0}}
+  GPU_FLAGS="--gpus all"
+  {{end}}
+
+  docker run -d --name="cloudvm-{{.EffectivePodUID}}" \
+    --net=host \
+    --ipc=host \
+    --pid=host \
+    $GPU_FLAGS \
+  {{range $k, $v := .Env}}  -e {{$k}}="{{$v}}" \
+  {{end}}  "{{.TargetContainerImage}}" \
+    {{.RenderContainerCommand}} || true
+fi
+
+# 6. Multi-Pod Idle Watchdog: Shuts down VM only when all containers finish and idle grace period expires
+echo "[cloudvm-bootstrap] Workload started. Monitoring active containers for node shutdown..."
+while true; do
+  ACTIVE=$(docker ps -q --filter "name=cloudvm" 2>/dev/null | wc -l || echo 0)
+  if [ "$ACTIVE" -eq 0 ]; then
+    echo "[cloudvm-bootstrap] No active cloudvm containers running. Waiting 60s idle grace period..."
+    sleep 60
+    ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm" 2>/dev/null | wc -l || echo 0)
+    if [ "$ACTIVE_AFTER" -eq 0 ]; then
+      echo "[cloudvm-bootstrap] Node idle grace expired. Shutting down VM..."
+      echo "CLOUDVM_STATUS: {\"status\": \"COMPLETED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+      shutdown -h now || poweroff
+      exit 0
+    fi
+  fi
+  sleep 10
+done
+{{end}}
 `
+
+// EffectivePodUID returns PodUID if set, or defaults to PodName.
+func (c *CloudInitConfig) EffectivePodUID() string {
+	if c.PodUID != "" {
+		return c.PodUID
+	}
+	return c.PodName
+}
 
 // RenderCommand formats Command and Args for bash execution.
 func (c *CloudInitConfig) RenderCommand() string {

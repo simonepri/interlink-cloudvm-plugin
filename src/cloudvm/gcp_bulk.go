@@ -46,6 +46,7 @@ func (p *GCPProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance, 
 	cloudInit, err := GenerateCloudInit(&CloudInitConfig{
 		PodName:              spec.PodName,
 		PodNamespace:         spec.PodNamespace,
+		PodUID:               spec.PodUID,
 		RayHeadAddress:       spec.RayHeadAddress,
 		RayVersion:           spec.RayVersion,
 		TargetContainerImage: spec.TargetContainerImage,

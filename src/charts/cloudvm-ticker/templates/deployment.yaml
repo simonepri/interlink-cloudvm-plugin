@@ -23,6 +23,8 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            - name: SERVICE_MODE
+              value: "ticker"
             - name: PORT
               value: "{{ .Values.service.port }}"
             - name: SCRAPE_INTERVAL_SECONDS

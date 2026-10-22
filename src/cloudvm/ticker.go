@@ -25,10 +25,15 @@ type SpotPriceFetcher interface {
 
 // SpotPriceEntry represents a real-time spot price record.
 type SpotPriceEntry struct {
-	Region       string    `json:"region"`
-	InstanceType string    `json:"instanceType"`
-	SpotPriceUSD float64   `json:"spotPriceUSD"`
-	Timestamp    time.Time `json:"timestamp"`
+	Region           string    `json:"region"`
+	AvailabilityZone string    `json:"availabilityZone,omitempty"`
+	InstanceType     string    `json:"instanceType"`
+	SpotPriceUSD     float64   `json:"spotPriceUSD"`
+	Timestamp        time.Time `json:"timestamp"`
+}
+
+func tickerKey(region, az, instanceType string) string {
+	return fmt.Sprintf("%s/%s/%s", region, az, instanceType)
 }
 
 // SpotPriceTicker maintains a live cache of spot prices and exports Prometheus metrics.
@@ -107,14 +112,20 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 		t.mu.Lock()
 		for _, ph := range out.SpotPriceHistory {
 			itype := string(ph.InstanceType)
-			key := fmt.Sprintf("%s/%s", reg, itype)
+			az := aws.ToString(ph.AvailabilityZone)
+			ts := aws.ToTime(ph.Timestamp)
+			key := tickerKey(reg, az, itype)
 			priceVal, err := strconv.ParseFloat(aws.ToString(ph.SpotPrice), 64)
 			if err == nil {
-				t.prices[key] = &SpotPriceEntry{
-					Region:       reg,
-					InstanceType: itype,
-					SpotPriceUSD: priceVal,
-					Timestamp:    aws.ToTime(ph.Timestamp),
+				existing, exists := t.prices[key]
+				if !exists || ts.After(existing.Timestamp) {
+					t.prices[key] = &SpotPriceEntry{
+						Region:           reg,
+						AvailabilityZone: az,
+						InstanceType:     itype,
+						SpotPriceUSD:     priceVal,
+						Timestamp:        ts,
+					}
 				}
 			}
 		}
@@ -138,12 +149,35 @@ func (t *SpotPriceTicker) Start(ctx context.Context) {
 	}
 }
 
-// GetPrice returns the latest known spot price for a region and instance type.
+// GetPrice returns the latest known spot price for a region and instance type across all AZs.
 func (t *SpotPriceTicker) GetPrice(region, instanceType string) (*SpotPriceEntry, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	key := fmt.Sprintf("%s/%s", region, instanceType)
-	entry, ok := t.prices[key]
+
+	// Check for exact AZ-agnostic key first
+	if entry, ok := t.prices[tickerKey(region, "", instanceType)]; ok {
+		return entry, true
+	}
+
+	var latest *SpotPriceEntry
+	for _, entry := range t.prices {
+		if entry.Region == region && entry.InstanceType == instanceType {
+			if latest == nil || entry.Timestamp.After(latest.Timestamp) {
+				latest = entry
+			}
+		}
+	}
+	if latest != nil {
+		return latest, true
+	}
+	return nil, false
+}
+
+// GetPriceAZ returns the spot price for a specific availability zone.
+func (t *SpotPriceTicker) GetPriceAZ(region, az, instanceType string) (*SpotPriceEntry, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	entry, ok := t.prices[tickerKey(region, az, instanceType)]
 	return entry, ok
 }
 
@@ -170,8 +204,13 @@ func (t *SpotPriceTicker) Routes() http.Handler {
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		for _, entry := range t.AllPrices() {
-			_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",instance_type=\"%s\"} %.4f\n",
-				entry.Region, entry.InstanceType, entry.SpotPriceUSD)
+			if entry.AvailabilityZone != "" {
+				_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %.4f\n",
+					entry.Region, entry.AvailabilityZone, entry.InstanceType, entry.SpotPriceUSD)
+			} else {
+				_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",instance_type=\"%s\"} %.4f\n",
+					entry.Region, entry.InstanceType, entry.SpotPriceUSD)
+			}
 		}
 	})
 

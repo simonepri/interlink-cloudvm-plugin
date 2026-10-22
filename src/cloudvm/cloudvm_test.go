@@ -162,6 +162,38 @@ func TestCloudInitGeneration(t *testing.T) {
 	}
 }
 
+func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
+	cfg := &CloudInitConfig{
+		PodName:              "multi-tenant-pod",
+		PodNamespace:         "ai-workloads",
+		PodUID:               "pod-uid-456",
+		TargetContainerImage: "ghcr.io/org/worker:v1",
+		Command:              []string{"python3", "worker.py"},
+		UseNativeDLAMI:       false,
+		NumGPUs:              2,
+		Region:               "us-east-1",
+		InstanceType:         "g5.12xlarge",
+	}
+
+	script, err := GenerateCloudInit(cfg)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit failed: %v", err)
+	}
+
+	if !bytes.Contains([]byte(script), []byte("PORT = 9090")) {
+		t.Errorf("cloud-init missing in-VM runner port 9090 configuration")
+	}
+	if !bytes.Contains([]byte(script), []byte("/usr/local/bin/cloudvm-runner.py")) {
+		t.Errorf("cloud-init missing in-VM runner daemon installation")
+	}
+	if !bytes.Contains([]byte(script), []byte(`docker run -d --name="cloudvm-pod-uid-456"`)) {
+		t.Errorf("cloud-init missing detached initial container launch with pod UID name, got script:\n%s", script)
+	}
+	if !bytes.Contains([]byte(script), []byte(`docker ps -q --filter "name=cloudvm"`)) {
+		t.Errorf("cloud-init missing multi-pod idle watchdog container check")
+	}
+}
+
 func TestReconcilerZombieDetection(t *testing.T) {
 	mock := NewMockProvider()
 	server := NewServer(mock, "test-cluster")
@@ -443,5 +475,17 @@ func TestServer_RecoverActiveInstances(t *testing.T) {
 	key := "custom-ns/recovered-pod"
 	if rec, ok := active[key]; !ok || rec.ID != inst.ID {
 		t.Fatalf("expected recovered instance %s under %s, got %+v", inst.ID, key, active)
+	}
+
+	node, _, found := server.NodePool().FindPodNode("recovered-uid-999")
+	if !found || !node.Cordoned {
+		t.Fatalf("expected recovered node to be cordoned for safe restart")
+	}
+
+	// Verify that Allocate skips this cordoned recovered node
+	req, _ := NewResourceVector("1", "2Gi", 0, 0)
+	_, _, _, err = server.NodePool().Allocate(req, "us-east-1", "new-pod", "custom-ns", "new-worker")
+	if err == nil {
+		t.Fatalf("expected Allocate to skip cordoned recovered node")
 	}
 }
