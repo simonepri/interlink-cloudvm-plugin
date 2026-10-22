@@ -117,8 +117,9 @@ if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
   aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --instance-initiated-shutdown-behavior terminate --region "{{.Region}}" 2>/dev/null || true
 fi
 
-# Block non-root container processes from reaching IMDS credentials
+# Block non-root and container processes from reaching IMDS credentials
 iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
+iptables -I DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null || true
 
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
@@ -358,7 +359,12 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             container_name = f"cloudvm-{pod_uid}"
             subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True)
 
-            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host', '--shm-size=16g']
+            shm_flag = '--shm-size=16g'
+            if mem_bytes and mem_bytes > 0:
+                shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
+                shm_flag = f"--shm-size={shm_bytes}"
+
+            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host', shm_flag]
             if cpu_milli and cpu_milli > 0:
                 docker_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
             if mem_bytes and mem_bytes > 0:
@@ -415,12 +421,23 @@ if [ -n "{{.TargetContainerImage}}" ]; then
     {{.RenderContainerCommand}} || true
 fi
 
-# 6. Orphaned Node Fail-Safe Watchdog (2-hour dead-man's switch against orphan cloud billing)
+# 6. Orphaned Node Idle Fail-Safe Watchdog
+# Powers off only after the node has had zero active containers continuously for 300s
 (
-  sleep 7200
-  echo "[cloudvm-bootstrap] Orphan safety timeout (2h) reached. Terminating VM..."
-  echo "CLOUDVM_STATUS: {\"status\": \"ORPHAN_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
-  shutdown -h now || poweroff
+  while true; do
+    ACTIVE=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+    if [ "$ACTIVE" -eq 0 ]; then
+      sleep 300
+      ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+      if [ "$ACTIVE_AFTER" -eq 0 ]; then
+        echo "[cloudvm-bootstrap] Node has been idle with no active containers for 300s. Terminating VM..."
+        echo "CLOUDVM_STATUS: {\"status\": \"IDLE_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+        shutdown -h now || poweroff
+        exit 0
+      fi
+    fi
+    sleep 30
+  done
 ) &
 {{end}}
 `

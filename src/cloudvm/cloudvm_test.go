@@ -515,3 +515,85 @@ func TestServer_RecoverActiveInstances(t *testing.T) {
 		t.Fatalf("expected Allocate to skip cordoned recovered node")
 	}
 }
+
+func TestServer_HandleStatus_InFlightAndFinished(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	// 1. In-flight / unknown pod status query returns Waiting (ContainerCreating)
+	queryPayload := `[{"pod": {"metadata": {"name": "inflight-pod", "namespace": "default", "uid": "uid-inflight-1"}}}]`
+	resp, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var statuses []PodStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&statuses); err != nil {
+		t.Fatalf("failed to decode status response: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected 1 status, got %d", len(statuses))
+	}
+	st := statuses[0]
+	if len(st.Containers) != 1 || st.Containers[0].State.Waiting == nil {
+		t.Fatalf("expected Waiting state for in-flight pod, got: %+v", st)
+	}
+	if st.Containers[0].State.Waiting.Reason != "ContainerCreating" {
+		t.Fatalf("expected Reason ContainerCreating, got %s", st.Containers[0].State.Waiting.Reason)
+	}
+
+	// 2. Pod container completed returns Terminated and frees node allocations
+	runner := NewMockContainerRunner()
+	runner.SetStatus("uid-done-1", &ContainerStatusResult{
+		Running:    false,
+		ExitCode:   0,
+		Reason:     "Completed",
+		FinishedAt: time.Now(),
+	})
+	server.SetContainerRunner(runner)
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode("i-done-node", ProviderMock, "us-east-1", "100.64.0.10", capVec)
+	reqVec, _ := NewResourceVector("1", "4Gi", 1, 0)
+	server.NodePool().RegisterAndAllocate(node, reqVec, "uid-done-1", "default", "done-pod")
+
+	server.mu.Lock()
+	server.instances["uid-done-1"] = &Instance{
+		ID:        "i-done-node",
+		Provider:  ProviderMock,
+		Region:    "us-east-1",
+		State:     StateRunning,
+		CreatedAt: time.Now(),
+	}
+	server.mu.Unlock()
+
+	queryDonePayload := `[{"pod": {"metadata": {"name": "done-pod", "namespace": "default", "uid": "uid-done-1"}}}]`
+	resp2, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryDonePayload))
+	if err != nil {
+		t.Fatalf("POST /status for done pod failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	var statuses2 []PodStatusResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&statuses2); err != nil {
+		t.Fatalf("failed to decode status response: %v", err)
+	}
+	if len(statuses2) != 1 {
+		t.Fatalf("expected 1 status, got %d", len(statuses2))
+	}
+	st2 := statuses2[0]
+	if len(st2.Containers) != 1 || st2.Containers[0].State.Terminated == nil {
+		t.Fatalf("expected Terminated state for finished pod, got: %+v", st2)
+	}
+	if st2.Containers[0].State.Terminated.Reason != "Completed" {
+		t.Fatalf("expected Reason Completed, got %s", st2.Containers[0].State.Terminated.Reason)
+	}
+
+	// Verify that nodePool has released the allocation
+	if _, _, found := server.NodePool().FindPodNode("uid-done-1"); found {
+		t.Fatalf("expected uid-done-1 allocation to be released immediately on termination")
+	}
+}

@@ -324,6 +324,15 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 
 ---
 
+## Provider Support Matrix
+
+| Provider | Backend Mechanism | Maturity | Capabilities |
+| :--- | :--- | :--- | :--- |
+| **AWS** | EC2 Instant Fleet (`CreateFleet`) | Production-ready | Multi-shape portfolio bidding, dynamic hardware catalog discovery, `price-capacity-optimized` spot allocation, IMDSv2 interruption poller, rate limiting via `tc` |
+| **GCP** | Compute Engine (`bulkInsert`) | Experimental / Preview | Single-zone spot provisioning, preemption metadata polling, basic egress rate limiting |
+
+---
+
 ## Security & Isolation
 
 1. **VM-Level Isolation**: Each job runs in a dedicated cloud VM (AWS Nitro / GCP KVM) with its own kernel and ephemeral root disk.

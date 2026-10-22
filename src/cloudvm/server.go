@@ -10,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,10 +56,15 @@ type Server struct {
 	nodePool      *NodePool
 	runner        ContainerRunner
 	spotTicker    *SpotPriceTicker
+	tokenStore    *TokenStore
 }
 
 // NewServer initializes an InterLink Server with a default provider.
 func NewServer(defaultProvider Provider, clusterTag string) *Server {
+	tokenPath := os.Getenv("TOKEN_STORE_PATH")
+	if tokenPath == "" {
+		tokenPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tokens-%s.json", clusterTag))
+	}
 	return &Server{
 		providers:     make(map[ProviderType]Provider),
 		defaultProv:   defaultProvider,
@@ -66,7 +73,15 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		defaultRegion: "us-east-1",
 		nodePool:      NewNodePool(60 * time.Second),
 		runner:        NewMockContainerRunner(),
+		tokenStore:    NewTokenStore(tokenPath),
 	}
+}
+
+// SetTokenStore overrides the token store for runner credentials.
+func (s *Server) SetTokenStore(ts *TokenStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokenStore = ts
 }
 
 // SetContainerRunner overrides the container runner (e.g. HTTPContainerRunner).
@@ -457,6 +472,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("launch failed: %v", err), http.StatusInternalServerError)
 		return
 	}
+	if s.tokenStore != nil && spec.RunnerAuthToken != "" {
+		_ = s.tokenStore.Set(inst.ID, spec.RunnerAuthToken)
+	}
 
 	// Register new node in pool with hardware capacity from instance type catalog
 	itype := inst.InstanceType
@@ -594,6 +612,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	s.nodePool.UnregisterNode(inst.ID)
+	if s.tokenStore != nil {
+		_ = s.tokenStore.Delete(inst.ID)
+	}
 	if err := prov.Terminate(r.Context(), inst.ID); err != nil {
 		log.Printf("[cloudvm] Error terminating instance %s: %v", inst.ID, err)
 	}
@@ -722,89 +743,95 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	var responses []PodStatusResponse
-	for _, target := range targets {
-		status := ContainerStatus{
-			Name: "worker",
-		}
+	responses := make([]PodStatusResponse, len(targets))
+	var wg sync.WaitGroup
 
-		if target.inst != nil {
-			switch target.inst.State {
-			case StateProvisioning:
+	for i, target := range targets {
+		wg.Add(1)
+		go func(idx int, tgt statusTarget) {
+			defer wg.Done()
+			status := ContainerStatus{
+				Name: "worker",
+			}
+
+			if tgt.inst != nil {
+				switch tgt.inst.State {
+				case StateProvisioning:
+					status.State.Waiting = &ContainerWaitingState{
+						Reason:  "ContainerCreating",
+						Message: fmt.Sprintf("Provisioning cloud VM %s in %s...", tgt.inst.ID, tgt.inst.Region),
+					}
+				case StateRunning:
+					if s.runner != nil && tgt.node != nil && tgt.uid != "" {
+						cResult, err := s.runner.GetStatus(r.Context(), tgt.node, tgt.uid)
+						if err != nil {
+							status.Ready = false
+							status.State.Waiting = &ContainerWaitingState{
+								Reason:  "ContainerStatusUnknown",
+								Message: err.Error(),
+							}
+						} else if cResult != nil {
+							if cResult.Running {
+								status.Ready = true
+								status.State.Running = &ContainerRunningState{
+									StartedAt: cResult.StartedAt,
+								}
+							} else {
+								status.Ready = false
+								status.State.Terminated = &ContainerTerminatedState{
+									ExitCode:   cResult.ExitCode,
+									Reason:     cResult.Reason,
+									Message:    cResult.Message,
+									FinishedAt: cResult.FinishedAt,
+								}
+								s.nodePool.Release(tgt.uid)
+							}
+						}
+					} else {
+						status.Ready = true
+						status.State.Running = &ContainerRunningState{
+							StartedAt: tgt.inst.CreatedAt,
+						}
+					}
+				case StateTerminating:
+					status.State.Terminated = &ContainerTerminatedState{
+						ExitCode:   0,
+						Reason:     "Terminating",
+						FinishedAt: time.Now(),
+					}
+				case StateTerminated:
+					status.State.Terminated = &ContainerTerminatedState{
+						ExitCode:   0,
+						Reason:     "Completed",
+						FinishedAt: time.Now(),
+					}
+				case StateFailed:
+					status.State.Terminated = &ContainerTerminatedState{
+						ExitCode:   1,
+						Reason:     "Failed",
+						Message:    "Cloud instance failed",
+						FinishedAt: time.Now(),
+					}
+				}
+			} else {
 				status.State.Waiting = &ContainerWaitingState{
 					Reason:  "ContainerCreating",
-					Message: fmt.Sprintf("Provisioning cloud VM %s in %s...", target.inst.ID, target.inst.Region),
-				}
-			case StateRunning:
-				if s.runner != nil && target.node != nil && target.uid != "" {
-					cResult, err := s.runner.GetStatus(r.Context(), target.node, target.uid)
-					if err != nil {
-						status.Ready = false
-						status.State.Waiting = &ContainerWaitingState{
-							Reason:  "ContainerStatusUnknown",
-							Message: err.Error(),
-						}
-					} else if cResult != nil {
-						if cResult.Running {
-							status.Ready = true
-							status.State.Running = &ContainerRunningState{
-								StartedAt: cResult.StartedAt,
-							}
-						} else {
-							status.Ready = false
-							status.State.Terminated = &ContainerTerminatedState{
-								ExitCode:   cResult.ExitCode,
-								Reason:     cResult.Reason,
-								Message:    cResult.Message,
-								FinishedAt: cResult.FinishedAt,
-							}
-						}
-					}
-				} else {
-					status.Ready = true
-					status.State.Running = &ContainerRunningState{
-						StartedAt: target.inst.CreatedAt,
-					}
-				}
-			case StateTerminating:
-				status.State.Terminated = &ContainerTerminatedState{
-					ExitCode:   0,
-					Reason:     "Terminating",
-					FinishedAt: time.Now(),
-				}
-			case StateTerminated:
-				status.State.Terminated = &ContainerTerminatedState{
-					ExitCode:   0,
-					Reason:     "Completed",
-					FinishedAt: time.Now(),
-				}
-			case StateFailed:
-				status.State.Terminated = &ContainerTerminatedState{
-					ExitCode:   1,
-					Reason:     "Failed",
-					Message:    "Cloud instance failed",
-					FinishedAt: time.Now(),
+					Message: fmt.Sprintf("Pod %s/%s is provisioning or awaiting discovery", tgt.ns, tgt.name),
 				}
 			}
-		} else {
-			status.State.Terminated = &ContainerTerminatedState{
-				ExitCode:   1,
-				Reason:     "InstanceNotFound",
-				Message:    fmt.Sprintf("Instance for %s/%s does not exist", target.ns, target.name),
-				FinishedAt: time.Now(),
-			}
-		}
 
-		responses = append(responses, PodStatusResponse{
-			PodUID:    target.uid,
-			Name:      target.name,
-			Namespace: target.ns,
-			JID:       target.jid,
-			Containers: []ContainerStatus{
-				status,
-			},
-		})
+			responses[idx] = PodStatusResponse{
+				PodUID:    tgt.uid,
+				Name:      tgt.name,
+				Namespace: tgt.ns,
+				JID:       tgt.jid,
+				Containers: []ContainerStatus{
+					status,
+				},
+			}
+		}(i, target)
 	}
+	wg.Wait()
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(responses)
@@ -850,9 +877,18 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
 		recNode.Namespace = ns
 		recNode.Cordoned = true
-		tok := inst.Metadata["runnerToken"]
+		tok := ""
+		if s.tokenStore != nil {
+			tok = s.tokenStore.Get(inst.ID)
+		}
+		if tok == "" {
+			tok = inst.Metadata["runnerToken"]
+		}
 		if tok == "" {
 			tok = inst.Metadata["cloudvm:runner-token"]
+		}
+		if tok != "" && s.tokenStore != nil {
+			_ = s.tokenStore.Set(inst.ID, tok)
 		}
 		recNode.RunnerAuthToken = tok
 		s.nodePool.RegisterAndAllocate(recNode, defaultVec, podUID, ns, podName)

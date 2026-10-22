@@ -203,9 +203,6 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		{Key: aws.String("Namespace"), Value: aws.String(req.PodNamespace)},
 		{Key: aws.String("PodUID"), Value: aws.String(req.PodUID)},
 	}
-	if req.RunnerAuthToken != "" {
-		tags = append(tags, ec2types.Tag{Key: aws.String("RunnerToken"), Value: aws.String(req.RunnerAuthToken)})
-	}
 	if req.CostCenter != "" {
 		tags = append(tags, ec2types.Tag{Key: aws.String("CostCenter"), Value: aws.String(req.CostCenter)})
 	}

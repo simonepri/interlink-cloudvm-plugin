@@ -224,3 +224,9 @@ func (m *MockContainerRunner) ListContainers(_ context.Context, _ *CloudVMNode) 
 	}
 	return out, nil
 }
+
+func (m *MockContainerRunner) SetStatus(podUID string, res *ContainerStatusResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.containers[podUID] = res
+}
