@@ -46,8 +46,16 @@ type InstanceSpec struct {
 	GPUType string `json:"gpuType,omitempty"`
 	// AMIMode selects "dlami" (fast native boot) or "container" (docker runner).
 	AMIMode string `json:"amiMode,omitempty"`
-	// MaxSpotPrice defines maximum spot price bid in USD/hr.
+	// MaxPrice defines maximum spot or hourly price cap in USD/hr.
+	MaxPrice string `json:"maxPrice,omitempty"`
+	// MaxSpotPrice is an alias for MaxPrice.
 	MaxSpotPrice string `json:"maxSpotPrice,omitempty"`
+	// PricePolicy specifies "fail-fast" or "wait" when price exceeds cap.
+	PricePolicy string `json:"pricePolicy,omitempty"`
+	// EgressBandwidth specifies the rate limit (e.g. "100Mbps", "1Gbps").
+	EgressBandwidth string `json:"egressBandwidth,omitempty"`
+	// EgressBurst specifies the token bucket burst size (e.g. "10MB").
+	EgressBurst string `json:"egressBurst,omitempty"`
 	// TargetContainerImage is the container image to execute.
 	TargetContainerImage string `json:"targetContainerImage,omitempty"`
 	// Command is the command override for container execution.

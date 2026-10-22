@@ -74,7 +74,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 	name := pod.Metadata.Name
 
 	// 1. Region
-	region := pod.Metadata.Annotations["cloudvm-job.vk.io/region"]
+	region := pod.Metadata.Annotations["cloudvm.vk.io/region"]
 	if region == "" {
 		region = pod.Spec.NodeSelector["topology.kubernetes.io/region"]
 	}
@@ -84,7 +84,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 
 	// Candidate regions for multi-region spot arbitrage
 	var candidateRegions []string
-	if regionsStr := pod.Metadata.Annotations["cloudvm-job.vk.io/regions"]; regionsStr != "" {
+	if regionsStr := pod.Metadata.Annotations["cloudvm.vk.io/regions"]; regionsStr != "" {
 		for _, r := range strings.Split(regionsStr, ",") {
 			r = strings.TrimSpace(r)
 			if r != "" {
@@ -94,7 +94,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 	}
 
 	// 2. Instance Type
-	instanceType := pod.Metadata.Annotations["cloudvm-job.vk.io/instance-type"]
+	instanceType := pod.Metadata.Annotations["cloudvm.vk.io/instance-type"]
 	if instanceType == "" {
 		instanceType = pod.Spec.NodeSelector["node.kubernetes.io/instance-type"]
 	}
@@ -103,7 +103,10 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 	}
 
 	// 3. Market / Capacity Type (spot vs on-demand)
-	marketType := pod.Metadata.Annotations["cloudvm-job.vk.io/capacity-type"]
+	marketType := pod.Metadata.Annotations["cloudvm.vk.io/capacity-type"]
+	if marketType == "" && pod.Metadata.Annotations["cloudvm.vk.io/spot"] == "false" {
+		marketType = "on-demand"
+	}
 	if marketType == "" {
 		marketType = pod.Spec.NodeSelector["cloudvm.vk.io/capacity-type"]
 	}
@@ -112,13 +115,27 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 	}
 
 	// 4. AMI Mode (dlami vs container)
-	amiMode := pod.Metadata.Annotations["cloudvm-job.vk.io/ami-mode"]
+	amiMode := pod.Metadata.Annotations["cloudvm.vk.io/ami-mode"]
 	if amiMode == "" {
 		amiMode = "container"
 	}
 
-	// 5. Max Spot Price bid
-	maxSpotPrice := pod.Metadata.Annotations["cloudvm-job.vk.io/max-spot-price"]
+	// 5. Max Price cap & policy
+	maxPrice := pod.Metadata.Annotations["cloudvm.vk.io/max-price"]
+	if maxPrice == "" {
+		maxPrice = pod.Metadata.Annotations["cloudvm.vk.io/max-spot-price"]
+	}
+	pricePolicy := pod.Metadata.Annotations["cloudvm.vk.io/price-policy"]
+	if pricePolicy == "" {
+		pricePolicy = "fail-fast"
+	}
+
+	// 6. Network Egress Rate Limiting (Token Bucket Filter)
+	egressBandwidth := pod.Metadata.Annotations["cloudvm.vk.io/egress-bandwidth"]
+	if egressBandwidth == "" {
+		egressBandwidth = pod.Metadata.Annotations["kubernetes.io/egress-bandwidth"]
+	}
+	egressBurst := pod.Metadata.Annotations["cloudvm.vk.io/egress-burst"]
 
 	var targetImage string
 	var command []string
@@ -165,7 +182,11 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		InstanceType:         instanceType,
 		MarketType:           marketType,
 		AMIMode:              amiMode,
-		MaxSpotPrice:         maxSpotPrice,
+		MaxPrice:             maxPrice,
+		MaxSpotPrice:         maxPrice,
+		PricePolicy:          pricePolicy,
+		EgressBandwidth:      egressBandwidth,
+		EgressBurst:          egressBurst,
 		NumGPUs:              numGPUs,
 		TargetContainerImage: targetImage,
 		Command:              command,

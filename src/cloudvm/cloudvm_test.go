@@ -21,9 +21,9 @@ func TestServerCreateAndDelete(t *testing.T) {
 			Name:      "test-worker-1",
 			Namespace: "default",
 			Annotations: map[string]string{
-				"cloudvm-job.vk.io/capacity-type": "spot",
-				"cloudvm-job.vk.io/region":        "us-east-1",
-				"cloudvm-job.vk.io/instance-type": "g5.xlarge",
+				"cloudvm.vk.io/capacity-type": "spot",
+				"cloudvm.vk.io/region":        "us-east-1",
+				"cloudvm.vk.io/instance-type": "g5.xlarge",
 			},
 		},
 		Spec: PodSpecWrapper{
@@ -161,5 +161,64 @@ func TestReconcilerZombieDetection(t *testing.T) {
 
 	if len(res.TerminatedZombies) != 1 || res.TerminatedZombies[0] != inst.ID {
 		t.Fatalf("expected zombie %s to be terminated, got %+v", inst.ID, res.TerminatedZombies)
+	}
+}
+
+func TestPodToInstanceSpec_PriceCapAndEgress(t *testing.T) {
+	pod := &Pod{
+		Metadata: PodMeta{
+			Name:      "test-worker-price",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"cloudvm.vk.io/spot":             "false",
+				"cloudvm.vk.io/max-price":        "2.50",
+				"cloudvm.vk.io/price-policy":     "wait",
+				"cloudvm.vk.io/egress-bandwidth": "100Mbps",
+				"cloudvm.vk.io/egress-burst":     "15MB",
+			},
+		},
+		Spec: PodSpecWrapper{
+			Containers: []ContainerSpec{
+				{
+					Name:  "worker",
+					Image: "test:latest",
+				},
+			},
+		},
+	}
+
+	spec := PodToInstanceSpec(pod, "cluster-1")
+	if spec.MarketType != "on-demand" {
+		t.Errorf("expected marketType on-demand, got %s", spec.MarketType)
+	}
+	if spec.MaxPrice != "2.50" {
+		t.Errorf("expected maxPrice 2.50, got %s", spec.MaxPrice)
+	}
+	if spec.PricePolicy != "wait" {
+		t.Errorf("expected pricePolicy wait, got %s", spec.PricePolicy)
+	}
+	if spec.EgressBandwidth != "100Mbps" {
+		t.Errorf("expected egressBandwidth 100Mbps, got %s", spec.EgressBandwidth)
+	}
+	if spec.EgressBurst != "15MB" {
+		t.Errorf("expected egressBurst 15MB, got %s", spec.EgressBurst)
+	}
+}
+
+func TestCloudInit_EgressRateLimiting(t *testing.T) {
+	cfg := &CloudInitConfig{
+		PodName:         "rate-limited-pod",
+		PodNamespace:    "default",
+		EgressBandwidth: "250Mbps",
+		EgressBurst:     "20MB",
+	}
+
+	script, err := GenerateCloudInit(cfg)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit failed: %v", err)
+	}
+
+	if !bytes.Contains([]byte(script), []byte("tc qdisc add dev \"$DEV\" root tbf rate 250Mbps burst 20MB latency 50ms")) {
+		t.Errorf("cloud-init missing expected tc rate limiting command, got:\n%s", script)
 	}
 }

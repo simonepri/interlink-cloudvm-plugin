@@ -57,6 +57,8 @@ func (p *GCPProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance, 
 		MeshAuthKey:          spec.MeshAuthKey,
 		Region:               spec.Region,
 		InstanceType:         spec.InstanceType,
+		EgressBandwidth:      spec.EgressBandwidth,
+		EgressBurst:          spec.EgressBurst,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate gcp startup script: %w", err)

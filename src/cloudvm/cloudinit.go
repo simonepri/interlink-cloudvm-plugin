@@ -23,6 +23,8 @@ type CloudInitConfig struct {
 	MeshAuthKey          string
 	Region               string
 	InstanceType         string
+	EgressBandwidth      string
+	EgressBurst          string
 }
 
 const cloudInitTemplate = `#!/usr/bin/env bash
@@ -55,6 +57,17 @@ if [ -n "{{.MeshAuthKey}}" ]; then
     --ssh
   echo "[cloudvm-bootstrap] Connected to mesh. Assigned IP: $(tailscale ip -4)"
 fi
+
+{{if .EgressBandwidth}}
+# Network Egress Rate Limiting (Token Bucket Filter via Linux TC)
+echo "[cloudvm-bootstrap] Configuring network egress rate limit: {{.EgressBandwidth}} (burst: {{if .EgressBurst}}{{.EgressBurst}}{{else}}10mb{{end}})..."
+DEV=$(ip -4 route show default 2>/dev/null | awk '{print $5}' || echo "eth0")
+if [ -n "$DEV" ] && command -v tc >/dev/null 2>&1; then
+  tc qdisc del dev "$DEV" root 2>/dev/null || true
+  tc qdisc add dev "$DEV" root tbf rate {{.EgressBandwidth}} burst {{if .EgressBurst}}{{.EgressBurst}}{{else}}10mb{{end}} latency 50ms || true
+  echo "[cloudvm-bootstrap] Egress rate limiting applied to $DEV"
+fi
+{{end}}
 
 # 3. Configure Multi-Cloud Spot Interruption Watcher (AWS IMDSv2 & GCP Metadata)
 cat << 'EOF' > /usr/local/bin/spot-monitor.sh

@@ -86,11 +86,12 @@ flowchart LR
 
 ### Core Engines
 
-To deliver this, `interlink-provider-cloudvm` is built on three core internal engines:
+To deliver this, `interlink-provider-cloudvm` is built on four core internal engines:
 
-1. **Spot Portfolio Solver**: Translates pod resource requirements into multi-family weighted fleet requests (`CreateFleet` / `bulkInsert`) to bid at the lowest spot price without overprovisioning.
-2. **In-VM Ephemeral Bootstrap & Watchdogs**: A hardened cloud-init engine providing fast native boot (~33s), P2P WireGuard mesh networking, a 2-minute preemption watcher, and a self-destruct watchdog.
-3. **Bidirectional Reconciler**: A background garbage collector that terminates orphan/zombie cloud VMs if pods vanish, and evicts pods from Kubernetes if cloud instances are preempted.
+1. **Fleet Capacity Engine (Spot & On-Demand)**: Translates pod resource requirements into multi-family weighted fleet requests (`CreateFleet` / `bulkInsert`) across both Spot and On-Demand pools, with native hourly price capping (`cloudvm.vk.io/max-price`).
+2. **Backpressure & Orchestrator Feedback Loop**: Emits real-time scheduling conditions (`CapacityExhausted`, `PriceCapExceeded`) back to Kubernetes, driving upstream multi-flavor fallback (Spot → On-Demand) and queue backoff in Kueue and cluster autoscalers.
+3. **In-VM Ephemeral Bootstrap, Watchdogs & Traffic Shaping**: A hardened cloud-init engine providing fast native boot (~33s), P2P WireGuard mesh networking, a 2-minute preemption watcher, a 300s fail-safe watchdog, and kernel-level network egress rate limiting with token bucketing (Linux `tc`).
+4. **Bidirectional Reconciler**: A background garbage collector that terminates orphan/zombie cloud VMs if pods vanish, and evicts pods from Kubernetes if cloud instances are preempted.
 
 ---
 
@@ -136,7 +137,67 @@ flowchart LR
 
 ---
 
-### B. In-VM Ephemeral Lifecycle & Execution Modes
+### B. Backpressure Feedback Loop & On-Demand Capacity
+
+When cloud capacity is constrained or spot pools dry up, the driver prevents API hammering and enables seamless fallback:
+
+```mermaid
+flowchart TD
+    classDef cloud fill:#0C4A6E,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
+    classDef driver fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
+    classDef k8s fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
+    classDef queue fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
+
+    Cloud["Cloud Provider API
+(InsufficientCapacity / SpotPoolExhausted)"]:::cloud
+    --> Driver["CloudVM Provider (/create)
+Translates to structured error"]:::driver
+    --> VK["InterLink / Virtual-Kubelet
+Emits Warning Event & Sets Pod Condition:
+PodScheduled=False (CapacityExhausted)"]:::k8s
+    --> Kueue["Upstream Orchestrator (Kueue / Scheduler)
+1. Multi-Flavor Fallback (Spot -> On-Demand)
+2. Exponential Queue Backoff (10s -> 30s -> 60s)"]:::queue
+```
+
+#### On-Demand & Spot Capacity Toggles
+Workloads choose their capacity type via annotations:
+- `cloudvm.vk.io/capacity-type: "on-demand"` (or `"spot"`, default)
+- `cloudvm.vk.io/spot: "false"`
+
+In AWS EC2 Fleet, the driver configures `TargetCapacityType: "on-demand"` with `AllocationStrategy: "lowest-price"`. In GCP, it provisions with `provisioningModel: "STANDARD"`.
+
+#### Hourly Price Caps & Policies
+To guard against spot pricing spikes, jobs specify a hard price ceiling and reaction policy:
+- `cloudvm.vk.io/max-price: "2.50"` (Max USD/hr willing to pay)
+- `cloudvm.vk.io/price-policy: "fail-fast"` (Default: immediate rejection if market price > cap)
+- `cloudvm.vk.io/price-policy: "wait"` (Backpressure: keeps pod pending in Kueue until spot prices dip below cap)
+
+---
+
+### C. Network Egress Rate Limiting & Token Bucketing
+
+Data egress from public clouds (AWS/GCP) is costly ($0.08–$0.12/GB). `interlink-provider-cloudvm` provides kernel-level egress traffic shaping with token-bucket filtering:
+
+- `cloudvm.vk.io/egress-bandwidth: "100Mbps"` (or standard `kubernetes.io/egress-bandwidth`)
+- `cloudvm.vk.io/egress-burst: "15MB"` (Token bucket burst capacity)
+
+#### Architectural Advantage: Selective Shaping
+During VM bootstrap, `cloud-init` applies Linux Traffic Control (`tc`) with a **Token Bucket Filter (TBF)** directly to the primary network interface (`eth0`):
+
+```bash
+tc qdisc add dev eth0 root tbf rate 100Mbps burst 15MB latency 50ms
+```
+
+- **Internet & Cloud Egress (`eth0`)**: Enforces rate limiting with token-bucket burst smoothing, preventing bandwidth hogging and runaway transfer bills.
+- **Cluster Mesh (`wg0` / `tailscale0`)**: Exempt from rate limiting. Worker-to-head Ray communication, distributed training parameter rings, and P2P layer caching operate at full line rate (10–25 Gbps).
+
+#### Comparison with SkyPilot Egress Handling
+In SkyPilot, egress management is primarily focused on **smart placement to eliminate egress fees** (scheduling compute in the exact region/cloud where data buckets reside) and **tool-level throttling** (passing `--bwlimit` to `rsync` or `rclone`). SkyPilot does not provide an automated OS kernel-level token bucket filter. `interlink-provider-cloudvm` integrates both kernel-level `tc` traffic shaping on the host and native Kubernetes `kubernetes.io/egress-bandwidth` annotation compatibility.
+
+---
+
+### D. In-VM Ephemeral Lifecycle & Execution Modes
 
 `interlink-provider-cloudvm` supports two runtime modes:
 
@@ -288,10 +349,10 @@ kind: Pod
 metadata:
   name: esm2-gpu-inference
   annotations:
-    cloudvm-job.vk.io/provider: "aws"
-    cloudvm-job.vk.io/capacity-type: "spot"
-    cloudvm-job.vk.io/ami-mode: "dlami"
-    cloudvm-job.vk.io/instance-type: "g5.xlarge"
+    cloudvm.vk.io/provider: "aws"
+    cloudvm.vk.io/capacity-type: "spot"
+    cloudvm.vk.io/ami-mode: "dlami"
+    cloudvm.vk.io/instance-type: "g5.xlarge"
 spec:
   nodeSelector:
     kubernetes.io/role: cloudvm
@@ -314,9 +375,9 @@ kind: Pod
 metadata:
   name: ray-data-transform
   annotations:
-    cloudvm-job.vk.io/provider: "aws"
-    cloudvm-job.vk.io/capacity-type: "spot"
-    cloudvm-job.vk.io/instance-type: "c6i.2xlarge"
+    cloudvm.vk.io/provider: "aws"
+    cloudvm.vk.io/capacity-type: "spot"
+    cloudvm.vk.io/instance-type: "c6i.2xlarge"
 spec:
   nodeSelector:
     kubernetes.io/role: cloudvm

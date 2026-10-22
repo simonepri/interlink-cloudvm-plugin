@@ -54,6 +54,9 @@ type FleetRequest struct {
 	AllocationStrategy FleetAllocationStrategy `json:"allocationStrategy"`
 	ClusterTag         string                  `json:"clusterTag"`
 	PodName            string                  `json:"podName"`
+	MarketType         string                  `json:"marketType,omitempty"`
+	MaxPrice           string                  `json:"maxPrice,omitempty"`
+	PricePolicy        string                  `json:"pricePolicy,omitempty"`
 }
 
 // FleetResponse represents the result of a bulk fleet launch.
@@ -110,15 +113,35 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		strategy = StrategyPriceCapacityOptimized
 	}
 
+	targetCapType := ec2types.DefaultTargetCapacityTypeSpot
+	var spotOpts *ec2types.SpotOptionsRequest
+	var onDemandOpts *ec2types.OnDemandOptionsRequest
+
+	if req.MarketType == "on-demand" {
+		targetCapType = ec2types.DefaultTargetCapacityTypeOnDemand
+		onDemandOpts = &ec2types.OnDemandOptionsRequest{
+			AllocationStrategy: ec2types.FleetOnDemandAllocationStrategyLowestPrice,
+		}
+		if req.MaxPrice != "" {
+			onDemandOpts.MaxTotalPrice = aws.String(req.MaxPrice)
+		}
+	} else {
+		spotOpts = &ec2types.SpotOptionsRequest{
+			AllocationStrategy: ec2types.SpotAllocationStrategy(strategy),
+		}
+		if req.MaxPrice != "" {
+			spotOpts.MaxTotalPrice = aws.String(req.MaxPrice)
+		}
+	}
+
 	input := &ec2.CreateFleetInput{
 		Type: ec2types.FleetTypeInstant,
 		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{
 			TotalTargetCapacity:       aws.Int32(int32(req.TargetCapacity & 0x7fffffff)),
-			DefaultTargetCapacityType: ec2types.DefaultTargetCapacityTypeSpot,
+			DefaultTargetCapacityType: targetCapType,
 		},
-		SpotOptions: &ec2types.SpotOptionsRequest{
-			AllocationStrategy: ec2types.SpotAllocationStrategy(strategy),
-		},
+		SpotOptions:     spotOpts,
+		OnDemandOptions: onDemandOpts,
 		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{
 			{
 				LaunchTemplateSpecification: &ec2types.FleetLaunchTemplateSpecificationRequest{
@@ -212,6 +235,8 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		MeshAuthKey:          spec.MeshAuthKey,
 		Region:               spec.Region,
 		InstanceType:         spec.InstanceType,
+		EgressBandwidth:      spec.EgressBandwidth,
+		EgressBurst:          spec.EgressBurst,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate cloud-init: %w", err)
@@ -240,6 +265,9 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		SubnetIDs:          spec.SubnetIDs,
 		ClusterTag:         spec.ClusterTag,
 		PodName:            spec.PodName,
+		MarketType:         spec.MarketType,
+		MaxPrice:           spec.MaxPrice,
+		PricePolicy:        spec.PricePolicy,
 		AllocationStrategy: StrategyPriceCapacityOptimized,
 	}
 
