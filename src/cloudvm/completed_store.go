@@ -98,11 +98,11 @@ func (cs *CompletedStore) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return atomicSaveWithFsync(cs.filePath, data, 0600)
+	return atomicSaveWithFsync(cs.filePath, data)
 }
 
 // atomicSaveWithFsync safely persists data to disk using a tempfile, fsync, and atomic rename.
-func atomicSaveWithFsync(path string, data []byte, perm os.FileMode) error {
+func atomicSaveWithFsync(path string, data []byte) error {
 	cleanPath := filepath.Clean(path)
 	dir := filepath.Dir(cleanPath)
 	if err := os.MkdirAll(dir, 0700); err != nil { // #nosec G301,G703
@@ -110,7 +110,7 @@ func atomicSaveWithFsync(path string, data []byte, perm os.FileMode) error {
 	}
 
 	tmpFile := cleanPath + ".tmp"
-	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm) // #nosec G304,G703
+	f, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600) // #nosec G304,G703
 	if err != nil {
 		return err
 	}

@@ -68,6 +68,9 @@ type Server struct {
 	spotTicker      *SpotPriceTicker
 	tokenStore      *TokenStore
 	completedStore  *CompletedStore
+	tombstoneStore  *TombstoneStore
+	tombstones      map[string]time.Time                 // podUID or instanceID -> deletion timestamp
+	activeSightings map[string]time.Time                 // podUID -> last seen in /status or /create
 	launchTokens    map[string]string                    // podUID -> runnerAuthToken (reused across retries)
 	completedPods   map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
 	inFlightCreates map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
@@ -91,7 +94,15 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	if err != nil {
 		log.Printf("[cloudvm] ERROR loading completed store: %v", err)
 	}
-	return &Server{
+	tombstonePath := os.Getenv("TOMBSTONE_STORE_PATH")
+	if tombstonePath == "" {
+		tombstonePath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tombstones-%s.json", clusterTag))
+	}
+	tombStore, err := NewTombstoneStore(tombstonePath)
+	if err != nil {
+		log.Printf("[cloudvm] ERROR loading tombstone store: %v", err)
+	}
+	s := &Server{
 		providers:       make(map[ProviderType]Provider),
 		defaultProv:     defaultProvider,
 		instances:       make(map[string]*Instance),
@@ -101,10 +112,21 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		runner:          NewMockContainerRunner(),
 		tokenStore:      tokStore,
 		completedStore:  compStore,
+		tombstoneStore:  tombStore,
+		tombstones:      make(map[string]time.Time),
+		activeSightings: make(map[string]time.Time),
 		launchTokens:    make(map[string]string),
 		completedPods:   make(map[string]*ContainerTerminatedState),
 		inFlightCreates: make(map[string]*inFlightCreate),
 	}
+	if tombStore != nil {
+		tombStore.mu.RLock()
+		for k, v := range tombStore.tombstones {
+			s.tombstones[k] = v
+		}
+		tombStore.mu.RUnlock()
+	}
+	return s
 }
 
 // SetTokenStore overrides the token store for runner credentials.
@@ -119,6 +141,56 @@ func (s *Server) SetCompletedStore(cs *CompletedStore) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.completedStore = cs
+}
+
+// SetTombstoneStore overrides the tombstone store for deleted pod records.
+func (s *Server) SetTombstoneStore(ts *TombstoneStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tombstoneStore = ts
+	if ts != nil {
+		ts.mu.RLock()
+		for k, v := range ts.tombstones {
+			s.tombstones[k] = v
+		}
+		ts.mu.RUnlock()
+	}
+}
+
+func (s *Server) isTombstonedLocked(id string) bool {
+	if id == "" {
+		return false
+	}
+	if !s.tombstones[id].IsZero() {
+		return true
+	}
+	if s.tombstoneStore != nil && s.tombstoneStore.Has(id) {
+		return true
+	}
+	return false
+}
+
+// IsTombstoned reports whether the instance or its associated pod has been explicitly deleted.
+func (s *Server) IsTombstoned(inst *Instance) bool {
+	if inst == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.nodePool != nil {
+		if node, found := s.nodePool.nodes[inst.ID]; found && len(node.ActivePods) > 0 {
+			return false
+		}
+	}
+	if s.isTombstonedLocked(inst.ID) {
+		return true
+	}
+	if inst.Metadata != nil {
+		if podUID := inst.Metadata["podUID"]; podUID != "" && s.isTombstonedLocked(podUID) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetContainerRunner overrides the container runner (e.g. HTTPContainerRunner).
@@ -536,6 +608,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Single-flight in-flight create check and idempotency under lock
 	s.mu.Lock()
 	if spec.PodUID != "" {
+		s.activeSightings[spec.PodUID] = time.Now()
+		delete(s.tombstones, spec.PodUID)
 		if inFlightTracker, exists := s.inFlightCreates[spec.PodUID]; exists {
 			s.mu.Unlock()
 			select {
@@ -879,6 +953,29 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if !exists || inst == nil {
 		inst, exists = s.instances[podName]
 	}
+
+	uid := pod.Metadata.UID
+	if uid == "" && exists && inst != nil && inst.Metadata != nil {
+		uid = inst.Metadata["podUID"]
+	}
+	if uid == "" {
+		uid = key
+	}
+
+	now := time.Now()
+	s.tombstones[uid] = now
+	delete(s.activeSightings, uid)
+	if s.tombstoneStore != nil {
+		_ = s.tombstoneStore.Set(uid)
+	}
+	if pod.Metadata.UID != "" {
+		s.tombstones[pod.Metadata.UID] = now
+		delete(s.activeSightings, pod.Metadata.UID)
+		if s.tombstoneStore != nil {
+			_ = s.tombstoneStore.Set(pod.Metadata.UID)
+		}
+	}
+
 	if pod.Metadata.UID != "" {
 		delete(s.instances, pod.Metadata.UID)
 		delete(s.completedPods, pod.Metadata.UID)
@@ -896,17 +993,21 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	delete(s.completedPods, podName)
 	s.mu.Unlock()
 
-	uid := pod.Metadata.UID
-	if uid == "" {
-		uid = key
-	}
-
 	// Release resources from NodePool
 	remainingPods := 0
 	if node, _, found := s.nodePool.FindPodNode(uid); found {
 		_ = s.runner.StopContainer(r.Context(), node, uid)
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
+	}
+
+	if inst != nil && inst.ID != "" && remainingPods == 0 {
+		s.mu.Lock()
+		s.tombstones[inst.ID] = time.Now()
+		if s.tombstoneStore != nil {
+			_ = s.tombstoneStore.Set(inst.ID)
+		}
+		s.mu.Unlock()
 	}
 
 	if !exists || inst == nil || remainingPods > 0 {
@@ -949,6 +1050,23 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				pods = append(pods, single)
 			}
 		}
+	}
+
+	if len(pods) > 0 {
+		s.mu.Lock()
+		now := time.Now()
+		for _, p := range pods {
+			if p.Metadata.UID != "" {
+				s.activeSightings[p.Metadata.UID] = now
+			}
+			if p.Metadata.Name != "" {
+				s.activeSightings[p.Metadata.Name] = now
+				if p.Metadata.Namespace != "" {
+					s.activeSightings[fmt.Sprintf("%s/%s", p.Metadata.Namespace, p.Metadata.Name)] = now
+				}
+			}
+		}
+		s.mu.Unlock()
 	}
 
 	type statusTarget struct {
@@ -1230,7 +1348,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // AdoptInstance re-adopts an active cloud VM into the server tracked state if it has valid pod tags
 // and has not been explicitly deleted or completed.
-func (s *Server) AdoptInstance(_ context.Context, inst *Instance) bool {
+func (s *Server) AdoptInstance(ctx context.Context, inst *Instance) bool {
 	if inst == nil || inst.Metadata == nil {
 		return false
 	}
@@ -1254,9 +1372,22 @@ func (s *Server) AdoptInstance(_ context.Context, inst *Instance) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// If this pod or instance has been tombstoned (explicitly deleted), NEVER adopt
+	if s.isTombstonedLocked(podUID) || s.isTombstonedLocked(inst.ID) {
+		return false
+	}
+
 	// If this pod was already recorded as completed or terminated, do not re-adopt
 	if s.completedPods[podUID] != nil || (s.completedStore != nil && s.completedStore.Get(podUID) != nil) {
 		return false
+	}
+
+	// If InterLink has sent status queries, verify active sighting evidence
+	if len(s.activeSightings) > 0 {
+		sighting, sighted := s.activeSightings[podUID]
+		if !sighted || time.Since(sighting) > 10*time.Minute {
+			return false
+		}
 	}
 
 	// Check if already tracked
@@ -1280,9 +1411,45 @@ func (s *Server) AdoptInstance(_ context.Context, inst *Instance) bool {
 		capVec := CapacityForInstanceType(inst.InstanceType, defaultVec)
 		recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
 		recNode.Namespace = ns
-		recNode.RunnerAuthToken = inst.Metadata["runnerToken"]
 		recNode.Spot = (marketType == "spot")
-		s.nodePool.RegisterNode(recNode)
+		recNode.Cordoned = true
+
+		// Look up runner auth token from tokenStore (by inst.ID, then podUID), then metadata
+		tok := ""
+		if s.tokenStore != nil {
+			tok = s.tokenStore.Get(inst.ID)
+			if tok == "" && podUID != "" {
+				tok = s.tokenStore.Get(podUID)
+			}
+			if tok != "" && s.tokenStore.Get(inst.ID) == "" {
+				_ = s.tokenStore.Set(inst.ID, tok)
+			}
+		}
+		if tok == "" {
+			tok = inst.Metadata["runnerToken"]
+		}
+		if tok == "" {
+			tok = inst.Metadata["cloudvm:runner-token"]
+		}
+		if tok != "" && s.tokenStore != nil {
+			_ = s.tokenStore.Set(inst.ID, tok)
+		}
+		recNode.RunnerAuthToken = tok
+
+		// Reconstruct allocations: allocate primary pod
+		s.nodePool.RegisterAndAllocate(recNode, defaultVec, podUID, ns, podName)
+
+		// Reconstruct allocations for any co-tenant containers running in this VM
+		if s.runner != nil {
+			if containers, err := s.runner.ListContainers(ctx, recNode); err == nil {
+				for _, c := range containers {
+					if c.PodUID != "" && c.PodUID != podUID {
+						s.instances[c.PodUID] = inst
+						s.nodePool.RegisterAndAllocate(recNode, defaultVec, c.PodUID, ns, c.PodUID)
+					}
+				}
+			}
+		}
 	}
 
 	return true
@@ -1430,6 +1597,10 @@ func (s *Server) GetActivePods(_ context.Context) (map[string]string, error) {
 		uid := k
 		if inst.Metadata != nil && inst.Metadata["podUID"] != "" {
 			uid = inst.Metadata["podUID"]
+		}
+		// If pod has been tombstoned (explicitly deleted), skip it!
+		if s.isTombstonedLocked(uid) {
+			continue
 		}
 		// If pod is already recorded completed or terminated, skip it!
 		if s.completedPods[uid] != nil || (s.completedStore != nil && s.completedStore.Get(uid) != nil) {

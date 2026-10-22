@@ -1977,6 +1977,13 @@ func TestAWSProvider_LaggingInstanceNotPrunedAndRegionRetained(t *testing.T) {
 	awsProv.instanceRegions["i-new-lagging"] = "us-west-2"
 	_ = awsProv.regionStore.Set("i-new-lagging", "us-west-2")
 
+	eastClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return &ec2.DescribeInstancesOutput{}, nil
+		},
+	}
+	awsProv.SetRegionClient("us-east-1", eastClient)
+
 	// Pass 1: us-west-2 returns empty list (EC2 eventual consistency lagging)
 	westClient := &mockEC2FleetClient{
 		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
@@ -2586,5 +2593,184 @@ func TestServer_WarmNodeCotenantMetadataAndOnDemandNodeLost(t *testing.T) {
 	}
 	if len(result2.EvictedPods) != 0 {
 		t.Fatalf("expected 0 evicted pods on second pass, got %d", len(result2.EvictedPods))
+	}
+}
+
+func TestServer_DeletedPodVMWithFailedTerminationIsTerminatedAsZombie(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "test-cluster")
+
+	podJSON := `{
+		"metadata": {
+			"name": "u1",
+			"namespace": "default",
+			"uid": "uid-u1"
+		},
+		"spec": {
+			"containers": [
+				{
+					"name": "c1",
+					"resources": {
+						"limits": {
+							"cpu": "2",
+							"memory": "4Gi"
+						}
+					}
+				}
+			]
+		}
+	}`
+
+	// Create pod u1
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewBufferString(podJSON))
+	rec := httptest.NewRecorder()
+	srv.handleCreate(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create failed with code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify u1 is active
+	active, err := srv.GetActivePods(context.Background())
+	if err != nil || active["uid-u1"] == "" {
+		t.Fatalf("expected u1 active, got: %v", active)
+	}
+	instID := active["uid-u1"]
+
+	// Simulate provider Terminate failure (e.g. EC2 throttling or permission denied)
+	mock.SetTerminateFn(func(_ context.Context, id string) error {
+		if id == instID {
+			return fmt.Errorf("API throttled: unable to terminate")
+		}
+		return nil
+	})
+
+	// Delete pod u1
+	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(podJSON))
+	delRec := httptest.NewRecorder()
+	srv.handleDelete(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("delete returned %d", delRec.Code)
+	}
+
+	// Verify instance is still running in cloud inventory (because termination failed)
+	activeInsts, err := mock.ListActiveInstances(context.Background(), "test-cluster")
+	if err != nil || len(activeInsts) != 1 || activeInsts[0].ID != instID {
+		t.Fatalf("expected instance %s still in cloud inventory, got: %v", instID, activeInsts)
+	}
+
+	// Now provider termination succeeds
+	mock.SetTerminateFn(nil)
+
+	// Run reconciler with 0 grace period
+	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+
+	// Instance MUST be terminated as a zombie!
+	if len(result.TerminatedZombies) != 1 || result.TerminatedZombies[0] != instID {
+		t.Fatalf("expected %s terminated as zombie, got: %v", instID, result.TerminatedZombies)
+	}
+
+	// Pod MUST NOT reappear in active pods or be re-adopted!
+	activeAfter, _ := srv.GetActivePods(context.Background())
+	if _, exists := activeAfter["uid-u1"]; exists {
+		t.Fatalf("expected uid-u1 NOT in active pods after zombie termination, got: %v", activeAfter)
+	}
+}
+
+func TestNodePool_AdoptedVMIsCordonedAndRejectsNewPodPacking(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "test-cluster")
+
+	// Set up runner token in tokenStore
+	if err := srv.tokenStore.Set("i-adopted-01", "adopted-secret-token"); err != nil {
+		t.Fatalf("failed to store token: %v", err)
+	}
+
+	inst := &Instance{
+		ID:           "i-adopted-01",
+		Provider:     ProviderMock,
+		Region:       "us-east-1",
+		InstanceType: "g5.12xlarge",
+		IP:           "10.0.1.50",
+		State:        StateRunning,
+		CreatedAt:    time.Now().Add(-5 * time.Minute),
+		Metadata: map[string]string{
+			"podUID":     "uid-adopted-1",
+			"podName":    "pod-adopted-1",
+			"namespace":  "default",
+			"marketType": "on-demand",
+		},
+	}
+
+	// Adopt instance
+	ctx := context.Background()
+	adopted := srv.AdoptInstance(ctx, inst)
+	if !adopted {
+		t.Fatalf("expected AdoptInstance to succeed")
+	}
+
+	// 1. Verify adopted node is cordoned
+	node, alloc, found := srv.nodePool.FindPodNode("uid-adopted-1")
+	if !found {
+		t.Fatalf("expected node found in nodePool for uid-adopted-1")
+	}
+	if !node.Cordoned {
+		t.Fatalf("CRITICAL: adopted node must be cordoned to prevent packing collisions")
+	}
+	if alloc.PodUID != "uid-adopted-1" {
+		t.Fatalf("expected allocation reconstructed for uid-adopted-1")
+	}
+	if node.RunnerAuthToken != "adopted-secret-token" {
+		t.Fatalf("expected runner token loaded from tokenStore, got %q", node.RunnerAuthToken)
+	}
+
+	// 2. Launch new pod u2 requesting resources
+	pod2JSON := `{
+		"metadata": {
+			"name": "pod-new-2",
+			"namespace": "default",
+			"uid": "uid-new-2"
+		},
+		"spec": {
+			"containers": [
+				{
+					"name": "c1",
+					"resources": {
+						"limits": {
+							"cpu": "4",
+							"memory": "8Gi",
+							"nvidia.com/gpu": "1"
+						}
+					}
+				}
+			]
+		}
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewBufferString(pod2JSON))
+	rec := httptest.NewRecorder()
+	srv.handleCreate(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create for pod 2 failed: %s", rec.Body.String())
+	}
+
+	// Verify pod 2 did NOT pack onto adopted node i-adopted-01
+	node2, _, found2 := srv.nodePool.FindPodNode("uid-new-2")
+	if !found2 {
+		t.Fatalf("expected pod 2 registered in nodePool")
+	}
+	if node2.InstanceID == "i-adopted-01" {
+		t.Fatalf("CRITICAL: new pod packed onto cordoned adopted VM %s!", node2.InstanceID)
 	}
 }

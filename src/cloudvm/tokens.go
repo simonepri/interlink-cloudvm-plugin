@@ -62,7 +62,7 @@ func (ts *TokenStore) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return atomicSaveWithFsync(ts.filePath, data, 0600)
+	return atomicSaveWithFsync(ts.filePath, data)
 }
 
 // Get returns the runner token for the specified instance ID, or empty string if not found.

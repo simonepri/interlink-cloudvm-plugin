@@ -218,8 +218,13 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		_, existsFull := activePods[fullKey]
 		_, existsBare := activePods[podName]
 
+		isTombstoned := false
+		if checker, ok := r.tracker.(interface{ IsTombstoned(inst *Instance) bool }); ok {
+			isTombstoned = checker.IsTombstoned(inst)
+		}
+
 		if !existsFull && !existsBare {
-			if now.Sub(inst.CreatedAt) > r.graceTTL {
+			if isTombstoned || now.Sub(inst.CreatedAt) > r.graceTTL {
 				cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
 				cleanKey := strings.ReplaceAll(strings.ReplaceAll(fullKey, "\n", ""), "\r", "")
 				log.Printf("[reconciler] Detected zombie instance %s for vanished pod %s. Terminating...", cleanID, cleanKey)

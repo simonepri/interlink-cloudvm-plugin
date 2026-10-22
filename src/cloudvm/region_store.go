@@ -66,7 +66,7 @@ func (rs *RegionStore) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return atomicSaveWithFsync(rs.filePath, data, 0600)
+	return atomicSaveWithFsync(rs.filePath, data)
 }
 
 // Get returns the AWS region for the specified instance ID, or empty string if not found.

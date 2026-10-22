@@ -10,9 +10,10 @@ import (
 
 // MockProvider provides an in-memory simulation for local testing and CI.
 type MockProvider struct {
-	mu        sync.RWMutex
-	instances map[string]*Instance
-	counter   int
+	mu          sync.RWMutex
+	instances   map[string]*Instance
+	counter     int
+	terminateFn func(ctx context.Context, instanceID string) error
 }
 
 // NewMockProvider creates an initialized MockProvider.
@@ -49,9 +50,15 @@ func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance,
 	return cloneInstance(inst), nil
 }
 
-func (m *MockProvider) Terminate(_ context.Context, instanceID string) error {
+func (m *MockProvider) Terminate(ctx context.Context, instanceID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if m.terminateFn != nil {
+		if err := m.terminateFn(ctx, instanceID); err != nil {
+			return err
+		}
+	}
 
 	inst, exists := m.instances[instanceID]
 	if !exists {
@@ -87,6 +94,13 @@ func (m *MockProvider) ListActiveInstances(_ context.Context, clusterTag string)
 		}
 	}
 	return active, nil
+}
+
+// SetTerminateFn overrides the termination logic (used for testing failure scenarios).
+func (m *MockProvider) SetTerminateFn(fn func(ctx context.Context, instanceID string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.terminateFn = fn
 }
 
 // LaunchCount returns the total number of instance launches performed by MockProvider.
