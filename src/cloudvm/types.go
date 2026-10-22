@@ -207,7 +207,7 @@ type CreateStruct struct {
 // PodStatusResponse represents the status response contract sent back to InterLink.
 // Matches CNCF InterLink pkg/interlink/types.go PodStatus definition.
 type PodStatusResponse struct {
-	PodUID     string            `json:"PodUID"`
+	PodUID     string            `json:"UID"`
 	Name       string            `json:"name"`
 	Namespace  string            `json:"namespace"`
 	JID        string            `json:"JID"`

@@ -34,21 +34,32 @@ func EgressRateToBandwidth(dollarPerHour float64, provider string) string {
 
 // Server implements the InterLink REST API for the cloudvm provider plugin.
 type Server struct {
-	mu          sync.RWMutex
-	providers   map[ProviderType]Provider
-	defaultProv Provider
-	instances   map[string]*Instance // key: namespace/podName -> *Instance
-	clusterTag  string
-	reconciler  *Reconciler
+	mu            sync.RWMutex
+	providers     map[ProviderType]Provider
+	defaultProv   Provider
+	instances     map[string]*Instance // key: UID and namespace/podName -> *Instance
+	clusterTag    string
+	defaultRegion string
+	reconciler    *Reconciler
 }
 
 // NewServer initializes an InterLink Server with a default provider.
 func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	return &Server{
-		providers:   make(map[ProviderType]Provider),
-		defaultProv: defaultProvider,
-		instances:   make(map[string]*Instance),
-		clusterTag:  clusterTag,
+		providers:     make(map[ProviderType]Provider),
+		defaultProv:   defaultProvider,
+		instances:     make(map[string]*Instance),
+		clusterTag:    clusterTag,
+		defaultRegion: "us-east-1",
+	}
+}
+
+// SetDefaultRegion sets the baseline cloud region for pods without explicit region annotations.
+func (s *Server) SetDefaultRegion(region string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if region != "" {
+		s.defaultRegion = region
 	}
 }
 
@@ -84,7 +95,7 @@ func (s *Server) Routes() http.Handler {
 }
 
 // PodToInstanceSpec converts an incoming InterLink Pod into an InstanceSpec.
-func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
+func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...string) *InstanceSpec {
 	ns := pod.Metadata.Namespace
 	if ns == "" {
 		ns = "default"
@@ -107,7 +118,11 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		region = pod.Spec.NodeSelector["topology.kubernetes.io/region"]
 	}
 	if region == "" {
-		region = "us-east-1"
+		if len(defaultRegion) > 0 && defaultRegion[0] != "" {
+			region = defaultRegion[0]
+		} else {
+			region = "us-east-1"
+		}
 	}
 
 	var candidateRegions []string
@@ -298,7 +313,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spec := PodToInstanceSpec(pod, s.clusterTag)
+	spec := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
 	prov := s.selectProvider(spec)
 
 	log.Printf("[cloudvm] Launching opportunistic VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
@@ -314,6 +329,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
 	s.instances[key] = inst
+	if spec.PodUID != "" {
+		s.instances[spec.PodUID] = inst
+	}
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
@@ -349,9 +367,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	key := fmt.Sprintf("%s/%s", ns, podName)
 	s.mu.Lock()
-	inst, exists := s.instances[key]
-	if !exists {
-		inst, exists = s.instances[podName] // fallback for legacy keys
+	inst, exists := s.instances[pod.Metadata.UID]
+	if !exists || inst == nil {
+		inst, exists = s.instances[key]
+	}
+	if !exists || inst == nil {
+		inst, exists = s.instances[podName]
+	}
+	if pod.Metadata.UID != "" {
+		delete(s.instances, pod.Metadata.UID)
 	}
 	delete(s.instances, key)
 	delete(s.instances, podName)
@@ -404,18 +428,32 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 
 	if len(pods) == 0 {
+		seen := make(map[string]bool)
 		for key, inst := range s.instances {
-			parts := strings.SplitN(key, "/", 2)
+			if inst == nil || seen[inst.ID] {
+				continue
+			}
+			seen[inst.ID] = true
+
 			ns := "default"
 			name := key
-			if len(parts) == 2 {
-				ns = parts[0]
-				name = parts[1]
-			}
 			uid := ""
 			if inst.Metadata != nil {
+				if n := inst.Metadata["podName"]; n != "" {
+					name = n
+				}
+				if n := inst.Metadata["namespace"]; n != "" {
+					ns = n
+				}
 				uid = inst.Metadata["podUID"]
+			} else {
+				parts := strings.SplitN(key, "/", 2)
+				if len(parts) == 2 {
+					ns = parts[0]
+					name = parts[1]
+				}
 			}
+
 			pods = append(pods, Pod{
 				Metadata: PodMeta{
 					Name:      name,
@@ -434,9 +472,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			ns = "default"
 		}
 		key := fmt.Sprintf("%s/%s", ns, name)
-		inst, exists := s.instances[key]
-		if !exists {
-			inst, exists = s.instances[name] // fallback
+		var inst *Instance
+		var exists bool
+		if pod.Metadata.UID != "" {
+			inst, exists = s.instances[pod.Metadata.UID]
+		}
+		if !exists || inst == nil {
+			inst, exists = s.instances[key]
+		}
+		if !exists || inst == nil {
+			inst, exists = s.instances[name]
 		}
 
 		status := ContainerStatus{

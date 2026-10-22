@@ -32,14 +32,15 @@ func main() {
 
 	var defaultProvider Provider
 	mockProv := NewMockProvider()
+	awsRegion := os.Getenv("AWS_REGION")
+	if awsRegion == "" {
+		awsRegion = "us-east-1"
+	}
+	awsProv := NewAWSProvider(awsRegion)
 
 	switch providerType {
 	case "aws":
-		awsRegion := os.Getenv("AWS_REGION")
-		if awsRegion == "" {
-			awsRegion = "us-east-1"
-		}
-		defaultProvider = NewAWSProvider(awsRegion)
+		defaultProvider = awsProv
 	case "gcp":
 		gcpProject := os.Getenv("GCP_PROJECT")
 		gcpZone := os.Getenv("GCP_ZONE")
@@ -49,7 +50,8 @@ func main() {
 	}
 
 	server := NewServer(defaultProvider, clusterTag)
-	server.RegisterProvider(ProviderAWS, NewAWSProvider("us-east-1"))
+	server.SetDefaultRegion(awsRegion)
+	server.RegisterProvider(ProviderAWS, awsProv)
 	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
 	server.RegisterProvider(ProviderMock, mockProv)
 

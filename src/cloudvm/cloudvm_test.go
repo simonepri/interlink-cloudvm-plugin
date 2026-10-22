@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -362,8 +363,28 @@ func TestInterLinkAPIContract_NestedPodAndStatus(t *testing.T) {
 		t.Fatalf("expected 200 from GET /status, got %d", statusResp.StatusCode)
 	}
 
+	rawStatus, err := io.ReadAll(statusResp.Body)
+	if err != nil {
+		t.Fatalf("failed to read status body: %v", err)
+	}
+
+	// Verify exact JSON field names matching CNCF InterLink api/status.go and types.go (MUST be "UID", not "PodUID")
+	var rawMaps []map[string]interface{}
+	if err := json.Unmarshal(rawStatus, &rawMaps); err != nil {
+		t.Fatalf("failed to decode raw status JSON: %v", err)
+	}
+	if len(rawMaps) != 1 {
+		t.Fatalf("expected 1 status map, got %d", len(rawMaps))
+	}
+	if uidVal, ok := rawMaps[0]["UID"].(string); !ok || uidVal != "pod-uid-abcdef-12345" {
+		t.Errorf("interLink contract violation: expected top-level field \"UID\": \"pod-uid-abcdef-12345\", got %+v", rawMaps[0])
+	}
+	if _, present := rawMaps[0]["PodUID"]; present {
+		t.Errorf("interLink contract violation: \"PodUID\" field must not be emitted in PodStatusResponse")
+	}
+
 	var statuses []PodStatusResponse
-	if err := json.NewDecoder(statusResp.Body).Decode(&statuses); err != nil {
+	if err := json.Unmarshal(rawStatus, &statuses); err != nil {
 		t.Fatalf("failed to decode PodStatusResponse: %v", err)
 	}
 

@@ -278,10 +278,11 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 
 // AWSProvider implements Provider for AWS EC2 Fleet.
 type AWSProvider struct {
-	Region  string
-	mu      sync.RWMutex
-	clients map[string]EC2FleetClient
-	client  EC2FleetClient
+	Region          string
+	mu              sync.RWMutex
+	clients         map[string]EC2FleetClient
+	instanceRegions map[string]string
+	client          EC2FleetClient
 }
 
 // NewAWSProvider creates an AWS provider instance.
@@ -290,8 +291,9 @@ func NewAWSProvider(region string) *AWSProvider {
 		region = "us-east-1"
 	}
 	return &AWSProvider{
-		Region:  region,
-		clients: make(map[string]EC2FleetClient),
+		Region:          region,
+		clients:         make(map[string]EC2FleetClient),
+		instanceRegions: make(map[string]string),
 	}
 }
 
@@ -402,11 +404,24 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}
 
 	inst := resp.Instances[0]
+	p.mu.Lock()
+	if p.instanceRegions == nil {
+		p.instanceRegions = make(map[string]string)
+	}
+	p.instanceRegions[inst.ID] = spec.Region
+	p.mu.Unlock()
 	return inst, nil
 }
 
 func (p *AWSProvider) Terminate(ctx context.Context, instanceID string) error {
-	client, err := p.getClient(ctx, p.Region)
+	p.mu.RLock()
+	region, ok := p.instanceRegions[instanceID]
+	p.mu.RUnlock()
+	if !ok || region == "" {
+		region = p.Region
+	}
+
+	client, err := p.getClient(ctx, region)
 	if err != nil {
 		return err
 	}
@@ -417,7 +432,14 @@ func (p *AWSProvider) Terminate(ctx context.Context, instanceID string) error {
 }
 
 func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance, error) {
-	client, err := p.getClient(ctx, p.Region)
+	p.mu.RLock()
+	region, ok := p.instanceRegions[instanceID]
+	p.mu.RUnlock()
+	if !ok || region == "" {
+		region = p.Region
+	}
+
+	client, err := p.getClient(ctx, region)
 	if err != nil {
 		return nil, err
 	}
@@ -500,8 +522,16 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 					podUID = v
 				}
 			}
+			instID := aws.ToString(inst.InstanceId)
+			p.mu.Lock()
+			if p.instanceRegions == nil {
+				p.instanceRegions = make(map[string]string)
+			}
+			p.instanceRegions[instID] = p.Region
+			p.mu.Unlock()
+
 			instances = append(instances, &Instance{
-				ID:           aws.ToString(inst.InstanceId),
+				ID:           instID,
 				Provider:     ProviderAWS,
 				Region:       p.Region,
 				InstanceType: string(inst.InstanceType),
