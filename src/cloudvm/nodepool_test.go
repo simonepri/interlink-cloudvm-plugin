@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -265,5 +267,121 @@ func TestEndToEnd_Two4GPUPodsBinPackIntoOne8GPUVM(t *testing.T) {
 	activeVMsAfterDel2, _ := mock.ListActiveInstances(context.Background(), "test-cluster")
 	if len(activeVMsAfterDel2) != 0 {
 		t.Fatalf("expected shared VM to be terminated after last pod exited, got %d active VMs", len(activeVMsAfterDel2))
+	}
+}
+
+func TestNodePool_OnDemandPodNeverPacksOntoSpotVM(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-market-separation")
+
+	// Launch spot Pod 1
+	spotPodJSON := `{
+		"metadata": {
+			"name": "pod-spot-1",
+			"namespace": "default",
+			"uid": "uid-spot-1",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "spot",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req1 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(spotPodJSON)))
+	w1 := httptest.NewRecorder()
+	srv.handleCreate(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("spot pod create failed: %d: %s", w1.Code, w1.Body.String())
+	}
+	var res1 CreateStruct
+	_ = json.NewDecoder(w1.Body).Decode(&res1)
+	spotInstID := strings.Split(res1.PodJID, ":")[0]
+
+	// Launch on-demand Pod 2 with small resources that would fit on spotInstID if market were ignored
+	odPodJSON := `{
+		"metadata": {
+			"name": "pod-od-1",
+			"namespace": "default",
+			"uid": "uid-od-1",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "on-demand",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req2 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(odPodJSON)))
+	w2 := httptest.NewRecorder()
+	srv.handleCreate(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("on-demand pod create failed: %d: %s", w2.Code, w2.Body.String())
+	}
+	var res2 CreateStruct
+	_ = json.NewDecoder(w2.Body).Decode(&res2)
+	odInstID := strings.Split(res2.PodJID, ":")[0]
+
+	if spotInstID == odInstID {
+		t.Fatalf("CRITICAL BUG: on-demand pod was packed onto spot VM %s!", spotInstID)
+	}
+
+	srv.mu.RLock()
+	instSpot := srv.instances["uid-spot-1"]
+	instOD := srv.instances["uid-od-1"]
+	srv.mu.RUnlock()
+
+	if instSpot.Metadata["marketType"] != "spot" {
+		t.Fatalf("expected spot VM metadata marketType spot, got %s", instSpot.Metadata["marketType"])
+	}
+	if instOD.Metadata["marketType"] != "on-demand" {
+		t.Fatalf("expected on-demand VM metadata marketType on-demand, got %s", instOD.Metadata["marketType"])
+	}
+
+	// Launch a second on-demand pod: verify it CAN bin-pack onto the on-demand VM!
+	odPod2JSON := `{
+		"metadata": {
+			"name": "pod-od-2",
+			"namespace": "default",
+			"uid": "uid-od-2",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "on-demand",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req3 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(odPod2JSON)))
+	w3 := httptest.NewRecorder()
+	srv.handleCreate(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("on-demand pod 2 create failed: %d: %s", w3.Code, w3.Body.String())
+	}
+	var res3 CreateStruct
+	_ = json.NewDecoder(w3.Body).Decode(&res3)
+	odInstID2 := strings.Split(res3.PodJID, ":")[0]
+
+	if odInstID2 != odInstID {
+		t.Fatalf("expected on-demand pod 2 to bin-pack on on-demand VM %s, got %s", odInstID, odInstID2)
+	}
+
+	srv.mu.RLock()
+	instOD2 := srv.instances["uid-od-2"]
+	srv.mu.RUnlock()
+	if instOD2.Metadata["marketType"] != "on-demand" {
+		t.Fatalf("expected packed on-demand pod to inherit marketType on-demand, got %s", instOD2.Metadata["marketType"])
 	}
 }

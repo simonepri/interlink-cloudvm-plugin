@@ -776,7 +776,7 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 	}
 
 	for reg, err := range errorsByRegion {
-		cleanReg := strings.ReplaceAll(strings.ReplaceAll(reg, "\n", ""), "\r", "")
+		cleanReg := sanitizeLog(reg)
 		log.Printf("[aws] Warning: region %s failed inventory query: %v", cleanReg, err) //nolint:gosec // region sanitized
 	}
 

@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -85,7 +84,7 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 	for _, reg := range t.regions {
 		fetcher, err := t.fetcherFactory(ctx, reg)
 		if err != nil {
-			cleanReg := strings.ReplaceAll(strings.ReplaceAll(reg, "\n", ""), "\r", "")
+			cleanReg := sanitizeLog(reg)
 			log.Printf("[cloudvm-ticker] Error initializing EC2 client for %s: %v", cleanReg, err) //nolint:gosec // region sanitized
 			continue
 		}
@@ -104,7 +103,7 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 			EndTime:             aws.Time(now),
 		})
 		if err != nil {
-			cleanReg := strings.ReplaceAll(strings.ReplaceAll(reg, "\n", ""), "\r", "")
+			cleanReg := sanitizeLog(reg)
 			log.Printf("[cloudvm-ticker] Error querying spot prices in %s: %v", cleanReg, err) //nolint:gosec // region sanitized
 			continue
 		}
