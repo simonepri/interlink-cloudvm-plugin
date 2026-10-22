@@ -60,6 +60,10 @@ type InstanceSpec struct {
 	GPUType string `json:"gpuType,omitempty"`
 	// AMIMode selects "dlami" (fast native boot) or "container" (docker runner).
 	AMIMode string `json:"amiMode,omitempty"`
+	// RunAsUser specifies UID for container execution.
+	RunAsUser *int64 `json:"runAsUser,omitempty"`
+	// RunAsGroup specifies GID for container execution.
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
 	// MaxPrice defines maximum spot or hourly price cap in USD/hr.
 	MaxPrice string `json:"maxPrice,omitempty"`
 	// MaxSpotPrice is an alias for MaxPrice.
@@ -152,18 +156,32 @@ type ContainerResourceRequirements struct {
 	Requests map[string]string `json:"requests,omitempty"`
 }
 
+// SecurityContext specifies privilege and user settings for a container.
+type SecurityContext struct {
+	RunAsUser  *int64 `json:"runAsUser,omitempty"`
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+}
+
+// PodSecurityContext specifies privilege and user settings at the pod level.
+type PodSecurityContext struct {
+	RunAsUser  *int64 `json:"runAsUser,omitempty"`
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+}
+
 type ContainerSpec struct {
-	Name      string                        `json:"name"`
-	Image     string                        `json:"image"`
-	Command   []string                      `json:"command,omitempty"`
-	Args      []string                      `json:"args,omitempty"`
-	Env       []EnvVar                      `json:"env,omitempty"`
-	Resources ContainerResourceRequirements `json:"resources,omitempty"`
+	Name            string                        `json:"name"`
+	Image           string                        `json:"image"`
+	Command         []string                      `json:"command,omitempty"`
+	Args            []string                      `json:"args,omitempty"`
+	Env             []EnvVar                      `json:"env,omitempty"`
+	Resources       ContainerResourceRequirements `json:"resources,omitempty"`
+	SecurityContext *SecurityContext              `json:"securityContext,omitempty"`
 }
 
 type PodSpecWrapper struct {
-	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
-	Containers   []ContainerSpec   `json:"containers"`
+	NodeSelector    map[string]string   `json:"nodeSelector,omitempty"`
+	Containers      []ContainerSpec     `json:"containers"`
+	SecurityContext *PodSecurityContext `json:"securityContext,omitempty"`
 }
 
 // Pod represents the incoming pod definition from InterLink.

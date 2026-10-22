@@ -33,6 +33,8 @@ type CloudInitConfig struct {
 	InstanceType         string
 	EgressBandwidth      string
 	EgressBurst          string
+	RunAsUser            *int64
+	RunAsGroup           *int64
 }
 
 // EffectivePodUID returns PodUID if set, or defaults to PodName.
@@ -72,6 +74,8 @@ func (c *CloudInitConfig) InitialContainerJSON() string {
 		Env:           c.Env,
 		AssignedGPUs:  c.AssignedGPUs,
 		MemoryBytes:   c.MemoryBytes,
+		RunAsUser:     c.RunAsUser,
+		RunAsGroup:    c.RunAsGroup,
 	}
 	if c.CPULimit() != "" {
 		if q, err := resource.ParseQuantity(c.CPULimit()); err == nil {
@@ -157,20 +161,25 @@ fi
 # Prevent non-root container workloads from accessing cloud metadata services (IMDS)
 iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
 
-# Protect runner port 9090: allow loopback, tailscale mesh, and private network
-iptables -I INPUT -p tcp --dport 9090 -i lo -j ACCEPT 2>/dev/null || true
-iptables -I INPUT -p tcp --dport 9090 -i tailscale0 -j ACCEPT 2>/dev/null || true
-iptables -I INPUT -p tcp --dport 9090 -s 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
-iptables -I INPUT -p tcp --dport 9090 -s 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
-iptables -I INPUT -p tcp --dport 9090 -s 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
-iptables -I INPUT -p tcp --dport 9090 -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || true
-iptables -A INPUT -p tcp --dport 9090 -j DROP 2>/dev/null || true
+# Runner port 9090 dedicated firewall chain inserted at head of INPUT
+iptables -N CLOUDVM_RUNNER 2>/dev/null || iptables -F CLOUDVM_RUNNER
+iptables -I INPUT 1 -p tcp --dport 9090 -j CLOUDVM_RUNNER 2>/dev/null || true
+iptables -A CLOUDVM_RUNNER -i lo -j ACCEPT 2>/dev/null || true
+iptables -A CLOUDVM_RUNNER -i tailscale0 -j ACCEPT 2>/dev/null || true
+iptables -A CLOUDVM_RUNNER -s 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
+iptables -A CLOUDVM_RUNNER -s 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
+iptables -A CLOUDVM_RUNNER -s 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
+iptables -A CLOUDVM_RUNNER -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || true
+iptables -A CLOUDVM_RUNNER -j DROP 2>/dev/null || true
 
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
   echo "[cloudvm-bootstrap] Connecting to private mesh network..."
   if ! command -v tailscale >/dev/null 2>&1; then
-    curl -fsSL https://tailscale.com/install.sh | sh
+    mkdir -p --mode=0755 /usr/share/keyrings
+    curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null 2>&1 || true
+    curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list 2>/dev/null || true
+    apt-get update -y && apt-get install -y tailscale || curl -fsSL https://tailscale.com/install.sh | sh
   fi
   tailscale up --authkey="{{.MeshAuthKey}}" \
     --hostname="cloudvm-{{.PodName}}" \
@@ -385,13 +394,14 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
             with start_lock:
                 if pod_uid in start_failures:
+                    reason_val, err_val = start_failures[pod_uid]
                     resp = {
                         "podUID": pod_uid,
                         "running": False,
                         "status": "dead",
                         "exitCode": 1,
-                        "reason": "ErrImagePull",
-                        "message": start_failures[pod_uid],
+                        "reason": reason_val,
+                        "message": err_val,
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -458,13 +468,16 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b'{"status":"already_starting"}')
                     return
 
-            inspect_res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
-            if inspect_res.returncode == 0:
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"status":"already_exists"}')
-                return
+                inspect_res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
+                if inspect_res.returncode == 0:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"already_exists"}')
+                    return
+
+                starting_pods.add(pod_uid)
+                start_failures.pop(pod_uid, None)
 
             image = str(req.get('image', ''))
             gpus = req.get('assignedGPUs', [])
@@ -473,11 +486,19 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             args = req.get('args', [])
             cpu_milli = req.get('cpuMillicores', 0)
             mem_bytes = req.get('memoryBytes', 0)
+            run_as_user = req.get('runAsUser')
+            run_as_group = req.get('runAsGroup')
 
             shm_flag = '--shm-size=16g'
             if mem_bytes and mem_bytes > 0:
                 shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
                 shm_flag = f"--shm-size={shm_bytes}"
+
+            if run_as_user is not None:
+                grp = run_as_group if run_as_group is not None else run_as_user
+                user_flag = f"--user={run_as_user}:{grp}"
+            else:
+                user_flag = "--user=65532:65532"
 
             docker_cmd = [
                 'docker', 'run', '-d',
@@ -486,7 +507,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 '--cap-drop=SETUID',
                 '--cap-drop=SETGID',
                 '--security-opt=no-new-privileges',
-                '--user=1000:1000',
+                user_flag,
                 shm_flag,
             ]
             if cpu_milli and cpu_milli > 0:
@@ -505,17 +526,18 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(args, list):
                 docker_cmd.extend(args)
 
-            with start_lock:
-                starting_pods.add(pod_uid)
-                start_failures.pop(pod_uid, None)
-
             def run_async(uid, c):
                 res = subprocess.run(c, capture_output=True, text=True)
                 with start_lock:
                     starting_pods.discard(uid)
                     if res.returncode != 0:
                         err_msg = res.stderr.strip() or "container start failed"
-                        start_failures[uid] = err_msg
+                        low = err_msg.lower()
+                        if "pull" in low or "not found" in low or "manifest" in low or "repository does not exist" in low:
+                            reason = "ErrImagePull"
+                        else:
+                            reason = "StartError"
+                        start_failures[uid] = (reason, err_msg)
 
             threading.Thread(target=run_async, args=(pod_uid, docker_cmd), daemon=True).start()
 

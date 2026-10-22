@@ -519,6 +519,8 @@ func TestServer_RecoverActiveInstances(t *testing.T) {
 }
 
 func TestServer_HandleStatus_InFlightAndFinished(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
 	mock := NewMockProvider()
 	server := NewServer(mock, "test-cluster")
 	ts := httptest.NewServer(server.Routes())
@@ -605,6 +607,8 @@ func TestServer_HandleStatus_InFlightAndFinished(t *testing.T) {
 }
 
 func TestRegression_FinishedPodDoesNotRevertToRunning(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
 	mock := NewMockProvider()
 	server := NewServer(mock, "test-cluster")
 	runner := NewMockContainerRunner()
@@ -788,6 +792,8 @@ func TestServer_CreateIdempotency(t *testing.T) {
 }
 
 func TestRegression_CompletedPodPreservesStatusAfterIdleVMTermination(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
 	mock := NewMockProvider()
 	server := NewServer(mock, "test-cluster")
 	runner := NewMockContainerRunner()
@@ -911,7 +917,7 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	}
 
 	// Verify container capability isolation
-	if !strings.Contains(script, "--cap-drop=SETUID") || !strings.Contains(script, "--security-opt=no-new-privileges") || !strings.Contains(script, "--user=1000:1000") {
+	if !strings.Contains(script, "--cap-drop=SETUID") || !strings.Contains(script, "--security-opt=no-new-privileges") || !strings.Contains(script, "--user=65532:65532") {
 		t.Fatalf("cloud-init missing container privilege isolation flags")
 	}
 }
@@ -1023,6 +1029,8 @@ func TestCompletedStore_PersistenceAcrossReload(t *testing.T) {
 }
 
 func TestServer_ContainerStates_NotPrematurelyCompleted(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
 	mock := NewMockProvider()
 	server := NewServer(mock, "test-states")
 	runner := NewMockContainerRunner()
@@ -1100,5 +1108,155 @@ func TestServer_ContainerStates_NotPrematurelyCompleted(t *testing.T) {
 	}
 	if statuses2[0].Containers[0].State.Terminated.Reason != "Completed" {
 		t.Fatalf("expected Reason Completed, got %s", statuses2[0].Containers[0].State.Terminated.Reason)
+	}
+}
+
+func TestServer_CompletedStatusSurvivesServerRestart(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(tmpDir, "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(tmpDir, "tokens.json"))
+	clusterTag := fmt.Sprintf("restart-test-%d", time.Now().UnixNano())
+	mock := NewMockProvider()
+	server1 := NewServer(mock, clusterTag)
+	runner1 := NewMockContainerRunner()
+	server1.SetContainerRunner(runner1)
+	ts1 := httptest.NewServer(server1.Routes())
+	defer ts1.Close()
+
+	inst, err := mock.Launch(context.Background(), &InstanceSpec{
+		PodName:      "survive-pod",
+		PodNamespace: "default",
+		PodUID:       "uid-survive-1",
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to launch mock instance: %v", err)
+	}
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode(inst.ID, ProviderMock, "us-east-1", "100.64.0.10", capVec)
+	reqVec, _ := NewResourceVector("1", "4Gi", 1, 0)
+	server1.NodePool().RegisterAndAllocate(node, reqVec, "uid-survive-1", "default", "survive-pod")
+
+	server1.mu.Lock()
+	server1.instances["uid-survive-1"] = inst
+	server1.mu.Unlock()
+
+	runner1.SetStatus("uid-survive-1", &ContainerStatusResult{
+		Running:    false,
+		Status:     "exited",
+		ExitCode:   0,
+		Reason:     "Completed",
+		FinishedAt: time.Now(),
+	})
+
+	queryPayload := `[{"pod": {"metadata": {"name": "survive-pod", "namespace": "default", "uid": "uid-survive-1"}}}]`
+	resp1, err := http.Post(ts1.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status failed: %v", err)
+	}
+	var st1 []PodStatusResponse
+	_ = json.NewDecoder(resp1.Body).Decode(&st1)
+	_ = resp1.Body.Close()
+	if len(st1) != 1 || st1[0].Containers[0].State.Terminated == nil {
+		t.Fatalf("expected Terminated on server1, got: %+v", st1)
+	}
+
+	// Terminate node so VM is gone
+	server1.TerminateIdleNode(context.Background(), node)
+
+	// Spin up server2 with default configuration using the same clusterTag (simulating pod restart)
+	server2 := NewServer(mock, clusterTag)
+	ts2 := httptest.NewServer(server2.Routes())
+	defer ts2.Close()
+
+	// Query status on server2: must survive restart and report Terminated(Completed)!
+	resp2, err := http.Post(ts2.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status on server2 failed: %v", err)
+	}
+	var st2 []PodStatusResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&st2)
+	_ = resp2.Body.Close()
+
+	if len(st2) != 1 || st2[0].Containers[0].State.Terminated == nil {
+		t.Fatalf("expected completed status to survive server restart, got: %+v", st2)
+	}
+	if st2[0].Containers[0].State.Terminated.Reason != "Completed" {
+		t.Fatalf("expected Reason Completed, got %s", st2[0].Containers[0].State.Terminated.Reason)
+	}
+
+	// Re-creating completed pod on server2 returns identical PodJID
+	createPayload := `{"pod": {"metadata": {"name": "survive-pod", "namespace": "default", "uid": "uid-survive-1"}}}`
+	cResp, err := http.Post(ts2.URL+"/create", "application/json", strings.NewReader(createPayload))
+	if err != nil {
+		t.Fatalf("POST /create on server2 failed: %v", err)
+	}
+	var cRes CreateStruct
+	_ = json.NewDecoder(cResp.Body).Decode(&cRes)
+	_ = cResp.Body.Close()
+	if cRes.PodJID != fmt.Sprintf("%s:uid-survive-1", inst.ID) {
+		t.Fatalf("expected matching PodJID %s:uid-survive-1, got %s", inst.ID, cRes.PodJID)
+	}
+}
+
+func TestServer_FirstCallerCancelDoesNotFailDuplicate(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, fmt.Sprintf("cancel-test-%d", time.Now().UnixNano()))
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	payload := `{"pod": {"metadata": {"name": "cancel-worker", "namespace": "default", "uid": "uid-cancel-1"}, "spec": {"containers": [{"name": "worker", "image": "ubuntu:24.04"}]}}}`
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	req1, err := http.NewRequestWithContext(ctx1, http.MethodPost, ts.URL+"/create", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("failed to create req1: %v", err)
+	}
+	req1.Header.Set("Content-Type", "application/json")
+
+	var res2 CreateStruct
+	var err2 error
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(5 * time.Millisecond) // Ensure caller 1 hits server first
+		resp2, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(payload))
+		if err != nil {
+			err2 = err
+			return
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode != http.StatusOK {
+			err2 = fmt.Errorf("caller 2 got status %d", resp2.StatusCode)
+			return
+		}
+		_ = json.NewDecoder(resp2.Body).Decode(&res2)
+	}()
+
+	// Cancel caller 1
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel1()
+	}()
+
+	resp1, _ := http.DefaultClient.Do(req1)
+	if resp1 != nil && resp1.Body != nil {
+		_ = resp1.Body.Close()
+	}
+
+	wg.Wait()
+
+	if err2 != nil {
+		t.Fatalf("caller 2 should have succeeded despite caller 1 cancellation, but got: %v", err2)
+	}
+	if res2.PodUID != "uid-cancel-1" || res2.PodJID == "" {
+		t.Fatalf("caller 2 received invalid response: %+v", res2)
+	}
+
+	if mock.LaunchCount() != 1 {
+		t.Fatalf("expected exactly 1 launch, got %d", mock.LaunchCount())
 	}
 }

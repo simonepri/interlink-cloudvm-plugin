@@ -2,15 +2,20 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 )
 
+// CompletedRecordTTL defines the duration to retain finished pod telemetry before garbage collection.
+const CompletedRecordTTL = 24 * time.Hour
+
 // CompletedPodRecord stores the terminal execution telemetry of a finished pod.
 type CompletedPodRecord struct {
 	PodUID     string    `json:"podUID"`
+	PodJID     string    `json:"podJID,omitempty"`
 	ExitCode   int32     `json:"exitCode"`
 	Reason     string    `json:"reason"`
 	Message    string    `json:"message"`
@@ -39,6 +44,15 @@ func NewCompletedStore(filePath string) *CompletedStore {
 	return cs
 }
 
+func (cs *CompletedStore) pruneLocked() {
+	now := time.Now()
+	for uid, rec := range cs.records {
+		if rec != nil && !rec.FinishedAt.IsZero() && now.Sub(rec.FinishedAt) > CompletedRecordTTL {
+			delete(cs.records, uid)
+		}
+	}
+}
+
 func (cs *CompletedStore) load() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -46,12 +60,24 @@ func (cs *CompletedStore) load() error {
 	cleanPath := filepath.Clean(cs.filePath)
 	data, err := os.ReadFile(cleanPath) // #nosec G304,G703
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	return json.Unmarshal(data, &cs.records)
+
+	var loaded map[string]*CompletedPodRecord
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		return fmt.Errorf("corrupt completed store data: %w", err)
+	}
+
+	cs.records = loaded
+	cs.pruneLocked()
+	return nil
 }
 
 func (cs *CompletedStore) saveLocked() error {
+	cs.pruneLocked()
 	data, err := json.Marshal(cs.records)
 	if err != nil {
 		return err

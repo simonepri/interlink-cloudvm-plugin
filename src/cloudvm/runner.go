@@ -25,6 +25,8 @@ type StartContainerRequest struct {
 	MemoryBytes   int64             `json:"memoryBytes"`
 	AssignedGPUs  []int             `json:"assignedGPUs,omitempty"`
 	AssignedTPUs  []int             `json:"assignedTPUs,omitempty"`
+	RunAsUser     *int64            `json:"runAsUser,omitempty"`
+	RunAsGroup    *int64            `json:"runAsGroup,omitempty"`
 }
 
 // ContainerStatusResult encapsulates container execution telemetry from the in-VM runner.

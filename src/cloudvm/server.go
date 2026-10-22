@@ -49,9 +49,10 @@ func EgressRateToBandwidth(dollarPerHour float64, provider string) string {
 
 // Server implements the InterLink REST API for the cloudvm provider plugin.
 type inFlightCreate struct {
-	done chan struct{}
-	resp *CreateStruct
-	err  error
+	done  chan struct{}
+	token string
+	resp  *CreateStruct
+	err   error
 }
 
 type Server struct {
@@ -67,6 +68,7 @@ type Server struct {
 	spotTicker      *SpotPriceTicker
 	tokenStore      *TokenStore
 	completedStore  *CompletedStore
+	launchTokens    map[string]string                    // podUID -> runnerAuthToken (reused across retries)
 	completedPods   map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
 	inFlightCreates map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
 }
@@ -75,11 +77,11 @@ type Server struct {
 func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	tokenPath := os.Getenv("TOKEN_STORE_PATH")
 	if tokenPath == "" {
-		tokenPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tokens-%s-%d.json", clusterTag, time.Now().UnixNano()))
+		tokenPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tokens-%s.json", clusterTag))
 	}
 	completedPath := os.Getenv("COMPLETED_STORE_PATH")
 	if completedPath == "" {
-		completedPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-completed-pods-%s-%d.json", clusterTag, time.Now().UnixNano()))
+		completedPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-completed-pods-%s.json", clusterTag))
 	}
 	return &Server{
 		providers:       make(map[ProviderType]Provider),
@@ -91,6 +93,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		runner:          NewMockContainerRunner(),
 		tokenStore:      NewTokenStore(tokenPath),
 		completedStore:  NewCompletedStore(completedPath),
+		launchTokens:    make(map[string]string),
 		completedPods:   make(map[string]*ContainerTerminatedState),
 		inFlightCreates: make(map[string]*inFlightCreate),
 	}
@@ -375,6 +378,20 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		}
 	}
 
+	var runAsUser *int64
+	var runAsGroup *int64
+	if len(pod.Spec.Containers) > 0 {
+		c := pod.Spec.Containers[0]
+		if c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil {
+			runAsUser = c.SecurityContext.RunAsUser
+			runAsGroup = c.SecurityContext.RunAsGroup
+		}
+	}
+	if runAsUser == nil && pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.RunAsUser != nil {
+		runAsUser = pod.Spec.SecurityContext.RunAsUser
+		runAsGroup = pod.Spec.SecurityContext.RunAsGroup
+	}
+
 	if rayHeadAddress == "" {
 		rayHeadAddress = pod.Metadata.Annotations["ray.io/head-address"]
 	}
@@ -406,6 +423,8 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		Env:                  envMap,
 		RayHeadAddress:       rayHeadAddress,
 		MeshAuthKey:          meshAuthKey,
+		RunAsUser:            runAsUser,
+		RunAsGroup:           runAsGroup,
 		ClusterTag:           defaultClusterTag,
 	}
 }
@@ -487,10 +506,14 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		if s.completedStore != nil {
 			if rec := s.completedStore.Get(spec.PodUID); rec != nil {
 				s.mu.Unlock()
+				podJID := rec.PodJID
+				if podJID == "" {
+					podJID = fmt.Sprintf("cvm-%s", spec.PodUID)
+				}
 				w.WriteHeader(http.StatusOK)
 				_ = json.NewEncoder(w).Encode(CreateStruct{
 					PodUID: spec.PodUID,
-					PodJID: fmt.Sprintf("cvm-%s", spec.PodUID),
+					PodJID: podJID,
 				})
 				return
 			}
@@ -586,6 +609,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			MemoryBytes:   memLimitBytes,
 			AssignedGPUs:  assignedGPUs,
 			AssignedTPUs:  assignedTPUs,
+			RunAsUser:     spec.RunAsUser,
+			RunAsGroup:    spec.RunAsGroup,
 		})
 
 		s.mu.Lock()
@@ -624,12 +649,28 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[cloudvm] Bin-pack miss. Launching new VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
 		spec.PodNamespace, spec.PodName, spec.InstanceType, spec.NumGPUs, spec.Region)
 
-	tok, err := generateToken()
-	if err != nil {
-		finalErr = err
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	s.mu.Lock()
+	tok := ""
+	if spec.PodUID != "" {
+		tok = s.launchTokens[spec.PodUID]
 	}
+	if tok == "" {
+		var err error
+		tok, err = generateToken()
+		if err != nil {
+			s.mu.Unlock()
+			finalErr = err
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if spec.PodUID != "" {
+			s.launchTokens[spec.PodUID] = tok
+		}
+	}
+	if flight != nil {
+		flight.token = tok
+	}
+	s.mu.Unlock()
 	spec.RunnerAuthToken = tok
 
 	var preAssignedGPUs []int
@@ -638,7 +679,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	spec.AssignedGPUs = preAssignedGPUs
 
-	inst, err := prov.Launch(r.Context(), spec)
+	// Detach from client HTTP request context so client timeouts or cancellations do not abort in-flight VM launch
+	launchCtx, launchCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
+	defer launchCancel()
+
+	inst, err := prov.Launch(launchCtx, spec)
 	if err != nil {
 		log.Printf("[cloudvm] Failed to launch VM for %s: %v", spec.PodName, err)
 		finalErr = fmt.Errorf("launch failed: %w", err)
@@ -690,6 +735,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		MemoryBytes:   reqVec.Memory.Value(),
 		AssignedGPUs:  gpus,
 		AssignedTPUs:  tpus,
+		RunAsUser:     spec.RunAsUser,
+		RunAsGroup:    spec.RunAsGroup,
 	})
 
 	s.mu.Lock()
@@ -756,6 +803,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if pod.Metadata.UID != "" {
 		delete(s.instances, pod.Metadata.UID)
 		delete(s.completedPods, pod.Metadata.UID)
+		delete(s.launchTokens, pod.Metadata.UID)
 		if s.completedStore != nil {
 			_ = s.completedStore.Delete(pod.Metadata.UID)
 		}
@@ -1011,7 +1059,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 									Reason:  cResult.Reason,
 									Message: fmt.Sprintf("Container is %s", cResult.Status),
 								}
-							case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || cResult.Reason == "ErrImagePull" || (cResult.ExitCode != 0 && !cResult.Running):
+							case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || cResult.Reason == "ErrImagePull" || cResult.Reason == "StartError" || (cResult.ExitCode != 0 && !cResult.Running):
 								status.Ready = false
 								term := &ContainerTerminatedState{
 									ExitCode:   cResult.ExitCode,
@@ -1029,6 +1077,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								if tgt.uid != "" && s.completedStore != nil {
 									_ = s.completedStore.Set(tgt.uid, &CompletedPodRecord{
 										PodUID:     tgt.uid,
+										PodJID:     tgt.jid,
 										ExitCode:   cResult.ExitCode,
 										Reason:     cResult.Reason,
 										Message:    cResult.Message,

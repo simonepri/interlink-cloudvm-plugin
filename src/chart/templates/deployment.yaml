@@ -47,6 +47,8 @@ spec:
               value: "{{ .Values.provider.awsLaunchTemplateName }}"
             - name: TOKEN_STORE_PATH
               value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/tokens.json"
+            - name: COMPLETED_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/completed-pods.json"
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
