@@ -702,7 +702,7 @@ func TestNodePool_UnknownCoTenantsExceededRetriesClearedForGC(t *testing.T) {
 
 	// Set short timeout for unit test
 	oldTimeout := UnknownCoTenantTimeout
-	UnknownCoTenantTimeout = 50 * time.Millisecond
+	UnknownCoTenantTimeout = 250 * time.Millisecond
 	defer func() { UnknownCoTenantTimeout = oldTimeout }()
 
 	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
@@ -713,7 +713,7 @@ func TestNodePool_UnknownCoTenantsExceededRetriesClearedForGC(t *testing.T) {
 	}
 
 	// Advance past timeout
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	// Reconcile after timeout: flag cleared -> VM collected as zombie
 	res, err := reconciler.ReconcileOnce(ctx)

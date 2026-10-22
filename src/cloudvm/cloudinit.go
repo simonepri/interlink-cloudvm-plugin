@@ -3,7 +3,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"text/template"
@@ -26,6 +25,9 @@ type CloudInitConfig struct {
 	CPUMillicores        int64
 	MemoryBytes          int64
 	RunnerAuthToken      string
+	KMSEncryptedToken    bool
+	KMSKeyID             string
+	KMSCiphertext        string
 	MeshAuthKey          string
 	Region               string
 	InstanceType         string
@@ -33,6 +35,25 @@ type CloudInitConfig struct {
 	EgressBurst          string
 	RunAsUser            *int64
 	RunAsGroup           *int64
+	DockerConfigJSON     string
+}
+
+// IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
+// Ciphertext returns the encrypted runner token string for KMS decrypt.
+func (c *CloudInitConfig) Ciphertext() string {
+	return c.KMSCiphertext
+}
+
+// Validate ensures cloud-init configuration integrity.
+func (c *CloudInitConfig) Validate() error {
+	if c.IsKMSEncrypted() && c.KMSCiphertext == "" {
+		return fmt.Errorf("KMS token encryption is enabled but KMSCiphertext is empty")
+	}
+	return nil
+}
+
+func (c *CloudInitConfig) IsKMSEncrypted() bool {
+	return c.KMSEncryptedToken || c.KMSCiphertext != ""
 }
 
 // EffectivePodUID returns PodUID if set, or defaults to PodName.
@@ -49,38 +70,6 @@ func (c *CloudInitConfig) CPULimit() string {
 		return ""
 	}
 	return fmt.Sprintf("%.2f", float64(c.CPUMillicores)/1000.0)
-}
-
-// InitialContainerJSON serializes the initial pod spec into JSON for the runner,
-// avoiding bash variable expansion and shell injection vulnerabilities.
-func (c *CloudInitConfig) InitialContainerJSON() string {
-	if c.TargetContainerImage == "" {
-		return ""
-	}
-	cmd := c.Command
-	if c.RayHeadAddress != "" && len(cmd) == 0 {
-		cmd = []string{"ray", "start", fmt.Sprintf("--address=%s", c.RayHeadAddress), fmt.Sprintf("--num-gpus=%d", c.NumGPUs), "--block"}
-	}
-	req := StartContainerRequest{
-		PodUID:        c.EffectivePodUID(),
-		Namespace:     c.PodNamespace,
-		PodName:       c.PodName,
-		ContainerName: "worker",
-		Image:         c.TargetContainerImage,
-		Command:       cmd,
-		Args:          c.Args,
-		Env:           c.Env,
-		AssignedGPUs:  c.AssignedGPUs,
-		CPUMillicores: c.CPUMillicores,
-		MemoryBytes:   c.MemoryBytes,
-		RunAsUser:     c.RunAsUser,
-		RunAsGroup:    c.RunAsGroup,
-	}
-	b, err := json.Marshal(req)
-	if err != nil {
-		return ""
-	}
-	return string(b)
 }
 
 // GPUFlag returns the exact docker --gpus flag based on discrete device allocations.
@@ -299,18 +288,38 @@ shutdown -h now || poweroff
 # 5. Container Execution Mode with In-VM Micro-Runner Daemon (:9090)
 echo "[cloudvm-bootstrap] Starting in-VM micro-runner daemon on port 9090..."
 
+mkdir -p /etc/cloudvm
+chmod 700 /etc/cloudvm
+{{if .IsKMSEncrypted}}
+CIPHERTEXT="{{.Ciphertext}}"
+REGION="{{.Region}}"
+aws kms decrypt --ciphertext-blob fileb://<(echo "$CIPHERTEXT" | base64 -d) --output text --query Plaintext --region $REGION | base64 -d > /etc/cloudvm/runner-token
+chmod 600 /etc/cloudvm/runner-token
+{{else}}
+echo -n "{{.RunnerAuthToken}}" > /etc/cloudvm/runner-token
+chmod 600 /etc/cloudvm/runner-token
+{{end}}
+
 cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
 import datetime
 import hmac
 import http.server
 import json
+import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
 
 PORT = 9090
-AUTH_TOKEN = "{{.RunnerAuthToken}}"
+AUTH_TOKEN = ""
+try:
+    with open('/etc/cloudvm/runner-token', 'r') as f:
+        AUTH_TOKEN = f.read().strip()
+except Exception:
+    pass
 
 pod_locks = {}
 pod_locks_guard = threading.Lock()
@@ -335,6 +344,13 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def check_auth(self):
+        global AUTH_TOKEN
+        if not AUTH_TOKEN:
+            try:
+                with open('/etc/cloudvm/runner-token', 'r') as f:
+                    AUTH_TOKEN = f.read().strip()
+            except Exception:
+                pass
         if not AUTH_TOKEN:
             self.send_response(500)
             self.send_header('Content-Type', 'application/json')
@@ -608,9 +624,34 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(args, list):
                 docker_cmd.extend(args)
 
-            def run_async(uid, img, c):
-                # 1. Pull container image first
-                pull_res = subprocess.run(['docker', 'pull', img], capture_output=True, text=True)
+            docker_cfg = req.get('dockerConfigJSON')
+
+            def run_async(uid, img, c, auth_cfg):
+                # 0. Isolate credentials in an ephemeral per-pod directory (never shared with co-tenants)
+                cfg_dir = None
+                if auth_cfg:
+                    try:
+                        cfg_dir = tempfile.mkdtemp(prefix=f"docker-cfg-{uid}-")
+                        cfg_path = os.path.join(cfg_dir, 'config.json')
+                        with open(cfg_path, 'w', encoding='utf-8') as cf:
+                            cf.write(auth_cfg if isinstance(auth_cfg, str) else json.dumps(auth_cfg))
+                        os.chmod(cfg_path, 0o600)
+                    except Exception:
+                        cfg_dir = None
+
+                # 1. Pull container image using isolated ephemeral docker config
+                pull_cmd = ['docker']
+                if cfg_dir:
+                    pull_cmd.extend(['--config', cfg_dir])
+                pull_cmd.extend(['pull', img])
+                pull_res = subprocess.run(pull_cmd, capture_output=True, text=True)
+
+                # Clean up isolated credentials directory immediately
+                if cfg_dir:
+                    try:
+                        shutil.rmtree(cfg_dir)
+                    except Exception:
+                        pass
                 if pull_res.returncode != 0:
                     err_msg = pull_res.stderr.strip() or pull_res.stdout.strip() or "image pull failed"
                     with get_pod_lock(uid):
@@ -626,7 +667,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         err_msg = res.stderr.strip() or res.stdout.strip() or "container start failed"
                         start_failures[uid] = ("StartError", err_msg)
 
-            threading.Thread(target=run_async, args=(pod_uid, image, docker_cmd), daemon=True).start()
+            threading.Thread(target=run_async, args=(pod_uid, image, docker_cmd, docker_cfg), daemon=True).start()
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -646,37 +687,6 @@ if command -v python3 >/dev/null 2>&1; then
   nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
 
-# Launch initial container workload via runner (eliminates bash env expansion & shell injection)
-{{if .InitialContainerJSON}}
-mkdir -p /etc/cloudvm
-cat << 'INITIAL_POD_EOF' > /etc/cloudvm/initial-pod.json
-{{.InitialContainerJSON}}
-INITIAL_POD_EOF
-
-if [ -s /etc/cloudvm/initial-pod.json ]; then
-  echo "[cloudvm-bootstrap] Launching initial container workload via runner..."
-  python3 -c "
-import json, urllib.request, time
-for _ in range(15):
-    try:
-        with open('/etc/cloudvm/initial-pod.json', 'rb') as f:
-            data = f.read()
-        req = urllib.request.Request(
-            'http://127.0.0.1:9090/containers/start',
-            data=data,
-            headers={
-                'Authorization': 'Bearer {{.RunnerAuthToken}}',
-                'Content-Type': 'application/json'
-            }
-        )
-        urllib.request.urlopen(req, timeout=30)
-        print('[cloudvm-bootstrap] Initial pod successfully started via runner')
-        break
-    except Exception as e:
-        time.sleep(1)
-" || true
-fi
-{{end}}
 
 # 6. Orphaned Node Idle Fail-Safe Watchdog
 # Powers off only after the node has had zero active containers AND no provider heartbeat for >300s
@@ -714,6 +724,12 @@ fi
 
 // RenderCloudInit fills the template with runtime parameters.
 func RenderCloudInit(cfg *CloudInitConfig) (string, error) {
+	if cfg == nil {
+		return "", fmt.Errorf("cloud-init config is nil")
+	}
+	if err := cfg.Validate(); err != nil {
+		return "", err
+	}
 	tmpl, err := template.New("cloudinit").Parse(cloudInitTemplate)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse cloud-init template: %w", err)

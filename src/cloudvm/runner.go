@@ -15,20 +15,21 @@ import (
 
 // StartContainerRequest contains the parameters required to execute a sliced container on a warm VM.
 type StartContainerRequest struct {
-	PodUID        string            `json:"podUID"`
-	Namespace     string            `json:"namespace"`
-	PodName       string            `json:"podName"`
-	ContainerName string            `json:"containerName"`
-	Image         string            `json:"image"`
-	Command       []string          `json:"command,omitempty"`
-	Args          []string          `json:"args,omitempty"`
-	Env           map[string]string `json:"env,omitempty"`
-	CPUMillicores int64             `json:"cpuMillicores"`
-	MemoryBytes   int64             `json:"memoryBytes"`
-	AssignedGPUs  []int             `json:"assignedGPUs,omitempty"`
-	AssignedTPUs  []int             `json:"assignedTPUs,omitempty"`
-	RunAsUser     *int64            `json:"runAsUser,omitempty"`
-	RunAsGroup    *int64            `json:"runAsGroup,omitempty"`
+	PodUID           string            `json:"podUID"`
+	Namespace        string            `json:"namespace"`
+	PodName          string            `json:"podName"`
+	ContainerName    string            `json:"containerName"`
+	Image            string            `json:"image"`
+	Command          []string          `json:"command,omitempty"`
+	Args             []string          `json:"args,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	CPUMillicores    int64             `json:"cpuMillicores"`
+	MemoryBytes      int64             `json:"memoryBytes"`
+	AssignedGPUs     []int             `json:"assignedGPUs,omitempty"`
+	AssignedTPUs     []int             `json:"assignedTPUs,omitempty"`
+	RunAsUser        *int64            `json:"runAsUser,omitempty"`
+	RunAsGroup       *int64            `json:"runAsGroup,omitempty"`
+	DockerConfigJSON string            `json:"dockerConfigJSON,omitempty"`
 }
 
 // ContainerStatusResult encapsulates container execution telemetry from the in-VM runner.
@@ -76,12 +77,11 @@ func (h *HTTPContainerRunner) setAuthHeader(httpReq *http.Request, node *CloudVM
 	}
 }
 
-func (h *HTTPContainerRunner) endpoint(node *CloudVMNode, path string) string {
-	ip := node.MeshIP
-	if ip == "" {
-		ip = "127.0.0.1"
+func (h *HTTPContainerRunner) endpoint(node *CloudVMNode, path string) (string, error) {
+	if node == nil || node.MeshIP == "" {
+		return "", fmt.Errorf("node has no mesh or internal IP assigned")
 	}
-	return fmt.Sprintf("http://%s:%d%s", ip, h.port, path)
+	return fmt.Sprintf("http://%s:%d%s", node.MeshIP, h.port, path), nil
 }
 
 func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) error {
@@ -98,7 +98,10 @@ func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMN
 		return err
 	}
 
-	url := h.endpoint(node, "/containers/start")
+	url, err := h.endpoint(node, "/containers/start")
+	if err != nil {
+		return err
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload)) //nolint:gosec // mesh endpoint is an internal private WireGuard IP
 	if err != nil {
 		return err
@@ -120,7 +123,11 @@ func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMN
 }
 
 func (h *HTTPContainerRunner) GetStatus(ctx context.Context, node *CloudVMNode, podUID string) (*ContainerStatusResult, error) {
-	url := fmt.Sprintf("%s?podUID=%s", h.endpoint(node, "/containers/status"), podUID)
+	baseEndpoint, err := h.endpoint(node, "/containers/status")
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s?podUID=%s", baseEndpoint, podUID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // internal private WireGuard mesh endpoint
 	if err != nil {
 		return nil, err
@@ -141,7 +148,11 @@ func (h *HTTPContainerRunner) GetStatus(ctx context.Context, node *CloudVMNode, 
 }
 
 func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNode, podUID string) error {
-	url := fmt.Sprintf("%s?podUID=%s", h.endpoint(node, "/containers/stop"), podUID)
+	baseEndpoint, err := h.endpoint(node, "/containers/stop")
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("%s?podUID=%s", baseEndpoint, podUID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil) //nolint:gosec // internal private WireGuard mesh endpoint
 	if err != nil {
 		return err
@@ -157,7 +168,10 @@ func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNo
 }
 
 func (h *HTTPContainerRunner) ListContainers(ctx context.Context, node *CloudVMNode) ([]*ContainerStatusResult, error) {
-	url := h.endpoint(node, "/containers/list")
+	url, err := h.endpoint(node, "/containers/list")
+	if err != nil {
+		return nil, err
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // internal mesh call
 	if err != nil {
 		return nil, err
@@ -185,24 +199,37 @@ func (h *HTTPContainerRunner) ListContainers(ctx context.Context, node *CloudVMN
 type MockContainerRunner struct {
 	mu         sync.RWMutex
 	containers map[string]*ContainerStatusResult
+	requests   map[string]*StartContainerRequest
 }
 
 // NewMockContainerRunner initializes an in-memory mock container runner.
 func NewMockContainerRunner() *MockContainerRunner {
 	return &MockContainerRunner{
 		containers: make(map[string]*ContainerStatusResult),
+		requests:   make(map[string]*StartContainerRequest),
 	}
 }
 
 func (m *MockContainerRunner) StartContainer(_ context.Context, _ *CloudVMNode, req *StartContainerRequest) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.requests == nil {
+		m.requests = make(map[string]*StartContainerRequest)
+	}
+	m.requests[req.PodUID] = req
 	m.containers[req.PodUID] = &ContainerStatusResult{
 		PodUID:    req.PodUID,
 		Running:   true,
 		StartedAt: time.Now(),
 	}
 	return nil
+}
+
+// GetStartRequest retrieves the StartContainerRequest recorded for podUID.
+func (m *MockContainerRunner) GetStartRequest(podUID string) *StartContainerRequest {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.requests[podUID]
 }
 
 func (m *MockContainerRunner) GetStatus(_ context.Context, _ *CloudVMNode, podUID string) (*ContainerStatusResult, error) {

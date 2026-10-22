@@ -68,8 +68,8 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	if bytes.Contains([]byte(script), []byte("--pid=host")) || bytes.Contains([]byte(script), []byte("--ipc=host")) {
 		t.Errorf("cloud-init containers must not share pid or ipc namespace with host")
 	}
-	if !bytes.Contains([]byte(script), []byte(fmt.Sprintf(`AUTH_TOKEN = "%s"`, testToken))) {
-		t.Errorf("cloud-init missing runner auth token configuration")
+	if !bytes.Contains([]byte(script), []byte(fmt.Sprintf(`echo -n "%s" > /etc/cloudvm/runner-token`, testToken))) {
+		t.Errorf("cloud-init missing runner auth token configuration in /etc/cloudvm/runner-token")
 	}
 	if !bytes.Contains([]byte(script), []byte("ThreadingHTTPServer")) {
 		t.Errorf("cloud-init runner should use ThreadingHTTPServer for concurrent requests")
@@ -80,8 +80,9 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	if !bytes.Contains([]byte(script), []byte("--shm-size=16g")) {
 		t.Errorf("cloud-init missing shared memory limit for PyTorch DataLoader")
 	}
-	if !bytes.Contains([]byte(script), []byte("pod-uid-456")) || !bytes.Contains([]byte(script), []byte("/containers/start")) {
-		t.Errorf("cloud-init missing initial container launch via runner endpoint, got script:\n%s", script)
+	// Verify initial container is not launched via cloud-init to prevent credential and spec leakage
+	if bytes.Contains([]byte(script), []byte("initial-pod.json")) {
+		t.Errorf("cloud-init must not launch initial-pod.json via user-data")
 	}
 	if !bytes.Contains([]byte(script), []byte(`docker ps -q --filter "name=cloudvm"`)) {
 		t.Errorf("cloud-init missing multi-pod idle watchdog container check")
@@ -221,9 +222,9 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 		t.Fatalf("cloud-init runner missing import time or import threading")
 	}
 
-	// Verify Ray auto-start command restored in JSON
-	if !strings.Contains(script, "ray") || !strings.Contains(script, "10.0.0.1:6379") {
-		t.Fatalf("cloud-init runner missing ray auto-start command in initial pod JSON")
+	// Verify runner does not hardcode ray initial container in user-data
+	if strings.Contains(script, "initial-pod.json") {
+		t.Fatalf("cloud-init should not embed initial-pod.json")
 	}
 
 	// Verify IMDS protection and runner port protection

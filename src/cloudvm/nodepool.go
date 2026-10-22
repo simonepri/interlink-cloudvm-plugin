@@ -470,3 +470,12 @@ func (np *NodePool) RegisterAndAllocate(node *CloudVMNode, req ResourceVector, p
 	node.AssignPod(alloc)
 	return gpus, tpus
 }
+
+// Cordon marks an instance as cordoned, excluding it from future bin-pack allocations.
+func (np *NodePool) Cordon(instanceID string) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	if node, exists := np.nodes[instanceID]; exists && node != nil {
+		node.Cordoned = true
+	}
+}

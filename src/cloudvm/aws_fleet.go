@@ -410,6 +410,10 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 }
 
 func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
+	runnerToken := spec.RunnerAuthToken
+	if spec.KMSEncryptedToken || spec.KMSCiphertext != "" {
+		runnerToken = ""
+	}
 	cloudInit, err := RenderCloudInit(&CloudInitConfig{
 		PodName:              spec.PodName,
 		PodNamespace:         spec.PodNamespace,
@@ -418,7 +422,10 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		InstanceType:         spec.InstanceType,
 		NumGPUs:              spec.NumGPUs,
 		AssignedGPUs:         spec.AssignedGPUs,
-		RunnerAuthToken:      spec.RunnerAuthToken,
+		RunnerAuthToken:      runnerToken,
+		KMSEncryptedToken:    spec.KMSEncryptedToken,
+		KMSKeyID:             spec.KMSKeyID,
+		KMSCiphertext:        spec.KMSCiphertext,
 		UseNativeDLAMI:       spec.AMIMode == "dlami",
 		RayHeadAddress:       spec.RayHeadAddress,
 		RayVersion:           spec.RayVersion,

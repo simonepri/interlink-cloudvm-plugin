@@ -139,6 +139,8 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	launchTemplateID := pod.Metadata.Annotations["cloudvm.vk.io/aws-launch-template"]
 	launchTemplateName := pod.Metadata.Annotations["cloudvm.vk.io/aws-launch-template-name"]
 
+	// KMS token encryption is controlled exclusively by provider configuration
+
 	// 6. Network Egress Rate Limiting (Token Bucket Filter via rate or dollar/hr spend)
 	maxEgressRate := pod.Metadata.Annotations["cloudvm.vk.io/max-egress-rate"]
 	egressBandwidth := pod.Metadata.Annotations["cloudvm.vk.io/egress-bandwidth"]
@@ -165,6 +167,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	var rayHeadAddress string
 	var meshAuthKey string
 	numGPUs := 0
+	numTPUs := 0
 
 	if len(pod.Spec.Containers) > 0 {
 		c := pod.Spec.Containers[0]
@@ -176,6 +179,17 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		if gpuStr, exists := c.Resources.Limits["nvidia.com/gpu"]; exists {
 			if n, err := strconv.Atoi(gpuStr); err == nil {
 				numGPUs = n
+			}
+		}
+
+		// Extract TPU count
+		if tpuStr, exists := c.Resources.Limits["google.com/tpu"]; exists {
+			if n, err := strconv.Atoi(tpuStr); err == nil {
+				numTPUs = n
+			}
+		} else if tpuStr, exists := c.Resources.Requests["google.com/tpu"]; exists {
+			if n, err := strconv.Atoi(tpuStr); err == nil {
+				numTPUs = n
 			}
 		}
 
@@ -246,6 +260,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		EgressBandwidth:      egressBandwidth,
 		EgressBurst:          egressBurst,
 		NumGPUs:              numGPUs,
+		NumTPUs:              numTPUs,
 		TargetContainerImage: targetImage,
 		Command:              command,
 		Args:                 args,

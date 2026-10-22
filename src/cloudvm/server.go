@@ -45,6 +45,9 @@ type Server struct {
 	defaultRegion   string
 	reconciler      *Reconciler
 	nodePool        *NodePool
+	kmsClient       KMSClient
+	kmsKeyID        string
+	secretResolver  SecretResolver
 	runner          ContainerRunner
 	spotTicker      *SpotPriceTicker
 	tokenStore      *TokenStore
@@ -105,6 +108,12 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		for k, v := range tombStore.GetAll() {
 			s.tombstones[k] = v
 		}
+	}
+	if kmsKey := os.Getenv("KMS_KEY_ID"); kmsKey != "" {
+		s.kmsKeyID = kmsKey
+	}
+	if sr, err := NewKubeSecretResolverFromConfig(); err == nil {
+		s.secretResolver = sr
 	}
 	return s
 }
@@ -180,6 +189,21 @@ func (s *Server) IsTombstoned(inst *Instance) bool {
 }
 
 // SetContainerRunner overrides the container runner (e.g. HTTPContainerRunner).
+// SetKMSConfig configures AWS KMS encryption for runner authentication tokens.
+func (s *Server) SetKMSConfig(client KMSClient, keyID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kmsClient = client
+	s.kmsKeyID = keyID
+}
+
+// SetSecretResolver sets the Kubernetes secret resolver for imagePullSecrets.
+func (s *Server) SetSecretResolver(sr SecretResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.secretResolver = sr
+}
+
 func (s *Server) SetContainerRunner(r ContainerRunner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -347,6 +371,19 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve imagePullSecrets via Kubernetes SecretResolver
+	if len(pod.Spec.ImagePullSecrets) > 0 {
+		if s.secretResolver != nil {
+			dockerConfigJSON, err := ResolveImagePullSecrets(r.Context(), s.secretResolver, spec.PodNamespace, pod.Spec.ImagePullSecrets)
+			if err != nil {
+				finalErr = fmt.Errorf("failed to resolve imagePullSecrets: %w", err)
+				http.Error(w, finalErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			spec.DockerConfigJSON = dockerConfigJSON
+		}
+	}
+
 	// Single-flight in-flight create check and idempotency under lock
 	s.mu.Lock()
 	if spec.PodUID != "" {
@@ -464,20 +501,21 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			cName = pod.Spec.Containers[0].Name
 		}
 		_ = s.runner.StartContainer(r.Context(), warmNode, &StartContainerRequest{
-			PodUID:        spec.PodUID,
-			Namespace:     spec.PodNamespace,
-			PodName:       spec.PodName,
-			ContainerName: cName,
-			Image:         spec.TargetContainerImage,
-			Command:       spec.Command,
-			Args:          spec.Args,
-			Env:           spec.Env,
-			CPUMillicores: cpuLimitMilli,
-			MemoryBytes:   memLimitBytes,
-			AssignedGPUs:  assignedGPUs,
-			AssignedTPUs:  assignedTPUs,
-			RunAsUser:     spec.RunAsUser,
-			RunAsGroup:    spec.RunAsGroup,
+			PodUID:           spec.PodUID,
+			Namespace:        spec.PodNamespace,
+			PodName:          spec.PodName,
+			ContainerName:    cName,
+			Image:            spec.TargetContainerImage,
+			Command:          spec.Command,
+			Args:             spec.Args,
+			Env:              spec.Env,
+			CPUMillicores:    cpuLimitMilli,
+			MemoryBytes:      memLimitBytes,
+			AssignedGPUs:     assignedGPUs,
+			AssignedTPUs:     assignedTPUs,
+			RunAsUser:        spec.RunAsUser,
+			RunAsGroup:       spec.RunAsGroup,
+			DockerConfigJSON: spec.DockerConfigJSON,
 		})
 
 		marketType := "on-demand"
@@ -559,6 +597,38 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	spec.RunnerAuthToken = tok
 
+	// Resolve KMS token encryption (AWS EC2 instances only, key taken strictly from provider configuration)
+	_, isAWS := prov.(*AWSProvider)
+	if !isAWS && spec != nil && strings.ToLower(spec.Provider) == "aws" {
+		isAWS = true
+	}
+	if isAWS && (s.kmsClient != nil || s.kmsKeyID != "") {
+		kmsKeyID := s.kmsKeyID
+		kmsClient := s.kmsClient
+		if kmsClient == nil {
+			region := spec.Region
+			if region == "" {
+				region = s.defaultRegion
+			}
+			var err error
+			kmsClient, err = NewKMSClientFromConfig(r.Context(), region)
+			if err != nil {
+				finalErr = fmt.Errorf("failed to initialize KMS client for region %s: %w", region, err)
+				http.Error(w, finalErr.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		ciphertext, err := EncryptRunnerToken(r.Context(), kmsClient, kmsKeyID, tok)
+		if err != nil {
+			finalErr = fmt.Errorf("failed to encrypt runner token with KMS key %s: %w", kmsKeyID, err)
+			http.Error(w, finalErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		spec.KMSEncryptedToken = true
+		spec.KMSKeyID = kmsKeyID
+		spec.KMSCiphertext = ciphertext
+	}
+
 	var preAssignedGPUs []int
 	for i := 0; i < spec.NumGPUs; i++ {
 		preAssignedGPUs = append(preAssignedGPUs, i)
@@ -612,22 +682,28 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
 		cName = pod.Spec.Containers[0].Name
 	}
-	_ = s.runner.StartContainer(r.Context(), newNode, &StartContainerRequest{
-		PodUID:        spec.PodUID,
-		Namespace:     spec.PodNamespace,
-		PodName:       spec.PodName,
-		ContainerName: cName,
-		Image:         spec.TargetContainerImage,
-		Command:       spec.Command,
-		Args:          spec.Args,
-		Env:           spec.Env,
-		CPUMillicores: reqVec.CPU.MilliValue(),
-		MemoryBytes:   reqVec.Memory.Value(),
-		AssignedGPUs:  gpus,
-		AssignedTPUs:  tpus,
-		RunAsUser:     spec.RunAsUser,
-		RunAsGroup:    spec.RunAsGroup,
-	})
+	startReq := &StartContainerRequest{
+		PodUID:           spec.PodUID,
+		Namespace:        spec.PodNamespace,
+		PodName:          spec.PodName,
+		ContainerName:    cName,
+		Image:            spec.TargetContainerImage,
+		Command:          spec.Command,
+		Args:             spec.Args,
+		Env:              spec.Env,
+		CPUMillicores:    reqVec.CPU.MilliValue(),
+		MemoryBytes:      reqVec.Memory.Value(),
+		AssignedGPUs:     gpus,
+		AssignedTPUs:     tpus,
+		RunAsUser:        spec.RunAsUser,
+		RunAsGroup:       spec.RunAsGroup,
+		DockerConfigJSON: spec.DockerConfigJSON,
+	}
+	startErr := s.runner.StartContainer(r.Context(), newNode, startReq)
+	if startErr != nil {
+		log.Printf("[cloudvm] Initial StartContainer call returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
+		go s.retryStartContainer(context.WithoutCancel(r.Context()), newNode, startReq) //nolint:gosec // detached background retry outlives HTTP request
+	}
 
 	s.mu.Lock()
 	if inst.Metadata == nil {
@@ -1117,4 +1193,57 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[cloudvm] Timed out waiting to start container for pod %s/%s on node %s: %v", req.Namespace, req.PodName, node.InstanceID, ctx.Err())
+			s.mu.Lock()
+			term := &ContainerTerminatedState{
+				ExitCode:   1,
+				Reason:     "StartError",
+				Message:    fmt.Sprintf("timed out waiting for in-VM runner on node %s: %v", node.InstanceID, ctx.Err()),
+				FinishedAt: time.Now(),
+			}
+			s.completedPods[req.PodUID] = term
+			if s.completedStore != nil {
+				_ = s.completedStore.Set(req.PodUID, &CompletedPodRecord{
+					PodUID:     req.PodUID,
+					ExitCode:   1,
+					Reason:     term.Reason,
+					Message:    term.Message,
+					FinishedAt: term.FinishedAt,
+				})
+			}
+			if s.nodePool != nil {
+				s.nodePool.MarkPodCompleted(req.PodUID, 1, "StartError", term.Message, term.FinishedAt)
+				s.nodePool.Cordon(node.InstanceID)
+			}
+			s.mu.Unlock()
+			return
+		case <-ticker.C:
+			s.mu.RLock()
+			tombstoned := s.isTombstonedLocked(req.PodUID)
+			s.mu.RUnlock()
+			if tombstoned {
+				log.Printf("[cloudvm] Pod %s was tombstoned while waiting to start container; aborting retry", req.PodUID)
+				return
+			}
+
+			err := s.runner.StartContainer(ctx, node, req)
+			if err == nil {
+				log.Printf("[cloudvm] Successfully started container for pod %s/%s on node %s", req.Namespace, req.PodName, node.InstanceID)
+				return
+			}
+			log.Printf("[cloudvm] Retrying StartContainer for pod %s/%s on node %s: %v", req.Namespace, req.PodName, node.InstanceID, err)
+		}
+	}
 }

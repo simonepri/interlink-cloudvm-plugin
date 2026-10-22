@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // ProviderType represents supported cloud providers.
@@ -108,8 +110,22 @@ type InstanceSpec struct {
 	ClusterTag string `json:"clusterTag,omitempty"`
 	// RunnerAuthToken is the shared bearer secret for the in-VM micro-runner daemon.
 	RunnerAuthToken string `json:"runnerAuthToken,omitempty"`
+	// KMSEncryptedToken indicates whether RunnerAuthToken is encrypted with AWS KMS.
+	KMSEncryptedToken bool `json:"kmsEncryptedToken,omitempty"`
+	// KMSKeyID specifies the AWS KMS key ARN or ID used to encrypt the runner token.
+	KMSKeyID string `json:"kmsKeyId,omitempty"`
+	// KMSCiphertext holds the base64-encoded KMS ciphertext for runner token bootstrap.
+	KMSCiphertext string `json:"kmsCiphertext,omitempty"`
+	// NumTPUs specifies the number of discrete Cloud TPU cores/slices requested.
+	NumTPUs int `json:"numTPUs,omitempty"`
+	// EnablePublicIP specifies whether a public NAT IP should be attached to the VM.
+	EnablePublicIP bool `json:"enablePublicIP,omitempty"`
+	// ServiceAccountScopes specifies OAuth2 scopes for the instance service account.
+	ServiceAccountScopes []string `json:"serviceAccountScopes,omitempty"`
 	// AssignedGPUs are the discrete GPU device indices allocated for the pod.
 	AssignedGPUs []int `json:"assignedGPUs,omitempty"`
+	// DockerConfigJSON holds the serialized .dockerconfigjson for private container registry authentication.
+	DockerConfigJSON string `json:"dockerConfigJSON,omitempty"`
 }
 
 // Instance represents an active or terminating cloud VM instance.
@@ -198,9 +214,10 @@ type ContainerSpec struct {
 }
 
 type PodSpecWrapper struct {
-	NodeSelector    map[string]string   `json:"nodeSelector,omitempty"`
-	Containers      []ContainerSpec     `json:"containers"`
-	SecurityContext *PodSecurityContext `json:"securityContext,omitempty"`
+	NodeSelector     map[string]string             `json:"nodeSelector,omitempty"`
+	Containers       []ContainerSpec               `json:"containers"`
+	SecurityContext  *PodSecurityContext           `json:"securityContext,omitempty"`
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
 // Pod represents the incoming pod definition from InterLink.

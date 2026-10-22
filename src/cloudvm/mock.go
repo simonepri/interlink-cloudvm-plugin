@@ -14,6 +14,14 @@ type MockProvider struct {
 	instances   map[string]*Instance
 	counter     int
 	terminateFn func(ctx context.Context, instanceID string) error
+	lastSpec    *InstanceSpec
+}
+
+// LastSpec returns the most recent InstanceSpec passed to Launch.
+func (m *MockProvider) LastSpec() *InstanceSpec {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastSpec
 }
 
 // NewMockProvider creates an initialized MockProvider.
@@ -26,6 +34,7 @@ func NewMockProvider() *MockProvider {
 func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.lastSpec = spec
 
 	m.counter++
 	id := fmt.Sprintf("i-mock-%04d", m.counter)
