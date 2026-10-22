@@ -52,6 +52,8 @@ type InstanceSpec struct {
 	MaxSpotPrice string `json:"maxSpotPrice,omitempty"`
 	// PricePolicy specifies "fail-fast" or "wait" when price exceeds cap.
 	PricePolicy string `json:"pricePolicy,omitempty"`
+	// MaxEgressRate defines maximum allowed egress spend rate in USD/hr (e.g. "0.50").
+	MaxEgressRate string `json:"maxEgressRate,omitempty"`
 	// EgressBandwidth specifies the rate limit (e.g. "100Mbps", "1Gbps").
 	EgressBandwidth string `json:"egressBandwidth,omitempty"`
 	// EgressBurst specifies the token bucket burst size (e.g. "10MB").

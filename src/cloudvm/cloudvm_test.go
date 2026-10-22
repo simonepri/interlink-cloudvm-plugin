@@ -222,3 +222,51 @@ func TestCloudInit_EgressRateLimiting(t *testing.T) {
 		t.Errorf("cloud-init missing expected tc rate limiting command, got:\n%s", script)
 	}
 }
+
+func TestEgressRateToBandwidthCalculation(t *testing.T) {
+	// $0.90/hr on AWS ($0.09/GB) should yield ~22mbit
+	bwAWS := EgressRateToBandwidth(0.90, "aws")
+	if bwAWS != "22mbit" {
+		t.Errorf("expected 22mbit for $0.90/hr on AWS, got %s", bwAWS)
+	}
+
+	// $4.05/hr on AWS should yield ~100mbit
+	bw100 := EgressRateToBandwidth(4.05, "aws")
+	if bw100 != "100mbit" {
+		t.Errorf("expected 100mbit for $4.05/hr on AWS, got %s", bw100)
+	}
+
+	// $0.85/hr on GCP ($0.085/GB) should yield ~22mbit
+	bwGCP := EgressRateToBandwidth(0.85, "gcp")
+	if bwGCP != "22mbit" {
+		t.Errorf("expected 22mbit for $0.85/hr on GCP, got %s", bwGCP)
+	}
+}
+
+func TestPodToInstanceSpec_MaxEgressRateDollarConversion(t *testing.T) {
+	pod := &Pod{
+		Metadata: PodMeta{
+			Name:      "test-dollar-egress",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"cloudvm.vk.io/max-egress-rate": "$0.90",
+			},
+		},
+		Spec: PodSpecWrapper{
+			Containers: []ContainerSpec{
+				{Name: "worker", Image: "test:latest"},
+			},
+		},
+	}
+
+	spec := PodToInstanceSpec(pod, "cluster-1")
+	if spec.MaxEgressRate != "$0.90" {
+		t.Errorf("expected MaxEgressRate $0.90, got %s", spec.MaxEgressRate)
+	}
+	if spec.EgressBandwidth != "22mbit" {
+		t.Errorf("expected calculated EgressBandwidth 22mbit, got %s", spec.EgressBandwidth)
+	}
+	if spec.EgressBurst != "100mb" {
+		t.Errorf("expected default burst 100mb, got %s", spec.EgressBurst)
+	}
+}

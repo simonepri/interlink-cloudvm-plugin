@@ -90,8 +90,8 @@ To deliver this, `interlink-provider-cloudvm` is built on four core internal eng
 
 1. **Fleet Capacity Engine (Spot & On-Demand)**: Translates pod resource requirements into multi-family weighted fleet requests (`CreateFleet` / `bulkInsert`) across both Spot and On-Demand pools, with native hourly price capping (`cloudvm.vk.io/max-price`).
 2. **Backpressure & Orchestrator Feedback Loop**: Emits real-time scheduling conditions (`CapacityExhausted`, `PriceCapExceeded`) back to Kubernetes, driving upstream multi-flavor fallback (Spot → On-Demand) and queue backoff in Kueue and cluster autoscalers.
-3. **In-VM Ephemeral Bootstrap, Watchdogs & Traffic Shaping**: A hardened cloud-init engine providing fast native boot (~33s), P2P WireGuard mesh networking, a 2-minute preemption watcher, a 300s fail-safe watchdog, and kernel-level network egress rate limiting with token bucketing (Linux `tc`).
-4. **Bidirectional Reconciler**: A background garbage collector that terminates orphan/zombie cloud VMs if pods vanish, and evicts pods from Kubernetes if cloud instances are preempted.
+3. **Hourly Spend Governors & Traffic Shaping**: Symmetrical burn-rate enforcement in `$/hr` for both Compute (`cloudvm.vk.io/max-price`) and Network Egress (`cloudvm.vk.io/max-egress-rate`). Translates authorized egress dollars directly into kernel-level Token Bucket Filters (Linux `tc`), permitting native line-rate bursts while pacing sustained egress to avoid runaway bandwidth bills.
+4. **Bidirectional Reconciler & FinOps Accounting**: A background reconciler that garbage collects zombie instances, synchronizes status, and maps cloud costs to Kubernetes pods for full **OpenCost** FinOps visibility.
 
 ---
 
@@ -175,25 +175,35 @@ To guard against spot pricing spikes, jobs specify a hard price ceiling and reac
 
 ---
 
-### C. Network Egress Rate Limiting & Token Bucketing
+### C. Network Egress Spend Governor ($/hr) & Token Bucketing
 
-Data egress from public clouds (AWS/GCP) is costly ($0.08–$0.12/GB). `interlink-provider-cloudvm` provides kernel-level egress traffic shaping with token-bucket filtering:
+Unrestricted cloud data egress ($0.08–$0.12/GB on AWS/GCP) can quickly outpace compute costs. A single instance saturating a 10 Gbps pipe can incur over **$400/hour** in egress fees alone. Rather than imposing arbitrary speed limits that throttle performance during short checkpoint saves, `interlink-provider-cloudvm` enforces **Egress Spend Rate Governance ($/hr)**.
 
-- `cloudvm.vk.io/egress-bandwidth: "100Mbps"` (or standard `kubernetes.io/egress-bandwidth`)
-- `cloudvm.vk.io/egress-burst: "15MB"` (Token bucket burst capacity)
+```yaml
+metadata:
+  annotations:
+    # Maximum authorized network egress spend rate in USD/hr
+    cloudvm.vk.io/max-egress-rate: "$0.50"
 
-#### Architectural Advantage: Selective Shaping
-During VM bootstrap, `cloud-init` applies Linux Traffic Control (`tc`) with a **Token Bucket Filter (TBF)** directly to the primary network interface (`eth0`):
-
-```bash
-tc qdisc add dev eth0 root tbf rate 100Mbps burst 15MB latency 50ms
+    # Optional overrides for raw network bandwidth & burst
+    cloudvm.vk.io/egress-bandwidth: "100Mbps"  # or kubernetes.io/egress-bandwidth
+    cloudvm.vk.io/egress-burst: "100mb"        # Default burst allowance for checkpoints
 ```
 
-- **Internet & Cloud Egress (`eth0`)**: Enforces rate limiting with token-bucket burst smoothing, preventing bandwidth hogging and runaway transfer bills.
-- **Cluster Mesh (`wg0` / `tailscale0`)**: Exempt from rate limiting. Worker-to-head Ray communication, distributed training parameter rings, and P2P layer caching operate at full line rate (10–25 Gbps).
+#### How the Egress Spend Governor Works:
+1. **Dynamic Dollar-to-Token Rate Translation**:
+   The provider automatically translates your hourly budget ceiling into a kernel-level token rate based on the target cloud's egress pricing catalog ($0.09/GB on AWS, $0.085/GB on GCP):
+   $$\text{Sustained Rate} = \frac{\text{MaxEgressRate (\$/hr)}}{\text{CostPerGB}} \times \frac{8 \text{ bits}}{\text{Byte}}$$
+   For example, `$0.90/hr` on AWS configures a sustained rate of **`22mbit`**.
+2. **Instant Line-Rate Bursts**:
+   The Token Bucket Filter is configured with a generous burst capacity (`100mb`). When a workload uploads periodic checkpoints or model weights, packets transfer at full **10 Gbps line speed** without penalty until tokens are depleted.
+3. **Pacing Sustained Streams**:
+   If an uncompressed dataset stream or rogue process attempts continuous high-speed egress, the kernel smoothly paces the traffic down to the authorized hourly spend rate. Compute is never killed, work is preserved, and your cloud bill is protected.
+4. **Selective Interface Shaping**:
+   Shaping is bound strictly to the primary cloud interface (`eth0`). Internal cluster mesh traffic (`wg0` / `tailscale0`) has zero dollar cost and remains completely unthrottled at full physical wire speed.
 
-#### Comparison with SkyPilot Egress Handling
-In SkyPilot, egress management is primarily focused on **smart placement to eliminate egress fees** (scheduling compute in the exact region/cloud where data buckets reside) and **tool-level throttling** (passing `--bwlimit` to `rsync` or `rclone`). SkyPilot does not provide an automated OS kernel-level token bucket filter. `interlink-provider-cloudvm` integrates both kernel-level `tc` traffic shaping on the host and native Kubernetes `kubernetes.io/egress-bandwidth` annotation compatibility.
+#### Comparison with SkyPilot Egress Handling:
+SkyPilot addresses egress primarily via **smart placement** (co-locating compute in the region where data storage lives) and **application-level flags** (passing `--bwlimit` to `rsync` or `rclone`). SkyPilot does not provide host-level token bucket filters or dollar-based egress rate governance. `interlink-provider-cloudvm` combines native Kubernetes annotation compatibility with kernel-level traffic control.
 
 ---
 
@@ -326,12 +336,53 @@ flowchart TD
 | **Parca** | Parca DaemonSet with host eBPF | Runs as systemd service with eBPF enabled on VM kernel | Continuously pushes pprof profiles over mesh $\\to$ central Parca server. |
 | **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP $\\to$ central `falcosidekick`. |
 | **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs $\\to$ avoids registry rate-limits. |
+| **OpenCost / Kubecost** | cAdvisor / NodeExporter DaemonSet | Cloud resource tagging + CUR billing reconciliation + Virtual-Kubelet status pricing | Tags instances with `PodName`/`Namespace` $\\to$ OpenCost attributes out-of-cluster cloud bills to K8s workloads. |
 
 ### Golden AMI vs. Dynamic Cloud-Init Injection
 
 To maintain the **~33-second cold-start**, daemons can be packaged in two ways:
 1. **Pre-baked Golden AMI (Recommended for Production)**: Tools (Parca, Falco, Dragonfly) are pre-installed into custom AMIs via Packer. The VM boots with all binaries and kernel eBPF probes already on disk—zero network downloads at runtime.
 2. **Cloud-Init Systemd Hooks**: Lightweight binaries or systemd units are launched dynamically at boot through cloud-init user-data scripts.
+
+### OpenCost & FinOps Cost Allocation (Outside Kubernetes)
+
+A major challenge with virtual nodes and off-cluster cloud VMs is that traditional Kubernetes cost monitoring tools (such as **OpenCost** and **Kubecost**) rely on Kubernetes metrics APIs (`cadvisor` / `kubelet`) running directly on physical worker nodes. Because CloudVM instances run outside the Kubernetes node boundary, standard daemonsets cannot scrape their container cgroups.
+
+`interlink-provider-cloudvm` provides seamless OpenCost and FinOps integration through three coordinated mechanisms:
+
+```mermaid
+flowchart LR
+    classDef pod fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
+    classDef driver fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
+    classDef cloud fill:#0C4A6E,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
+    classDef opencost fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
+
+    Pod["Kubernetes Pod
+(Namespace, Job, Team)"]:::pod
+    --> Driver["interlink-provider-cloudvm"]:::driver
+    Driver -->|1. Injects Bidding Tags| Cloud["AWS EC2 / GCP VM
+Tags: PodName, Namespace,
+ClusterTag, JobID"]:::cloud
+    Cloud -->|2. CUR / Billing Export| OpenCost["OpenCost / Kubecost
+Cloud Billing Reconciler"]:::opencost
+    Driver -->|3. Reflects Accurate Spot Price| OpenCost
+```
+
+#### 1. Bidirectional Resource Tagging (Cloud Billing Export)
+When launching an EC2 Fleet or GCP bulk insert, `interlink-provider-cloudvm` stamps native cloud resource tags onto every instance and attached EBS volume:
+- `ManagedBy: interlink-provider-cloudvm`
+- `ClusterTag: <cluster-name>`
+- `PodName: <pod-metadata-name>`
+- `Namespace: <pod-metadata-namespace>`
+- `CostCenter: <inherited-annotation>`
+
+OpenCost's **Cloud Cost Reconciliation** pipeline ingests the AWS Cost and Usage Report (CUR) and GCP Cloud Billing BigQuery export. By matching the instance's `PodName` and `Namespace` tags, OpenCost automatically attributes 100% of out-of-cluster spot/on-demand VM compute and disk spend directly to the corresponding Kubernetes Namespace, Service, or Kueue Workload.
+
+#### 2. Virtual-Kubelet Pod Resource Pricing
+For real-time in-cluster cost estimation (before billing exports finalize 24 hours later), the provider surfaces the exact negotiated spot bid and instance type back to the Virtual-Kubelet node status. OpenCost reads the pod's declared CPU, GPU, and Memory limits against the real-time spot pricing model, accurately allocating costs across teams and jobs.
+
+#### 3. Network Egress Cost Tracking
+Because public egress flows across the shaped `eth0` interface, the VM's OTEL host agent or OBI eBPF probes stream total transmitted bytes (`obi.network.flow.bytes` and `node_network_transmit_bytes_total`) tagged with the pod name over the private mesh. OpenCost aggregates these metrics with cloud provider egress pricing tables to show precise network spend per pod.
 
 ### Why Ephemeral VMs Offer Stronger Security (Falco & eBPF)
 On a multi-tenant Kubernetes worker node, a compromised container sharing the node kernel poses a risk to neighboring pods. With 1:1 ephemeral VMs:

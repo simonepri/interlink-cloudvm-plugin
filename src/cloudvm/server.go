@@ -14,6 +14,24 @@ import (
 	"time"
 )
 
+// EgressRateToBandwidth converts an hourly budget in USD/hr to an equivalent network rate string (e.g. "22mbit").
+// Uses provider baseline egress rates ($0.09/GB for AWS, $0.085/GB for GCP).
+func EgressRateToBandwidth(dollarPerHour float64, provider string) string {
+	if dollarPerHour <= 0 {
+		return ""
+	}
+	costPerGB := 0.09 // default AWS
+	if strings.EqualFold(provider, "gcp") {
+		costPerGB = 0.085
+	}
+	// Megabits per second = (GB/hr * 8 * 1000) / 3600
+	mbps := (dollarPerHour / costPerGB) * 8000.0 / 3600.0
+	if mbps < 1.0 {
+		return fmt.Sprintf("%dkbit", int(mbps*1000))
+	}
+	return fmt.Sprintf("%dmbit", int(mbps))
+}
+
 // Server implements the InterLink REST API for the cloudvm provider plugin.
 type Server struct {
 	mu          sync.RWMutex
@@ -130,12 +148,24 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		pricePolicy = "fail-fast"
 	}
 
-	// 6. Network Egress Rate Limiting (Token Bucket Filter)
+	// 6. Network Egress Rate Limiting (Token Bucket Filter via rate or dollar/hr spend)
+	maxEgressRate := pod.Metadata.Annotations["cloudvm.vk.io/max-egress-rate"]
 	egressBandwidth := pod.Metadata.Annotations["cloudvm.vk.io/egress-bandwidth"]
 	if egressBandwidth == "" {
 		egressBandwidth = pod.Metadata.Annotations["kubernetes.io/egress-bandwidth"]
 	}
 	egressBurst := pod.Metadata.Annotations["cloudvm.vk.io/egress-burst"]
+
+	// If dollar/hr rate is configured and raw bandwidth is omitted, calculate equivalent token rate
+	if maxEgressRate != "" && egressBandwidth == "" {
+		clean := strings.TrimPrefix(strings.TrimSpace(maxEgressRate), "$")
+		if rateVal, err := strconv.ParseFloat(clean, 64); err == nil && rateVal > 0 {
+			egressBandwidth = EgressRateToBandwidth(rateVal, "aws")
+			if egressBurst == "" {
+				egressBurst = "100mb" // generous burst allowance for checkpoints
+			}
+		}
+	}
 
 	var targetImage string
 	var command []string
@@ -185,6 +215,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string) *InstanceSpec {
 		MaxPrice:             maxPrice,
 		MaxSpotPrice:         maxPrice,
 		PricePolicy:          pricePolicy,
+		MaxEgressRate:        maxEgressRate,
 		EgressBandwidth:      egressBandwidth,
 		EgressBurst:          egressBurst,
 		NumGPUs:              numGPUs,
