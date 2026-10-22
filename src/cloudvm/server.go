@@ -746,6 +746,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, finalErr.Error(), http.StatusInternalServerError)
 		return
 	}
+	if inst.Metadata == nil {
+		inst.Metadata = make(map[string]string)
+	}
+	inst.Metadata["marketType"] = spec.MarketType
 	if s.tokenStore != nil && spec.RunnerAuthToken != "" {
 		_ = s.tokenStore.Set(inst.ID, spec.RunnerAuthToken)
 	}
@@ -1305,13 +1309,33 @@ func (s *Server) ActiveInstances() map[string]*Instance {
 	return out
 }
 
-// GetActivePods returns a map of active pod keys known to the server.
+// GetActivePods returns a map of genuinely active (running/pending) pod UIDs to their cloud instance IDs.
 func (s *Server) GetActivePods(_ context.Context) (map[string]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	res := make(map[string]string)
 	for k, inst := range s.instances {
-		res[k] = inst.ID
+		if inst == nil {
+			continue
+		}
+		uid := k
+		if inst.Metadata != nil && inst.Metadata["podUID"] != "" {
+			uid = inst.Metadata["podUID"]
+		}
+		// If pod is already recorded completed or terminated, skip it!
+		if s.completedPods[uid] != nil || (s.completedStore != nil && s.completedStore.Get(uid) != nil) {
+			continue
+		}
+		// Check nodepool allocation completion
+		if s.nodePool != nil {
+			if _, alloc, found := s.nodePool.FindPodNode(uid); found && alloc.Completed {
+				continue
+			}
+		}
+		// Only track active running or provisioning instances
+		if inst.State == StateRunning || inst.State == StateProvisioning {
+			res[uid] = inst.ID
+		}
 	}
 	return res, nil
 }
@@ -1333,6 +1357,29 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 	if uid == "" {
 		uid = podKey
 	}
+
+	// 1. Guard against overwriting successful completed pods
+	if existing := s.completedPods[uid]; existing != nil && existing.Reason == "Completed" {
+		return nil
+	}
+	if s.completedStore != nil {
+		if rec := s.completedStore.Get(uid); rec != nil && rec.Reason == "Completed" {
+			return nil
+		}
+	}
+
+	// 2. Guard against idempotent duplicate calls on already-failed pods
+	if existing := s.completedPods[uid]; existing != nil && (existing.Reason == "SpotInterruption" || existing.Reason == "NodeLost") {
+		return nil
+	}
+
+	// 3. Distinguish SpotInterruption vs NodeLost
+	if reason == "SpotInterruption" && inst != nil && inst.Metadata != nil {
+		if inst.Metadata["marketType"] == "on-demand" {
+			reason = "NodeLost"
+		}
+	}
+
 	if inst != nil {
 		inst.State = StateFailed
 		if inst.Metadata == nil {
@@ -1353,7 +1400,6 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 		FinishedAt: finAt,
 	}
 	s.completedPods[uid] = term
-	s.completedPods[podKey] = term
 
 	if s.nodePool != nil {
 		s.nodePool.MarkPodCompleted(uid, exitCode, reason, term.Message, finAt)

@@ -502,71 +502,92 @@ func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance,
 }
 
 func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string) ([]*Instance, error) {
-	client, err := p.getClient(ctx, p.Region)
-	if err != nil {
-		return nil, err
+	p.mu.RLock()
+	regionsMap := make(map[string]bool)
+	if p.Region != "" {
+		regionsMap[p.Region] = true
 	}
-	out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-		Filters: []ec2types.Filter{
-			{
-				Name:   aws.String("tag:ClusterTag"),
-				Values: []string{clusterTag},
-			},
-			{
-				Name:   aws.String("instance-state-name"),
-				Values: []string{"pending", "running"},
-			},
-		},
-	})
-	if err != nil {
-		return nil, err
+	for _, reg := range p.instanceRegions {
+		if reg != "" {
+			regionsMap[reg] = true
+		}
 	}
+	p.mu.RUnlock()
 
 	var instances []*Instance
-	for _, res := range out.Reservations {
-		for _, inst := range res.Instances {
-			podName := ""
-			podNamespace := "default"
-			podUID := ""
-			runnerToken := ""
-			for _, tag := range inst.Tags {
-				k := aws.ToString(tag.Key)
-				v := aws.ToString(tag.Value)
-				switch k {
-				case "PodName":
-					podName = v
-				case "Namespace":
-					podNamespace = v
-				case "PodUID":
-					podUID = v
-				case "RunnerToken":
-					runnerToken = v
-				}
-			}
-			instID := aws.ToString(inst.InstanceId)
-			p.mu.Lock()
-			if p.instanceRegions == nil {
-				p.instanceRegions = make(map[string]string)
-			}
-			p.instanceRegions[instID] = p.Region
-			p.mu.Unlock()
-
-			instances = append(instances, &Instance{
-				ID:           instID,
-				Provider:     ProviderAWS,
-				Region:       p.Region,
-				InstanceType: string(inst.InstanceType),
-				IP:           aws.ToString(inst.PrivateIpAddress),
-				State:        StateRunning,
-				CreatedAt:    aws.ToTime(inst.LaunchTime),
-				Metadata: map[string]string{
-					"podName":     podName,
-					"namespace":   podNamespace,
-					"podUID":      podUID,
-					"runnerToken": runnerToken,
-				},
-			})
+	var lastErr error
+	for reg := range regionsMap {
+		client, err := p.getClient(ctx, reg)
+		if err != nil {
+			lastErr = err
+			continue
 		}
+		out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+			Filters: []ec2types.Filter{
+				{
+					Name:   aws.String("tag:ClusterTag"),
+					Values: []string{clusterTag},
+				},
+				{
+					Name:   aws.String("instance-state-name"),
+					Values: []string{"pending", "running"},
+				},
+			},
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		for _, res := range out.Reservations {
+			for _, inst := range res.Instances {
+				podName := ""
+				podNamespace := "default"
+				podUID := ""
+				runnerToken := ""
+				for _, tag := range inst.Tags {
+					k := aws.ToString(tag.Key)
+					v := aws.ToString(tag.Value)
+					switch k {
+					case "PodName":
+						podName = v
+					case "Namespace":
+						podNamespace = v
+					case "PodUID":
+						podUID = v
+					case "RunnerToken":
+						runnerToken = v
+					}
+				}
+				instID := aws.ToString(inst.InstanceId)
+				p.mu.Lock()
+				if p.instanceRegions == nil {
+					p.instanceRegions = make(map[string]string)
+				}
+				p.instanceRegions[instID] = reg
+				p.mu.Unlock()
+
+				instances = append(instances, &Instance{
+					ID:           instID,
+					Provider:     ProviderAWS,
+					Region:       reg,
+					InstanceType: string(inst.InstanceType),
+					IP:           aws.ToString(inst.PrivateIpAddress),
+					State:        StateRunning,
+					CreatedAt:    aws.ToTime(inst.LaunchTime),
+					Metadata: map[string]string{
+						"podName":     podName,
+						"namespace":   podNamespace,
+						"podUID":      podUID,
+						"clusterTag":  clusterTag,
+						"runnerToken": runnerToken,
+					},
+				})
+			}
+		}
+	}
+	if len(instances) == 0 && lastErr != nil {
+		return nil, lastErr
 	}
 	return instances, nil
 }

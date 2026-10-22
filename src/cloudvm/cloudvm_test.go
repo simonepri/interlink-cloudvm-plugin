@@ -1630,3 +1630,101 @@ func TestReconciler_SpotInterruptionMarksPodFailed(t *testing.T) {
 		t.Fatalf("expected exit code 137, got %d", cStatus.State.Terminated.ExitCode)
 	}
 }
+
+func TestReconciler_CompletedCotenantNotOverwritten(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-cotenant")
+
+	// Pod 1
+	p1 := &Pod{
+		Metadata: PodMeta{Name: "cotenant-1", Namespace: "default", UID: "uid-cot-1"},
+		Spec: PodSpecWrapper{
+			Containers: []ContainerSpec{{Name: "main", Image: "alpine"}},
+		},
+	}
+	body1, _ := json.Marshal(p1)
+	w1 := httptest.NewRecorder()
+	srv.handleCreate(w1, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body1)))
+	if w1.Code != http.StatusOK {
+		t.Fatalf("failed to create pod 1: %d", w1.Code)
+	}
+
+	var res1 CreateStruct
+	_ = json.NewDecoder(w1.Body).Decode(&res1)
+	instID := strings.Split(res1.PodJID, ":")[0]
+
+	// Mark pod 1 as completed successfully
+	term1 := &ContainerTerminatedState{
+		ExitCode:   0,
+		Reason:     "Completed",
+		Message:    "job succeeded",
+		FinishedAt: time.Now().Add(-10 * time.Minute),
+	}
+	srv.mu.Lock()
+	srv.completedPods["uid-cot-1"] = term1
+	srv.mu.Unlock()
+	_ = srv.completedStore.Set("uid-cot-1", &CompletedPodRecord{
+		PodUID:     "uid-cot-1",
+		ExitCode:   0,
+		Reason:     "Completed",
+		Message:    "job succeeded",
+		FinishedAt: term1.FinishedAt,
+	})
+
+	// Pod 2 on the same instance
+	p2 := &Pod{
+		Metadata: PodMeta{Name: "cotenant-2", Namespace: "default", UID: "uid-cot-2"},
+		Spec: PodSpecWrapper{
+			Containers: []ContainerSpec{{Name: "main", Image: "alpine"}},
+		},
+	}
+	body2, _ := json.Marshal(p2)
+	w2 := httptest.NewRecorder()
+	srv.handleCreate(w2, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body2)))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("failed to create pod 2: %d", w2.Code)
+	}
+
+	// Terminate the shared VM in cloud provider
+	if err := mock.Terminate(context.Background(), instID); err != nil {
+		t.Fatalf("failed to terminate instance: %v", err)
+	}
+
+	// Run ReconcileOnce
+	reconciler := NewReconciler(mock, srv, mock, "cluster-cotenant", 10*time.Minute)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+
+	// Succeeded pod 1 must NOT be in EvictedPods
+	for _, evicted := range result.EvictedPods {
+		if evicted == "uid-cot-1" {
+			t.Fatalf("succeeded pod uid-cot-1 was erroneously evicted!")
+		}
+	}
+
+	// Verify pod 1 status is STILL Completed
+	rec1 := srv.completedStore.Get("uid-cot-1")
+	if rec1 == nil || rec1.Reason != "Completed" || rec1.ExitCode != 0 {
+		t.Fatalf("completed record for pod 1 was overwritten: %+v", rec1)
+	}
+
+	// Verify pod 2 status is SpotInterruption
+	rec2 := srv.completedStore.Get("uid-cot-2")
+	if rec2 == nil || rec2.Reason != "SpotInterruption" || rec2.ExitCode != 137 {
+		t.Fatalf("expected pod 2 to be marked SpotInterruption, got: %+v", rec2)
+	}
+
+	// Run a second reconcile pass: verify it is idempotent and does not re-evict
+	result2, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("second reconcile failed: %v", err)
+	}
+	if len(result2.EvictedPods) != 0 {
+		t.Fatalf("second reconcile pass re-evicted pods: %v", result2.EvictedPods)
+	}
+}

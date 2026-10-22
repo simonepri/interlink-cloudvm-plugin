@@ -42,6 +42,7 @@ func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance,
 			"podUID":      spec.PodUID,
 			"clusterTag":  spec.ClusterTag,
 			"runnerToken": spec.RunnerAuthToken,
+			"marketType":  spec.MarketType,
 		},
 	}
 	m.instances[id] = inst
