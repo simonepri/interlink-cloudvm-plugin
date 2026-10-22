@@ -36,11 +36,11 @@
 
 ---
 
-## 1. High-Level Concept
+## Overview
 
-`interlink-provider-cloudvm` is an open-source provider plugin for **[CNCF InterLink](https://github.com/interlink-hq/interLink)**.
+`interlink-provider-cloudvm` is a **[CNCF InterLink](https://github.com/interlink-hq/interLink)** provider plugin that lets a Kubernetes cluster burst pods directly onto ephemeral cloud VMs across regions and cloud providers.
 
-Its primary purpose is to solve the **Spot GPU bottleneck** in Kubernetes: allowing clusters to tap into global, multi-region spot and on-demand GPU fleets (e.g. NVIDIA A10G, L4, L40S, H100) with zero local node-pool overhead. It also supports general-purpose CPU batch workloads (such as data preprocessing, ETL, and Ray data pipelines).
+When a single region runs out of spot GPUs (A10G, L4, L40S, H100), in-cluster autoscalers get stuck in `Pending` because they can only launch nodes inside the local cluster VPC. `interlink-provider-cloudvm` bypasses that limit by turning scheduled pods into standalone EC2 Fleet or GCP Compute Engine requests in any target region, connecting the VM back to the cluster over a private WireGuard mesh.
 
 ```mermaid
 flowchart LR
@@ -48,68 +48,62 @@ flowchart LR
     classDef plugin fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
     classDef cloud fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
 
-    A["1. Kubernetes Workload
-(Ray / PyTorch / Pod)"]:::k8s 
+    A["1. Kubernetes Pod
+(Ray / PyTorch / Batch)"]:::k8s 
     -->|"Schedules on
 virtual-node"| B["2. interlink-provider-cloudvm
-(CNCF InterLink Plugin)"]:::plugin
-    -->|"Provisions 1:1 Cloud VM
+(InterLink Plugin)"]:::plugin
+    -->|"Launches 1:1 VM
 (AWS Fleet / GCP Bulk)"| C["3. Ephemeral Cloud VM
-(Runs workload & terminates)"]:::cloud
+(Runs workload & powers off)"]:::cloud
 ```
 
-### Extending Kubernetes: In-Cluster vs. Global Burst
+### In-Cluster Autoscaling vs. Virtual Bursting
 
-`interlink-provider-cloudvm` does not replace Kubernetes or in-cluster node autoscalers like Karpenter; it **extends** them. A common production pattern is a hybrid topology:
-- **In-Cluster Nodes (Karpenter)**: Manages local persistent infrastructure (Ray head, Kueue queues, databases, web ingress, intra-VPC low latency services).
-- **Virtual Burst Nodes (`interlink-provider-cloudvm`)**: Absorbs elastic, large-scale GPU/TPU batch computing across spot markets globally whenever local capacity is constrained.
+Most setups run both side-by-side:
+- **In-Cluster Nodes (Karpenter / Cluster Autoscaler)**: Run persistent services, Ray head nodes, Kueue controllers, databases, and low-latency workloads inside the cluster VPC.
+- **Burst Virtual Nodes (`interlink-provider-cloudvm`)**: Run stateless GPU/CPU batch jobs across external regions and spot pools when local capacity is full or too expensive.
 
-| Capability | In-Cluster Autoscaler (Karpenter) | `interlink-provider-cloudvm` (Burst Engine) |
+| Capability | In-Cluster Autoscaler (Karpenter) | `interlink-provider-cloudvm` |
 | :--- | :---: | :---: |
-| **Primary Role** | In-cluster microservices & local steady-state | Ephemeral multi-region & multi-cloud burst |
-| **Geographic Scope** | ❌ Single VPC & region | ✅ Global fleet across regions & clouds |
-| **Spot Arbitrage** | ❌ Local AZ pools only | ✅ Multi-region price/capacity solver |
-| **Node Join Overhead** | ⚠️ 2–4 min (Kubelet, CNI, DaemonSets) | ✅ Instant (boots directly into container) |
-| **Cluster Impact** | ⚠️ `Node` in etcd + DaemonSets + VPC IPs | ✅ Zero (single static virtual node) |
-| **Isolation Boundary** | ⚠️ Shared host kernel across pods | ✅ Dedicated hardware hypervisor per job |
-| **Stateful Storage (CSI/PVC)** | ✅ Native EBS / CSI support | ❌ Object storage / network mounts (S3/GCS) |
-| **Idle Cost Baseline** | Scale-down delays & consolidation cooldown | **`$0`** (VM terminates immediately on exit) |
+| **Primary Role** | Local steady-state & stateful services | Multi-region & multi-cloud batch burst |
+| **Geographic Scope** | ❌ Single VPC & region | ✅ Any region or cloud via WireGuard |
+| **Spot Pool Access** | ❌ Local AZs only | ✅ Cross-region price & capacity arbitrage |
+| **Node Bootstrap** | ⚠️ Kubelet join + CNI + DaemonSets | ✅ Boots straight into workload |
+| **Cluster Overhead** | ⚠️ `Node` object in etcd + VPC IPs | ✅ Single static virtual node, 0 VPC IPs |
+| **Isolation** | ⚠️ Shared host kernel across pods | ✅ Dedicated VM hypervisor per job |
+| **Persistent Volumes (CSI)** | ✅ Native EBS / CSI mounts | ❌ S3 / GCS / FUSE mounts only |
+| **Idle Cost** | Consolidation & scale-down cooldown | **`$0`** (VM powers off on process exit) |
 
 ---
 
-## 2. How It Works (Step-by-Step)
-
-A workload progresses through three stages:
+## Architecture
 
 ```mermaid
 flowchart LR
     classDef stage fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
 
-    S1["<b>1. Scheduling</b><br>Workload schedules onto<br>virtual-node via Kueue / Ray"]:::stage
-    --> S2["<b>2. Bidding</b><br>Solver selects equivalent shapes<br>& invokes EC2 Fleet API"]:::stage
-    --> S3["<b>3. Execution</b><br>VM boots, runs workload,<br>and terminates upon completion"]:::stage
+    S1["<b>1. Schedule</b><br>Pod binds to virtual-node<br>via Kueue or Ray"]:::stage
+    --> S2["<b>2. Bid</b><br>Solver picks candidate shapes<br>& calls EC2 Fleet / GCP API"]:::stage
+    --> S3["<b>3. Run</b><br>VM joins mesh, runs container,<br>and terminates on exit"]:::stage
 ```
 
-### Core Architecture
+The provider consists of four main components:
 
-`interlink-provider-cloudvm` is built on four core components:
-
-1. **Fleet Capacity Engine (Spot & On-Demand)**: Translates pod resource requirements into single-instance fleet requests (`CreateFleet` / `bulkInsert`) across diversified equivalent candidate shapes, supporting native hourly price caps (`cloudvm.vk.io/max-price`).
-2. **Backpressure & Orchestrator Feedback Loop**: Emits real-time scheduling conditions (`CapacityExhausted`, `PriceCapExceeded`) back to Kubernetes, driving upstream multi-flavor fallback (Spot → On-Demand) and queue backoff in Kueue.
-3. **Hourly Spend Governors & Traffic Shaping**: Burn-rate enforcement in `USD/hr` for both Compute (`cloudvm.vk.io/max-price`) and Network Egress (`cloudvm.vk.io/max-egress-rate`). Translates authorized egress dollars directly into kernel-level Token Bucket Filters (Linux `tc`), permitting burst transfers while pacing sustained egress to avoid runaway bandwidth bills.
-4. **Bidirectional Reconciler & FinOps Accounting**: A background loop that garbage collects zombie instances, synchronizes status, and maps cloud costs to Kubernetes pods for **OpenCost** FinOps visibility.
+1. **Fleet Solver**: Maps pod resource requests (`nvidia.com/gpu`, CPU, memory) to equivalent cloud instance types (`CreateFleet` on AWS, `bulkInsert` on GCP) with optional hourly price caps (`cloudvm.vk.io/max-price`).
+2. **Backpressure Loop**: Returns capacity status (`CapacityExhausted`, `PriceCapExceeded`) to Kubernetes so job queues like Kueue can fall back to on-demand or another region.
+3. **Egress Spend Governor**: Converts an hourly dollar budget (`cloudvm.vk.io/max-egress-rate: "$0.50"`) into a Linux `tc` Token Bucket Filter on `eth0`, throttling public internet egress while leaving private mesh traffic untouched.
+4. **Reconciler & Cost Tagging**: Polls cloud APIs every 60s to clean up orphaned VMs, update pod states on spot preemption, and tag instances/EBS volumes for OpenCost billing reports.
 
 ---
 
-## 3. Subsystem Deep Dives
+## Core Subsystems
 
-### A. Spot Portfolio Solver & Single-Instance Fleet Allocation
+### 1. Spot Fleet Bidding
 
-In `interlink-provider-cloudvm`, **1 Pod = 1 Dedicated Cloud VM**.
+Each pod scheduled onto the virtual node gets its own cloud VM (`TotalTargetCapacity = 1`).
 
-When bidding for spot capacity across diversified GPU instance families (`g4dn`, `g5`, `g6`, `g6e`, `p4d`, `p5`), the solver defines a portfolio of **equivalent single-VM candidate shapes** that satisfy the pod's accelerator requirements.
-
-Fleet `TotalTargetCapacity` is strictly set to **1 instance**. The allocation strategy (`price-capacity-optimized`) instructs the cloud hypervisor to provision the single lowest-priced, highest-availability instance from the approved candidate list.
+Rather than hardcoding a single instance type that might be out of stock, the solver builds a list of compatible shapes and asks the cloud API for a `price-capacity-optimized` allocation.
 
 ```mermaid
 flowchart LR
@@ -118,9 +112,9 @@ flowchart LR
     classDef cloud fill:#0C4A6E,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
 
     Req["Pod Spec
-(e.g. 1 GPU requested)"]:::req --> Solver["Spot Portfolio Solver"]:::solver
+(1 GPU requested)"]:::req --> Solver["Spot Solver"]:::solver
 
-    subgraph Portfolio["Equivalent Candidate Shapes (Weight: 1.0)"]
+    subgraph Portfolio["Candidate Shapes (Weight: 1.0)"]
         direction TB
         W1["g5.xlarge (1x A10G)"]
         W2["g6.xlarge (1x L4)"]
@@ -129,33 +123,28 @@ flowchart LR
     Solver --> Portfolio
 
     Portfolio --> AWS["AWS EC2 Fleet API
-(TargetCapacity = 1 Instance)"]:::cloud
+(TargetCapacity = 1)"]:::cloud
     Portfolio --> GCP["GCP Compute Engine
 (bulkInsert)"]:::cloud
 ```
 
-| Workload Requirement | Target Capacity | Candidate Shapes Offered to Fleet | Resulting Provisioning |
+| Pod Request | Fleet Target | Candidate Shapes | Result |
 | :--- | :---: | :--- | :--- |
-| **1-GPU Pod** | 1 instance | `g5.xlarge`, `g6.xlarge`, `g4dn.xlarge` | Provisions **1 VM** with 1 GPU (cheapest available) |
-| **4-GPU Pod** | 1 instance | `g5.12xlarge`, `g5.24xlarge`, `g6.12xlarge` | Provisions **1 VM** with 4 GPUs |
-| **8-GPU Pod** | 1 instance | `p5.48xlarge`, `p4de.24xlarge`, `g5.48xlarge` | Provisions **1 VM** with 8 GPUs |
+| **1 GPU** | 1 VM | `g5.xlarge`, `g6.xlarge`, `g4dn.xlarge` | 1 VM with 1 GPU |
+| **4 GPUs** | 1 VM | `g5.12xlarge`, `g5.24xlarge`, `g6.12xlarge` | 1 VM with 4 GPUs |
+| **8 GPUs** | 1 VM | `p5.48xlarge`, `p4de.24xlarge`, `g5.48xlarge` | 1 VM with 8 GPUs |
 
 > [!NOTE]
-> Multi-node distributed workloads (such as distributed PyTorch or multi-node Ray clusters) are orchestrated by scheduling **multiple worker pods** in Kubernetes (e.g. 1 head pod and N worker pods). Each worker pod schedules to the virtual node and receives its own 1:1 dedicated cloud VM.
+> Multi-node jobs (distributed PyTorch, Ray clusters) run as multiple Kubernetes pods. Each worker pod binds to the virtual node and gets its own VM.
 
-#### Multi-Cloud Placement Strategies
-- **`price-capacity-optimized` (AWS EC2 Fleet)**: Filters for spot pools with deep inventory (lowest preemption probability), then allocates the lowest-priced pool among them.
-- **`locationPolicy: ANY_SINGLE_ZONE` (GCP Compute Engine)**: Automatically places worker batches in whichever single availability zone has sufficient spot inventory.
-
-#### Request Idempotency & Hardware Pinning
-- **Idempotent Launches**: Every EC2 Fleet request passes a unique `ClientToken: cvm-<uid>-<namespace>-<pod>` placing the Pod UID first. A missing Pod UID is rejected as an error. Retries triggered by network timeouts or controller restarts cannot spin up duplicate instances.
-- **Hardware Family Pinning**: When specific accelerator architectures are required (e.g. NVIDIA H100 vs A10G), users specify `cloudvm.vk.io/instance-type: "p4d.24xlarge"` or restrict candidate instance families.
+- **Idempotency**: Every AWS `CreateFleet` call sets a deterministic `ClientToken` (`cvm-<uid>-<namespace>-<pod>`) with the Pod UID first. Network retries will not launch duplicate VMs.
+- **Hardware Pinning**: If a workload requires a specific GPU architecture, set `cloudvm.vk.io/instance-type: "p4d.24xlarge"` on the pod.
 
 ---
 
-### B. Backpressure Feedback Loop & On-Demand Capacity
+### 2. Capacity Backpressure & Kueue Integration
 
-When cloud spot capacity is temporarily unavailable, the driver emits structured feedback to prevent API hammering:
+When spot pools are empty or above the price cap, the provider fails fast so upstream controllers can react instead of hanging:
 
 ```mermaid
 flowchart TD
@@ -164,35 +153,24 @@ flowchart TD
     classDef k8s fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
     classDef queue fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
 
-    Cloud["Cloud Provider API
-(InsufficientCapacity / SpotPoolExhausted)"]:::cloud
-    --> Driver["CloudVM Provider (/create)
-Translates to structured status"]:::driver
-    --> VK["InterLink / Virtual-Kubelet
-Emits Warning Event & Sets Pod Condition:
-PodScheduled=False (CapacityExhausted)"]:::k8s
-    --> Kueue["Upstream Orchestrator (Kueue / Job Controller)
-1. Multi-Flavor Fallback (Spot -> On-Demand)
-2. Exponential Queue Backoff (10s -> 30s -> 60s)"]:::queue
+    Cloud["Cloud API
+(InsufficientCapacity)"]:::cloud
+    --> Driver["CloudVM (/create)
+Returns error code"]:::driver
+    --> VK["InterLink
+Sets PodScheduled=False"]:::k8s
+    --> Kueue["Kueue / Job Controller
+Falls back to On-Demand or backs off"]:::queue
 ```
 
-1. **Structured Capacity Signals**:
-   - `CapacityExhausted`: All candidate spot pools in the requested region are dry.
-   - `PriceCapExceeded`: Current spot pricing exceeds `cloudvm.vk.io/max-price`.
-2. **Kueue Multi-Flavor Fallback**:
-   Kueue can configure a `ClusterQueue` with multiple `ResourceFlavors`:
-   - Primary: `spot-gpu` (tolerates virtual-node, requests spot).
-   - Fallback: `on-demand-gpu` (`cloudvm.vk.io/capacity-type: "on-demand"`).
+- `CapacityExhausted`: Requested spot pools have no capacity in the target region.
+- `PriceCapExceeded`: Current spot price is higher than `cloudvm.vk.io/max-price`.
 
 ---
 
-### C. Network Egress Spend Rate Governor (Linux tc Token Bucket Filter)
+### 3. Egress Rate Limiting (Linux `tc`)
 
-Public cloud egress costs (\$0.09/GB on AWS, \$0.085/GB on GCP) can exceed compute costs during large-scale inference or data extraction.
-
-Users declare a maximum hourly spend ceiling via `cloudvm.vk.io/max-egress-rate` in dollars per hour (e.g. `"$0.50"`).
-
-The driver converts this spend limit into kernel-level rate limiting using Linux Traffic Control (`tc`):
+Cloud internet egress ($0.09/GB on AWS, $0.085/GB on GCP) can easily surprise teams running data-heavy jobs. Setting `cloudvm.vk.io/max-egress-rate: "$0.50"` caps public egress spend at $0.50/hr by configuring a Linux `tc` Token Bucket Filter at boot:
 
 ```mermaid
 flowchart LR
@@ -201,33 +179,24 @@ flowchart LR
     classDef tc fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
 
     Ann["Annotation:
-cloudvm.vk.io/max-egress-rate: zsh.50"]:::user
-    --> Calc["Formula: EgressRateToBandwidth
+max-egress-rate: $0.50"]:::user
+    --> Calc["EgressRateToBandwidth
 ($0.50/hr / $0.09/GB) * 8000 / 3600"]:::calc
-    --> TC["Linux TC Token Bucket Filter
+    --> TC["Linux tc TBF
 Rate: 12mbit | Burst: 100mb"]:::tc
 ```
 
-#### Two-Band Priority Queue (Mesh Exemption)
-Linux Traffic Control (`tc`) configures a two-band priority scheduler (`prio bands 2`) on `eth0`:
-- **Band 1 (Unthrottled Priority)**: Kernel filters classify encapsulated WireGuard (`UDP 51820`) and Tailscale (`UDP 41641`) mesh packets into Band 1, allowing cluster control plane communication, Ray GCS heartbeat, and metadata synchronization to operate unthrottled.
-- **Band 2 (Spend Governed)**: All outbound public internet traffic flows through Band 2, governed by the Token Bucket Filter.
-
-> [!NOTE]
-> Same-region VPC traffic or VPC endpoints that bypass the default internet gateway can be routed via direct VPC subnet routes.
+`tc` sets up a two-band priority queue (`prio bands 2`) on `eth0`:
+- **Band 1 (Unthrottled)**: WireGuard (`UDP 51820`) and Tailscale (`UDP 41641`) mesh traffic bypasses the rate limit so cluster heartbeats and Ray GCS traffic are never throttled.
+- **Band 2 (Throttled)**: All other outbound traffic goes through the Token Bucket Filter.
 
 ---
 
-### D. In-VM Ephemeral Lifecycle & Execution Modes
+### 4. VM Boot Lifecycle & Watchdogs
 
-`interlink-provider-cloudvm` supports two runtime modes:
-
-1. **Native DLAMI Fast-Boot (Optimized for GPU ML Workloads)**:
-   - Utilizes the official **AWS Deep Learning AMI (DLAMI)** with NVIDIA drivers, CUDA, and PyTorch pre-installed.
-   - Bypasses pulling heavy container images over the network.
-   - Reaches cluster-ready status in **~30–60 seconds**.
-2. **Container Mode (Optimized for CPU & Custom Workloads)**:
-   - Uses Docker/Containerd execution for CPU pipelines, data transformations, or custom application containers.
+The provider supports two boot modes:
+1. **DLAMI Mode (`cloudvm.vk.io/ami-mode: "dlami"`)**: Boots an AWS Deep Learning AMI with NVIDIA drivers, CUDA, and PyTorch pre-installed on disk.
+2. **Container Mode (Default)**: Pulls and runs the pod's container image via Docker/Containerd.
 
 ```mermaid
 flowchart TD
@@ -236,49 +205,40 @@ flowchart TD
     classDef watch fill:#451A03,stroke:#F59E0B,stroke-width:2px,color:#F8FAFC
     classDef exit fill:#4C0519,stroke:#F43F5E,stroke-width:2px,color:#F8FAFC
 
-    Start["1. Cloud-Init Bootstrap"]:::init --> Mesh["Join Private Mesh
-(Tailscale / WireGuard)"]:::init
-    Mesh --> Arm["Arm 300s Startup Watchdog"]:::watch
+    Start["1. Cloud-Init"]:::init --> Mesh["Join WireGuard / Tailscale"]:::init
+    Mesh --> Arm["Start 300s Boot Watchdog"]:::watch
     
-    Arm --> Mode{"Execution Mode"}
-    Mode -->|"DLAMI Fast-Boot
-GPU Accelerators"| Native["Native PyTorch / ML Worker"]:::runtime
-    Mode -->|"Container Mode
-Custom Images"| Docker["Docker / Containerd Image"]:::runtime
+    Arm --> Mode{"Boot Mode"}
+    Mode -->|DLAMI| Native["Host ML Worker"]:::runtime
+    Mode -->|Container| Docker["Docker Container"]:::runtime
 
-    Native --> Health["Asynchronous Healthcheck"]:::runtime
+    Native --> Health["Ready Check"]:::runtime
     Docker --> Health
-    Health -->|Touches /tmp/workload-ready| Disarm["Disarms Startup Watchdog"]:::runtime
+    Health -->|Touches /tmp/workload-ready| Disarm["Stop Boot Watchdog"]:::runtime
 
-    subgraph Monitors["Active In-VM Daemons"]
+    subgraph Monitors["Background Watchdogs"]
         direction LR
-        Preempt["Spot Interruption Monitor
-(IMDSv2 & Cloud Metadata)"]:::watch
-        DeadMan["Post-Startup Dead-Man Switch
-(Checks process liveness every 60s)"]:::watch
+        Preempt["Spot Interruption Poller
+(IMDSv2 / GCP Metadata)"]:::watch
+        DeadMan["Process Watchdog
+(Polls every 60s)"]:::watch
     end
     Native --- Monitors
 
-    Preempt -->|"Termination Warning"| Drain["Drain Workload & Flush"]:::exit
-    Drain --> Terminate["Self-Destruct (poweroff)"]:::exit
-    Native -->|"Task Completed"| Terminate
+    Preempt -->|Preemption Notice| Drain["SIGTERM & Flush"]:::exit
+    Drain --> Terminate["poweroff"]:::exit
+    Native -->|Process Exits| Terminate
 ```
 
-#### Watchdogs & Shutdown Behavior
-- **Multi-Cloud Preemption Monitors**:
-  - **AWS (120s window)**: Continuously polls IMDSv2 (`/latest/meta-data/spot/instance-action`). Triggers graceful drain before hypervisor termination.
-  - **GCP (30s window)**: Polls metadata (`/computeMetadata/v1/instance/preempted`). Initiates checkpointing within the 30-second ACPI window.
-- **Two-Phase Watchdog & Dead-Man's Switch**:
-  - **Startup Watchdog (300s)**: Automatically terminates the instance if the workload fails to reach readiness (`/tmp/workload-ready`) within 5 minutes.
-  - **Post-Startup Dead-Man's Switch**: After becoming ready, the background monitor checks workload container/process liveness every 60s. If the target workload exits without a clean shutdown, the VM automatically powers off.
-- **Shutdown Guarantee (`InstanceInitiatedShutdownBehavior=terminate`)**:
-  - AWS instances are configured with `instance-initiated-shutdown-behavior: terminate`. When the workload completes and invokes `poweroff`, the instance transitions directly to `terminated`, releasing root EBS volumes and IP addresses.
+- **Spot Interruption Poller**: Polls AWS IMDSv2 (`/latest/meta-data/spot/instance-action`, 120s warning) or GCP metadata (`/computeMetadata/v1/instance/preempted`, 30s warning) and sends `SIGTERM` to the container before shutting down.
+- **300s Boot Watchdog**: Powers off the VM if the container fails to start within 5 minutes, preventing stuck VMs from accruing charges.
+- **Process Exit Hook**: AWS VMs launch with `InstanceInitiatedShutdownBehavior=terminate`. As soon as the container exits and `cloud-init` runs `poweroff`, AWS terminates the instance and deletes its root EBS volume.
 
 ---
 
-### E. Bidirectional Reconciler & Zombie Instance Garbage Collection
+### 5. Reconciler & Zombie Cleanup
 
-An asynchronous background loop runs every 60 seconds to synchronize Kubernetes Pod state with live cloud inventory:
+A background loop runs every 60 seconds in the provider to keep Kubernetes and cloud state in sync:
 
 ```mermaid
 flowchart TD
@@ -287,33 +247,30 @@ flowchart TD
     classDef cloud fill:#0C4A6E,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
     classDef act fill:#4C0519,stroke:#F43F5E,stroke-width:2px,color:#F8FAFC
 
-    subgraph State["State Sources"]
-        CloudInv["Live Cloud Inventory
-(AWS EC2 & GCP APIs)"]:::cloud
-        K8sPods["Active Virtual Pods
-(InterLink API / K8s etcd)"]:::k8s
+    subgraph State["Sources"]
+        CloudInv["Cloud API Inventory
+(EC2 / GCE)"]:::cloud
+        K8sPods["Active Pods
+(InterLink State)"]:::k8s
     end
 
-    CloudInv --> Reconciler["Background Reconciler
-(Runs every 60s)"]:::rec
+    CloudInv --> Reconciler["Reconciler (60s loop)"]:::rec
     K8sPods --> Reconciler
 
-    Reconciler --> Check1{"Instance exists in Cloud,
-but Pod vanished from K8s?"}
-    Check1 -->|"Yes & Age > Grace TTL (10m)"| KillZombie["Terminate Zombie VM
-(Calls cloud Terminate API)"]:::act
+    Reconciler --> Check1{"VM running in cloud,
+but Pod deleted in K8s?"}
+    Check1 -->|"Age > 10m"| KillZombie["Terminate Orphaned VM"]:::act
 
     Reconciler --> Check2{"Pod active in K8s,
-but Instance terminated in Cloud?"}
-    Check2 -->|"Yes (Preempted / Terminated)"| EvictPod["Mark Pod Failed
-(Triggers K8s Reschedule)"]:::act
+but VM gone in cloud?"}
+    Check2 -->|Yes| EvictPod["Mark Pod Failed"]:::act
 ```
 
 ---
 
-### F. Pricing Catalog & Central Ticker Architecture (cloudvm-ticker)
+### 6. Spot Price Ticker (`cloudvm-ticker`)
 
-To evaluate spot arbitrage without exhausting cloud API rate limits, pricing is decoupled into two tiers:
+To avoid hitting AWS/GCP API rate limits when running multiple provider instances, spot price polling can be separated into a standalone `cloudvm-ticker` deployment:
 
 ```mermaid
 flowchart TD
@@ -321,62 +278,32 @@ flowchart TD
     classDef cell fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
     classDef otel fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
 
-    subgraph Central["Central Management Cluster"]
-        Ticker["cloudvm-ticker (Standalone Chart)
-Polls AWS Spot History every 10m"]:::central
-        Ticker --> HTTP["HTTP Catalog Endpoint
-(GET /prices)"]:::central
-        Ticker --> Metrics["Prometheus Metrics (/metrics)
+    subgraph Central["Management Cluster"]
+        Ticker["cloudvm-ticker
+Polls Spot Price History (10m)"]:::central
+        Ticker --> HTTP["GET /prices"]:::central
+        Ticker --> Metrics["GET /metrics
 cloudvm_spot_price_usd_per_hour"]:::central
     end
 
-    Metrics --> OTEL["OTEL Collector / Prometheus"]:::otel
-    OTEL --> Dash["Grafana / SigNoz Cost Dashboard
-(Spot Arbitrage & Savings Tracker)"]:::otel
+    Metrics --> OTEL["Prometheus / Grafana"]:::otel
 
-    subgraph Cells["Distributed Worker Cells"]
-        HTTP -->|Private WireGuard Mesh| Cell1["Cell 1 Provider
+    subgraph Cells["Worker Clusters"]
+        HTTP --> Cell1["Provider 1
 (--ticker-url=http://...)"]:::cell
-        HTTP -->|Private WireGuard Mesh| Cell2["Cell 2 Provider
+        HTTP --> Cell2["Provider 2
 (--ticker-url=http://...)"]:::cell
     end
 ```
 
-#### Deployment Modes:
-1. **Embedded Ticker (Standalone Default)**:
-   - When running in an isolated cluster without a central ticker, the provider uses an internal ticker with randomized jitter (`10m ± 2m`).
-2. **Central Ticker Service (`cloudvm-ticker` Chart)**:
-   - In multi-cell environments, deploy the standalone `cloudvm-ticker` chart once in your management cluster.
-   - Worker cells configure `provider.tickerURL: "http://cloudvm-ticker.monitoring.svc:8080"`.
-   - The ticker exports Prometheus metrics (`cloudvm_spot_price_usd_per_hour`) for Grafana and SigNoz cost dashboards.
+- **Embedded Mode (Default)**: The provider polls spot prices directly every `10m ± 2m`.
+- **Central Ticker Mode**: Deploy the `cloudvm-ticker` Helm chart once and point providers at `--ticker-url=http://cloudvm-ticker.monitoring.svc:8080`.
 
 ---
 
-### G. OpenCost & FinOps Cloud Cost Allocation
+### 7. Cost Allocation (OpenCost)
 
-Because CloudVM instances run outside the Kubernetes node boundary, standard cAdvisor daemonsets cannot scrape their container cgroups.
-
-`interlink-provider-cloudvm` integrates with OpenCost and cloud billing pipelines via structured tagging:
-
-```mermaid
-flowchart LR
-    classDef pod fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
-    classDef driver fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
-    classDef cloud fill:#0C4A6E,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
-    classDef opencost fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
-
-    Pod["Kubernetes Pod
-(Namespace, Job, Team)"]:::pod
-    --> Driver["interlink-provider-cloudvm"]:::driver
-    Driver -->|1. Injects Bidding Tags| Cloud["AWS EC2 / GCP VM
-Tags: PodName, Namespace,
-ClusterTag, CostCenter, JobID"]:::cloud
-    Cloud -->|2. CUR / Billing Export| OpenCost["OpenCost / Kubecost
-Cloud Billing Reconciler"]:::opencost
-```
-
-#### 1. Bidirectional Resource Tagging
-When launching an EC2 Fleet or GCP bulk insert, `interlink-provider-cloudvm` tags every instance and attached EBS volume:
+Because burst VMs do not run Kubelet or cAdvisor, cost attribution relies on cloud billing tags. Every instance and EBS volume is tagged on creation:
 - `ManagedBy: interlink-provider-cloudvm`
 - `ClusterTag: <cluster-name>`
 - `PodName: <pod-name>`
@@ -385,70 +312,64 @@ When launching an EC2 Fleet or GCP bulk insert, `interlink-provider-cloudvm` tag
 - `CostCenter: <cost-center>`
 - `JobID: <job-id>`
 
-OpenCost matches these tags in the AWS Cost and Usage Report (CUR) or GCP Cloud Billing export to attribute cloud compute and storage spend to Kubernetes namespaces and jobs.
+OpenCost ingests these tags from the AWS Cost and Usage Report (CUR) or GCP billing export to map VM spend back to Kubernetes namespaces and jobs.
 
 ---
 
-## 4. Node Daemon Architecture (Virtual Worker Environment)
+### 8. Replacing Node DaemonSets on Bare VMs
 
-In standard Kubernetes, cluster tooling runs as **DaemonSets**. Because `interlink-provider-cloudvm` provisions pure 1:1 cloud instances without a local Kubelet, DaemonSets do not schedule on ephemeral VMs.
+Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, host-level tools are configured via `cloud-init` or pre-baked into the VM image:
 
-Instead, node-level capabilities are provided via host-level services and cloud-init hooks:
-
-| Traditional DaemonSet | CloudVM Host Mechanism | Integration Mode | Architectural Purpose |
+| Kubernetes DaemonSet | CloudVM Equivalent | How It Runs | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Storage FUSE Driver** (`csi_rclone`) | In-VM `cloud-init` FUSE mount (`rclone mount` / `s3fs` / `gcsfuse`) | Host FUSE mount | Mounts object storage buckets directly to `/mnt/data` before workload starts. |
-| **Torch Compile Cache** | Pre-warmed Triton/Inductor kernel cache in Golden AMI | Disk Cache / S3 Gateway | Eliminates 5–15 minute CUDA compilation delays on cold spot boot. |
-| **Node Problem Detector** (`npd`) | In-VM watchdog polling NVML for GPU Xid and ECC memory errors | Host background watcher | Emits structured `HARDWARE_FAULT` logs to serial console for pod re-queuing. |
-| **NVIDIA DCGM Exporter** (`gpu_operator`) | Bundled in DLAMI or host OTEL collector scraping NVML | Host telemetry agent | Pushes GPU SM utilization, Tensor core activity, and VRAM over private mesh. |
+| **CSI FUSE Driver** (`csi-rclone`) | `rclone mount` / `s3fs` / `gcsfuse` | `cloud-init` service | Mounts S3/GCS buckets to `/mnt/data` before the container starts. |
+| **Torch Compile Cache** | Pre-populated kernel cache in AMI | Local disk / S3 | Avoids 5-15 minute Triton/Inductor compilation on cold boot. |
+| **Node Problem Detector** | NVML health check script | Host cron / systemd | Checks for GPU Xid/ECC errors and exits the VM if a card fails. |
+| **DCGM Exporter** | Host OTEL / DCGM agent | Systemd service | Pushes GPU utilization and memory metrics over the WireGuard mesh. |
 
 ---
 
-## 5. Security & Ephemeral VM Isolation Model
+## Security & Isolation
 
-1. **Hardware-Level Hypervisor Isolation**:
-   - Each workload runs in its own dedicated virtual machine (AWS Nitro / GCP KVM). Unlike shared multi-tenant Kubernetes nodes, container escapes cannot compromise adjacent tenant workloads.
-2. **IMDSv2 Token Protection**:
-   - AWS IMDSv2 session tokens are required for all metadata queries, with `HttpPutResponseHopLimit: 1` preventing containerized processes from accessing instance metadata credentials.
-3. **No Open SSH Ports**:
-   - The Tailscale mesh connection runs without `--ssh`. Inbound SSH ports are disabled in security groups by default.
-4. **Tag-Scoped Ephemeral Mesh Credentials**:
-   - Network mesh join keys are scoped to ephemeral tags with short lifespans.
+1. **VM-Level Isolation**: Each job runs in a dedicated cloud VM (AWS Nitro / GCP KVM) with its own kernel and ephemeral root disk.
+2. **IMDSv2 Hop Limit**: AWS instances enforce IMDSv2 with `HttpPutResponseHopLimit: 1`, blocking containers from stealing host IAM role credentials via `169.254.169.254`.
+3. **No Inbound SSH**: VMs join the WireGuard/Tailscale mesh without `--ssh` enabled and with no inbound ports open on the cloud security group.
+4. **Ephemeral Mesh Keys**: Mesh auth keys are scoped to short-lived tags.
 
 ---
 
-## 6. Operational Boundaries (When NOT to Use This)
+## When NOT to Use This
 
-| Workload Characteristic | Why CloudVM is NOT Suitable | Recommended Alternative |
+| Workload Type | Why It Fits Poorly | Use This Instead |
 | :--- | :--- | :--- |
-| **High-Bandwidth Multi-Node NCCL Training** (e.g. 400–3200 Gbps RoCE/EFA internode all-reduce) | Encapsulated mesh overlays (WireGuard / Tailscale) are designed for control plane and Ray GCS coordination. They cannot carry multi-hundred-gigabit internode tensor-parallel training. | Bare-metal GPU clusters with AWS Elastic Fabric Adapter (EFA) and Cluster Placement Groups. |
-| **Microservices & Sub-Core Tasks** (e.g. 0.25 CPU, 512MB RAM) | 1 Pod = 1 Dedicated Cloud VM. Running tiny microservices on dedicated VMs wastes compute and incurs a 60-second cloud billing minimum. | Traditional Kubernetes worker nodes with **Karpenter** bin-packing. |
-| **Complex Multi-Container Pods with Shared Volumes** | Only the primary container is executed on the bare VM. Kubernetes ConfigMaps and Secrets are not mounted as local in-pod volumes. | Standard Kubernetes node pools or pre-baking configuration into container images. |
-| **Short-Lived Tasks (< 60 seconds)** | AWS and GCP bill cloud instances with a **60-second minimum charge**. | In-cluster warm pod pools or serverless functions (Knative / AWS Lambda). |
+| **Tightly Coupled Multi-Node Training** (e.g. 400-3200 Gbps EFA/RoCE NCCL all-reduce) | WireGuard overlays are built for control-plane traffic and Ray GCS coordination, not multi-hundred-gigabit RDMA tensor parallelism. | Same-AZ GPU placement groups with AWS EFA or GCP GPUDirect-TCPXO. |
+| **Small Microservices** (e.g. 0.25 vCPU, 512MB RAM) | Launching a dedicated VM per pod wastes capacity and hits the 60-second cloud billing minimum. | Standard Kubernetes nodes managed by **Karpenter**. |
+| **Multi-Container Pods with Shared Volumes** | Only the primary workload container runs on the VM; Kubernetes `ConfigMap` and `Secret` volume mounts are not projected into the VM filesystem. | In-cluster node pools, or pass config via environment variables and S3. |
+| **Sub-Minute Tasks (< 60s)** | Cloud providers charge a 60-second minimum per VM launch, and VM boot takes ~30-60s. | Warm in-cluster pod pools or serverless functions. |
 
 ---
 
-## 7. Failure Modes & Resilience Matrix
+## Failure Modes
 
-| Failure Event | Detection Mechanism | Automated Reaction | System State & Recovery |
+| Event | How It's Detected | What Happens | Recovery |
 | :--- | :--- | :--- | :--- |
-| **Spot Market Preemption** | In-VM metadata monitor (IMDSv2 on AWS, metadata on GCP) | Workload captures notice (120s AWS, 30s GCP), flushes checkpoints, and powers off. | Reconciler detects instance exit; Pod marked `Failed` (Reason: `SpotInterruption`); Kueue re-queues. |
-| **Cloud Capacity Pool Exhaustion** | Cloud API returns `InsufficientInstanceCapacity` / 429 | `/create` sets Pod condition `PodScheduled=False (CapacityExhausted)`. | Upstream orchestrator (Kueue) triggers fallback to On-Demand flavor or exponential queue backoff. |
-| **Workload Initialization Failure** | In-VM 300s startup watchdog | Watchdog triggers `poweroff` after 300s without `/tmp/workload-ready`. | VM terminates; Reconciler evicts pod; prevents zombie idle billing. |
-| **Workload Process Crash** | In-VM 60s dead-man's switch | Background monitor detects process vanished; executes `poweroff`. | Instance terminates immediately; Pod status updated to `Failed`. |
-| **Control Plane Network Partition** | Background reconciler tracking instance timestamps | If pod object vanishes from K8s API for longer than grace TTL (default 10m), reconciler terminates cloud VM. | Prevents orphaned VMs from running indefinitely during network splits. |
+| **Spot Preemption** | In-VM poller checks IMDSv2 / GCP metadata | Sends `SIGTERM` to workload (120s on AWS, 30s on GCP), flushes logs, and powers off. | Reconciler marks pod `Failed (SpotInterruption)`; job controller re-queues. |
+| **Spot Pool Empty** | Cloud API returns `InsufficientInstanceCapacity` | `/create` fails immediately and sets `PodScheduled=False (CapacityExhausted)`. | Kueue falls back to on-demand flavor or retries with backoff. |
+| **Container Fails to Start** | 300s boot watchdog on the VM | Watchdog powers off the VM if `/tmp/workload-ready` is not created within 5m. | VM terminates; pod is marked `Failed`. |
+| **Container Crashes** | 60s process liveness check | Script sees container exited and runs `poweroff`. | VM terminates; pod is marked `Failed`. |
+| **Control Plane Disconnected** | Provider reconciler loop | If the pod no longer exists in Kubernetes after 10m, the provider terminates the VM via cloud API. | Prevents orphaned VMs from running if the cluster loses connectivity. |
 
 ---
 
-## 8. Usage Examples
+## Usage Examples
 
-### Example 1: Spot GPU ML Worker (Fast-Boot)
+### Example 1: Spot GPU Job (DLAMI Fast-Boot)
 
 ```yaml
 apiVersion: v1
 kind: Pod
 metadata:
-  name: esm2-gpu-inference
+  name: gpu-inference-worker
   annotations:
     cloudvm.vk.io/provider: "aws"
     cloudvm.vk.io/capacity-type: "spot"
@@ -470,13 +391,13 @@ spec:
           nvidia.com/gpu: "1"
 ```
 
-### Example 2: Spot CPU Data Pipeline Worker (Container Mode)
+### Example 2: Spot CPU Worker (Container Mode)
 
 ```yaml
 apiVersion: v1
 kind: Pod
 metadata:
-  name: ray-data-transform
+  name: ray-data-worker
   annotations:
     cloudvm.vk.io/provider: "aws"
     cloudvm.vk.io/capacity-type: "spot"
@@ -502,46 +423,45 @@ spec:
 
 ---
 
-## 9. Installation via Helm
+## Installation
 
-### InterLink CloudVM Provider Plugin
+### Provider Chart
 
 ```bash
-helm upgrade --install interlink-provider-cloudvm   oci://ghcr.io/simonepri/charts/interlink-provider-cloudvm   --namespace interlink   --create-namespace   --set provider.type=aws   --set provider.awsRegion=us-east-1
+helm upgrade --install interlink-provider-cloudvm \
+  oci://ghcr.io/simonepri/charts/interlink-provider-cloudvm \
+  --namespace interlink \
+  --create-namespace \
+  --set provider.type=aws \
+  --set provider.awsRegion=us-east-1
 ```
 
-### Standalone Spot Price Ticker (Optional)
+### Spot Price Ticker Chart (Optional)
 
 ```bash
-helm upgrade --install cloudvm-ticker   oci://ghcr.io/simonepri/charts/cloudvm-ticker   --namespace monitoring   --create-namespace   --set serviceMonitor.enabled=true
+helm upgrade --install cloudvm-ticker \
+  oci://ghcr.io/simonepri/charts/cloudvm-ticker \
+  --namespace monitoring \
+  --create-namespace \
+  --set serviceMonitor.enabled=true
 ```
 
 ---
 
-## 10. Development & Verification
+## Development
 
-### Local Toolchain Setup via mise
+Requires [mise](https://mise.jdx.dev/) for tool management.
 
 ```bash
-# Install toolchain and dependencies
+# Install Go, linters, and Helm
 mise install
 
-# Run the complete verification gate (lint + security + tests)
+# Run all linters, security checks, and tests
 mise run verify
-```
 
-### Verification Tasks
-
-```bash
-# Run race-enabled unit tests
+# Run unit tests with race detector
 mise run test
 
-# Run Go static analysis and linters
-mise run lint-go
-
-# Audit GitHub Actions workflows for security vulnerabilities
-mise run lint-actions-security
-
-# Scan for committed secrets
-mise run lint-secrets
+# Build binary to ./bin/interlink-provider-cloudvm
+mise run build
 ```
