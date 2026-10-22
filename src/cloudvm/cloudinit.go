@@ -57,13 +57,17 @@ func (c *CloudInitConfig) InitialContainerJSON() string {
 	if c.TargetContainerImage == "" {
 		return ""
 	}
+	cmd := c.Command
+	if c.RayHeadAddress != "" && len(cmd) == 0 {
+		cmd = []string{"ray", "start", fmt.Sprintf("--address=%s", c.RayHeadAddress), fmt.Sprintf("--num-gpus=%d", c.NumGPUs), "--block"}
+	}
 	req := StartContainerRequest{
 		PodUID:        c.EffectivePodUID(),
 		Namespace:     c.PodNamespace,
 		PodName:       c.PodName,
 		ContainerName: "worker",
 		Image:         c.TargetContainerImage,
-		Command:       c.Command,
+		Command:       cmd,
 		Args:          c.Args,
 		Env:           c.Env,
 		AssignedGPUs:  c.AssignedGPUs,
@@ -150,13 +154,15 @@ if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
   aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --instance-initiated-shutdown-behavior terminate --region "{{.Region}}" 2>/dev/null || true
 fi
 
-# Block non-root host processes from reaching IMDS credentials
-iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
+# Create dedicated system user for IMDS spot poller
+useradd -r -s /bin/bash cloudvm-poller 2>/dev/null || true
 
-# Isolate bridge containers: block IMDS access and Runner port (9090)
-iptables -N DOCKER-USER 2>/dev/null || true
-iptables -I DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null || true
-iptables -I DOCKER-USER -p tcp --dport 9090 -j DROP 2>/dev/null || true
+# Allow only the designated spot poller user to reach IMDS; drop all other processes (including root & containers)
+iptables -I OUTPUT -d 169.254.169.254 -m owner --uid-owner cloudvm-poller -j ACCEPT 2>/dev/null || true
+iptables -A OUTPUT -d 169.254.169.254 -j DROP 2>/dev/null || true
+
+# Runner port 9090 is accessible only over the WireGuard mesh (wg0) or loopback (127.0.0.1)
+iptables -I INPUT -p tcp --dport 9090 ! -i wg0 ! -s 127.0.0.1 -j DROP 2>/dev/null || true
 
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
@@ -211,7 +217,7 @@ while true; do
 done
 EOF
 chmod +x /usr/local/bin/spot-monitor.sh
-nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
+su -s /bin/bash cloudvm-poller -c "/usr/local/bin/spot-monitor.sh" > /var/log/spot-monitor.log 2>&1 &
 
 # 4. Asynchronous Readiness Watcher
 (
@@ -268,6 +274,8 @@ import hmac
 import http.server
 import json
 import subprocess
+import threading
+import time
 import urllib.parse
 
 PORT = 9090
@@ -346,13 +354,15 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 try:
                     data = json.loads(res.stdout)[0]
                     state = data.get('State', {})
+                    status_str = state.get('Status', '')
                     running = state.get('Running', False)
                     exit_code = state.get('ExitCode', 0)
                     resp = {
                         "podUID": pod_uid,
                         "running": running,
+                        "status": status_str,
                         "exitCode": exit_code,
-                        "reason": "Running" if running else ("Completed" if exit_code == 0 else "Error"),
+                        "reason": "Running" if running else ("ContainerCreating" if status_str == "created" else ("Completed" if exit_code == 0 else "Error")),
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -402,6 +412,14 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             mem_bytes = req.get('memoryBytes', 0)
 
             container_name = f"cloudvm-{pod_uid}"
+            inspect_res = subprocess.run(['docker', 'inspect', '-f', '{{print "{{"}}.State.Running{{print "}}"}}', container_name], capture_output=True, text=True)
+            if inspect_res.returncode == 0 and inspect_res.stdout.strip() == 'true':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status":"already_running"}')
+                return
+
             subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True)
 
             shm_flag = '--shm-size=16g'
@@ -409,7 +427,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
                 shm_flag = f"--shm-size={shm_bytes}"
 
-            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=bridge', shm_flag]
+            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host', shm_flag]
             if cpu_milli and cpu_milli > 0:
                 docker_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
             if mem_bytes and mem_bytes > 0:
@@ -426,17 +444,15 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(args, list):
                 docker_cmd.extend(args)
 
-            res = subprocess.run(docker_cmd, capture_output=True, text=True)
-            if res.returncode == 0:
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"status":"started"}')
-            else:
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": res.stderr.strip()}).encode('utf-8'))
+            def run_async(c):
+                subprocess.run(c, capture_output=True, text=True)
+
+            threading.Thread(target=run_async, args=(docker_cmd,), daemon=True).start()
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status":"starting"}')
             return
 
         self.send_response(404)
@@ -491,9 +507,14 @@ fi
     if [ "$ACTIVE" -eq 0 ]; then
       HB_AGE=9999
       if [ -f /tmp/cloudvm-heartbeat ]; then
-        HB_TIME=$(cat /tmp/cloudvm-heartbeat 2>/dev/null || echo 0)
-        NOW=$(date +%s)
-        HB_AGE=$(( NOW - ${HB_TIME%.*} ))
+        HB_TIME=$(cat /tmp/cloudvm-heartbeat 2>/dev/null | tr -dc '0-9.' || echo "")
+        if [ -n "$HB_TIME" ]; then
+          NOW=$(date +%s)
+          HB_INT=${HB_TIME%.*}
+          if [ -n "$HB_INT" ] && [ "$HB_INT" -gt 0 ] 2>/dev/null; then
+            HB_AGE=$(( NOW - HB_INT ))
+          fi
+        fi
       fi
       if [ "$HB_AGE" -gt 300 ]; then
         sleep 60

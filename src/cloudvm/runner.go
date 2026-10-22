@@ -31,6 +31,7 @@ type StartContainerRequest struct {
 type ContainerStatusResult struct {
 	PodUID     string    `json:"podUID"`
 	Running    bool      `json:"running"`
+	Status     string    `json:"status,omitempty"` // "created", "running", "exited", "dead"
 	ExitCode   int32     `json:"exitCode"`
 	Reason     string    `json:"reason,omitempty"`
 	Message    string    `json:"message,omitempty"`

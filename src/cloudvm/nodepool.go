@@ -335,17 +335,17 @@ func (np *NodePool) Release(podUID string) int {
 	return 0
 }
 
-// FindPodNode returns the node and allocation for a given podUID.
-func (np *NodePool) FindPodNode(podUID string) (*CloudVMNode, *PodAllocation, bool) {
+// FindPodNode returns the node and a thread-safe copy of the allocation for a given podUID.
+func (np *NodePool) FindPodNode(podUID string) (*CloudVMNode, PodAllocation, bool) {
 	np.mu.RLock()
 	defer np.mu.RUnlock()
 
 	for _, node := range np.nodes {
 		if alloc, ok := node.ActivePods[podUID]; ok {
-			return node, alloc, true
+			return node, *alloc, true
 		}
 	}
-	return nil, nil, false
+	return nil, PodAllocation{}, false
 }
 
 // CollectExpiredIdleNodes returns instance IDs of nodes that have had 0 active pods for > idleGracePeriod.

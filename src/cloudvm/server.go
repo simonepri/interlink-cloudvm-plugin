@@ -49,17 +49,19 @@ func EgressRateToBandwidth(dollarPerHour float64, provider string) string {
 
 // Server implements the InterLink REST API for the cloudvm provider plugin.
 type Server struct {
-	mu            sync.RWMutex
-	providers     map[ProviderType]Provider
-	defaultProv   Provider
-	instances     map[string]*Instance // key: UID and namespace/podName -> *Instance
-	clusterTag    string
-	defaultRegion string
-	reconciler    *Reconciler
-	nodePool      *NodePool
-	runner        ContainerRunner
-	spotTicker    *SpotPriceTicker
-	tokenStore    *TokenStore
+	mu                sync.RWMutex
+	providers         map[ProviderType]Provider
+	defaultProv       Provider
+	instances         map[string]*Instance // key: UID and namespace/podName -> *Instance
+	clusterTag        string
+	defaultRegion     string
+	reconciler        *Reconciler
+	nodePool          *NodePool
+	runner            ContainerRunner
+	spotTicker        *SpotPriceTicker
+	tokenStore        *TokenStore
+	completedPods     map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
+	inProgressCreates map[string]string                    // podUID -> runnerToken (in-flight create deduplication)
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -69,14 +71,16 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		tokenPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tokens-%s.json", clusterTag))
 	}
 	return &Server{
-		providers:     make(map[ProviderType]Provider),
-		defaultProv:   defaultProvider,
-		instances:     make(map[string]*Instance),
-		clusterTag:    clusterTag,
-		defaultRegion: "us-east-1",
-		nodePool:      NewNodePool(60 * time.Second),
-		runner:        NewMockContainerRunner(),
-		tokenStore:    NewTokenStore(tokenPath),
+		providers:         make(map[ProviderType]Provider),
+		defaultProv:       defaultProvider,
+		instances:         make(map[string]*Instance),
+		clusterTag:        clusterTag,
+		defaultRegion:     "us-east-1",
+		nodePool:          NewNodePool(60 * time.Second),
+		runner:            NewMockContainerRunner(),
+		tokenStore:        NewTokenStore(tokenPath),
+		completedPods:     make(map[string]*ContainerTerminatedState),
+		inProgressCreates: make(map[string]string),
 	}
 }
 
@@ -156,7 +160,10 @@ func (s *Server) TerminateIdleNode(ctx context.Context, node *CloudVMNode) {
 	cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
 	log.Printf("[cloudvm] Terminating expired idle node %s", cleanID) //nolint:gosec
 	if prov != nil {
-		_ = prov.Terminate(ctx, node.InstanceID)
+		if err := prov.Terminate(ctx, node.InstanceID); err != nil {
+			log.Printf("[cloudvm] Error terminating idle instance %s: %v", cleanID, err)
+			return
+		}
 	}
 	if s.tokenStore != nil {
 		_ = s.tokenStore.Delete(node.InstanceID)
@@ -434,19 +441,30 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	spec := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
 
-	// Idempotency check: if pod is already created or active, return existing response immediately
-	s.mu.RLock()
-	existingInst := s.instances[spec.PodUID]
-	if existingInst == nil {
+	// Idempotency check: if pod is already completed or active, return existing response immediately
+	s.mu.Lock()
+	if term, done := s.completedPods[spec.PodUID]; done && term != nil {
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(CreateStruct{
+			PodUID: spec.PodUID,
+			PodJID: fmt.Sprintf("cvm-%s", spec.PodUID),
+		})
+		return
+	}
+
+	var existingInst *Instance
+	if spec.PodUID != "" {
+		existingInst = s.instances[spec.PodUID]
+	} else {
 		existingInst = s.instances[fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)]
 	}
-	s.mu.RUnlock()
-
 	if existingInst != nil {
 		podJID := existingInst.ID
 		if spec.PodUID != "" {
 			podJID = fmt.Sprintf("%s:%s", existingInst.ID, spec.PodUID)
 		}
+		s.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(CreateStruct{
 			PodUID: spec.PodUID,
@@ -454,6 +472,18 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// In-progress create deduplication: if already being launched by a concurrent request, reuse token
+	if _, inFlight := s.inProgressCreates[spec.PodUID]; inFlight && spec.PodUID != "" {
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(CreateStruct{
+			PodUID: spec.PodUID,
+			PodJID: fmt.Sprintf("cvm-%s", spec.PodUID),
+		})
+		return
+	}
+	s.mu.Unlock()
 
 	prov := s.selectProvider(spec)
 	reqVec := ResourceVectorFromPod(pod)
@@ -541,6 +571,20 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.RunnerAuthToken = tok
+
+	s.mu.Lock()
+	if spec.PodUID != "" {
+		s.inProgressCreates[spec.PodUID] = tok
+	}
+	s.mu.Unlock()
+
+	defer func() {
+		if spec.PodUID != "" {
+			s.mu.Lock()
+			delete(s.inProgressCreates, spec.PodUID)
+			s.mu.Unlock()
+		}
+	}()
 
 	var preAssignedGPUs []int
 	for i := 0; i < spec.NumGPUs; i++ {
@@ -663,9 +707,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if pod.Metadata.UID != "" {
 		delete(s.instances, pod.Metadata.UID)
+		delete(s.completedPods, pod.Metadata.UID)
 	}
 	delete(s.instances, key)
 	delete(s.instances, podName)
+	delete(s.completedPods, key)
+	delete(s.completedPods, podName)
 	s.mu.Unlock()
 
 	uid := pod.Metadata.UID
@@ -730,7 +777,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		jid   string
 		inst  *Instance
 		node  *CloudVMNode
-		alloc *PodAllocation
+		alloc PodAllocation
 	}
 
 	var targets []statusTarget
@@ -799,7 +846,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 		jid := ""
 		var node *CloudVMNode
-		var alloc *PodAllocation
+		var alloc PodAllocation
 		if exists && inst != nil {
 			if uid != "" {
 				jid = fmt.Sprintf("%s:%s", inst.ID, uid)
@@ -839,8 +886,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				Name: "worker",
 			}
 
+			s.mu.RLock()
+			completedTerm := s.completedPods[tgt.uid]
+			if completedTerm == nil {
+				completedTerm = s.completedPods[fmt.Sprintf("%s/%s", tgt.ns, tgt.name)]
+			}
+			s.mu.RUnlock()
+
 			switch {
-			case tgt.alloc != nil && tgt.alloc.Completed:
+			case completedTerm != nil:
+				status.Ready = false
+				status.State.Terminated = completedTerm
+			case tgt.alloc.Completed:
 				status.Ready = false
 				finishedAt := time.Now()
 				if tgt.alloc.FinishedAt != nil {
@@ -869,20 +926,34 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								Message: err.Error(),
 							}
 						} else if cResult != nil {
-							if cResult.Running {
+							switch {
+							case cResult.Running:
 								status.Ready = true
 								status.State.Running = &ContainerRunningState{
 									StartedAt: cResult.StartedAt,
 								}
-							} else {
+							case cResult.Status == "created":
 								status.Ready = false
-								status.State.Terminated = &ContainerTerminatedState{
+								status.State.Waiting = &ContainerWaitingState{
+									Reason:  "ContainerCreating",
+									Message: "Container created, starting up...",
+								}
+							default:
+								status.Ready = false
+								term := &ContainerTerminatedState{
 									ExitCode:   cResult.ExitCode,
 									Reason:     cResult.Reason,
 									Message:    cResult.Message,
 									FinishedAt: cResult.FinishedAt,
 								}
+								status.State.Terminated = term
 								s.nodePool.MarkPodCompleted(tgt.uid, cResult.ExitCode, cResult.Reason, cResult.Message, cResult.FinishedAt)
+								s.mu.Lock()
+								if tgt.uid != "" {
+									s.completedPods[tgt.uid] = term
+								}
+								s.completedPods[fmt.Sprintf("%s/%s", tgt.ns, tgt.name)] = term
+								s.mu.Unlock()
 							}
 						}
 					} else {

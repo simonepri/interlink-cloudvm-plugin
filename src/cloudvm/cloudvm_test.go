@@ -784,3 +784,127 @@ func TestServer_CreateIdempotency(t *testing.T) {
 		t.Fatalf("expected exactly 1 node launched, got %d", server.NodePool().ActiveNodeCount())
 	}
 }
+
+func TestRegression_CompletedPodPreservesStatusAfterIdleVMTermination(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	runner := NewMockContainerRunner()
+	server.SetContainerRunner(runner)
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	// 1. Seed launched instance in mock provider so termination succeeds
+	inst, err := mock.Launch(context.Background(), &InstanceSpec{
+		PodName:      "batch-job",
+		PodNamespace: "default",
+		PodUID:       "uid-ephem-1",
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to launch mock instance: %v", err)
+	}
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode(inst.ID, ProviderMock, "us-east-1", "100.64.0.30", capVec)
+	reqVec, _ := NewResourceVector("2", "8Gi", 1, 0)
+	server.NodePool().RegisterAndAllocate(node, reqVec, "uid-ephem-1", "default", "batch-job")
+
+	server.mu.Lock()
+	server.instances["uid-ephem-1"] = inst
+	server.instances["default/batch-job"] = inst
+	server.mu.Unlock()
+
+	// 2. Pod finishes
+	runner.SetStatus("uid-ephem-1", &ContainerStatusResult{
+		Running:    false,
+		ExitCode:   0,
+		Reason:     "Completed",
+		FinishedAt: time.Now(),
+	})
+
+	queryPayload := `[{"pod": {"metadata": {"name": "batch-job", "namespace": "default", "uid": "uid-ephem-1"}}}]`
+	resp1, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("Poll 1 failed: %v", err)
+	}
+	var statuses1 []PodStatusResponse
+	_ = json.NewDecoder(resp1.Body).Decode(&statuses1)
+	_ = resp1.Body.Close()
+
+	if len(statuses1) != 1 || statuses1[0].Containers[0].State.Terminated == nil {
+		t.Fatalf("expected Terminated state on poll 1, got: %+v", statuses1)
+	}
+
+	// 3. VM becomes idle and is terminated by idle collector
+	server.TerminateIdleNode(context.Background(), node)
+
+	// Verify instances map no longer has the VM instance
+	server.mu.RLock()
+	_, instExists := server.instances["uid-ephem-1"]
+	server.mu.RUnlock()
+	if instExists {
+		t.Fatalf("expected instance to be removed after idle node termination")
+	}
+
+	// 4. Poll /status again: REGRESSION CHECK: Must STILL report Terminated (Completed), NOT Waiting(ContainerCreating)!
+	resp2, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("Poll 2 failed: %v", err)
+	}
+	var statuses2 []PodStatusResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&statuses2)
+	_ = resp2.Body.Close()
+
+	if len(statuses2) != 1 || statuses2[0].Containers[0].State.Terminated == nil {
+		t.Fatalf("REGRESSION: completed pod lost its terminal status after VM shutdown and reverted to: %+v", statuses2)
+	}
+	if statuses2[0].Containers[0].State.Terminated.Reason != "Completed" {
+		t.Fatalf("expected Reason Completed, got %s", statuses2[0].Containers[0].State.Terminated.Reason)
+	}
+
+	// 5. Explicit /delete cleans up the terminal record
+	delPayload := `{"pod": {"metadata": {"name": "batch-job", "namespace": "default", "uid": "uid-ephem-1"}}}`
+	delResp, err := http.Post(ts.URL+"/delete", "application/json", strings.NewReader(delPayload))
+	if err != nil {
+		t.Fatalf("DELETE failed: %v", err)
+	}
+	_ = delResp.Body.Close()
+
+	server.mu.RLock()
+	_, termExists := server.completedPods["uid-ephem-1"]
+	server.mu.RUnlock()
+	if termExists {
+		t.Fatalf("expected completedPods to be cleaned up after explicit /delete")
+	}
+}
+
+func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
+	cfg := &CloudInitConfig{
+		PodName:              "syntax-test",
+		PodNamespace:         "default",
+		PodUID:               "uid-syntax-1",
+		RunnerAuthToken:      "test-token",
+		TargetContainerImage: "rayproject/ray:2.44.0",
+		RayHeadAddress:       "10.0.0.1:6379",
+	}
+
+	script, err := GenerateCloudInit(cfg)
+	if err != nil {
+		t.Fatalf("failed to generate cloud-init: %v", err)
+	}
+
+	// Verify Python runner imports time and threading
+	if !strings.Contains(script, "import time") || !strings.Contains(script, "import threading") {
+		t.Fatalf("cloud-init runner missing import time or import threading")
+	}
+
+	// Verify Ray auto-start command restored in JSON
+	if !strings.Contains(script, "ray") || !strings.Contains(script, "10.0.0.1:6379") {
+		t.Fatalf("cloud-init runner missing ray auto-start command in initial pod JSON")
+	}
+
+	// Verify IMDS protection and runner port protection
+	if !strings.Contains(script, "cloudvm-poller") || !strings.Contains(script, "--dport 9090") {
+		t.Fatalf("cloud-init missing cloudvm-poller IMDS or runner port firewall rules")
+	}
+}
