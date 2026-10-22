@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -102,6 +103,26 @@ func main() {
 			}
 		}()
 	}
+
+	// Background idle node collector (terminates warm VMs after idle grace period)
+	go func() {
+		idleTicker := time.NewTicker(30 * time.Second)
+		defer idleTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-idleTicker.C:
+				if terminator != nil {
+					for _, node := range server.NodePool().CollectExpiredIdleNodes() {
+						cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
+						log.Printf("[cloudvm] Terminating expired idle node %s", cleanID) //nolint:gosec // instance ID is internal and sanitized
+						_ = terminator.Terminate(ctx, node.InstanceID)
+					}
+				}
+			}
+		}
+	}()
 
 	httpServer := &http.Server{
 		Addr:         ":" + port,

@@ -41,6 +41,8 @@ type Server struct {
 	clusterTag    string
 	defaultRegion string
 	reconciler    *Reconciler
+	nodePool      *NodePool
+	runner        ContainerRunner
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -51,7 +53,21 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		instances:     make(map[string]*Instance),
 		clusterTag:    clusterTag,
 		defaultRegion: "us-east-1",
+		nodePool:      NewNodePool(60 * time.Second),
+		runner:        NewMockContainerRunner(),
 	}
+}
+
+// SetContainerRunner overrides the container runner (e.g. HTTPContainerRunner).
+func (s *Server) SetContainerRunner(r ContainerRunner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runner = r
+}
+
+// NodePool returns the underlying multi-cloud node pool.
+func (s *Server) NodePool() *NodePool {
+	return s.nodePool
 }
 
 // SetDefaultRegion sets the baseline cloud region for pods without explicit region annotations.
@@ -315,8 +331,67 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	spec := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
 	prov := s.selectProvider(spec)
+	reqVec := ResourceVectorFromPod(pod)
 
-	log.Printf("[cloudvm] Launching opportunistic VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
+	// 1. Try to bin-pack into an existing warm node
+	warmNode, assignedGPUs, assignedTPUs, err := s.nodePool.Allocate(reqVec, spec.Region, spec.PodUID, spec.PodNamespace, spec.PodName)
+	if err == nil && warmNode != nil {
+		log.Printf("[cloudvm] Bin-pack hit! Slicing pod %s/%s into warm node %s (GPUs=%v, TPUs=%v)",
+			spec.PodNamespace, spec.PodName, warmNode.InstanceID, assignedGPUs, assignedTPUs)
+
+		// Start container via runner
+		cName := "worker"
+		if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
+			cName = pod.Spec.Containers[0].Name
+		}
+		_ = s.runner.StartContainer(r.Context(), warmNode, &StartContainerRequest{
+			PodUID:        spec.PodUID,
+			Namespace:     spec.PodNamespace,
+			PodName:       spec.PodName,
+			ContainerName: cName,
+			Image:         spec.TargetContainerImage,
+			Command:       spec.Command,
+			Args:          spec.Args,
+			Env:           spec.Env,
+			CPUMillicores: reqVec.CPU.MilliValue(),
+			MemoryBytes:   reqVec.Memory.Value(),
+			AssignedGPUs:  assignedGPUs,
+			AssignedTPUs:  assignedTPUs,
+		})
+
+		s.mu.Lock()
+		inst := &Instance{
+			ID:        warmNode.InstanceID,
+			Provider:  warmNode.Provider,
+			Region:    warmNode.Region,
+			IP:        warmNode.MeshIP,
+			State:     StateRunning,
+			CreatedAt: time.Now(),
+		}
+		key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
+		s.instances[key] = inst
+		if spec.PodUID != "" {
+			s.instances[spec.PodUID] = inst
+		}
+		s.mu.Unlock()
+
+		var podJID string
+		if spec.PodUID != "" {
+			podJID = fmt.Sprintf("%s:%s", warmNode.InstanceID, spec.PodUID)
+		} else {
+			podJID = warmNode.InstanceID
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(CreateStruct{
+			PodUID: spec.PodUID,
+			PodJID: podJID,
+		})
+		return
+	}
+
+	// 2. Bin-pack miss: Launch a new cloud VM
+	log.Printf("[cloudvm] Bin-pack miss. Launching new VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
 		spec.PodNamespace, spec.PodName, spec.InstanceType, spec.NumGPUs, spec.Region)
 
 	inst, err := prov.Launch(r.Context(), spec)
@@ -326,7 +401,48 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Register new node in pool with capacity (in real provider, capacity comes from instance type specs)
+	nodeCapacity := ResourceVector{
+		CPU:    reqVec.CPU.DeepCopy(),
+		Memory: reqVec.Memory.DeepCopy(),
+		GPUs:   spec.NumGPUs,
+	}
+	if nodeCapacity.GPUs < 8 && strings.Contains(inst.InstanceType, "48xlarge") {
+		nodeCapacity.GPUs = 8
+	} else if nodeCapacity.GPUs < 4 && strings.Contains(inst.InstanceType, "12xlarge") {
+		nodeCapacity.GPUs = 4
+	}
+
+	newNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, nodeCapacity)
+	s.nodePool.RegisterNode(newNode)
+	_, gpus, tpus, _ := s.nodePool.Allocate(reqVec, spec.Region, spec.PodUID, spec.PodNamespace, spec.PodName)
+
+	cName := "worker"
+	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
+		cName = pod.Spec.Containers[0].Name
+	}
+	_ = s.runner.StartContainer(r.Context(), newNode, &StartContainerRequest{
+		PodUID:        spec.PodUID,
+		Namespace:     spec.PodNamespace,
+		PodName:       spec.PodName,
+		ContainerName: cName,
+		Image:         spec.TargetContainerImage,
+		Command:       spec.Command,
+		Args:          spec.Args,
+		Env:           spec.Env,
+		CPUMillicores: reqVec.CPU.MilliValue(),
+		MemoryBytes:   reqVec.Memory.Value(),
+		AssignedGPUs:  gpus,
+		AssignedTPUs:  tpus,
+	})
+
 	s.mu.Lock()
+	if inst.Metadata == nil {
+		inst.Metadata = make(map[string]string)
+	}
+	if spec.PodUID != "" {
+		inst.Metadata["podUID"] = spec.PodUID
+	}
 	key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
 	s.instances[key] = inst
 	if spec.PodUID != "" {
@@ -334,11 +450,17 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	var podJID string
+	if spec.PodUID != "" {
+		podJID = fmt.Sprintf("%s:%s", inst.ID, spec.PodUID)
+	} else {
+		podJID = inst.ID
+	}
+
 	w.WriteHeader(http.StatusOK)
-	// Return InterLink CreateStruct contract
 	_ = json.NewEncoder(w).Encode(CreateStruct{
 		PodUID: spec.PodUID,
-		PodJID: inst.ID,
+		PodJID: podJID,
 	})
 }
 
@@ -380,6 +502,14 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	delete(s.instances, key)
 	delete(s.instances, podName)
 	s.mu.Unlock()
+
+	// Release resources from NodePool
+	if node, alloc, found := s.nodePool.FindPodNode(pod.Metadata.UID); found {
+		_ = s.runner.StopContainer(r.Context(), node, pod.Metadata.UID)
+		s.nodePool.Release(pod.Metadata.UID)
+		log.Printf("[cloudvm] Released resources for pod %s from node %s", pod.Metadata.UID, node.InstanceID)
+		_ = alloc
+	}
 
 	if !exists || inst == nil {
 		w.WriteHeader(http.StatusOK)
@@ -488,9 +618,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			Name: "worker",
 		}
 
+		uid := pod.Metadata.UID
+		if uid == "" && exists && inst != nil && inst.Metadata != nil {
+			uid = inst.Metadata["podUID"]
+		}
+
 		jid := ""
 		if exists && inst != nil {
-			jid = inst.ID
+			if uid != "" {
+				jid = fmt.Sprintf("%s:%s", inst.ID, uid)
+			} else {
+				jid = inst.ID
+			}
 			switch inst.State {
 			case StateProvisioning:
 				status.State.Waiting = &ContainerWaitingState{
@@ -527,11 +666,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				Reason:  "ContainerCreating",
 				Message: fmt.Sprintf("Instance for %s is pending discovery or provisioning", key),
 			}
-		}
-
-		uid := pod.Metadata.UID
-		if uid == "" && exists && inst.Metadata != nil {
-			uid = inst.Metadata["podUID"]
 		}
 
 		responses = append(responses, PodStatusResponse{
