@@ -1,0 +1,55 @@
+image:
+  repository: ghcr.io/simonepri/interlink-cloudvm-plugin
+  pullPolicy: IfNotPresent
+  tag: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+provider:
+  type: "mock"  # "aws" | "gcp" | "mock"
+  clusterTag: "interlink-cloudvm"
+  awsRegion: "us-east-1"
+  awsRegions: []
+  awsLaunchTemplateId: ""
+  awsLaunchTemplateName: ""
+  awsSubnetId: ""
+  awsSecurityGroupId: ""
+  gcpProject: ""
+  gcpZone: "us-central1-a"
+  tickerURL: ""
+  reconcileIntervalSeconds: 60
+  reconcileLaunchGraceSeconds: 120
+
+service:
+  type: ClusterIP
+  port: 4040
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 1Gi
+  mountPath: /var/lib/cloudvm
+
+rbac:
+  create: true
+  clusterWide: true  # Set to false to restrict secret reading to tenantNamespaces
+  tenantNamespaces: []  # e.g. ["default", "ml-workloads"] when clusterWide is false

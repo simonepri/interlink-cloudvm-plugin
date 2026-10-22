@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "interlink-cloudvm-plugin.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}
+      containers:
+        - name: provider
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: PORT
+              value: "{{ .Values.service.port }}"
+            - name: PROVIDER_TYPE
+              value: "{{ .Values.provider.type }}"
+            - name: CLUSTER_TAG
+              value: "{{ .Values.provider.clusterTag }}"
+            - name: AWS_REGION
+              value: "{{ .Values.provider.awsRegion }}"
+            - name: AWS_REGIONS
+              value: "{{ join "," .Values.provider.awsRegions | default .Values.provider.awsRegion }}"
+            - name: RECONCILE_LAUNCH_GRACE_SECONDS
+              value: "{{ .Values.provider.reconcileLaunchGraceSeconds | default 120 }}"
+            - name: REGION_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/instance-regions.json"
+            - name: GCP_PROJECT
+              value: "{{ .Values.provider.gcpProject }}"
+            - name: GCP_ZONE
+              value: "{{ .Values.provider.gcpZone }}"
+            - name: RECONCILE_INTERVAL_SECONDS
+              value: "{{ .Values.provider.reconcileIntervalSeconds }}"
+            - name: TICKER_URL
+              value: "{{ .Values.provider.tickerURL }}"
+            - name: AWS_LAUNCH_TEMPLATE_ID
+              value: "{{ .Values.provider.awsLaunchTemplateId }}"
+            - name: AWS_LAUNCH_TEMPLATE_NAME
+              value: "{{ .Values.provider.awsLaunchTemplateName }}"
+            {{- if .Values.provider.kmsKeyId }}
+            - name: KMS_KEY_ID
+              value: "{{ .Values.provider.kmsKeyId }}"
+            {{- end }}
+            - name: TOKEN_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/tokens.json"
+            - name: COMPLETED_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/completed-pods.json"
+            - name: TOMBSTONE_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/tombstones.json"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}
+      volumes:
+        - name: data
+        {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "interlink-cloudvm-plugin.fullname" . }}-data
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
