@@ -341,6 +341,9 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 4. **Ephemeral Mesh Keys**: Mesh auth keys are scoped to short-lived tags.
 5. **Non-Root Container Execution & IMDS Lockdown**: Workload containers run as non-root (defaulting to UID `65532:65532` unless configured via pod or container `securityContext.runAsUser`), dropping `SETUID` and `SETGID` with `no-new-privileges`. Pods or containers specifying `runAsUser: 0` or `runAsGroup: 0` are rejected to prevent accessing cloud instance metadata under host networking. Host iptables rules drop all non-root outbound traffic to `169.254.169.254`, preventing containers from reading cloud instance metadata (IMDS) or user-data while allowing host system daemons (dockerd, SSM, AWS CLI, spot-monitor) full access.
 6. **Same-Namespace Host Network Sharing**: Bin-packed multi-tenant containers on a shared VM run with `--net=host` to provide native throughput for Ray workers and distributed training. Co-tenants on the same VM share localhost networking within the same Kubernetes namespace (bin-packing across different namespaces is disallowed).
+7. **AWS KMS Runner Token Encryption**: When `KMS_KEY_ID` is configured, runner authentication tokens are encrypted using AWS KMS before rendering instance user-data. The VM decrypts the token at boot using its instance profile (`kms:Decrypt`), ensuring zero plaintext tokens are present in user-data or cloud instance metadata.
+8. **Private Registry Auth & Ephemeral Credentials**: Kubernetes `imagePullSecrets` are resolved directly by the provider daemon via `get` permissions on Kubernetes Secrets and transferred exclusively over the authenticated runner channel. The in-VM runner creates an ephemeral, permission-restricted (`0700`) temporary directory for `docker --config` during image pull and deletes it immediately in a `finally:` block, preventing co-tenant credential leakage.
+9. **Runner Channel Transport Security**: The runner exposes an HTTP daemon on port 9090. To protect runner Bearer tokens and image pull credentials from network inspection, traffic should flow across the WireGuard / Tailscale encrypted mesh network. When operating directly over VPC private IPs without an encrypted overlay mesh, intra-VPC network encryption must be enabled.
 
 ---
 
@@ -351,7 +354,7 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 | **Tightly Coupled Multi-Node Training** (e.g. 400-3200 Gbps EFA/RoCE NCCL all-reduce) | WireGuard overlays are built for control-plane traffic and Ray GCS coordination, not multi-hundred-gigabit RDMA tensor parallelism. | Same-AZ GPU placement groups with AWS EFA or GCP GPUDirect-TCPXO. |
 | **Small Microservices** (e.g. 0.25 vCPU, 512MB RAM) | Launching a dedicated VM per pod wastes capacity and hits the 60-second cloud billing minimum. | Standard Kubernetes nodes managed by **Karpenter**. |
 | **Multi-Container Pods with Shared Volumes** | Only the primary workload container runs on the VM; Kubernetes `ConfigMap` and `Secret` volume mounts are not projected into the VM filesystem. | In-cluster node pools, or pass config via environment variables and S3. |
-| **Pods Requiring Kubernetes imagePullSecrets** | Docker pulls images directly from the VM; Kubernetes `imagePullSecrets` are not mounted onto the VM. Images must be public or accessible via instance profile credentials (e.g. AWS ECR via instance IAM role). | In-cluster Karpenter nodes or host-profile authenticated registries. |
+| **Pods Requiring Arbitrary In-VM Secret Projections** | Only the primary workload container runs on the VM; Kubernetes `ConfigMap` and volume mounts are not projected into the VM filesystem. Private container registry authentication via `imagePullSecrets` is natively supported. | In-cluster node pools, or pass configuration via environment variables and S3/GCS object stores. |
 | **Sub-Minute Tasks (< 60s)** | Cloud providers charge a 60-second minimum per VM launch, and VM boot takes ~30-60s. | Warm in-cluster pod pools or serverless functions. |
 
 ---
@@ -486,3 +489,19 @@ Runner authorization tokens are generated securely per instance and passed throu
 
 3. Co-tenant Discovery Timeout:
 When the provider restarts while an in-VM runner is unreachable, the node is flagged with unverified co-tenants and protected from idle collection and zombie cleanup. Background reconciliation retries container discovery on each reconcile pass for up to 30 minutes before releasing the node for garbage collection.
+
+
+### AWS KMS Runner Token Encryption
+
+For high-compliance environments, set `KMS_KEY_ID` (or `provider.kmsKeyId` in Helm). When configured:
+- The provider daemon encrypts the generated runner authorization token using `kms:Encrypt` before launching EC2 instances.
+- Only the base64 ciphertext is placed into EC2 user-data. Zero plaintext authentication secrets appear in launch templates, user-data, or cloud-init logs.
+- During instance boot, cloud-init runs `aws kms decrypt` to populate `/etc/cloudvm/runner-token` (`chmod 0600`), and the in-VM micro-runner enforces Bearer authentication on port `:9090`.
+- The EC2 instance role attached to worker VMs requires `kms:Decrypt` permissions on the specified KMS key ARN.
+
+### Private Container Registries and imagePullSecrets
+
+- Standard Kubernetes `imagePullSecrets` on pod specifications are resolved by the provider and delivered securely over the private WireGuard mesh via `/containers/start`.
+- The in-VM micro-runner creates an ephemeral, pod-isolated credentials directory (`mode 0600`) during `docker --config <dir> pull <image>`, and deletes the directory immediately after the pull completes.
+- Credentials never touch EC2/GCE user-data and are never shared across co-tenant containers on the same VM.
+- In addition to standard Kubernetes secrets, AWS ECR private image repositories remain supported natively via the instance profile EC2 credential helper (`docker-credential-ecr-login`).
