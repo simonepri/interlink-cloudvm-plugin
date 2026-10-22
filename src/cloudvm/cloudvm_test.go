@@ -1381,3 +1381,133 @@ func TestServer_LaunchTokenPreSavedToTokenStore(t *testing.T) {
 		t.Fatal("expected token to be saved under pod UID in tokenStore, but was empty")
 	}
 }
+
+func TestTokenStore_CorruptFilePreserved(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "tokens.json")
+
+	if err := os.WriteFile(storePath, []byte(`{"corrupt": [truncated...`), 0600); err != nil {
+		t.Fatalf("failed to write corrupt file: %v", err)
+	}
+
+	store, err := NewTokenStore(storePath)
+	if err == nil {
+		t.Fatal("expected error loading corrupt token store, got nil")
+	}
+
+	files, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+	var corruptFileFound bool
+	for _, f := range files {
+		if strings.Contains(f.Name(), ".corrupt.") {
+			corruptFileFound = true
+			data, _ := os.ReadFile(filepath.Join(tmpDir, f.Name()))
+			if !strings.Contains(string(data), "truncated") {
+				t.Fatalf("corrupt file preserved incorrect data: %s", string(data))
+			}
+		}
+	}
+	if !corruptFileFound {
+		t.Fatal("expected .corrupt file backup to be created")
+	}
+
+	if err := store.Set("inst-1", "tok-1"); err != nil {
+		t.Fatalf("failed to set token in new store: %v", err)
+	}
+
+	// Verify backup was not clobbered
+	filesAfter, _ := os.ReadDir(tmpDir)
+	var backupStillPresent bool
+	for _, f := range filesAfter {
+		if strings.Contains(f.Name(), ".corrupt.") {
+			backupStillPresent = true
+		}
+	}
+	if !backupStillPresent {
+		t.Fatal("corrupt backup was clobbered by subsequent Set")
+	}
+}
+
+func TestPodToInstanceSpec_LimitsOnly(t *testing.T) {
+	pod := &Pod{
+		Metadata: PodMeta{Name: "req-pod", Namespace: "default"},
+		Spec: PodSpecWrapper{
+			Containers: []ContainerSpec{
+				{
+					Name:  "main",
+					Image: "alpine",
+					Resources: ContainerResourceRequirements{
+						Requests: map[string]string{
+							"cpu":    "2",
+							"memory": "4Gi",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	spec, err := PodToInstanceSpec(pod, "cluster-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if spec.CPUMillicores != 0 {
+		t.Fatalf("expected CPUMillicores to be 0 when only requests are set, got %d", spec.CPUMillicores)
+	}
+	if spec.MemoryBytes != 0 {
+		t.Fatalf("expected MemoryBytes to be 0 when only requests are set, got %d", spec.MemoryBytes)
+	}
+}
+
+func TestServer_RecoverActiveInstances_FallbackToPodUIDToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	tokPath := filepath.Join(tmpDir, "tokens.json")
+	store, _ := NewTokenStore(tokPath)
+	_ = store.Set("uid-crash-1", "secret-token-123")
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-1")
+	srv.tokenStore = store
+
+	inst := &Instance{
+		ID:           "i-crash-123",
+		Provider:     "aws",
+		Region:       "us-east-1",
+		InstanceType: "g5.xlarge",
+		Metadata: map[string]string{
+			"podName":   "worker-crash",
+			"namespace": "default",
+			"podUID":    "uid-crash-1",
+		},
+	}
+	inv := &mockCloudInventory{instances: []*Instance{inst}}
+
+	if err := srv.RecoverActiveInstances(context.Background(), inv); err != nil {
+		t.Fatalf("failed to recover instances: %v", err)
+	}
+
+	srv.mu.RLock()
+	node := srv.nodePool.nodes["i-crash-123"]
+	srv.mu.RUnlock()
+
+	if node == nil {
+		t.Fatal("expected node to be recovered")
+	}
+	if node.RunnerAuthToken != "secret-token-123" {
+		t.Fatalf("expected token secret-token-123 to be recovered from podUID, got %q", node.RunnerAuthToken)
+	}
+	if store.Get("i-crash-123") != "secret-token-123" {
+		t.Fatalf("expected token to be linked to instance ID in store, got %q", store.Get("i-crash-123"))
+	}
+}
+
+type mockCloudInventory struct {
+	instances []*Instance
+}
+
+func (m *mockCloudInventory) ListActiveInstances(_ context.Context, _ string) ([]*Instance, error) {
+	return m.instances, nil
+}

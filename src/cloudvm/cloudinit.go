@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"text/template"
-
-	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // CloudInitConfig contains the parameters needed to render the VM bootstrap script.
@@ -77,11 +75,6 @@ func (c *CloudInitConfig) InitialContainerJSON() string {
 		MemoryBytes:   c.MemoryBytes,
 		RunAsUser:     c.RunAsUser,
 		RunAsGroup:    c.RunAsGroup,
-	}
-	if req.CPUMillicores <= 0 && c.CPULimit() != "" {
-		if q, err := resource.ParseQuantity(c.CPULimit()); err == nil {
-			req.CPUMillicores = q.MilliValue()
-		}
 	}
 	b, err := json.Marshal(req)
 	if err != nil {
@@ -187,20 +180,21 @@ if [ -n "{{.MeshAuthKey}}" ]; then
       mkdir -p --mode=0755 /usr/share/keyrings
       curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg -o /usr/share/keyrings/tailscale-archive-keyring.gpg 2>/dev/null || true
       curl -fsSL --retry 3 https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list -o /etc/apt/sources.list.d/tailscale.list 2>/dev/null || true
-      apt-get update -y && apt-get install -y tailscale || echo "[cloudvm-bootstrap] apt install tailscale failed" >&2
+      apt-get update -y && apt-get install -y tailscale || true
     elif command -v yum >/dev/null 2>&1; then
       yum install -y yum-utils 2>/dev/null || true
       yum-config-manager --add-repo https://pkgs.tailscale.com/stable/amazon-linux/2/tailscale.repo 2>/dev/null || true
-      yum install -y tailscale || echo "[cloudvm-bootstrap] yum install tailscale failed" >&2
+      yum install -y tailscale || true
     fi
   fi
   if command -v tailscale >/dev/null 2>&1; then
     tailscale up --authkey="{{.MeshAuthKey}}" \
       --hostname="cloudvm-{{.PodName}}" \
-      --accept-routes
-    echo "[cloudvm-bootstrap] Connected to mesh. Assigned IP: $(tailscale ip -4 2>/dev/null || echo \x27unknown\x27)"
+      --accept-routes || { echo "[cloudvm-bootstrap] Error: tailscale mesh join failed" >&2; exit 1; }
+    echo "[cloudvm-bootstrap] Connected to mesh. Assigned IP: $(tailscale ip -4 2>/dev/null || echo unknown)"
   else
-    echo "[cloudvm-bootstrap] Warning: tailscale package not found; mesh join skipped" >&2
+    echo "[cloudvm-bootstrap] Error: tailscale package installation failed" >&2
+    exit 1
   fi
 fi
 
@@ -474,6 +468,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 with plock:
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
+                with pod_locks_guard:
+                    pod_locks.pop(pod_uid, None)
                 subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
             self.send_response(200)
             self.end_headers()
@@ -495,19 +491,40 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             run_as_user = req.get('runAsUser')
             run_as_group = req.get('runAsGroup')
 
-            if run_as_user is not None and int(run_as_user) == 0:
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"error":"runAsUser 0 is forbidden on host network"}')
-                return
+            user_val = None
+            group_val = None
 
-            if run_as_group is not None and int(run_as_group) == 0:
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"error":"runAsGroup 0 is forbidden on host network"}')
-                return
+            if run_as_user is not None:
+                try:
+                    user_val = int(run_as_user)
+                except (ValueError, TypeError):
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"invalid runAsUser"}')
+                    return
+                if user_val == 0:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"runAsUser 0 is forbidden on host network"}')
+                    return
+
+            if run_as_group is not None:
+                try:
+                    group_val = int(run_as_group)
+                except (ValueError, TypeError):
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"invalid runAsGroup"}')
+                    return
+                if group_val == 0:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"runAsGroup 0 is forbidden on host network"}')
+                    return
 
             plock = get_pod_lock(pod_uid)
             with plock:
@@ -542,11 +559,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
                 shm_flag = f"--shm-size={shm_bytes}"
 
-            if run_as_user is not None:
-                if run_as_group is not None:
-                    user_flag = f"--user={int(run_as_user)}:{int(run_as_group)}"
-                else:
-                    user_flag = f"--user={int(run_as_user)}"
+            if user_val is not None:
+                grp = group_val if group_val is not None else user_val
+                user_flag = f"--user={user_val}:{grp}"
             else:
                 user_flag = "--user=65532:65532"
 

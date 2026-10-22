@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // TokenStore safely persists in-VM runner authorization tokens locally
@@ -12,12 +14,12 @@ import (
 type TokenStore struct {
 	mu       sync.RWMutex
 	filePath string
-	tokens   map[string]string // instanceID -> runnerAuthToken
+	tokens   map[string]string // instanceID or podUID -> runnerAuthToken
 }
 
 // NewTokenStore initializes a TokenStore with the given file path.
 // If filePath is empty, a default path in os.TempDir is used.
-func NewTokenStore(filePath string) *TokenStore {
+func NewTokenStore(filePath string) (*TokenStore, error) {
 	if filePath == "" {
 		filePath = filepath.Join(os.TempDir(), "cloudvm-tokens.json")
 	}
@@ -26,8 +28,8 @@ func NewTokenStore(filePath string) *TokenStore {
 		filePath: filePath,
 		tokens:   make(map[string]string),
 	}
-	_ = ts.load()
-	return ts
+	err := ts.load()
+	return ts, err
 }
 
 func (ts *TokenStore) load() error {
@@ -37,9 +39,19 @@ func (ts *TokenStore) load() error {
 	cleanPath := filepath.Clean(ts.filePath)
 	data, err := os.ReadFile(cleanPath) // #nosec G304,G703
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	return json.Unmarshal(data, &ts.tokens)
+	var loaded map[string]string
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		corruptPath := fmt.Sprintf("%s.corrupt.%d", cleanPath, time.Now().UnixNano())
+		_ = os.Rename(cleanPath, corruptPath)
+		return fmt.Errorf("corrupt token store data moved to %s: %w", corruptPath, err)
+	}
+	ts.tokens = loaded
+	return nil
 }
 
 func (ts *TokenStore) saveLocked() error {

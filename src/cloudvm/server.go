@@ -79,11 +79,18 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	if tokenPath == "" {
 		tokenPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tokens-%s.json", clusterTag))
 	}
+	tokStore, err := NewTokenStore(tokenPath)
+	if err != nil {
+		log.Printf("[cloudvm] ERROR loading token store: %v", err)
+	}
 	completedPath := os.Getenv("COMPLETED_STORE_PATH")
 	if completedPath == "" {
 		completedPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-completed-pods-%s.json", clusterTag))
 	}
-	compStore, _ := NewCompletedStore(completedPath)
+	compStore, err := NewCompletedStore(completedPath)
+	if err != nil {
+		log.Printf("[cloudvm] ERROR loading completed store: %v", err)
+	}
 	return &Server{
 		providers:       make(map[ProviderType]Provider),
 		defaultProv:     defaultProvider,
@@ -92,7 +99,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		defaultRegion:   "us-east-1",
 		nodePool:        NewNodePool(60 * time.Second),
 		runner:          NewMockContainerRunner(),
-		tokenStore:      NewTokenStore(tokenPath),
+		tokenStore:      tokStore,
 		completedStore:  compStore,
 		launchTokens:    make(map[string]string),
 		completedPods:   make(map[string]*ContainerTerminatedState),
@@ -420,17 +427,9 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 			if q, err := resource.ParseQuantity(cpuLimit); err == nil {
 				cpuMillicores = q.MilliValue()
 			}
-		} else if cpuReq, exists := c.Resources.Requests["cpu"]; exists {
-			if q, err := resource.ParseQuantity(cpuReq); err == nil {
-				cpuMillicores = q.MilliValue()
-			}
 		}
 		if memLimit, exists := c.Resources.Limits["memory"]; exists {
 			if q, err := resource.ParseQuantity(memLimit); err == nil {
-				memoryBytes = q.Value()
-			}
-		} else if memReq, exists := c.Resources.Requests["memory"]; exists {
-			if q, err := resource.ParseQuantity(memReq); err == nil {
 				memoryBytes = q.Value()
 			}
 		}
@@ -1249,6 +1248,12 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		tok := ""
 		if s.tokenStore != nil {
 			tok = s.tokenStore.Get(inst.ID)
+			if tok == "" && podUID != "" {
+				tok = s.tokenStore.Get(podUID)
+			}
+			if tok != "" && s.tokenStore.Get(inst.ID) == "" {
+				_ = s.tokenStore.Set(inst.ID, tok)
+			}
 		}
 		if tok == "" {
 			tok = inst.Metadata["runnerToken"]

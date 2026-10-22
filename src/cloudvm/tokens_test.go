@@ -11,7 +11,7 @@ func TestTokenStore_SetGetDelete(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "test-tokens.json")
 
-	ts := NewTokenStore(storePath)
+	ts, _ := NewTokenStore(storePath)
 
 	// Initial get
 	if tok := ts.Get("i-12345"); tok != "" {
@@ -27,7 +27,7 @@ func TestTokenStore_SetGetDelete(t *testing.T) {
 	}
 
 	// Reload from disk to verify persistence
-	ts2 := NewTokenStore(storePath)
+	ts2, _ := NewTokenStore(storePath)
 	if tok := ts2.Get("i-12345"); tok != "secret-tok-abc" {
 		t.Fatalf("expected persisted secret-tok-abc, got %s", tok)
 	}
@@ -41,7 +41,7 @@ func TestTokenStore_SetGetDelete(t *testing.T) {
 	}
 
 	// Verify file updated
-	ts3 := NewTokenStore(storePath)
+	ts3, _ := NewTokenStore(storePath)
 	if tok := ts3.Get("i-12345"); tok != "" {
 		t.Fatalf("expected empty token in reloaded store, got %s", tok)
 	}
@@ -50,7 +50,7 @@ func TestTokenStore_SetGetDelete(t *testing.T) {
 func TestTokenStore_ConcurrentAccess(t *testing.T) {
 	tmpDir := t.TempDir()
 	storePath := filepath.Join(tmpDir, "concurrent-tokens.json")
-	ts := NewTokenStore(storePath)
+	ts, _ := NewTokenStore(storePath)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {

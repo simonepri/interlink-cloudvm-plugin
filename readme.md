@@ -351,6 +351,7 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 | **Tightly Coupled Multi-Node Training** (e.g. 400-3200 Gbps EFA/RoCE NCCL all-reduce) | WireGuard overlays are built for control-plane traffic and Ray GCS coordination, not multi-hundred-gigabit RDMA tensor parallelism. | Same-AZ GPU placement groups with AWS EFA or GCP GPUDirect-TCPXO. |
 | **Small Microservices** (e.g. 0.25 vCPU, 512MB RAM) | Launching a dedicated VM per pod wastes capacity and hits the 60-second cloud billing minimum. | Standard Kubernetes nodes managed by **Karpenter**. |
 | **Multi-Container Pods with Shared Volumes** | Only the primary workload container runs on the VM; Kubernetes `ConfigMap` and `Secret` volume mounts are not projected into the VM filesystem. | In-cluster node pools, or pass config via environment variables and S3. |
+| **Pods Requiring Kubernetes imagePullSecrets** | Docker pulls images directly from the VM; Kubernetes `imagePullSecrets` are not mounted onto the VM. Images must be public or accessible via instance profile credentials (e.g. AWS ECR via instance IAM role). | In-cluster Karpenter nodes or host-profile authenticated registries. |
 | **Sub-Minute Tasks (< 60s)** | Cloud providers charge a 60-second minimum per VM launch, and VM boot takes ~30-60s. | Warm in-cluster pod pools or serverless functions. |
 
 ---
