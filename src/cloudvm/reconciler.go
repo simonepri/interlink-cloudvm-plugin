@@ -203,6 +203,15 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 			}
 		}
 
+		// Co-tenant protection check: do not terminate VMs whose co-tenant workloads are still unverified
+		if checker, ok := r.tracker.(interface{ HasUnknownCoTenants(instanceID string) bool }); ok {
+			if checker.HasUnknownCoTenants(inst.ID) {
+				cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
+				log.Printf("[reconciler] Skipping VM %s with unverified co-tenants pending runner connectivity", cleanID) //nolint:gosec // cleanID sanitized
+				continue
+			}
+		}
+
 		podName := inst.Metadata["podName"]
 		if podName == "" {
 			podName = inst.Metadata["PodName"]

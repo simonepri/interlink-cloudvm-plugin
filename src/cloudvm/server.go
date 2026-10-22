@@ -171,13 +171,23 @@ func (s *Server) isTombstonedLocked(id string) bool {
 	return false
 }
 
+// HasUnknownCoTenants reports whether the node has unverified co-tenant workloads.
+func (s *Server) HasUnknownCoTenants(instanceID string) bool {
+	if s.nodePool == nil {
+		return false
+	}
+	return s.nodePool.HasUnknownCoTenants(instanceID)
+}
+
 // IsTombstoned reports whether the instance or its associated pod has been explicitly deleted.
 func (s *Server) IsTombstoned(inst *Instance) bool {
 	if inst == nil {
 		return false
 	}
-	if s.nodePool != nil && s.nodePool.HasActivePods(inst.ID) {
-		return false
+	if s.nodePool != nil {
+		if s.nodePool.HasActivePods(inst.ID) || s.nodePool.HasUnknownCoTenants(inst.ID) {
+			return false
+		}
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1000,7 +1010,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.runner.StopContainer(r.Context(), node, uid)
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
-		if node.UnknownCoTenants {
+		if s.nodePool.HasUnknownCoTenants(node.InstanceID) {
 			log.Printf("[cloudvm] Node %s has unknown co-tenants because container listing previously failed. Retaining VM.", node.InstanceID)
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1765,6 +1775,9 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 	return nil
 }
 
+// MaxUnknownCoTenantRetries defines the retry budget before an unverified node is released for garbage collection.
+const MaxUnknownCoTenantRetries = 10
+
 // RetryUnknownCoTenants attempts to query the in-VM runner for nodes whose startup listing failed.
 func (s *Server) RetryUnknownCoTenants(ctx context.Context) {
 	if s.nodePool == nil || s.runner == nil {
@@ -1790,6 +1803,14 @@ func (s *Server) RetryUnknownCoTenants(ctx context.Context) {
 			s.nodePool.SetUnknownCoTenants(node.InstanceID, false)
 			cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
 			log.Printf("[cloudvm] Successfully resolved co-tenants for node %s via background reconciliation", cleanID) //nolint:gosec // cleanID sanitized
+		} else {
+			retries, exceeded := s.nodePool.IncrementUnknownCoTenantRetries(node.InstanceID, MaxUnknownCoTenantRetries)
+			cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
+			if exceeded {
+				log.Printf("[cloudvm] ERROR: node %s exceeded %d co-tenant reconciliation retries (err: %v). Clearing unknown flag to allow garbage collection.", cleanID, retries, err) //nolint:gosec // cleanID sanitized
+			} else {
+				log.Printf("[cloudvm] Retrying co-tenant discovery for node %s (attempt %d/%d): %v", cleanID, retries, MaxUnknownCoTenantRetries, err) //nolint:gosec // cleanID sanitized
+			}
 		}
 	}
 }

@@ -25,20 +25,21 @@ type PodAllocation struct {
 
 // CloudVMNode represents a live ephemeral cloud VM capable of hosting one or more pods.
 type CloudVMNode struct {
-	InstanceID       string         `json:"instanceId"`
-	Provider         ProviderType   `json:"provider"`
-	Region           string         `json:"region"`
-	Namespace        string         `json:"namespace,omitempty"`
-	Spot             bool           `json:"spot"`
-	Zone             string         `json:"zone,omitempty"`
-	MeshIP           string         `json:"meshIp"`
-	Capacity         ResourceVector `json:"capacity"`
-	Allocated        ResourceVector `json:"allocated"`
-	CreatedAt        time.Time      `json:"createdAt"`
-	IdleSince        *time.Time     `json:"idleSince,omitempty"`
-	Cordoned         bool           `json:"cordoned,omitempty"`
-	UnknownCoTenants bool           `json:"unknownCoTenants,omitempty"`
-	RunnerAuthToken  string         `json:"runnerAuthToken,omitempty"`
+	InstanceID              string         `json:"instanceId"`
+	Provider                ProviderType   `json:"provider"`
+	Region                  string         `json:"region"`
+	Namespace               string         `json:"namespace,omitempty"`
+	Spot                    bool           `json:"spot"`
+	Zone                    string         `json:"zone,omitempty"`
+	MeshIP                  string         `json:"meshIp"`
+	Capacity                ResourceVector `json:"capacity"`
+	Allocated               ResourceVector `json:"allocated"`
+	CreatedAt               time.Time      `json:"createdAt"`
+	IdleSince               *time.Time     `json:"idleSince,omitempty"`
+	Cordoned                bool           `json:"cordoned,omitempty"`
+	UnknownCoTenants        bool           `json:"unknownCoTenants,omitempty"`
+	UnknownCoTenantsRetries int            `json:"unknownCoTenantsRetries,omitempty"`
+	RunnerAuthToken         string         `json:"runnerAuthToken,omitempty"`
 
 	// Discrete device maps: Slot Index -> PodUID
 	GPUSlots map[int]string `json:"gpuSlots"`
@@ -381,6 +382,21 @@ func (np *NodePool) NodesWithUnknownCoTenants() []*CloudVMNode {
 	return res
 }
 
+// IncrementUnknownCoTenantRetries increments retry counter and returns true if limit exceeded.
+func (np *NodePool) IncrementUnknownCoTenantRetries(instanceID string, maxRetries int) (int, bool) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	if node, ok := np.nodes[instanceID]; ok {
+		node.UnknownCoTenantsRetries++
+		if node.UnknownCoTenantsRetries >= maxRetries {
+			node.UnknownCoTenants = false
+			return node.UnknownCoTenantsRetries, true
+		}
+		return node.UnknownCoTenantsRetries, false
+	}
+	return 0, false
+}
+
 // HasNode returns true if the specified node exists in the pool.
 func (np *NodePool) HasNode(instanceID string) bool {
 	np.mu.RLock()
@@ -411,6 +427,9 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	now := time.Now()
 
 	for id, node := range np.nodes {
+		if node.UnknownCoTenants {
+			continue
+		}
 		if node.ActivePodCount() == 0 && node.IdleSince != nil {
 			if now.Sub(*node.IdleSince) > np.idleGracePeriod {
 				expired = append(expired, node)

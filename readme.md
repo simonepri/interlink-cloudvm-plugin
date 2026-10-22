@@ -483,3 +483,6 @@ The cloudvm provider maintains local state caches (runner tokens, completed pod 
 
 2. In-VM Runner Token Delivery:
 Runner authorization tokens are generated securely per instance and passed through cloud instance launch user-data templates. Runner credentials are never exposed via cloud provider metadata tags or external APIs.
+
+3. Co-tenant Discovery Retry Budget:
+When the provider restarts while an in-VM runner is unreachable, the node is flagged with unverified co-tenants and protected from idle collection and zombie cleanup. Background reconciliation retries container discovery up to 10 consecutive passes before releasing the node for garbage collection.

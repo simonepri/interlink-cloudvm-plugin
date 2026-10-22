@@ -3069,3 +3069,128 @@ func TestServer_RecoverActiveInstances_UnknownCoTenantsRetainedAndRetried(t *tes
 		t.Fatalf("expected VM terminated after last co-tenant was deleted, got: %v", activeAfterAll)
 	}
 }
+
+func TestNodePool_UnknownCoTenantsProtectedFromIdleCollectorAndReconcilerWhileDown(t *testing.T) {
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "test-cluster")
+
+	failingRunner := &failingContainerRunner{
+		shouldFail: true, // Runner remains down
+	}
+	srv.SetContainerRunner(failingRunner)
+
+	ctx := context.Background()
+	inst, err := mock.Launch(ctx, &InstanceSpec{
+		PodName:      "u1",
+		PodNamespace: "default",
+		PodUID:       "uid-u1",
+		ClusterTag:   "test-cluster",
+		Region:       "us-east-1",
+		InstanceType: "g5.12xlarge",
+	})
+	if err != nil {
+		t.Fatalf("launch failed: %v", err)
+	}
+
+	// Recover active instances while runner is down -> flags UnknownCoTenants
+	if err := srv.RecoverActiveInstances(ctx, mock); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// Delete pod u1
+	pod1JSON := `{"metadata":{"name":"u1","namespace":"default","uid":"uid-u1"}}`
+	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod1JSON))
+	delRec := httptest.NewRecorder()
+	srv.handleDelete(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("delete returned %d", delRec.Code)
+	}
+
+	// 1. Verify idle collector does NOT collect this node even with 0 active pods
+	expired := srv.nodePool.CollectExpiredIdleNodes()
+	if len(expired) != 0 {
+		t.Fatalf("CRITICAL: idle collector collected node %s while UnknownCoTenants is true!", expired[0].InstanceID)
+	}
+
+	// 2. Verify IsTombstoned returns false while UnknownCoTenants is true
+	if srv.IsTombstoned(inst) {
+		t.Fatalf("CRITICAL: IsTombstoned returned true for node %s while UnknownCoTenants is true!", inst.ID)
+	}
+
+	// 3. Verify ReconcileOnce does NOT terminate this node as a zombie
+	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
+	res, err := reconciler.ReconcileOnce(ctx)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if len(res.TerminatedZombies) != 0 {
+		t.Fatalf("CRITICAL: reconciler killed VM %s as a zombie while runner was down!", res.TerminatedZombies)
+	}
+
+	// VM must still be running in cloud inventory
+	activeVMs, err := mock.ListActiveInstances(ctx, "test-cluster")
+	if err != nil || len(activeVMs) != 1 || activeVMs[0].ID != inst.ID {
+		t.Fatalf("expected VM %s still active in cloud inventory, got: %v", inst.ID, activeVMs)
+	}
+}
+
+func TestNodePool_UnknownCoTenantsExceededRetriesClearedForGC(t *testing.T) {
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "test-cluster")
+
+	failingRunner := &failingContainerRunner{
+		shouldFail: true, // Runner permanently broken
+	}
+	srv.SetContainerRunner(failingRunner)
+
+	ctx := context.Background()
+	inst, err := mock.Launch(ctx, &InstanceSpec{
+		PodName:      "u1",
+		PodNamespace: "default",
+		PodUID:       "uid-u1",
+		ClusterTag:   "test-cluster",
+		Region:       "us-east-1",
+		InstanceType: "g5.12xlarge",
+	})
+	if err != nil {
+		t.Fatalf("launch failed: %v", err)
+	}
+
+	if err := srv.RecoverActiveInstances(ctx, mock); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// Delete u1
+	pod1JSON := `{"metadata":{"name":"u1","namespace":"default","uid":"uid-u1"}}`
+	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod1JSON))
+	srv.handleDelete(httptest.NewRecorder(), delReq)
+
+	// Simulate retries up to MaxUnknownCoTenantRetries
+	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
+	for i := 0; i < MaxUnknownCoTenantRetries-1; i++ {
+		_, _ = reconciler.ReconcileOnce(ctx)
+		if !srv.nodePool.HasUnknownCoTenants(inst.ID) {
+			t.Fatalf("expected UnknownCoTenants still true on retry %d", i+1)
+		}
+	}
+
+	// Final retry: limit exceeded -> flag cleared -> VM collected as zombie
+	res, err := reconciler.ReconcileOnce(ctx)
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+	if srv.nodePool.HasUnknownCoTenants(inst.ID) {
+		t.Fatalf("expected UnknownCoTenants cleared after exceeding retry limit")
+	}
+	if len(res.TerminatedZombies) != 1 || res.TerminatedZombies[0] != inst.ID {
+		t.Fatalf("expected VM %s terminated as zombie after retry limit exceeded, got: %v", inst.ID, res.TerminatedZombies)
+	}
+}
