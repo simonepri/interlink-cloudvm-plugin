@@ -42,53 +42,60 @@
 
 ---
 
-## Overview
+## 1. High-Level Concept
 
-`interlink-provider-cloudvm` is an open-source provider plugin for **[CNCF InterLink](https://github.com/interlink-hq/interLink)**. It allows Kubernetes clusters to burst computational workloads (such as distributed Ray clusters, PyTorch training, or batch genomics pipelines) directly onto opportunistic cloud virtual machines (**AWS EC2 Fleet**, **GCP Compute Engine**) without running local node pools or waiting for traditional Cluster Autoscalers.
+`interlink-provider-cloudvm` is an open-source provider plugin for **[CNCF InterLink](https://github.com/interlink-hq/interLink)**. 
+
+Its primary purpose is to solve the **Spot GPU bottleneck** in Kubernetes: allowing clusters to instantly tap into global, multi-region spot GPU fleets (e.g. NVIDIA A10G, L4, L40S, H100) with zero local node-pool overhead. It also seamlessly handles general-purpose CPU workloads (such as data preprocessing, ETL, and Ray data pipelines).
 
 ```mermaid
-flowchart TD
+flowchart LR
     classDef k8s fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
-    classDef daemon fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
-    classDef cloud fill:#0C4A6E,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
-    classDef vm fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
+    classDef plugin fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
+    classDef cloud fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
 
-    subgraph K8s["1. Kubernetes Workload Tier"]
-        Workload["Workload\n(Kueue / Ray / PyTorch / Pod)"]:::k8s
-        VK["InterLink Virtual Kubelet\n(virtual-node)"]:::k8s
-        Workload -->|Schedules on virtual-node| VK
-    end
+    A["1. Kubernetes Workload\n(Ray / PyTorch / Pod)"]:::k8s 
+    -->|"Schedules on\nvirtual-node"| B["2. interlink-provider-cloudvm\n(CNCF InterLink Plugin)"]:::plugin
+    -->|"Provisions 1:1 Cloud VM\n(AWS Fleet / GCP Bulk)"| C["3. Ephemeral Cloud VM\n(Runs workload & terminates)"]:::cloud
+```
 
-    subgraph Provider["2. Provider Daemon Tier (:4040)"]
-        Server["InterLink REST API Server"]:::daemon
-        Solver["Spot & Fleet Solver"]:::daemon
-        Reconciler["Bidirectional Reconciler"]:::daemon
-        Server --> Solver
-        Server <--> Reconciler
-    end
+### The Problem It Solves
 
-    subgraph Infrastructure["3. Multi-Cloud Infrastructure Tier"]
-        AWS["AWS EC2 Fleet\n(Spot / On-Demand)"]:::cloud
-        GCP["GCP Compute Engine\n(Bulk Insert)"]:::cloud
-        VMs["1:1 Ephemeral Workers\n(Fast-Boot Cloud VMs)"]:::vm
-        AWS --> VMs
-        GCP --> VMs
-    end
+| | Traditional Kubernetes (Cluster Autoscaler / Karpenter) | `interlink-provider-cloudvm` |
+| :--- | :--- | :--- |
+| **Execution Model** | Provisions full nodes $\\to$ registers `kubelet` $\\to$ pulls images $\\to$ schedules pods | **1 Pod = 1 Dedicated Cloud VM** |
+| **GPU Cold-Start** | 3–5 minutes (node bootstrap + pulling 15GB CUDA container images) | **~33 seconds** (native pre-baked DLAMI execution) |
+| **Geographic Scope** | Single VPC / Single Region | **Cross-Region & Multi-Cloud Fleet Arbitrage** |
+| **Idle Cost** | Keeps empty nodes warm; consolidation and scale-down delay | **$0** (VM terminates 2 seconds after the task process exits) |
+| **Workload Scope** | Any Kubernetes workload | **Optimized for Spot GPUs**, fully supports CPU pipelines |
 
-    VK -->|REST POST /create| Server
-    Solver --> AWS
-    Solver --> GCP
+---
+
+## 2. How It Works (Step-by-Step)
+
+A workload progresses through three clean stages:
+
+```
+[1. Scheduling]   Kubernetes schedules a Pod onto the virtual node (via Kueue, KubeRay, or nodeSelector).
+                         │
+                         ▼
+[2. Bidding]      interlink-provider-cloudvm solves the GPU allocation knapsack using Weighted Capacity
+                  and requests the lowest-cost spot instances across AWS EC2 Fleet or GCP Compute Engine.
+                         │
+                         ▼
+[3. Execution]    VM boots in ~33s, joins private mesh, runs the task, streams logs via serial console,
+                  and automatically self-destructs upon completion or spot interruption.
 ```
 
 ---
 
-## Core Subsystems
+## 3. Subsystem Deep Dives
 
-### 1. Spot Portfolio Solver & Weighted Capacity
+### A. Spot Portfolio Solver & Weighted Capacity
 
-When bidding for spot capacity across heterogeneous GPU instance families (`g4dn`, `g5`, `g6`, `p4d`, `p5`), default cloud fleet APIs treat each instance as `1 unit`. Without weighting, requesting 8 units from a fleet containing `g5.12xlarge` (4 GPUs each) would launch 8 instances with 32 GPUs total, multiplying cloud costs fourfold.
+When bidding for spot capacity across diversified GPU instance families (`g4dn`, `g5`, `g6`, `g6e`, `p4d`, `p5`), cloud fleet APIs count **instances**, not **GPUs**. Without weighting, requesting 8 units from a fleet containing `g5.12xlarge` (4 GPUs each) would launch 8 VMs with 32 GPUs total, quadrupling costs.
 
-The solver calculates exact **Weighted Capacity** based on physical accelerator count:
+The solver computes **Weighted Capacity** based on physical accelerator counts:
 
 $$\\sum (\\text{count}_i \\times \\text{weight}_i) = \\text{TargetCapacity}$$
 
@@ -118,21 +125,23 @@ flowchart LR
 | `g5.12xlarge` / `g6.12xlarge` | 4 | **4.0** | Provisions 2 VMs (2 × 4 = 8 GPUs) |
 | `p4d.24xlarge` / `p5.48xlarge` | 8 | **8.0** | Provisions 1 VM (1 × 8 = 8 GPUs) |
 
-#### Fleet Allocation Strategies
-
-- **`price-capacity-optimized` (AWS)**: Analyzes historical spot interruption data to identify deep capacity pools, then selects the lowest-priced pool among them. This provides 70–90% cost savings with the lowest preemption frequency.
-- **`locationPolicy: ANY_SINGLE_ZONE` (GCP)**: Dynamically selects whichever availability zone in a target region currently has sufficient spot inventory to fulfill the entire requested batch, avoiding inter-zone network egress latency and cross-zone traffic costs.
+#### Multi-Cloud Placement Strategies
+- **`price-capacity-optimized` (AWS EC2 Fleet)**: Filters for spot pools with the deepest available inventory (lowest preemption risk), then allocates the lowest-priced pool among them. Delivers 70–90% cost savings with industry-leading spot stability.
+- **`locationPolicy: ANY_SINGLE_ZONE` (GCP Compute Engine)**: Automatically places distributed worker batches in whichever single availability zone has enough spot capacity to host the entire group, eliminating cross-zone egress latency and inter-zone networking fees.
 
 ---
 
-### 2. In-VM Ephemeral Lifecycle & Fast-Boot
+### B. In-VM Ephemeral Lifecycle & Execution Modes
 
-Traditional Kubernetes nodes take 3–5 minutes to become ready: VM boot (~45s), Kubelet and CNI initialization (~45s), and pulling 10–15GB CUDA/PyTorch container images over the network (60–180s). During spot preemption, this delay halts distributed computation.
+`interlink-provider-cloudvm` supports two runtime modes:
 
-`interlink-provider-cloudvm` introduces **Native DLAMI Fast-Boot**:
-- **DLAMI (Deep Learning Amazon Machine Image)**: Official cloud images with pre-installed NVIDIA drivers, CUDA toolkits, and PyTorch runtimes directly on disk.
-- **~33-Second Cold Start**: By running natively within the pre-warmed DLAMI environment, the worker process launches directly without pulling heavy container layers, achieving cold-start-to-cluster readiness in ~33 seconds.
-- **Container Mode**: Standard container execution (Docker / Containerd) remains available for custom images.
+1. **Native DLAMI Fast-Boot (Optimized for GPU ML Workloads)**:
+   - Utilizes the official **AWS Deep Learning AMI (DLAMI)**, which comes with NVIDIA drivers, CUDA, and PyTorch pre-installed on disk.
+   - Bypasses pulling heavy 10–15GB container images over the network.
+   - Reaches cluster-ready status in **~33 seconds**.
+2. **Container Mode (Optimized for CPU & Custom Workloads)**:
+   - Uses standard Docker/Containerd execution for CPU pipelines, data transformations, or custom application containers.
+   - Ideal for Ray Data pipelines, genomics tools, and custom microservices.
 
 ```mermaid
 flowchart TD
@@ -145,8 +154,8 @@ flowchart TD
     Mesh --> Arm["Arm 300s Fail-Safe Watchdog"]:::watch
     
     Arm --> Mode{"Execution Mode"}
-    Mode -->|"DLAMI Fast-Boot (~33s)"| Native["Native PyTorch / ML Worker"]:::runtime
-    Mode -->|"Container Mode"| Docker["Docker / Containerd Image"]:::runtime
+    Mode -->|"DLAMI Fast-Boot (~33s)\nGPU Accelerators"| Native["Native PyTorch / ML Worker"]:::runtime
+    Mode -->|"Container Mode\nCPU Pipelines & Custom Images"| Docker["Docker / Containerd Image"]:::runtime
 
     Native --> Health["Asynchronous Healthcheck"]:::runtime
     Docker --> Health
@@ -164,16 +173,16 @@ flowchart TD
     Native -->|"Task Completed"| Terminate
 ```
 
-#### In-VM Watchdogs & Telemetry
-- **2-Minute Preemption Monitor**: Continuously polls AWS IMDSv2 metadata (`/latest/meta-data/spot/instance-action`) and GCP metadata (`/computeMetadata/v1/instance/preempted`) to trigger graceful worker drains before eviction.
+#### Watchdogs & Telemetry
+- **2-Minute Preemption Monitor**: Continuously polls AWS IMDSv2 metadata (`/latest/meta-data/spot/instance-action`) and GCP metadata (`/computeMetadata/v1/instance/preempted`) to cleanly drain workers and checkpoint state prior to eviction.
 - **300s Fail-Safe Self-Destruct**: Shuts down the machine if workload initialization fails within 5 minutes, preventing budget leaks from orphaned instances.
-- **Serial Console Telemetry**: Streams structured status heartbeats to `/dev/console`, allowing `kubectl logs` and status tracking without maintaining open SSH ports or credentials.
+- **Serial Console Telemetry**: Emits structured heartbeats to `/dev/console` (read via cloud serial port APIs), enabling `kubectl logs` without open SSH ports or credentials.
 
 ---
 
-### 3. Bidirectional Reconciler (Garbage Collection)
+### C. Bidirectional Reconciler (Garbage Collection)
 
-An asynchronous reconciliation loop runs every 60 seconds to synchronize Kubernetes Pod state with live cloud provider inventory:
+An asynchronous background loop runs every 60 seconds to synchronize Kubernetes Pod state with live cloud inventory:
 
 ```mermaid
 flowchart TD
@@ -199,15 +208,15 @@ flowchart TD
 
 ---
 
-## Usage
+## 4. Usage Examples
 
-Workloads target the `cloudvm` virtual node using standard InterLink annotations:
+### Example 1: Spot GPU ML Worker (Fast-Boot)
 
 ```yaml
 apiVersion: v1
 kind: Pod
 metadata:
-  name: gpu-inference-worker
+  name: esm2-gpu-inference
   annotations:
     cloudvm-job.vk.io/provider: "aws"
     cloudvm-job.vk.io/capacity-type: "spot"
@@ -227,9 +236,39 @@ spec:
           nvidia.com/gpu: "1"
 ```
 
+### Example 2: Spot CPU Data Pipeline Worker (Container Mode)
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ray-data-transform
+  annotations:
+    cloudvm-job.vk.io/provider: "aws"
+    cloudvm-job.vk.io/capacity-type: "spot"
+    cloudvm-job.vk.io/instance-type: "c6i.2xlarge"
+spec:
+  nodeSelector:
+    kubernetes.io/role: cloudvm
+  tolerations:
+    - key: virtual-node.interlink/no-schedule
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: worker
+      image: rayproject/ray:2.44.0
+      env:
+        - name: RAY_HEAD_ADDRESS
+          value: "ray-head.default.svc.cluster.local:6379"
+      resources:
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+```
+
 ---
 
-## Installation via Helm
+## 5. Installation via Helm
 
 ```bash
 helm upgrade --install interlink-provider-cloudvm \
@@ -242,13 +281,13 @@ helm upgrade --install interlink-provider-cloudvm \
 
 ---
 
-## Development
+## 6. Development
 
 ```bash
 # Install toolchain
 mise install
 
-# Run static checks and unit tests
+# Run static verification gate and unit tests
 mise run verify
 
 # Build binary
