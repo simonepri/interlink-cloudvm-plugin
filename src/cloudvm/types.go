@@ -141,6 +141,11 @@ type CloudInventory interface {
 	ListActiveInstances(ctx context.Context, clusterTag string) ([]*Instance, error)
 }
 
+// RegionInventory optionally allows multi-region providers to return inventory grouped by region with per-region errors.
+type RegionInventory interface {
+	ListActiveInstancesByRegion(ctx context.Context, clusterTag string) (map[string][]*Instance, map[string]error)
+}
+
 // Minimal Kubernetes Pod representation for InterLink Sidecar API without external k8s.io dependencies.
 type PodMeta struct {
 	Name        string            `json:"name"`

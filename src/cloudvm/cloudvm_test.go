@@ -1827,7 +1827,7 @@ func TestReconciler_LaunchGracePeriodPreventsPrematureEviction(t *testing.T) {
 	}
 }
 
-func TestAWSProvider_ListActiveInstances_PartialRegionFailureAbortsReconcile(t *testing.T) {
+func TestAWSProvider_ListActiveInstances_PartialRegionFailureDoesNotBlockOtherRegions(t *testing.T) {
 	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
 
 	awsProv := NewAWSProvider("us-east-1", "us-west-2")
@@ -1870,39 +1870,224 @@ func TestAWSProvider_ListActiveInstances_PartialRegionFailureAbortsReconcile(t *
 	}
 	awsProv.SetRegionClient("us-west-2", westClient)
 
-	// Direct ListActiveInstances check: must fail immediately without returning partial list
+	// 1. Direct ListActiveInstances check: returns healthy region instances instead of failing completely
 	instances, err := awsProv.ListActiveInstances(context.Background(), "test-cluster")
-	if err == nil {
-		t.Fatalf("expected error from partial region failure, got nil with %d instances", len(instances))
+	if err != nil {
+		t.Fatalf("expected successful response with instances from healthy regions, got error: %v", err)
 	}
-	if instances != nil {
-		t.Fatalf("expected nil instances on partial failure, got %v", instances)
+	if len(instances) != 1 || instances[0].ID != "i-east-1" {
+		t.Fatalf("expected 1 instance i-east-1 from us-east-1, got %v", instances)
 	}
 
-	// Reconciler test: partial failure must abort and NOT evict healthy pods
+	// 2. Reconciler test: healthy region reconciles, failed region skips without false evictions
 	mockTracker := &mockTrackerWrapper{
 		activePods: map[string]string{
 			"uid-east-1": "i-east-1",
+			"uid-east-2": "i-east-vanished",
+			"uid-west-1": "i-west-healthy-pod",
+		},
+		podRegions: map[string]string{
+			"uid-east-1": "us-east-1",
+			"uid-east-2": "us-east-1",
+			"uid-west-1": "us-west-2",
 		},
 	}
 	reconciler := NewReconciler(awsProv, mockTracker, nil, "test-cluster", 10*time.Minute)
 	reconciler.SetLaunchGracePeriod(0)
-	_, recErr := reconciler.ReconcileOnce(context.Background())
-	if recErr == nil {
-		t.Fatalf("expected reconciler to return error on partial cloud inventory failure")
+	result, recErr := reconciler.ReconcileOnce(context.Background())
+	if recErr != nil {
+		t.Fatalf("reconciler failed: %v", recErr)
 	}
-	if len(mockTracker.failedCalls) > 0 {
-		t.Fatalf("reconciler falsely evicted pods on partial inventory failure: %v", mockTracker.failedCalls)
+
+	// uid-east-1 is alive -> not evicted
+	// uid-east-2 is vanished from us-east-1 -> evicted
+	// uid-west-1 in failing region us-west-2 -> SKIPPED (protected from false eviction)
+	if len(result.EvictedPods) != 1 || result.EvictedPods[0] != "uid-east-2" {
+		t.Fatalf("expected only uid-east-2 to be evicted, got: %v", result.EvictedPods)
+	}
+	for _, f := range mockTracker.failedCalls {
+		if f == "uid-west-1" {
+			t.Fatalf("pod in failing region uid-west-1 was erroneously evicted!")
+		}
+	}
+}
+
+func TestAWSProvider_ListActiveInstances_AllRegionsFailureReturnsError(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	awsProv := NewAWSProvider("us-west-2")
+	westClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return nil, fmt.Errorf("AuthFailure: AWS credentials invalid")
+		},
+	}
+	awsProv.SetRegionClient("us-west-2", westClient)
+
+	instances, err := awsProv.ListActiveInstances(context.Background(), "test-cluster")
+	if err == nil {
+		t.Fatalf("expected error when all regions fail, got nil with instances: %v", instances)
+	}
+}
+
+func TestAWSProvider_StaleSpotReclaimedInstancesPrunedFromRegionStore(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	awsProv := NewAWSProvider("us-east-1")
+
+	// Pre-populate an instance in region store
+	if err := awsProv.regionStore.Set("i-spot-reclaimed", "us-east-1"); err != nil {
+		t.Fatalf("failed to set initial mapping: %v", err)
+	}
+	awsProv.instanceRegions["i-spot-reclaimed"] = "us-east-1"
+
+	// us-east-1 returns 0 instances (spot instance was reclaimed and terminated)
+	eastClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return &ec2.DescribeInstancesOutput{}, nil
+		},
+	}
+	awsProv.SetRegionClient("us-east-1", eastClient)
+
+	_, _ = awsProv.ListActiveInstancesByRegion(context.Background(), "test-cluster")
+
+	if reg := awsProv.instanceRegions["i-spot-reclaimed"]; reg != "" {
+		t.Fatalf("expected reclaimed instance pruned from instanceRegions, got %s", reg)
+	}
+	if reg := awsProv.regionStore.Get("i-spot-reclaimed"); reg != "" {
+		t.Fatalf("expected reclaimed instance pruned from regionStore, got %s", reg)
+	}
+}
+
+func TestNodePool_OnDemandPodNeverPacksOntoSpotVM(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-market-separation")
+
+	// Launch spot Pod 1
+	spotPodJSON := `{
+		"metadata": {
+			"name": "pod-spot-1",
+			"namespace": "default",
+			"uid": "uid-spot-1",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "spot",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req1 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(spotPodJSON)))
+	w1 := httptest.NewRecorder()
+	srv.handleCreate(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("spot pod create failed: %d: %s", w1.Code, w1.Body.String())
+	}
+	var res1 CreateStruct
+	_ = json.NewDecoder(w1.Body).Decode(&res1)
+	spotInstID := strings.Split(res1.PodJID, ":")[0]
+
+	// Launch on-demand Pod 2 with small resources that would fit on spotInstID if market were ignored
+	odPodJSON := `{
+		"metadata": {
+			"name": "pod-od-1",
+			"namespace": "default",
+			"uid": "uid-od-1",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "on-demand",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req2 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(odPodJSON)))
+	w2 := httptest.NewRecorder()
+	srv.handleCreate(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("on-demand pod create failed: %d: %s", w2.Code, w2.Body.String())
+	}
+	var res2 CreateStruct
+	_ = json.NewDecoder(w2.Body).Decode(&res2)
+	odInstID := strings.Split(res2.PodJID, ":")[0]
+
+	if spotInstID == odInstID {
+		t.Fatalf("CRITICAL BUG: on-demand pod was packed onto spot VM %s!", spotInstID)
+	}
+
+	srv.mu.RLock()
+	instSpot := srv.instances["uid-spot-1"]
+	instOD := srv.instances["uid-od-1"]
+	srv.mu.RUnlock()
+
+	if instSpot.Metadata["marketType"] != "spot" {
+		t.Fatalf("expected spot VM metadata marketType spot, got %s", instSpot.Metadata["marketType"])
+	}
+	if instOD.Metadata["marketType"] != "on-demand" {
+		t.Fatalf("expected on-demand VM metadata marketType on-demand, got %s", instOD.Metadata["marketType"])
+	}
+
+	// Launch a second on-demand pod: verify it CAN bin-pack onto the on-demand VM!
+	odPod2JSON := `{
+		"metadata": {
+			"name": "pod-od-2",
+			"namespace": "default",
+			"uid": "uid-od-2",
+			"annotations": {
+				"cloudvm.vk.io/instance-type": "g5.12xlarge",
+				"cloudvm.vk.io/capacity-type": "on-demand",
+				"cloudvm.vk.io/cpu": "4",
+				"cloudvm.vk.io/memory": "16Gi"
+			}
+		},
+		"spec": {
+			"containers": [{"name": "app", "image": "pytorch"}]
+		}
+	}`
+	req3 := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte(odPod2JSON)))
+	w3 := httptest.NewRecorder()
+	srv.handleCreate(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("on-demand pod 2 create failed: %d: %s", w3.Code, w3.Body.String())
+	}
+	var res3 CreateStruct
+	_ = json.NewDecoder(w3.Body).Decode(&res3)
+	odInstID2 := strings.Split(res3.PodJID, ":")[0]
+
+	if odInstID2 != odInstID {
+		t.Fatalf("expected on-demand pod 2 to bin-pack on on-demand VM %s, got %s", odInstID, odInstID2)
+	}
+
+	srv.mu.RLock()
+	instOD2 := srv.instances["uid-od-2"]
+	srv.mu.RUnlock()
+	if instOD2.Metadata["marketType"] != "on-demand" {
+		t.Fatalf("expected packed on-demand pod to inherit marketType on-demand, got %s", instOD2.Metadata["marketType"])
 	}
 }
 
 type mockTrackerWrapper struct {
 	activePods  map[string]string
+	podRegions  map[string]string
 	failedCalls []string
 }
 
 func (m *mockTrackerWrapper) GetActivePods(_ context.Context) (map[string]string, error) {
 	return m.activePods, nil
+}
+
+func (m *mockTrackerWrapper) GetPodRegion(_ context.Context, podKey string) (string, bool) {
+	if m.podRegions != nil {
+		reg, ok := m.podRegions[podKey]
+		return reg, ok
+	}
+	return "", false
 }
 
 func (m *mockTrackerWrapper) MarkPodFailed(_ context.Context, podName string, _ string) error {

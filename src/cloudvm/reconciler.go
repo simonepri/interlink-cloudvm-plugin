@@ -20,6 +20,11 @@ type PodCreationTracker interface {
 	GetPodCreatedAt(ctx context.Context, podKey string) (time.Time, bool)
 }
 
+// PodRegionTracker provides the home cloud region of an active pod/instance.
+type PodRegionTracker interface {
+	GetPodRegion(ctx context.Context, podKey string) (string, bool)
+}
+
 // InstanceTerminator abstracts VM termination for the reconciler.
 type InstanceTerminator interface {
 	Terminate(ctx context.Context, instanceID string) error
@@ -72,9 +77,28 @@ func NewReconciler(inventory CloudInventory, tracker PodStateTracker, terminator
 func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error) {
 	result := &ReconcileResult{}
 
-	activeInstances, err := r.inventory.ListActiveInstances(ctx, r.clusterTag)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query cloud inventory: %w", err)
+	var activeInstances []*Instance
+	var errorsByRegion map[string]error
+
+	if regInv, ok := r.inventory.(RegionInventory); ok {
+		byRegion, errs := regInv.ListActiveInstancesByRegion(ctx, r.clusterTag)
+		errorsByRegion = errs
+		for _, insts := range byRegion {
+			activeInstances = append(activeInstances, insts...)
+		}
+		if len(byRegion) == 0 && len(errs) > 0 {
+			var errMsgs []string
+			for reg, err := range errs {
+				errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", reg, err))
+			}
+			return nil, fmt.Errorf("failed to query all cloud inventory regions: %s", strings.Join(errMsgs, "; "))
+		}
+	} else {
+		insts, err := r.inventory.ListActiveInstances(ctx, r.clusterTag)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query cloud inventory: %w", err)
+		}
+		activeInstances = insts
 	}
 
 	activePods, err := r.tracker.GetActivePods(ctx)
@@ -94,9 +118,23 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		if instID == "" {
 			continue
 		}
-		inst, alive := cloudInstances[instID]
 		cleanKey := strings.ReplaceAll(strings.ReplaceAll(podKey, "\n", ""), "\r", "")
 		cleanID := strings.ReplaceAll(strings.ReplaceAll(instID, "\n", ""), "\r", "")
+
+		// Skip judging pods whose home cloud region failed to answer
+		if len(errorsByRegion) > 0 {
+			if rt, ok := r.tracker.(PodRegionTracker); ok {
+				if podReg, ok := rt.GetPodRegion(ctx, podKey); ok && podReg != "" {
+					if err, failed := errorsByRegion[podReg]; failed && err != nil {
+						cleanReg := strings.ReplaceAll(strings.ReplaceAll(podReg, "\n", ""), "\r", "")
+						log.Printf("[reconciler] Skipping pod %s in region %s because region query failed: %v", cleanKey, cleanReg, err) //nolint:gosec // cleanKey and cleanReg sanitized
+						continue
+					}
+				}
+			}
+		}
+
+		inst, alive := cloudInstances[instID]
 
 		if !alive {
 			// Check if instance was recently launched and may not yet be indexed by cloud inventory

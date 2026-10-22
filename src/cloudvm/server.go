@@ -636,7 +636,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Try to bin-pack into an existing warm node
-	warmNode, assignedGPUs, assignedTPUs, err := s.nodePool.Allocate(reqVec, spec.Region, spec.PodUID, spec.PodNamespace, spec.PodName)
+	isSpot := spec.MarketType != "on-demand"
+	warmNode, assignedGPUs, assignedTPUs, err := s.nodePool.Allocate(reqVec, spec.Region, spec.PodUID, spec.PodNamespace, spec.PodName, isSpot)
 	if err == nil && warmNode != nil {
 		log.Printf("[cloudvm] Bin-pack hit! Slicing pod %s/%s into warm node %s (GPUs=%v, TPUs=%v)",
 			spec.PodNamespace, spec.PodName, warmNode.InstanceID, assignedGPUs, assignedTPUs)
@@ -663,13 +664,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			RunAsGroup:    spec.RunAsGroup,
 		})
 
-		marketType := spec.MarketType
-		if marketType == "" {
-			if warmNode.Spot {
-				marketType = "spot"
-			} else {
-				marketType = "on-demand"
-			}
+		marketType := "on-demand"
+		if warmNode.Spot {
+			marketType = "spot"
 		}
 
 		s.mu.Lock()
@@ -823,6 +820,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if spec.PodUID != "" {
 		inst.Metadata["podUID"] = spec.PodUID
 	}
+	marketType := "on-demand"
+	if newNode.Spot {
+		marketType = "spot"
+	}
+	inst.Metadata["marketType"] = marketType
 	key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
 	s.instances[key] = inst
 	if spec.PodUID != "" {
@@ -1326,6 +1328,17 @@ func (s *Server) ActiveInstances() map[string]*Instance {
 	return out
 }
 
+// GetPodRegion returns the cloud region associated with podKey.
+func (s *Server) GetPodRegion(_ context.Context, podKey string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	inst, ok := s.instances[podKey]
+	if !ok || inst == nil {
+		return "", false
+	}
+	return inst.Region, true
+}
+
 // GetPodCreatedAt returns the creation timestamp of the instance associated with podKey.
 func (s *Server) GetPodCreatedAt(_ context.Context, podKey string) (time.Time, bool) {
 	s.mu.RLock()
@@ -1401,10 +1414,18 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 		return nil
 	}
 
-	// 3. Distinguish SpotInterruption vs NodeLost
-	if reason == "SpotInterruption" && inst != nil && inst.Metadata != nil {
-		if inst.Metadata["marketType"] == "on-demand" {
-			reason = "NodeLost"
+	// 3. Distinguish SpotInterruption vs NodeLost vs AWS StateReason
+	if inst != nil && inst.Metadata != nil {
+		if code := inst.Metadata["stateReasonCode"]; code != "" {
+			if strings.Contains(code, "SpotInstanceTermination") {
+				reason = "SpotInterruption"
+			} else {
+				reason = code
+			}
+		} else if reason == "SpotInterruption" {
+			if inst.Metadata["marketType"] == "on-demand" {
+				reason = "NodeLost"
+			}
 		}
 	}
 

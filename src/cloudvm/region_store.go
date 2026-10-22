@@ -25,6 +25,9 @@ func NewRegionStore(filePath string) (*RegionStore, error) {
 		filePath = filepath.Join(os.TempDir(), "cloudvm-instance-regions.json")
 	}
 	filePath = filepath.Clean(filePath)
+	if err := os.MkdirAll(filepath.Dir(filePath), 0750); err != nil { //nolint:gosec // directory creation for local store
+		filePath = filepath.Join(os.TempDir(), "cloudvm-instance-regions.json")
+	}
 	rs := &RegionStore{
 		filePath: filePath,
 		regions:  make(map[string]string),
@@ -85,23 +88,31 @@ func (rs *RegionStore) GetAll() map[string]string {
 }
 
 // Set stores and persists the AWS region for the specified instance ID.
+// If the region mapping is unchanged, it returns nil immediately without disk writes or fsync.
 func (rs *RegionStore) Set(instanceID, region string) error {
 	if instanceID == "" || region == "" {
 		return nil
 	}
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	if rs.regions[instanceID] == region {
+		return nil
+	}
 	rs.regions[instanceID] = region
 	return rs.saveLocked()
 }
 
 // Delete removes and persists the deletion of the specified instance ID.
+// If the instance ID does not exist in the store, it returns nil immediately without disk writes or fsync.
 func (rs *RegionStore) Delete(instanceID string) error {
 	if instanceID == "" {
 		return nil
 	}
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	if _, exists := rs.regions[instanceID]; !exists {
+		return nil
+	}
 	delete(rs.regions, instanceID)
 	return rs.saveLocked()
 }

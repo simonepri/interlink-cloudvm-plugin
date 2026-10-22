@@ -262,7 +262,7 @@ func (np *NodePool) UnregisterNode(instanceID string) {
 // Allocate attempts to bin-pack a pod into an existing warm node using MostAllocated scoring.
 // Returns (node, assignedGPUs, assignedTPUs, nil) on a Bin-Pack Hit.
 // Returns (nil, nil, nil, ErrNoWarmCapacity) on a Bin-Pack Miss.
-func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespace, podName string) (*CloudVMNode, []int, []int, error) {
+func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespace, podName string, spot ...bool) (*CloudVMNode, []int, []int, error) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 
@@ -273,6 +273,9 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 
 	for _, node := range np.nodes {
 		if node.Cordoned {
+			continue
+		}
+		if len(spot) > 0 && node.Spot != spot[0] {
 			continue
 		}
 		if region != "" && node.Region != region {

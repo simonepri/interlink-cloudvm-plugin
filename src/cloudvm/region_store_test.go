@@ -115,3 +115,41 @@ func TestRegionStore_ConcurrentAccess(t *testing.T) {
 		t.Fatalf("expected 20 mappings, got %d", len(rs.GetAll()))
 	}
 }
+
+func TestRegionStore_NoOpWhenUnchanged(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "noop-regions.json")
+
+	rs, err := NewRegionStore(storePath)
+	if err != nil {
+		t.Fatalf("failed to create RegionStore: %v", err)
+	}
+
+	if err := rs.Set("i-unchanged", "us-east-1"); err != nil {
+		t.Fatalf("failed to set: %v", err)
+	}
+
+	info1, err := os.Stat(storePath)
+	if err != nil {
+		t.Fatalf("failed to stat: %v", err)
+	}
+
+	// Calling Set with same region should be a no-op without rewriting disk
+	if err := rs.Set("i-unchanged", "us-east-1"); err != nil {
+		t.Fatalf("failed second set: %v", err)
+	}
+
+	info2, err := os.Stat(storePath)
+	if err != nil {
+		t.Fatalf("failed to stat: %v", err)
+	}
+
+	if info1.ModTime() != info2.ModTime() {
+		t.Fatalf("expected unchanged modtime on identical Set, but file was rewritten")
+	}
+
+	// Delete for missing ID should also be a no-op
+	if err := rs.Delete("non-existent-id"); err != nil {
+		t.Fatalf("failed delete of missing ID: %v", err)
+	}
+}

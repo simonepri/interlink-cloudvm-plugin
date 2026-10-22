@@ -299,7 +299,7 @@ func NewAWSProvider(region string, additionalRegions ...string) *AWSProvider {
 	}
 	storePath := os.Getenv("REGION_STORE_PATH")
 	if storePath == "" {
-		storePath = "/data/instance-regions.json"
+		storePath = filepath.Join(os.TempDir(), "cloudvm-instance-regions.json")
 	}
 	regStore, err := NewRegionStore(storePath)
 	if err != nil {
@@ -585,7 +585,9 @@ func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance,
 	return nil, fmt.Errorf("instance %s not found", instanceID)
 }
 
-func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string) ([]*Instance, error) {
+// ListActiveInstancesByRegion queries EC2 across all tracked and configured regions,
+// returning instances grouped by region and recording individual region query errors.
+func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTag string) (map[string][]*Instance, map[string]error) {
 	p.mu.RLock()
 	regionsMap := make(map[string]bool)
 	if p.Region != "" {
@@ -603,11 +605,14 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 	}
 	p.mu.RUnlock()
 
-	var instances []*Instance
+	instancesByRegion := make(map[string][]*Instance)
+	errorsByRegion := make(map[string]error)
+
 	for reg := range regionsMap {
 		client, err := p.getClient(ctx, reg)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get AWS client for region %s: %w", reg, err)
+			errorsByRegion[reg] = fmt.Errorf("failed to get AWS client for region %s: %w", reg, err)
+			continue
 		}
 		out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 			Filters: []ec2types.Filter{
@@ -622,9 +627,12 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 			},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to describe instances in region %s: %w", reg, err)
+			errorsByRegion[reg] = fmt.Errorf("failed to describe instances in region %s: %w", reg, err)
+			continue
 		}
 
+		var regionInstances []*Instance
+		seenInReg := make(map[string]bool)
 		for _, res := range out.Reservations {
 			for _, inst := range res.Instances {
 				podName := ""
@@ -646,17 +654,30 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 					}
 				}
 				instID := aws.ToString(inst.InstanceId)
+				seenInReg[instID] = true
+
+				stateReasonCode := ""
+				stateReasonMsg := ""
+				if inst.StateReason != nil {
+					stateReasonCode = aws.ToString(inst.StateReason.Code)
+					stateReasonMsg = aws.ToString(inst.StateReason.Message)
+				}
+
 				p.mu.Lock()
+				regChanged := false
 				if p.instanceRegions == nil {
 					p.instanceRegions = make(map[string]string)
 				}
-				p.instanceRegions[instID] = reg
+				if p.instanceRegions[instID] != reg {
+					p.instanceRegions[instID] = reg
+					regChanged = true
+				}
 				p.mu.Unlock()
-				if p.regionStore != nil {
+				if regChanged && p.regionStore != nil {
 					_ = p.regionStore.Set(instID, reg)
 				}
 
-				instances = append(instances, &Instance{
+				regionInstances = append(regionInstances, &Instance{
 					ID:           instID,
 					Provider:     ProviderAWS,
 					Region:       reg,
@@ -665,15 +686,62 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 					State:        StateRunning,
 					CreatedAt:    aws.ToTime(inst.LaunchTime),
 					Metadata: map[string]string{
-						"podName":     podName,
-						"namespace":   podNamespace,
-						"podUID":      podUID,
-						"clusterTag":  clusterTag,
-						"runnerToken": runnerToken,
+						"podName":            podName,
+						"namespace":          podNamespace,
+						"podUID":             podUID,
+						"clusterTag":         clusterTag,
+						"runnerToken":        runnerToken,
+						"stateReasonCode":    stateReasonCode,
+						"stateReasonMessage": stateReasonMsg,
 					},
 				})
 			}
 		}
+		instancesByRegion[reg] = regionInstances
+
+		// Prune stale instance mappings that belonged to this region but are no longer active
+		p.mu.Lock()
+		var staleIDs []string
+		for id, mappedReg := range p.instanceRegions {
+			if mappedReg == reg && !seenInReg[id] {
+				staleIDs = append(staleIDs, id)
+			}
+		}
+		for _, id := range staleIDs {
+			delete(p.instanceRegions, id)
+		}
+		p.mu.Unlock()
+		if p.regionStore != nil {
+			for _, id := range staleIDs {
+				_ = p.regionStore.Delete(id)
+			}
+		}
 	}
+
+	return instancesByRegion, errorsByRegion
+}
+
+// ListActiveInstances returns all active cloud instances across healthy regions.
+// If all queried regions fail, it returns an error.
+func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string) ([]*Instance, error) {
+	instancesByRegion, errorsByRegion := p.ListActiveInstancesByRegion(ctx, clusterTag)
+	var instances []*Instance
+	for _, regInsts := range instancesByRegion {
+		instances = append(instances, regInsts...)
+	}
+
+	if len(instancesByRegion) == 0 && len(errorsByRegion) > 0 {
+		var errMsgs []string
+		for reg, err := range errorsByRegion {
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", reg, err))
+		}
+		return nil, fmt.Errorf("all regions failed active instance query: %s", strings.Join(errMsgs, "; "))
+	}
+
+	for reg, err := range errorsByRegion {
+		cleanReg := strings.ReplaceAll(strings.ReplaceAll(reg, "\n", ""), "\r", "")
+		log.Printf("[aws] Warning: region %s failed inventory query: %v", cleanReg, err) //nolint:gosec // region sanitized
+	}
+
 	return instances, nil
 }
