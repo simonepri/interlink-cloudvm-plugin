@@ -51,6 +51,10 @@ spec:
               value: "{{ .Values.provider.awsLaunchTemplateId }}"
             - name: AWS_LAUNCH_TEMPLATE_NAME
               value: "{{ .Values.provider.awsLaunchTemplateName }}"
+            {{- if .Values.provider.idleGracePeriod }}
+            - name: IDLE_GRACE_PERIOD
+              value: "{{ .Values.provider.idleGracePeriod }}"
+            {{- end }}
             {{- if .Values.provider.kmsKeyId }}
             - name: KMS_KEY_ID
               value: "{{ .Values.provider.kmsKeyId }}"

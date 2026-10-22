@@ -1051,3 +1051,125 @@ func TestServer_WarmNodeCotenantMetadataAndOnDemandNodeLost(t *testing.T) {
 		t.Fatalf("expected 0 evicted pods on second pass, got %d", len(result2.EvictedPods))
 	}
 }
+
+func TestServer_WarmNodeReuseAcrossPodDeletions(t *testing.T) {
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-warm-reuse")
+	srv.SetIdleGracePeriod(100 * time.Millisecond)
+
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Launch Pod 1
+	p1Payload := `{
+		"pod": {
+			"metadata": {"name": "worker-1", "namespace": "default", "uid": "uid-p1"},
+			"spec": {
+				"containers": [{
+					"name": "c1",
+					"image": "rayproject/ray:2.38.0",
+					"resources": {
+						"requests": {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "2"},
+						"limits": {"nvidia.com/gpu": "2"}
+					}
+				}]
+			}
+		}
+	}`
+
+	resp1, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(p1Payload))
+	if err != nil {
+		t.Fatalf("POST /create for pod 1 failed: %v", err)
+	}
+	_ = resp1.Body.Close()
+
+	if srv.NodePool().ActiveNodeCount() != 1 {
+		t.Fatalf("expected 1 active node in pool, got %d", srv.NodePool().ActiveNodeCount())
+	}
+	node, _, found := srv.NodePool().FindPodNode("uid-p1")
+	if !found || node == nil {
+		t.Fatalf("pod 1 not found in node pool")
+	}
+	originalInstanceID := node.InstanceID
+
+	// 2. Delete Pod 1
+	delPayload1 := `{"pod": {"metadata": {"name": "worker-1", "namespace": "default", "uid": "uid-p1"}}}`
+	delResp1, err := http.Post(ts.URL+"/delete", "application/json", strings.NewReader(delPayload1))
+	if err != nil {
+		t.Fatalf("POST /delete for pod 1 failed: %v", err)
+	}
+	_ = delResp1.Body.Close()
+
+	// CRITICAL CHECK: Under IdleGracePeriod, the VM must NOT be terminated!
+	if srv.NodePool().ActiveNodeCount() != 1 {
+		t.Fatalf("REGRESSION: VM was eagerly terminated on delete instead of holding warm! ActiveNodeCount=%d", srv.NodePool().ActiveNodeCount())
+	}
+	if node.ActivePodCount() != 0 {
+		t.Fatalf("expected 0 active pods on warm node, got %d", node.ActivePodCount())
+	}
+	if node.IdleSince == nil {
+		t.Fatalf("expected IdleSince timestamp recorded on warm node")
+	}
+
+	// 3. Launch Pod 2 within idle grace period -> Should reuse the existing warm VM!
+	p2Payload := `{
+		"pod": {
+			"metadata": {"name": "worker-2", "namespace": "default", "uid": "uid-p2"},
+			"spec": {
+				"containers": [{
+					"name": "c2",
+					"image": "rayproject/ray:2.38.0",
+					"resources": {
+						"requests": {"cpu": "4", "memory": "16Gi", "nvidia.com/gpu": "2"},
+						"limits": {"nvidia.com/gpu": "2"}
+					}
+				}]
+			}
+		}
+	}`
+
+	resp2, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(p2Payload))
+	if err != nil {
+		t.Fatalf("POST /create for pod 2 failed: %v", err)
+	}
+	_ = resp2.Body.Close()
+
+	if srv.NodePool().ActiveNodeCount() != 1 {
+		t.Fatalf("expected Pod 2 to reuse warm VM, but new node was launched! ActiveNodeCount=%d", srv.NodePool().ActiveNodeCount())
+	}
+	node2, _, found2 := srv.NodePool().FindPodNode("uid-p2")
+	if !found2 || node2 == nil {
+		t.Fatalf("pod 2 not found in node pool")
+	}
+	if node2.InstanceID != originalInstanceID {
+		t.Fatalf("expected pod 2 to bin-pack onto original VM %s, got %s", originalInstanceID, node2.InstanceID)
+	}
+	if node2.IdleSince != nil {
+		t.Fatalf("expected IdleSince reset to nil after assigning pod 2")
+	}
+	if node2.ActivePodCount() != 1 {
+		t.Fatalf("expected 1 active pod on node, got %d", node2.ActivePodCount())
+	}
+
+	// 4. Delete Pod 2
+	delPayload2 := `{"pod": {"metadata": {"name": "worker-2", "namespace": "default", "uid": "uid-p2"}}}`
+	delResp2, err := http.Post(ts.URL+"/delete", "application/json", strings.NewReader(delPayload2))
+	if err != nil {
+		t.Fatalf("POST /delete for pod 2 failed: %v", err)
+	}
+	_ = delResp2.Body.Close()
+
+	// Wait for idle grace period to expire
+	time.Sleep(150 * time.Millisecond)
+
+	// Collect and terminate expired idle node
+	expired := srv.NodePool().CollectExpiredIdleNodes()
+	if len(expired) != 1 || expired[0].InstanceID != originalInstanceID {
+		t.Fatalf("expected 1 expired node (%s), got: %+v", originalInstanceID, expired)
+	}
+	srv.TerminateIdleNode(context.Background(), expired[0])
+
+	if srv.NodePool().ActiveNodeCount() != 0 {
+		t.Fatalf("expected 0 active nodes after idle termination, got %d", srv.NodePool().ActiveNodeCount())
+	}
+}

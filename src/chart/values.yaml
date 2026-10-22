@@ -23,6 +23,7 @@ provider:
   gcpProject: ""
   gcpZone: "us-central1-a"
   tickerURL: ""
+  idleGracePeriod: "60s"
   reconcileIntervalSeconds: 60
   reconcileLaunchGraceSeconds: 120
 

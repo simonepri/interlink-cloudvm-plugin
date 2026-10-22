@@ -116,6 +116,17 @@ func main() {
 
 	server := NewServer(defaultProvider, clusterTag)
 	server.SetDefaultRegion(awsRegion)
+
+	idleGrace := 60 * time.Second
+	if raw := os.Getenv("IDLE_GRACE_PERIOD"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+			idleGrace = d
+		} else if sec, err := strconv.Atoi(raw); err == nil && sec >= 0 {
+			idleGrace = time.Duration(sec) * time.Second
+		}
+	}
+	server.SetIdleGracePeriod(idleGrace)
+	log.Printf("[cloudvm] Node pool warm idle grace period configured to %v", idleGrace) //nolint:gosec // duration is safe
 	server.RegisterProvider(ProviderAWS, awsProv)
 	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
 	server.RegisterProvider(ProviderMock, mockProv)
@@ -204,7 +215,14 @@ func main() {
 
 	// Background idle node collector (terminates warm VMs after idle grace period)
 	go func() {
-		idleTicker := time.NewTicker(30 * time.Second)
+		idleInterval := 10 * time.Second
+		if ig := server.NodePool().IdleGracePeriod(); ig > 0 && ig < 10*time.Second {
+			idleInterval = ig / 2
+			if idleInterval < time.Second {
+				idleInterval = time.Second
+			}
+		}
+		idleTicker := time.NewTicker(idleInterval)
 		defer idleTicker.Stop()
 		for {
 			select {

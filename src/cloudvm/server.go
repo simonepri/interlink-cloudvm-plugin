@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -93,7 +94,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		instances:       make(map[string]*Instance),
 		clusterTag:      clusterTag,
 		defaultRegion:   "us-east-1",
-		nodePool:        NewNodePool(60 * time.Second),
+		nodePool:        NewNodePool(0),
 		runner:          NewMockContainerRunner(),
 		tokenStore:      tokStore,
 		completedStore:  compStore,
@@ -107,6 +108,13 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	if tombStore != nil {
 		for k, v := range tombStore.GetAll() {
 			s.tombstones[k] = v
+		}
+	}
+	if raw := os.Getenv("IDLE_GRACE_PERIOD"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+			s.nodePool.SetIdleGracePeriod(d)
+		} else if sec, err := strconv.Atoi(raw); err == nil && sec >= 0 {
+			s.nodePool.SetIdleGracePeriod(time.Duration(sec) * time.Second)
 		}
 	}
 	if kmsKey := os.Getenv("KMS_KEY_ID"); kmsKey != "" {
@@ -222,6 +230,13 @@ func (s *Server) NodePool() *NodePool {
 	return s.nodePool
 }
 
+// SetIdleGracePeriod updates the idle grace period on the underlying node pool.
+func (s *Server) SetIdleGracePeriod(d time.Duration) {
+	if s.nodePool != nil {
+		s.nodePool.SetIdleGracePeriod(d)
+	}
+}
+
 // SetDefaultRegion sets the baseline cloud region for pods without explicit region annotations.
 func (s *Server) SetDefaultRegion(region string) {
 	s.mu.Lock()
@@ -285,6 +300,10 @@ func (s *Server) TerminateIdleNode(ctx context.Context, node *CloudVMNode) {
 		if inst != nil && inst.ID == node.InstanceID {
 			delete(s.instances, k)
 		}
+	}
+	s.tombstones[node.InstanceID] = time.Now()
+	if s.tombstoneStore != nil {
+		_ = s.tombstoneStore.Set(node.InstanceID)
 	}
 	s.mu.Unlock()
 }
@@ -814,8 +833,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	// Release resources from NodePool
 	remainingPods := 0
 	foundInPool := false
+	var nodeRef *CloudVMNode
 	if node, _, found := s.nodePool.FindPodNode(uid); found {
 		foundInPool = true
+		nodeRef = node
 		_ = s.runner.StopContainer(r.Context(), node, uid)
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
@@ -833,6 +854,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+	}
+
+	// If the node pool has an active idle grace period and the node is not cordoned,
+	// retain the warm VM so subsequent pods can bin-pack onto it without VM cold-start.
+	if foundInPool && nodeRef != nil && !nodeRef.Cordoned && s.nodePool.IdleGracePeriod() > 0 {
+		log.Printf("[cloudvm] Node %s has 0 active pods; holding warm for %v for potential reuse",
+			nodeRef.InstanceID, s.nodePool.IdleGracePeriod())
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 
 	if inst != nil && inst.ID != "" && remainingPods == 0 {

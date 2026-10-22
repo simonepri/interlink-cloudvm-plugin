@@ -239,13 +239,27 @@ type NodePool struct {
 
 // NewNodePool initializes a NodePool with a default idle grace period before node termination.
 func NewNodePool(idleGracePeriod time.Duration) *NodePool {
-	if idleGracePeriod <= 0 {
+	if idleGracePeriod < 0 {
 		idleGracePeriod = 60 * time.Second
 	}
 	return &NodePool{
 		nodes:           make(map[string]*CloudVMNode),
 		idleGracePeriod: idleGracePeriod,
 	}
+}
+
+// IdleGracePeriod returns the configured idle cooldown period before an unused node is terminated.
+func (np *NodePool) IdleGracePeriod() time.Duration {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	return np.idleGracePeriod
+}
+
+// SetIdleGracePeriod updates the idle grace period for the node pool.
+func (np *NodePool) SetIdleGracePeriod(d time.Duration) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	np.idleGracePeriod = d
 }
 
 // RegisterNode adds a newly provisioned cloud node into the active bin-packing pool.
