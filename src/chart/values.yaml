@@ -1,0 +1,36 @@
+image:
+  repository: ghcr.io/simonepri/interlink-provider-cloudvm
+  pullPolicy: IfNotPresent
+  tag: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+provider:
+  type: "mock" # "aws" | "gcp" | "mock"
+  clusterTag: "interlink-cloudvm"
+  awsRegion: "us-east-1"
+  gcpProject: ""
+  gcpZone: "us-central1-a"
+  reconcileIntervalSeconds: 60
+
+service:
+  type: ClusterIP
+  port: 4040
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

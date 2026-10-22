@@ -1,0 +1,124 @@
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+)
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "4040"
+	}
+
+	clusterTag := os.Getenv("CLUSTER_TAG")
+	if clusterTag == "" {
+		clusterTag = "interlink-cloudvm"
+	}
+
+	providerType := os.Getenv("PROVIDER_TYPE")
+	if providerType == "" {
+		providerType = "mock"
+	}
+
+	log.Printf("[interlink-provider-cloudvm] Starting server (provider=%s, clusterTag=%s, port=%s)...",
+		providerType, clusterTag, port)
+
+	var defaultProvider Provider
+	mockProv := NewMockProvider()
+
+	switch providerType {
+	case "aws":
+		awsRegion := os.Getenv("AWS_REGION")
+		if awsRegion == "" {
+			awsRegion = "us-east-1"
+		}
+		defaultProvider = NewAWSProvider(awsRegion)
+	case "gcp":
+		gcpProject := os.Getenv("GCP_PROJECT")
+		gcpZone := os.Getenv("GCP_ZONE")
+		defaultProvider = NewGCPProvider(gcpProject, gcpZone)
+	default:
+		defaultProvider = mockProv
+	}
+
+	server := NewServer(defaultProvider, clusterTag)
+	server.RegisterProvider(ProviderAWS, NewAWSProvider("us-east-1"))
+	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
+	server.RegisterProvider(ProviderMock, mockProv)
+
+	// Background reconciler
+	reconcileInterval := 60 * time.Second
+	if intervalSec := os.Getenv("RECONCILE_INTERVAL_SECONDS"); intervalSec != "" {
+		if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
+			reconcileInterval = time.Duration(s) * time.Second
+		}
+	}
+
+	var inventory CloudInventory
+	if inv, ok := defaultProvider.(CloudInventory); ok {
+		inventory = inv
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if inventory != nil {
+		reconciler := NewReconciler(inventory, server, clusterTag, 5*time.Minute)
+		server.SetReconciler(reconciler)
+
+		go func() {
+			ticker := time.NewTicker(reconcileInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					res, err := reconciler.ReconcileOnce(ctx)
+					if err != nil {
+						log.Printf("[reconciler] Error during reconciliation: %v", err)
+					} else if len(res.TerminatedZombies) > 0 || len(res.EvictedPods) > 0 {
+						log.Printf("[reconciler] Cleaned %d zombies, evicted %d vanished pods",
+							len(res.TerminatedZombies), len(res.EvictedPods))
+					}
+				}
+			}
+		}()
+	}
+
+	httpServer := &http.Server{
+		Addr:         ":" + port,
+		Handler:      server.Routes(),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	}
+
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("[interlink-provider-cloudvm] Listening on :%s", port)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[interlink-provider-cloudvm] Server failed: %v", err)
+		}
+	}()
+
+	<-stopChan
+	log.Printf("[interlink-provider-cloudvm] Shutting down gracefully...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("[interlink-provider-cloudvm] Shutdown error: %v", err)
+	}
+
+	log.Printf("[interlink-provider-cloudvm] Server stopped.")
+}

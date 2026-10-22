@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "group-pull-request-title-pattern": "chore: release ${version}",
+  "packages": {
+    ".": {
+      "component": "interlink-provider-cloudvm",
+      "extra-files": [
+        {
+          "jsonpath": "$.version",
+          "path": "src/chart/Chart.yaml",
+          "type": "yaml"
+        },
+        {
+          "jsonpath": "$.appVersion",
+          "path": "src/chart/Chart.yaml",
+          "type": "yaml"
+        },
+        {
+          "path": "readme.md",
+          "type": "generic"
+        }
+      ],
+      "include-component-in-tag": false,
+      "initial-version": "0.1.0",
+      "package-name": "interlink-provider-cloudvm",
+      "release-type": "simple",
+      "skip-changelog": true,
+      "version-file": "version.txt"
+    }
+  }
+}

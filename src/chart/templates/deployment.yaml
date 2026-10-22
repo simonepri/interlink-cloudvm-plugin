@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "interlink-provider-cloudvm.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "interlink-provider-cloudvm.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "interlink-provider-cloudvm.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "interlink-provider-cloudvm.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "interlink-provider-cloudvm.serviceAccountName" . }}
+      containers:
+        - name: provider
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: PORT
+              value: "{{ .Values.service.port }}"
+            - name: PROVIDER_TYPE
+              value: "{{ .Values.provider.type }}"
+            - name: CLUSTER_TAG
+              value: "{{ .Values.provider.clusterTag }}"
+            - name: AWS_REGION
+              value: "{{ .Values.provider.awsRegion }}"
+            - name: GCP_PROJECT
+              value: "{{ .Values.provider.gcpProject }}"
+            - name: GCP_ZONE
+              value: "{{ .Values.provider.gcpZone }}"
+            - name: RECONCILE_INTERVAL_SECONDS
+              value: "{{ .Values.provider.reconcileIntervalSeconds }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

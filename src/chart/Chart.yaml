@@ -1,0 +1,24 @@
+apiVersion: v2
+name: interlink-provider-cloudvm
+description: >-
+  CNCF InterLink provider for ultra-fast, multi-cloud, cross-region Spot and
+  On-Demand VM bursting in Kubernetes
+type: application
+version: 0.1.0
+appVersion: 0.1.0
+keywords:
+  - kubernetes
+  - interlink
+  - virtual-kubelet
+  - spot
+  - ec2-fleet
+home: https://github.com/simonepri/interlink-provider-cloudvm
+icon: >-
+  https://raw.githubusercontent.com/simonepri/interlink-provider-cloudvm/main/assets/logo.png
+maintainers:
+  - name: simonepri
+    url: https://github.com/simonepri
+sources:
+  - https://github.com/simonepri/interlink-provider-cloudvm
+annotations:
+  artifacthub.io/license: Apache-2.0
