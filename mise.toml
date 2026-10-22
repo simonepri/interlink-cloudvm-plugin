@@ -1,0 +1,90 @@
+[tools]
+actionlint = "1.7.12"
+gitleaks = "8.30.1"
+go = "1.27.3"
+"go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
+golangci-lint = "2.15.0"
+helm = "3.22.1"
+kind = "0.33.0"
+kubectl = "1.37.1"
+shellcheck = "0.11.0"
+yamllint = "1.38.0"
+zizmor = "1.29.0"
+
+[tasks.format]
+description = "Format Go source"
+run = "go -C src fmt ./..."
+
+[tasks.lint-actions]
+description = "Lint GitHub Actions workflows"
+run = "actionlint -shellcheck shellcheck"
+
+[tasks.lint-actions-security]
+description = "Audit GitHub Actions workflows for security issues"
+run = "zizmor .github/workflows"
+
+[tasks.lint-go]
+description = "Run strict Go linting"
+dir = "src"
+run = "golangci-lint run --config ../.config/golangci.yaml ./..."
+
+[tasks.lint-mod]
+description = "Verify Go module is tidy"
+run = "go -C src mod tidy -diff"
+
+[tasks.lint-secrets]
+description = "Scan authored files for committed secrets"
+run = "gitleaks dir . --config .config/gitleaks.toml --no-banner --redact"
+
+[tasks.lint-vulnerabilities]
+description = "Check reachable Go code for known vulnerabilities"
+dir = "src"
+run = "govulncheck ./..."
+
+[tasks.lint-yaml]
+description = "Lint authored YAML files"
+run = "yamllint --config-file .config/yamllint.yaml .github/workflows src/chart/Chart.yaml src/chart/values.yaml"
+
+[tasks.lint-helm]
+description = "Lint Helm charts and validate template rendering"
+run = [
+  "helm lint src/chart",
+  "helm template src/chart > /dev/null",
+  "helm lint src/charts/cloudvm-ticker",
+  "helm template src/charts/cloudvm-ticker > /dev/null",
+]
+
+[tasks.lint]
+description = "Run every static repository check"
+depends = [
+  "lint-actions",
+  "lint-actions-security",
+  "lint-go",
+  "lint-mod",
+  "lint-secrets",
+  "lint-vulnerabilities",
+  "lint-yaml",
+  "lint-helm",
+]
+
+[tasks.test]
+description = "Run race-enabled Go unit tests"
+run = "go -C src test -race -count=1 -cover ./..."
+
+[tasks.verify]
+description = "Run the complete verification gate"
+run = [
+  "mise run lint",
+  "mise run test",
+]
+
+[tasks.build]
+description = "Build the provider binary"
+run = [
+  "mkdir -p bin",
+  "go -C src build -trimpath -ldflags='-s -w' -o ../bin/interlink-cloudvm-plugin ./cloudvm",
+]
+
+[tasks.ci]
+description = "Run the CI verification contract"
+run = "mise run verify"
