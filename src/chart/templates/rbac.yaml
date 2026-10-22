@@ -1,0 +1,67 @@
+{{- if and .Values.serviceAccount.create .Values.rbac.create -}}
+{{- if .Values.rbac.clusterWide }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "interlink-provider-cloudvm.serviceAccountName" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "interlink-provider-cloudvm.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "interlink-provider-cloudvm.serviceAccountName" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "interlink-provider-cloudvm.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "interlink-provider-cloudvm.serviceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "interlink-provider-cloudvm.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- $saName := include "interlink-provider-cloudvm.serviceAccountName" . -}}
+{{- $relName := .Release.Name -}}
+{{- $relNs := .Release.Namespace -}}
+{{- range .Values.rbac.tenantNamespaces }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $saName }}
+  namespace: {{ . }}
+  labels:
+    app.kubernetes.io/name: interlink-provider-cloudvm
+    app.kubernetes.io/instance: {{ $relName }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $saName }}
+  namespace: {{ . }}
+  labels:
+    app.kubernetes.io/name: interlink-provider-cloudvm
+    app.kubernetes.io/instance: {{ $relName }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $saName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $relNs }}
+---
+{{- end }}
+{{- end }}
+{{- end }}

@@ -48,3 +48,8 @@ persistence:
   accessMode: ReadWriteOnce
   size: 1Gi
   mountPath: /var/lib/cloudvm
+
+rbac:
+  create: true
+  clusterWide: true  # Set to false to restrict secret reading to tenantNamespaces
+  tenantNamespaces: []  # e.g. ["default", "ml-workloads"] when clusterWide is false
