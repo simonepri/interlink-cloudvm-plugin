@@ -63,10 +63,10 @@ flowchart LR
 
 | | Traditional Kubernetes (Cluster Autoscaler / Karpenter) | `interlink-provider-cloudvm` |
 | :--- | :--- | :--- |
-| **Execution Model** | Provisions full nodes $\\to$ registers `kubelet` $\\to$ pulls images $\\to$ schedules pods | **1 Pod = 1 Dedicated Cloud VM** |
+| **Execution Model** | Provisions full nodes $\→$ registers `kubelet` $\→$ pulls images $\→$ schedules pods | **1 Pod = 1 Dedicated Cloud VM** |
 | **GPU Cold-Start** | 3–5 minutes (node bootstrap + pulling 15GB CUDA container images) | **~33 seconds** (native pre-baked DLAMI execution) |
 | **Geographic Scope** | Single VPC / Single Region | **Cross-Region & Multi-Cloud Fleet Arbitrage** |
-| **Idle Cost** | Keeps empty nodes warm; consolidation and scale-down delay | **$0** (VM terminates 2 seconds after the task process exits) |
+| **Idle Cost** | Keeps empty nodes warm; consolidation and scale-down delay | **\$0** (VM terminates 2 seconds after the task process exits) |
 | **Workload Scope** | Any Kubernetes workload | **Optimized for Spot GPUs**, fully supports CPU pipelines |
 
 ---
@@ -90,7 +90,7 @@ To deliver this, `interlink-provider-cloudvm` is built on four core internal eng
 
 1. **Fleet Capacity Engine (Spot & On-Demand)**: Translates pod resource requirements into multi-family weighted fleet requests (`CreateFleet` / `bulkInsert`) across both Spot and On-Demand pools, with native hourly price capping (`cloudvm.vk.io/max-price`).
 2. **Backpressure & Orchestrator Feedback Loop**: Emits real-time scheduling conditions (`CapacityExhausted`, `PriceCapExceeded`) back to Kubernetes, driving upstream multi-flavor fallback (Spot → On-Demand) and queue backoff in Kueue and cluster autoscalers.
-3. **Hourly Spend Governors & Traffic Shaping**: Symmetrical burn-rate enforcement in `$/hr` for both Compute (`cloudvm.vk.io/max-price`) and Network Egress (`cloudvm.vk.io/max-egress-rate`). Translates authorized egress dollars directly into kernel-level Token Bucket Filters (Linux `tc`), permitting native line-rate bursts while pacing sustained egress to avoid runaway bandwidth bills.
+3. **Hourly Spend Governors & Traffic Shaping**: Symmetrical burn-rate enforcement in `USD/hr` for both Compute (`cloudvm.vk.io/max-price`) and Network Egress (`cloudvm.vk.io/max-egress-rate`). Translates authorized egress dollars directly into kernel-level Token Bucket Filters (Linux `tc`), permitting native line-rate bursts while pacing sustained egress to avoid runaway bandwidth bills.
 4. **Bidirectional Reconciler & FinOps Accounting**: A background reconciler that garbage collects zombie instances, synchronizes status, and maps cloud costs to Kubernetes pods for full **OpenCost** FinOps visibility.
 
 ---
@@ -175,9 +175,9 @@ To guard against spot pricing spikes, jobs specify a hard price ceiling and reac
 
 ---
 
-### C. Network Egress Spend Governor ($/hr) & Token Bucketing
+### C. Network Egress Spend Governor (USD/hr) & Token Bucketing
 
-Unrestricted cloud data egress ($0.08–$0.12/GB on AWS/GCP) can quickly outpace compute costs. A single instance saturating a 10 Gbps pipe can incur over **$400/hour** in egress fees alone. Rather than imposing arbitrary speed limits that throttle performance during short checkpoint saves, `interlink-provider-cloudvm` enforces **Egress Spend Rate Governance ($/hr)**.
+Unrestricted cloud data egress (\$0.08–\$0.12/GB on AWS/GCP) can quickly outpace compute costs. A single instance saturating a 10 Gbps pipe can incur over **\$400/hour** in egress fees alone. Rather than imposing arbitrary speed limits that throttle performance during short checkpoint saves, `interlink-provider-cloudvm` enforces **Egress Spend Rate Governance (USD/hr)**.
 
 ```yaml
 metadata:
@@ -192,9 +192,11 @@ metadata:
 
 #### How the Egress Spend Governor Works:
 1. **Dynamic Dollar-to-Token Rate Translation**:
-   The provider automatically translates your hourly budget ceiling into a kernel-level token rate based on the target cloud's egress pricing catalog ($0.09/GB on AWS, $0.085/GB on GCP):
-   $$\text{Sustained Rate} = \frac{\text{MaxEgressRate (\$/hr)}}{\text{CostPerGB}} \times \frac{8 \text{ bits}}{\text{Byte}}$$
-   For example, `$0.90/hr` on AWS configures a sustained rate of **`22mbit`**.
+   The provider automatically translates your hourly budget ceiling into a kernel-level token rate based on the target cloud's egress pricing catalog (\$0.09/GB on AWS, \$0.085/GB on GCP):
+
+   $$\text{Sustained Rate} = \frac{\text{MaxEgressRate}}{\text{CostPerGB}} \times \frac{8\text{ bits}}{\text{Byte}}$$
+
+   For example, `\$0.90/hr` on AWS configures a sustained rate of **`22mbit`**.
 2. **Instant Line-Rate Bursts**:
    The Token Bucket Filter is configured with a generous burst capacity (`100mb`). When a workload uploads periodic checkpoints or model weights, packets transfer at full **10 Gbps line speed** without penalty until tokens are depleted.
 3. **Pacing Sustained Streams**:
@@ -333,14 +335,14 @@ flowchart TD
 
 | Tool / Daemon | Traditional K8s DaemonSet | In Ephemeral CloudVM | Telemetry & Data Path |
 | :--- | :--- | :--- | :--- |
-| **OpenTelemetry (OTEL)** | OTEL DaemonSet scraping pods | Injected via pod env vars or host agent (`OTEL_EXPORTER_OTLP_ENDPOINT`) | OTLP gRPC over private mesh $\\to$ central in-cluster OTEL Collector. |
-| **OBI (OpenTelemetry eBPF)** | OBI DaemonSet (`preset: network`) | Runs as lightweight systemd service hooking kernel sockets | Exports `obi.network.flow.bytes` over mesh $\\to$ central OTEL Collector / SigNoz. |
-| **Parca** | Parca DaemonSet with host eBPF | Runs as systemd service with eBPF enabled on VM kernel | Continuously pushes pprof profiles over mesh $\\to$ central Parca server. |
-| **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP $\\to$ central `falcosidekick`. |
-| **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs $\\to$ avoids registry rate-limits. |
-| **OpenCost / Kubecost** | cAdvisor / NodeExporter DaemonSet | Cloud resource tagging + CUR billing reconciliation + Virtual-Kubelet status pricing | Tags instances with `PodName`/`Namespace` $\\to$ OpenCost attributes out-of-cluster cloud bills to K8s workloads. |
-| **NVIDIA DCGM Exporter** (`gpu_operator`) | DCGM Exporter DaemonSet | Bundled in DLAMI or host OTEL collector scraping NVML | Pushes GPU SM utilization, Tensor core activity, and VRAM over mesh $\\to$ central Prometheus / SigNoz. |
-| **Node Problem Detector (NPD)** | Node Problem Detector DaemonSet | In-VM watchdog polling `dmesg` and NVML for GPU Xid / ECC errors | Emits structured `HARDWARE_FAULT` logs to serial console $\\to$ provider evicts/reschedules pod. |
+| **OpenTelemetry (OTEL)** | OTEL DaemonSet scraping pods | Injected via pod env vars or host agent (`OTEL_EXPORTER_OTLP_ENDPOINT`) | OTLP gRPC over private mesh $\→$ central in-cluster OTEL Collector. |
+| **OBI (OpenTelemetry eBPF)** | OBI DaemonSet (`preset: network`) | Runs as lightweight systemd service hooking kernel sockets | Exports `obi.network.flow.bytes` over mesh $\→$ central OTEL Collector / SigNoz. |
+| **Parca** | Parca DaemonSet with host eBPF | Runs as systemd service with eBPF enabled on VM kernel | Continuously pushes pprof profiles over mesh $\→$ central Parca server. |
+| **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP $\→$ central `falcosidekick`. |
+| **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs $\→$ avoids registry rate-limits. |
+| **OpenCost / Kubecost** | cAdvisor / NodeExporter DaemonSet | Cloud resource tagging + CUR billing reconciliation + Virtual-Kubelet status pricing | Tags instances with `PodName`/`Namespace` $\→$ OpenCost attributes out-of-cluster cloud bills to K8s workloads. |
+| **NVIDIA DCGM Exporter** (`gpu_operator`) | DCGM Exporter DaemonSet | Bundled in DLAMI or host OTEL collector scraping NVML | Pushes GPU SM utilization, Tensor core activity, and VRAM over mesh $\→$ central Prometheus / SigNoz. |
+| **Node Problem Detector (NPD)** | Node Problem Detector DaemonSet | In-VM watchdog polling `dmesg` and NVML for GPU Xid / ECC errors | Emits structured `HARDWARE_FAULT` logs to serial console $\→$ provider evicts/reschedules pod. |
 | **Storage FUSE Driver** (`csi_rclone`) | CSI Node Driver DaemonSet | In-VM `cloud-init` FUSE mount (`rclone mount` / `s3fs` / `gcsfuse`) | Mounts object storage buckets directly to `/mnt/data` before workload container boots. |
 | **Torch Compile Cache** | Shared NFS or PVC compiler cache | S3/Dragonfly cache or pre-warmed Triton/Inductor kernel cache in Golden AMI | Eliminates 5–15 min CUDA compilation delays on every cold spot boot. |
 
