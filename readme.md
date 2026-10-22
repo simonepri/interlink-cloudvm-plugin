@@ -58,16 +58,22 @@ virtual-node"| B["2. interlink-provider-cloudvm
 (Runs workload & terminates)"]:::cloud
 ```
 
-### Architectural Comparison
+### Extending Kubernetes: In-Cluster vs. Global Burst
 
-| Dimension | In-Cluster Autoscaler (Karpenter / Cluster Autoscaler) | `interlink-provider-cloudvm` (Virtual-Kubelet Bridge) |
-| :--- | :--- | :--- |
-| **Node Join Pipeline** | Full node initialization: VM boot → Kubelet TLS bootstrap → CNI IPAM allocation → DaemonSet startup (`kube-proxy`, `aws-node`, `nvidia-device-plugin`) → Node `Ready` → scheduler binding | **Direct Workload Boot**: Pod is pre-bound in K8s; VM boots directly into workload container via cloud-init. Zero Kubelet join, zero CSR approvals, zero DaemonSet startup overhead |
-| **Geographic & Cloud Scope** | **Single VPC / Single Region**: Locked to the cluster's local VPC subnets. Multi-region or multi-cloud requires managing and federating multiple distinct K8s clusters | **Global Multi-Region & Multi-Cloud**: Centralized cluster dispatches spot/on-demand VMs across any AWS region or cloud provider over private WireGuard overlay |
-| **Spot Pool Depth** | **Local AZs Only**: Restricted to local region capacity pools. If local GPU spot instances are unavailable or priced out, jobs queue in `Pending` | **Global Arbitrage**: Scavenges spot capacity across multi-region candidate pools (`us-east-1`, `us-west-2`, `eu-west-1`, etc.) based on real-time price and capacity |
-| **Control Plane & IP Footprint** | **Heavy etcd & VPC Load**: Every VM creates a `Node` object in etcd, runs 5–10 DaemonSets, and claims secondary IPs from cluster VPC subnets | **Zero etcd Churn / Zero VPC IPs**: 1 static virtual node. Ephemeral VMs run in regional default VPCs without consuming cluster subnet IPs or bloating etcd |
-| **Tenant & Security Boundary** | Shared kernel and host by default across co-scheduled pods (unless running sandboxed runtimes or dedicated node pools) | **Hardware Hypervisor Isolation**: Dedicated VM boundary, instance profile, and ephemeral root disk per job |
-| **Best Suited For** | Long-running microservices, stateful workloads with local EBS/CSI volumes, service meshes, intra-VPC Pod-to-Pod low latency | Ephemeral GPU/TPU batch computing, distributed Ray/PyTorch clusters, hyperparameter sweeps, zero-idle-cost pipelines |
+`interlink-provider-cloudvm` does not replace Kubernetes or in-cluster node autoscalers like Karpenter—it **extends** them. A common production pattern is a hybrid topology:
+- **In-Cluster Nodes (Karpenter)**: Manages local persistent infrastructure (Ray head, Kueue queues, databases, web ingress, intra-VPC low latency services).
+- **Virtual Burst Nodes (`interlink-provider-cloudvm`)**: Absorbs elastic, large-scale GPU/TPU batch computing across spot markets globally whenever local capacity is constrained.
+
+| Capability | In-Cluster Autoscaler (Karpenter) | `interlink-provider-cloudvm` (Burst Engine) |
+| :--- | :---: | :---: |
+| **Primary Role** | In-cluster microservices & local steady-state | Ephemeral multi-region & multi-cloud burst |
+| **Geographic Scope** | ❌ Single VPC & region | ✅ Global fleet across regions & clouds |
+| **Spot Arbitrage** | ❌ Local AZ pools only | ✅ Multi-region price/capacity solver |
+| **Node Join Overhead** | ⚠️ 2–4 min (Kubelet, CNI, DaemonSets) | ✅ Instant (boots directly into container) |
+| **Cluster Impact** | ⚠️ `Node` in etcd + DaemonSets + VPC IPs | ✅ Zero (single static virtual node) |
+| **Isolation Boundary** | ⚠️ Shared host kernel across pods | ✅ Dedicated hardware hypervisor per job |
+| **Stateful Storage (CSI/PVC)** | ✅ Native EBS / CSI support | ❌ Object storage / network mounts (S3/GCS) |
+| **Idle Cost Baseline** | Scale-down delays & consolidation cooldown | **`$0`** (VM terminates immediately on exit) |
 
 ---
 
