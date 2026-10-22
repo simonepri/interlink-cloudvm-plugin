@@ -337,6 +337,25 @@ func (np *NodePool) Release(podUID string) int {
 	return 0
 }
 
+// HasActivePods returns true if the node exists in the pool and currently has non-completed pods assigned.
+func (np *NodePool) HasActivePods(instanceID string) bool {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	node, found := np.nodes[instanceID]
+	if !found {
+		return false
+	}
+	return node.ActivePodCount() > 0
+}
+
+// HasNode returns true if the specified node exists in the pool.
+func (np *NodePool) HasNode(instanceID string) bool {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	_, found := np.nodes[instanceID]
+	return found
+}
+
 // FindPodNode returns the node and a thread-safe copy of the allocation for a given podUID.
 func (np *NodePool) FindPodNode(podUID string) (*CloudVMNode, PodAllocation, bool) {
 	np.mu.RLock()

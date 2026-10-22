@@ -21,6 +21,21 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
+func TestMain(m *testing.M) {
+	cleanTempStores()
+	code := m.Run()
+	cleanTempStores()
+	os.Exit(code)
+}
+
+func cleanTempStores() {
+	pattern := filepath.Join(os.TempDir(), "cloudvm-*.json")
+	if matches, err := filepath.Glob(pattern); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+}
 func TestServerCreateAndDelete(t *testing.T) {
 	mock := NewMockProvider()
 	server := NewServer(mock, "test-cluster")
@@ -479,6 +494,9 @@ func TestInterLinkAPIContract_NestedPodAndStatus(t *testing.T) {
 }
 
 func TestServer_RecoverActiveInstances(t *testing.T) {
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
 	mock := NewMockProvider()
 	ctx := context.Background()
 
@@ -2773,4 +2791,155 @@ func TestNodePool_AdoptedVMIsCordonedAndRejectsNewPodPacking(t *testing.T) {
 	if node2.InstanceID == "i-adopted-01" {
 		t.Fatalf("CRITICAL: new pod packed onto cordoned adopted VM %s!", node2.InstanceID)
 	}
+}
+
+func TestServer_RestartWithPersistentTombstoneFile(t *testing.T) {
+	tombPath := filepath.Join(t.TempDir(), "tombstones.json")
+	tokPath := filepath.Join(t.TempDir(), "tokens.json")
+	compPath := filepath.Join(t.TempDir(), "completed.json")
+
+	t.Setenv("TOMBSTONE_STORE_PATH", tombPath)
+	t.Setenv("TOKEN_STORE_PATH", tokPath)
+	t.Setenv("COMPLETED_STORE_PATH", compPath)
+
+	mock := NewMockProvider()
+	srv1 := NewServer(mock, "test-cluster")
+
+	podJSON := `{
+		"metadata": {
+			"name": "u1",
+			"namespace": "default",
+			"uid": "uid-u1"
+		},
+		"spec": {
+			"containers": [
+				{
+					"name": "c1",
+					"resources": {
+						"limits": {
+							"cpu": "2",
+							"memory": "4Gi"
+						}
+					}
+				}
+			]
+		}
+	}`
+
+	// Create pod u1 in Server 1
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewBufferString(podJSON))
+	rec := httptest.NewRecorder()
+	srv1.handleCreate(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create failed with code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	active, err := srv1.GetActivePods(context.Background())
+	if err != nil || active["uid-u1"] == "" {
+		t.Fatalf("expected u1 active, got: %v", active)
+	}
+	instID := active["uid-u1"]
+
+	// Fail provider Terminate
+	mock.SetTerminateFn(func(_ context.Context, id string) error {
+		if id == instID {
+			return fmt.Errorf("API throttled: unable to terminate")
+		}
+		return nil
+	})
+
+	// Delete pod u1
+	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(podJSON))
+	delRec := httptest.NewRecorder()
+	srv1.handleDelete(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("delete returned %d", delRec.Code)
+	}
+
+	// Verify instance remains in cloud inventory
+	activeInsts, err := mock.ListActiveInstances(context.Background(), "test-cluster")
+	if err != nil || len(activeInsts) != 1 || activeInsts[0].ID != instID {
+		t.Fatalf("expected instance %s still in cloud inventory, got: %v", instID, activeInsts)
+	}
+
+	// Simulate daemon restart: create Server 2 with the same tombstone file path
+	srv2 := NewServer(mock, "test-cluster")
+
+	// Allow provider terminate to succeed now
+	mock.SetTerminateFn(nil)
+
+	// Run recovery on Server 2
+	if err := srv2.RecoverActiveInstances(context.Background(), mock); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// CRITICAL CHECK: srv2 must NOT have recovered uid-u1
+	activeAfterRecover, _ := srv2.GetActivePods(context.Background())
+	if _, exists := activeAfterRecover["uid-u1"]; exists {
+		t.Fatalf("CRITICAL: tombstoned pod uid-u1 was resurrected during recovery!")
+	}
+
+	// Run reconciler on Server 2
+	reconciler := NewReconciler(mock, srv2, mock, "test-cluster", 0)
+	res, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+
+	// CRITICAL CHECK: instID must be terminated as zombie immediately!
+	if len(res.TerminatedZombies) != 1 || res.TerminatedZombies[0] != instID {
+		t.Fatalf("expected %s terminated as zombie on restart, got: %v", instID, res.TerminatedZombies)
+	}
+}
+
+func TestNodePool_ConcurrentIsTombstonedAndRegisterNode(t *testing.T) {
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	mock := NewMockProvider()
+	srv := NewServer(mock, "test-cluster")
+
+	const iterations = 500
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	inst := &Instance{
+		ID:           "i-concurrent",
+		Provider:     ProviderMock,
+		Region:       "us-east-1",
+		InstanceType: "g5.xlarge",
+		Metadata: map[string]string{
+			"podUID":  "uid-concurrent",
+			"podName": "pod-concurrent",
+		},
+	}
+
+	// Goroutine 1: IsTombstoned calls
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = srv.IsTombstoned(inst)
+		}
+	}()
+
+	// Goroutine 2: Node registration and allocations
+	go func() {
+		defer wg.Done()
+		vec, _ := NewResourceVector("2", "4Gi", 0, 0)
+		for i := 0; i < iterations; i++ {
+			node := NewCloudVMNode("i-concurrent", ProviderMock, "us-east-1", "10.0.0.1", vec)
+			srv.nodePool.RegisterNode(node)
+			srv.nodePool.RegisterAndAllocate(node, vec, "uid-concurrent", "default", "pod-concurrent")
+		}
+	}()
+
+	// Goroutine 3: Node unregistration
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			srv.nodePool.UnregisterNode("i-concurrent")
+		}
+	}()
+
+	wg.Wait()
 }
