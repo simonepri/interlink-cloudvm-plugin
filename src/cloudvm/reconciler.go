@@ -77,6 +77,11 @@ func NewReconciler(inventory CloudInventory, tracker PodStateTracker, terminator
 func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error) {
 	result := &ReconcileResult{}
 
+	// Retry discovering containers on nodes with unverified co-tenants
+	if retrier, ok := r.tracker.(interface{ RetryUnknownCoTenants(ctx context.Context) }); ok {
+		retrier.RetryUnknownCoTenants(ctx)
+	}
+
 	var activeInstances []*Instance
 	var errorsByRegion map[string]error
 

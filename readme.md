@@ -472,3 +472,14 @@ mise run test
 # Build binary to ./bin/interlink-provider-cloudvm
 mise run build
 ```
+
+
+---
+
+## Known Production Architecture Notes
+
+1. Single Replica Provider Daemon:
+The cloudvm provider maintains local state caches (runner tokens, completed pod termination records, tombstones, and multi-region instance mappings) backed by an atomic fsync store on persistent volume storage (ReadWriteOnce PVC). To ensure lock integrity and state consistency across pod restarts, deploy the provider with replica count 1.
+
+2. In-VM Runner Token Delivery:
+Runner authorization tokens are generated securely per instance and passed through cloud instance launch user-data templates. Runner credentials are never exposed via cloud provider metadata tags or external APIs.

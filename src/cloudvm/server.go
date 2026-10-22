@@ -71,6 +71,7 @@ type Server struct {
 	tombstoneStore  *TombstoneStore
 	tombstones      map[string]time.Time                 // podUID or instanceID -> deletion timestamp
 	activeSightings map[string]time.Time                 // podUID -> last seen in /status or /create
+	statusPolled    bool                                 // set true when first /status query is received
 	launchTokens    map[string]string                    // podUID -> runnerAuthToken (reused across retries)
 	completedPods   map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
 	inFlightCreates map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
@@ -999,6 +1000,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.runner.StopContainer(r.Context(), node, uid)
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
+		if node.UnknownCoTenants {
+			log.Printf("[cloudvm] Node %s has unknown co-tenants because container listing previously failed. Retaining VM.", node.InstanceID)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 	}
 
 	if !foundInPool {
@@ -1060,6 +1066,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	s.mu.Lock()
+	s.statusPolled = true
+	s.mu.Unlock()
 
 	if len(pods) > 0 {
 		s.mu.Lock()
@@ -1391,13 +1401,15 @@ func (s *Server) AdoptInstance(ctx context.Context, inst *Instance) bool {
 		return false
 	}
 
-	// 3. If InterLink has sent status queries, verify active sighting evidence
-	if len(s.activeSightings) > 0 {
-		sighting, sighted := s.activeSightings[podUID]
-		if !sighted || time.Since(sighting) > 10*time.Minute {
-			s.mu.RUnlock()
-			return false
-		}
+	// 3. Evidence check: require that InterLink has polled status and sighted the pod within 10m
+	if !s.statusPolled {
+		s.mu.RUnlock()
+		return false
+	}
+	sighting, sighted := s.activeSightings[podUID]
+	if !sighted || time.Since(sighting) > 10*time.Minute {
+		s.mu.RUnlock()
+		return false
 	}
 
 	// 4. Check if already tracked
@@ -1477,7 +1489,7 @@ func (s *Server) AdoptInstance(ctx context.Context, inst *Instance) bool {
 
 		// Reconstruct allocations for any co-tenant containers running in this VM
 		for _, c := range containers {
-			if c != nil && c.PodUID != "" && c.PodUID != podUID {
+			if c != nil && c.PodUID != "" && c.PodUID != podUID && !s.isTombstonedLocked(c.PodUID) {
 				s.instances[c.PodUID] = inst
 				s.nodePool.RegisterAndAllocate(recNode, defaultVec, c.PodUID, ns, c.PodUID)
 			}
@@ -1564,13 +1576,18 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		s.nodePool.RegisterAndAllocate(recNode, defaultVec, podUID, ns, podName)
 
 		if s.runner != nil {
-			if containers, err := s.runner.ListContainers(ctx, recNode); err == nil {
+			containers, err := s.runner.ListContainers(ctx, recNode)
+			if err == nil {
 				for _, c := range containers {
-					if c.PodUID != "" && c.PodUID != podUID {
+					if c.PodUID != "" && c.PodUID != podUID && !s.isTombstonedLocked(c.PodUID) {
 						s.instances[c.PodUID] = inst
 						s.nodePool.RegisterAndAllocate(recNode, defaultVec, c.PodUID, ns, c.PodUID)
 					}
 				}
+			} else {
+				recNode.UnknownCoTenants = true
+				cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
+				log.Printf("[cloudvm] Warning: failed to list containers on recovered VM %s: %v. Flagged with UnknownCoTenants.", cleanID, err) //nolint:gosec // cleanID sanitized
 			}
 		}
 		cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
@@ -1746,4 +1763,33 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 		})
 	}
 	return nil
+}
+
+// RetryUnknownCoTenants attempts to query the in-VM runner for nodes whose startup listing failed.
+func (s *Server) RetryUnknownCoTenants(ctx context.Context) {
+	if s.nodePool == nil || s.runner == nil {
+		return
+	}
+	nodes := s.nodePool.NodesWithUnknownCoTenants()
+	for _, node := range nodes {
+		containers, err := s.runner.ListContainers(ctx, node)
+		if err == nil {
+			s.mu.Lock()
+			defaultVec, _ := NewResourceVector("2", "4Gi", 0, 0)
+			for _, c := range containers {
+				if c != nil && c.PodUID != "" && !s.isTombstonedLocked(c.PodUID) {
+					if _, _, exists := s.nodePool.FindPodNode(c.PodUID); !exists {
+						if inst := s.instances[node.InstanceID]; inst != nil {
+							s.instances[c.PodUID] = inst
+						}
+						s.nodePool.RegisterAndAllocate(node, defaultVec, c.PodUID, node.Namespace, c.PodUID)
+					}
+				}
+			}
+			s.mu.Unlock()
+			s.nodePool.SetUnknownCoTenants(node.InstanceID, false)
+			cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
+			log.Printf("[cloudvm] Successfully resolved co-tenants for node %s via background reconciliation", cleanID) //nolint:gosec // cleanID sanitized
+		}
+	}
 }

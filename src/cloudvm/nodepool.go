@@ -25,19 +25,20 @@ type PodAllocation struct {
 
 // CloudVMNode represents a live ephemeral cloud VM capable of hosting one or more pods.
 type CloudVMNode struct {
-	InstanceID      string         `json:"instanceId"`
-	Provider        ProviderType   `json:"provider"`
-	Region          string         `json:"region"`
-	Namespace       string         `json:"namespace,omitempty"`
-	Spot            bool           `json:"spot"`
-	Zone            string         `json:"zone,omitempty"`
-	MeshIP          string         `json:"meshIp"`
-	Capacity        ResourceVector `json:"capacity"`
-	Allocated       ResourceVector `json:"allocated"`
-	CreatedAt       time.Time      `json:"createdAt"`
-	IdleSince       *time.Time     `json:"idleSince,omitempty"`
-	Cordoned        bool           `json:"cordoned,omitempty"`
-	RunnerAuthToken string         `json:"runnerAuthToken,omitempty"`
+	InstanceID       string         `json:"instanceId"`
+	Provider         ProviderType   `json:"provider"`
+	Region           string         `json:"region"`
+	Namespace        string         `json:"namespace,omitempty"`
+	Spot             bool           `json:"spot"`
+	Zone             string         `json:"zone,omitempty"`
+	MeshIP           string         `json:"meshIp"`
+	Capacity         ResourceVector `json:"capacity"`
+	Allocated        ResourceVector `json:"allocated"`
+	CreatedAt        time.Time      `json:"createdAt"`
+	IdleSince        *time.Time     `json:"idleSince,omitempty"`
+	Cordoned         bool           `json:"cordoned,omitempty"`
+	UnknownCoTenants bool           `json:"unknownCoTenants,omitempty"`
+	RunnerAuthToken  string         `json:"runnerAuthToken,omitempty"`
 
 	// Discrete device maps: Slot Index -> PodUID
 	GPUSlots map[int]string `json:"gpuSlots"`
@@ -346,6 +347,38 @@ func (np *NodePool) HasActivePods(instanceID string) bool {
 		return false
 	}
 	return node.ActivePodCount() > 0
+}
+
+// SetUnknownCoTenants flags whether a node has unverified co-tenant workloads.
+func (np *NodePool) SetUnknownCoTenants(instanceID string, unknown bool) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	if node, ok := np.nodes[instanceID]; ok {
+		node.UnknownCoTenants = unknown
+	}
+}
+
+// HasUnknownCoTenants reports whether the node has unverified co-tenant workloads.
+func (np *NodePool) HasUnknownCoTenants(instanceID string) bool {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	if node, ok := np.nodes[instanceID]; ok {
+		return node.UnknownCoTenants
+	}
+	return false
+}
+
+// NodesWithUnknownCoTenants returns all nodes that need co-tenant reconciliation.
+func (np *NodePool) NodesWithUnknownCoTenants() []*CloudVMNode {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	var res []*CloudVMNode
+	for _, n := range np.nodes {
+		if n.UnknownCoTenants {
+			res = append(res, n)
+		}
+	}
+	return res
 }
 
 // HasNode returns true if the specified node exists in the pool.

@@ -2117,6 +2117,11 @@ func TestReconciler_RegionThrottledAtStartupAdoptsVMsInsteadOfKilling(t *testing
 		}, nil
 	}
 
+	// InterLink polls status for pod uid-west-active, providing active evidence
+	statusBody := `[{"pod":{"metadata":{"name":"pod-west-active","namespace":"default","uid":"uid-west-active"}}}]`
+	req := httptest.NewRequest(http.MethodPost, "/status", bytes.NewBufferString(statusBody))
+	srv.handleStatus(httptest.NewRecorder(), req)
+
 	reconciler := NewReconciler(awsProv, srv, awsProv, "cluster-recovery-throttle", 10*time.Minute)
 	result, err := reconciler.ReconcileOnce(context.Background())
 	if err != nil {
@@ -2731,6 +2736,11 @@ func TestNodePool_AdoptedVMIsCordonedAndRejectsNewPodPacking(t *testing.T) {
 		},
 	}
 
+	// InterLink polls status for pod uid-adopted-1, providing active evidence
+	statusBody := `[{"pod":{"metadata":{"name":"pod-adopted-1","namespace":"default","uid":"uid-adopted-1"}}}]`
+	reqStatus := httptest.NewRequest(http.MethodPost, "/status", bytes.NewBufferString(statusBody))
+	srv.handleStatus(httptest.NewRecorder(), reqStatus)
+
 	// Adopt instance
 	ctx := context.Background()
 	adopted := srv.AdoptInstance(ctx, inst)
@@ -2942,4 +2952,120 @@ func TestNodePool_ConcurrentIsTombstonedAndRegisterNode(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+type failingContainerRunner struct {
+	mu         sync.RWMutex
+	shouldFail bool
+	containers []*ContainerStatusResult
+}
+
+func (f *failingContainerRunner) StartContainer(_ context.Context, _ *CloudVMNode, _ *StartContainerRequest) error {
+	return nil
+}
+func (f *failingContainerRunner) StopContainer(_ context.Context, _ *CloudVMNode, _ string) error {
+	return nil
+}
+func (f *failingContainerRunner) GetStatus(_ context.Context, _ *CloudVMNode, _ string) (*ContainerStatusResult, error) {
+	return nil, nil
+}
+func (f *failingContainerRunner) ListContainers(_ context.Context, _ *CloudVMNode) ([]*ContainerStatusResult, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.shouldFail {
+		return nil, fmt.Errorf("connection refused: in-VM runner unreachable during mesh initialization")
+	}
+	return f.containers, nil
+}
+
+func TestServer_RecoverActiveInstances_UnknownCoTenantsRetainedAndRetried(t *testing.T) {
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "test-cluster")
+
+	failingRunner := &failingContainerRunner{
+		shouldFail: true, // Runner fails during initial recovery
+		containers: []*ContainerStatusResult{
+			{PodUID: "uid-u1", Running: true, Status: "running"},
+			{PodUID: "uid-u2", Running: true, Status: "running"},
+		},
+	}
+	srv.SetContainerRunner(failingRunner)
+
+	// Launch VM hosting pod u1
+	ctx := context.Background()
+	inst, err := mock.Launch(ctx, &InstanceSpec{
+		PodName:      "u1",
+		PodNamespace: "default",
+		PodUID:       "uid-u1",
+		ClusterTag:   "test-cluster",
+		Region:       "us-east-1",
+		InstanceType: "g5.12xlarge",
+	})
+	if err != nil {
+		t.Fatalf("launch failed: %v", err)
+	}
+
+	// 1. Recover active instances while runner is unreachable
+	if err := srv.RecoverActiveInstances(ctx, mock); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	// Verify node is marked with UnknownCoTenants
+	if !srv.nodePool.HasUnknownCoTenants(inst.ID) {
+		t.Fatalf("expected node %s marked with UnknownCoTenants when runner listing fails", inst.ID)
+	}
+
+	// 2. Delete pod u1 while UnknownCoTenants is true
+	pod1JSON := `{"metadata":{"name":"u1","namespace":"default","uid":"uid-u1"}}`
+	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod1JSON))
+	delRec := httptest.NewRecorder()
+	srv.handleDelete(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("delete returned %d", delRec.Code)
+	}
+
+	// CRITICAL CHECK: Shared VM must NOT be terminated while UnknownCoTenants is true!
+	activeInsts, err := mock.ListActiveInstances(ctx, "test-cluster")
+	if err != nil || len(activeInsts) != 1 || activeInsts[0].ID != inst.ID {
+		t.Fatalf("CRITICAL BUG: shared VM was terminated while UnknownCoTenants was true!")
+	}
+
+	// 3. In-VM runner and WireGuard mesh come up
+	failingRunner.mu.Lock()
+	failingRunner.shouldFail = false
+	failingRunner.mu.Unlock()
+
+	// 4. Background Reconciler runs
+	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
+	_, err = reconciler.ReconcileOnce(ctx)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	// Verify UnknownCoTenants was cleared and pod u2 was discovered
+	if srv.nodePool.HasUnknownCoTenants(inst.ID) {
+		t.Fatalf("expected UnknownCoTenants cleared after successful reconciliation")
+	}
+	if _, _, found := srv.nodePool.FindPodNode("uid-u2"); !found {
+		t.Fatalf("expected co-tenant pod uid-u2 registered in nodePool after reconciliation")
+	}
+
+	// 5. Delete remaining pod u2 -> VM should now terminate cleanly
+	pod2JSON := `{"metadata":{"name":"u2","namespace":"default","uid":"uid-u2"}}`
+	delReq2 := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod2JSON))
+	delRec2 := httptest.NewRecorder()
+	srv.handleDelete(delRec2, delReq2)
+	if delRec2.Code != http.StatusOK {
+		t.Fatalf("delete u2 returned %d", delRec2.Code)
+	}
+
+	// Verify VM is now terminated
+	activeAfterAll, err := mock.ListActiveInstances(ctx, "test-cluster")
+	if err != nil || len(activeAfterAll) != 0 {
+		t.Fatalf("expected VM terminated after last co-tenant was deleted, got: %v", activeAfterAll)
+	}
 }
