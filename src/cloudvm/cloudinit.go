@@ -3,9 +3,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"text/template"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // CloudInitConfig contains the parameters needed to render the VM bootstrap script.
@@ -46,6 +49,36 @@ func (c *CloudInitConfig) CPULimit() string {
 		return ""
 	}
 	return fmt.Sprintf("%.2f", float64(c.CPUMillicores)/1000.0)
+}
+
+// InitialContainerJSON serializes the initial pod spec into JSON for the runner,
+// avoiding bash variable expansion and shell injection vulnerabilities.
+func (c *CloudInitConfig) InitialContainerJSON() string {
+	if c.TargetContainerImage == "" {
+		return ""
+	}
+	req := StartContainerRequest{
+		PodUID:        c.EffectivePodUID(),
+		Namespace:     c.PodNamespace,
+		PodName:       c.PodName,
+		ContainerName: "worker",
+		Image:         c.TargetContainerImage,
+		Command:       c.Command,
+		Args:          c.Args,
+		Env:           c.Env,
+		AssignedGPUs:  c.AssignedGPUs,
+		MemoryBytes:   c.MemoryBytes,
+	}
+	if c.CPULimit() != "" {
+		if q, err := resource.ParseQuantity(c.CPULimit()); err == nil {
+			req.CPUMillicores = q.MilliValue()
+		}
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // GPUFlag returns the exact docker --gpus flag based on discrete device allocations.
@@ -117,9 +150,13 @@ if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
   aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --instance-initiated-shutdown-behavior terminate --region "{{.Region}}" 2>/dev/null || true
 fi
 
-# Block non-root and container processes from reaching IMDS credentials
+# Block non-root host processes from reaching IMDS credentials
 iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
+
+# Isolate bridge containers: block IMDS access and Runner port (9090)
+iptables -N DOCKER-USER 2>/dev/null || true
 iptables -I DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null || true
+iptables -I DOCKER-USER -p tcp --dport 9090 -j DROP 2>/dev/null || true
 
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
@@ -236,6 +273,13 @@ import urllib.parse
 PORT = 9090
 AUTH_TOKEN = "{{.RunnerAuthToken}}"
 
+def record_heartbeat():
+    try:
+        with open('/tmp/cloudvm-heartbeat', 'w') as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
 class RunnerHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -250,6 +294,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
         auth_header = self.headers.get('Authorization', '')
         expected = f"Bearer {AUTH_TOKEN}"
         if hmac.compare_digest(auth_header, expected):
+            record_heartbeat()
             return True
         self.send_response(401)
         self.send_header('Content-Type', 'application/json')
@@ -364,7 +409,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
                 shm_flag = f"--shm-size={shm_bytes}"
 
-            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host', shm_flag]
+            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=bridge', shm_flag]
             if cpu_milli and cpu_milli > 0:
                 docker_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
             if mem_bytes and mem_bytes > 0:
@@ -406,34 +451,59 @@ if command -v python3 >/dev/null 2>&1; then
   nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
 
-# Launch initial container workload if image is provided
-if [ -n "{{.TargetContainerImage}}" ]; then
-  echo "[cloudvm-bootstrap] Launching initial container workload..."
-  docker rm -f "cloudvm-{{.EffectivePodUID}}" 2>/dev/null || true
-  docker run -d --name="cloudvm-{{.EffectivePodUID}}" \
-    --net=host \
-    --shm-size=16g \
-    {{.GPUFlag}} \
-    {{if .CPULimit}}--cpus {{.CPULimit}} \{{end}}
-    {{if gt .MemoryBytes 0}}--memory {{.MemoryBytes}} \{{end}}
-  {{range $k, $v := .Env}}  -e {{$k}}="{{$v}}" \
-  {{end}}  "{{.TargetContainerImage}}" \
-    {{.RenderContainerCommand}} || true
+# Launch initial container workload via runner (eliminates bash env expansion & shell injection)
+{{if .InitialContainerJSON}}
+mkdir -p /etc/cloudvm
+cat << 'INITIAL_POD_EOF' > /etc/cloudvm/initial-pod.json
+{{.InitialContainerJSON}}
+INITIAL_POD_EOF
+
+if [ -s /etc/cloudvm/initial-pod.json ]; then
+  echo "[cloudvm-bootstrap] Launching initial container workload via runner..."
+  python3 -c "
+import json, urllib.request, time
+for _ in range(15):
+    try:
+        with open('/etc/cloudvm/initial-pod.json', 'rb') as f:
+            data = f.read()
+        req = urllib.request.Request(
+            'http://127.0.0.1:9090/containers/start',
+            data=data,
+            headers={
+                'Authorization': 'Bearer {{.RunnerAuthToken}}',
+                'Content-Type': 'application/json'
+            }
+        )
+        urllib.request.urlopen(req, timeout=30)
+        print('[cloudvm-bootstrap] Initial pod successfully started via runner')
+        break
+    except Exception as e:
+        time.sleep(1)
+" || true
 fi
+{{end}}
 
 # 6. Orphaned Node Idle Fail-Safe Watchdog
-# Powers off only after the node has had zero active containers continuously for 300s
+# Powers off only after the node has had zero active containers AND no provider heartbeat for >300s
 (
   while true; do
     ACTIVE=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
     if [ "$ACTIVE" -eq 0 ]; then
-      sleep 300
-      ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
-      if [ "$ACTIVE_AFTER" -eq 0 ]; then
-        echo "[cloudvm-bootstrap] Node has been idle with no active containers for 300s. Terminating VM..."
-        echo "CLOUDVM_STATUS: {\"status\": \"IDLE_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
-        shutdown -h now || poweroff
-        exit 0
+      HB_AGE=9999
+      if [ -f /tmp/cloudvm-heartbeat ]; then
+        HB_TIME=$(cat /tmp/cloudvm-heartbeat 2>/dev/null || echo 0)
+        NOW=$(date +%s)
+        HB_AGE=$(( NOW - ${HB_TIME%.*} ))
+      fi
+      if [ "$HB_AGE" -gt 300 ]; then
+        sleep 60
+        ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+        if [ "$ACTIVE_AFTER" -eq 0 ]; then
+          echo "[cloudvm-bootstrap] Node has been idle with zero active containers and no provider heartbeat for >300s. Terminating VM..."
+          echo "CLOUDVM_STATUS: {\"status\": \"IDLE_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+          shutdown -h now || poweroff
+          exit 0
+        fi
       fi
     fi
     sleep 30

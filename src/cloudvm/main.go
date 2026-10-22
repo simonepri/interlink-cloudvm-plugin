@@ -190,12 +190,8 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-idleTicker.C:
-				if terminator != nil {
-					for _, node := range server.NodePool().CollectExpiredIdleNodes() {
-						cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
-						log.Printf("[cloudvm] Terminating expired idle node %s", cleanID) //nolint:gosec // instance ID is internal and sanitized
-						_ = terminator.Terminate(ctx, node.InstanceID)
-					}
+				for _, node := range server.NodePool().CollectExpiredIdleNodes() {
+					server.TerminateIdleNode(ctx, node)
 				}
 			}
 		}

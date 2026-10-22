@@ -16,6 +16,11 @@ type PodAllocation struct {
 	AssignedGPUs []int          `json:"assignedGPUs,omitempty"`
 	AssignedTPUs []int          `json:"assignedTPUs,omitempty"`
 	StartedAt    time.Time      `json:"startedAt"`
+	Completed    bool           `json:"completed"`
+	FinishedAt   *time.Time     `json:"finishedAt,omitempty"`
+	ExitCode     int32          `json:"exitCode,omitempty"`
+	Reason       string         `json:"reason,omitempty"`
+	Message      string         `json:"message,omitempty"`
 }
 
 // CloudVMNode represents a live ephemeral cloud VM capable of hosting one or more pods.
@@ -145,14 +150,35 @@ func (node *CloudVMNode) AssignPod(alloc *PodAllocation) {
 	node.IdleSince = nil
 }
 
-// ReleasePod frees resources and discrete devices for a completed or failed pod.
-func (node *CloudVMNode) ReleasePod(podUID string) bool {
+// ActivePodCount returns the count of running (non-completed) pods on the node.
+func (node *CloudVMNode) ActivePodCount() int {
+	count := 0
+	for _, p := range node.ActivePods {
+		if !p.Completed {
+			count++
+		}
+	}
+	return count
+}
+
+// MarkPodCompleted frees hardware resources (GPUs, TPUs, CPU, Memory) for a finished container
+// while retaining the allocation record so subsequent status queries and co-tenant deletions
+// properly resolve the node and state without terminating the underlying VM prematurely.
+func (node *CloudVMNode) MarkPodCompleted(podUID string, exitCode int32, reason, message string, finishedAt time.Time) bool {
 	alloc, exists := node.ActivePods[podUID]
 	if !exists {
 		return false
 	}
+	if alloc.Completed {
+		return false
+	}
 
-	delete(node.ActivePods, podUID)
+	alloc.Completed = true
+	alloc.ExitCode = exitCode
+	alloc.Reason = reason
+	alloc.Message = message
+	alloc.FinishedAt = &finishedAt
+
 	node.Allocated = node.Allocated.Sub(alloc.Allocated)
 	for _, gpu := range alloc.AssignedGPUs {
 		if node.GPUSlots[gpu] == podUID {
@@ -165,7 +191,36 @@ func (node *CloudVMNode) ReleasePod(podUID string) bool {
 		}
 	}
 
-	if len(node.ActivePods) == 0 {
+	if node.ActivePodCount() == 0 {
+		now := time.Now()
+		node.IdleSince = &now
+	}
+	return true
+}
+
+// ReleasePod completely frees and removes a pod allocation (on explicit pod delete).
+func (node *CloudVMNode) ReleasePod(podUID string) bool {
+	alloc, exists := node.ActivePods[podUID]
+	if !exists {
+		return false
+	}
+
+	delete(node.ActivePods, podUID)
+	if !alloc.Completed {
+		node.Allocated = node.Allocated.Sub(alloc.Allocated)
+		for _, gpu := range alloc.AssignedGPUs {
+			if node.GPUSlots[gpu] == podUID {
+				node.GPUSlots[gpu] = ""
+			}
+		}
+		for _, tpu := range alloc.AssignedTPUs {
+			if node.TPUSlots[tpu] == podUID {
+				node.TPUSlots[tpu] = ""
+			}
+		}
+	}
+
+	if node.ActivePodCount() == 0 {
 		now := time.Now()
 		node.IdleSince = &now
 	}
@@ -253,6 +308,20 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 	return bestNode, bestGPUs, bestTPUs, nil
 }
 
+// MarkPodCompleted records a pod container as finished, frees its compute resources,
+// and returns true if the pod was found and marked.
+func (np *NodePool) MarkPodCompleted(podUID string, exitCode int32, reason, message string, finishedAt time.Time) bool {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+
+	for _, node := range np.nodes {
+		if node.MarkPodCompleted(podUID, exitCode, reason, message, finishedAt) {
+			return true
+		}
+	}
+	return false
+}
+
 // Release frees resources held by podUID across any active node in the pool and returns the remaining active pod count on that node.
 func (np *NodePool) Release(podUID string) int {
 	np.mu.Lock()
@@ -260,7 +329,7 @@ func (np *NodePool) Release(podUID string) int {
 
 	for _, node := range np.nodes {
 		if node.ReleasePod(podUID) {
-			return len(node.ActivePods)
+			return node.ActivePodCount()
 		}
 	}
 	return 0
@@ -288,7 +357,7 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	now := time.Now()
 
 	for id, node := range np.nodes {
-		if len(node.ActivePods) == 0 && node.IdleSince != nil {
+		if node.ActivePodCount() == 0 && node.IdleSince != nil {
 			if now.Sub(*node.IdleSince) > np.idleGracePeriod {
 				expired = append(expired, node)
 				delete(np.nodes, id)

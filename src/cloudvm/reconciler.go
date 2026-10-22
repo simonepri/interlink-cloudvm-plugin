@@ -22,11 +22,17 @@ type InstanceTerminator interface {
 
 // Reconciler handles background garbage collection for opportunistic VMs.
 type Reconciler struct {
-	inventory  CloudInventory
-	tracker    PodStateTracker
-	terminator InstanceTerminator
-	clusterTag string
-	graceTTL   time.Duration
+	inventory   CloudInventory
+	tracker     PodStateTracker
+	terminator  InstanceTerminator
+	clusterTag  string
+	graceTTL    time.Duration
+	onTerminate func(instanceID string)
+}
+
+// SetOnTerminated registers a callback invoked when a zombie instance is terminated.
+func (r *Reconciler) SetOnTerminated(fn func(instanceID string)) {
+	r.onTerminate = fn
 }
 
 // ReconcileResult summarizes the actions taken by one reconciliation pass.
@@ -105,6 +111,8 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 				if r.terminator != nil {
 					if err := r.terminator.Terminate(ctx, inst.ID); err != nil {
 						log.Printf("[reconciler] Error terminating zombie instance %s: %v", cleanID, err)
+					} else if r.onTerminate != nil {
+						r.onTerminate(inst.ID)
 					}
 				}
 			}

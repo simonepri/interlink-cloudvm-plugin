@@ -39,3 +39,10 @@ resources:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 1Gi
+  mountPath: /var/lib/cloudvm

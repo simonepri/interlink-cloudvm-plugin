@@ -201,14 +201,14 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	if !bytes.Contains([]byte(script), []byte("ThreadingHTTPServer")) {
 		t.Errorf("cloud-init runner should use ThreadingHTTPServer for concurrent requests")
 	}
-	if !bytes.Contains([]byte(script), []byte(`--gpus '"device=0,1"'`)) {
-		t.Errorf("cloud-init missing discrete device slicing flags with CSV quotes")
+	if cfg.GPUFlag() != `--gpus '"device=0,1"'` {
+		t.Errorf("cloud-init missing discrete device slicing flags with CSV quotes, got: %s", cfg.GPUFlag())
 	}
 	if !bytes.Contains([]byte(script), []byte("--shm-size=16g")) {
 		t.Errorf("cloud-init missing shared memory limit for PyTorch DataLoader")
 	}
-	if !bytes.Contains([]byte(script), []byte(`docker run -d --name="cloudvm-pod-uid-456"`)) {
-		t.Errorf("cloud-init missing detached initial container launch with pod UID name, got script:\n%s", script)
+	if !bytes.Contains([]byte(script), []byte("pod-uid-456")) || !bytes.Contains([]byte(script), []byte("/containers/start")) {
+		t.Errorf("cloud-init missing initial container launch via runner endpoint, got script:\n%s", script)
 	}
 	if !bytes.Contains([]byte(script), []byte(`docker ps -q --filter "name=cloudvm"`)) {
 		t.Errorf("cloud-init missing multi-pod idle watchdog container check")
@@ -575,7 +575,7 @@ func TestServer_HandleStatus_InFlightAndFinished(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /status for done pod failed: %v", err)
 	}
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 
 	var statuses2 []PodStatusResponse
 	if err := json.NewDecoder(resp2.Body).Decode(&statuses2); err != nil {
@@ -592,8 +592,195 @@ func TestServer_HandleStatus_InFlightAndFinished(t *testing.T) {
 		t.Fatalf("expected Reason Completed, got %s", st2.Containers[0].State.Terminated.Reason)
 	}
 
-	// Verify that nodePool has released the allocation
-	if _, _, found := server.NodePool().FindPodNode("uid-done-1"); found {
-		t.Fatalf("expected uid-done-1 allocation to be released immediately on termination")
+	// Verify that nodePool has marked the allocation completed without prematurely evicting it
+	node, alloc, found := server.NodePool().FindPodNode("uid-done-1")
+	if !found || !alloc.Completed {
+		t.Fatalf("expected uid-done-1 to be marked completed in node pool")
+	}
+	if node.ActivePodCount() != 0 {
+		t.Fatalf("expected 0 active pods on node, got %d", node.ActivePodCount())
+	}
+}
+
+func TestRegression_FinishedPodDoesNotRevertToRunning(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	runner := NewMockContainerRunner()
+	server.SetContainerRunner(runner)
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode("i-revert-node", ProviderMock, "us-east-1", "100.64.0.10", capVec)
+	reqVec, _ := NewResourceVector("1", "4Gi", 1, 0)
+	server.NodePool().RegisterAndAllocate(node, reqVec, "uid-revert-1", "default", "revert-pod")
+
+	server.mu.Lock()
+	server.instances["uid-revert-1"] = &Instance{
+		ID:        "i-revert-node",
+		Provider:  ProviderMock,
+		Region:    "us-east-1",
+		State:     StateRunning,
+		CreatedAt: time.Now(),
+	}
+	server.mu.Unlock()
+
+	// Simulate container exiting
+	runner.SetStatus("uid-revert-1", &ContainerStatusResult{
+		Running:    false,
+		ExitCode:   0,
+		Reason:     "Completed",
+		FinishedAt: time.Now(),
+	})
+
+	queryPayload := `[{"pod": {"metadata": {"name": "revert-pod", "namespace": "default", "uid": "uid-revert-1"}}}]`
+
+	// Poll 1: Must return Terminated (Completed)
+	resp1, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("Poll 1 failed: %v", err)
+	}
+	var statuses1 []PodStatusResponse
+	_ = json.NewDecoder(resp1.Body).Decode(&statuses1)
+	_ = resp1.Body.Close()
+
+	if len(statuses1) != 1 || statuses1[0].Containers[0].State.Terminated == nil {
+		t.Fatalf("Poll 1 expected Terminated state, got %+v", statuses1)
+	}
+	if statuses1[0].Containers[0].State.Terminated.Reason != "Completed" {
+		t.Fatalf("Poll 1 expected Reason Completed, got %s", statuses1[0].Containers[0].State.Terminated.Reason)
+	}
+
+	// Poll 2: Must STILL return Terminated (Completed), NOT revert to Running
+	resp2, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("Poll 2 failed: %v", err)
+	}
+	var statuses2 []PodStatusResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&statuses2)
+	_ = resp2.Body.Close()
+
+	if len(statuses2) != 1 || statuses2[0].Containers[0].State.Terminated == nil {
+		t.Fatalf("Poll 2 REGRESSION: pod reverted to non-terminated state on second poll: %+v", statuses2)
+	}
+	if statuses2[0].Containers[0].State.Terminated.Reason != "Completed" {
+		t.Fatalf("Poll 2 expected Reason Completed, got %s", statuses2[0].Containers[0].State.Terminated.Reason)
+	}
+}
+
+func TestRegression_DeleteFinishedPodDoesNotKillCoTenants(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	runner := NewMockContainerRunner()
+	server.SetContainerRunner(runner)
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	// 1. Launch node with 2 co-tenant pods
+	capVec, _ := NewResourceVector("8", "32Gi", 2, 0)
+	node := NewCloudVMNode("i-shared-node", ProviderMock, "us-east-1", "100.64.0.20", capVec)
+	req1, _ := NewResourceVector("2", "8Gi", 1, 0)
+	req2, _ := NewResourceVector("2", "8Gi", 1, 0)
+
+	server.NodePool().RegisterAndAllocate(node, req1, "uid-cotenant-1", "default", "worker-1")
+	_, _, _, err := server.NodePool().Allocate(req2, "us-east-1", "uid-cotenant-2", "default", "worker-2")
+	if err != nil {
+		t.Fatalf("failed to allocate co-tenant 2: %v", err)
+	}
+
+	server.mu.Lock()
+	sharedInst := &Instance{
+		ID:        "i-shared-node",
+		Provider:  ProviderMock,
+		Region:    "us-east-1",
+		State:     StateRunning,
+		CreatedAt: time.Now(),
+	}
+	server.instances["uid-cotenant-1"] = sharedInst
+	server.instances["default/worker-1"] = sharedInst
+	server.instances["uid-cotenant-2"] = sharedInst
+	server.instances["default/worker-2"] = sharedInst
+	server.mu.Unlock()
+
+	// 2. Pod 1 finishes
+	runner.SetStatus("uid-cotenant-1", &ContainerStatusResult{
+		Running:    false,
+		ExitCode:   0,
+		Reason:     "Completed",
+		FinishedAt: time.Now(),
+	})
+	// Pod 2 is still running
+	runner.SetStatus("uid-cotenant-2", &ContainerStatusResult{
+		Running:   true,
+		StartedAt: time.Now(),
+	})
+
+	// Poll status for pod 1 to record completion
+	queryPayload := `[{"pod": {"metadata": {"name": "worker-1", "namespace": "default", "uid": "uid-cotenant-1"}}}]`
+	resp1, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status failed: %v", err)
+	}
+	_ = resp1.Body.Close()
+
+	// 3. Delete finished pod 1
+	delPayload1 := `{"pod": {"metadata": {"name": "worker-1", "namespace": "default", "uid": "uid-cotenant-1"}}}`
+	delResp1, err := http.Post(ts.URL+"/delete", "application/json", strings.NewReader(delPayload1))
+	if err != nil {
+		t.Fatalf("POST /delete for pod 1 failed: %v", err)
+	}
+	_ = delResp1.Body.Close()
+
+	// 4. REGRESSION CHECK: Verify the underlying VM was NOT terminated! Pod 2 is still running on it!
+	if server.NodePool().ActiveNodeCount() != 1 {
+		t.Fatalf("REGRESSION: deleting finished co-tenant killed shared VM while pod 2 was still active! ActiveNodeCount=%d", server.NodePool().ActiveNodeCount())
+	}
+	if _, _, found := server.NodePool().FindPodNode("uid-cotenant-2"); !found {
+		t.Fatalf("REGRESSION: co-tenant pod 2 was evicted from node pool when pod 1 was deleted")
+	}
+
+	// 5. Now delete pod 2; since no more active pods remain, the VM can be terminated
+	delPayload2 := `{"pod": {"metadata": {"name": "worker-2", "namespace": "default", "uid": "uid-cotenant-2"}}}`
+	delResp2, err := http.Post(ts.URL+"/delete", "application/json", strings.NewReader(delPayload2))
+	if err != nil {
+		t.Fatalf("POST /delete for pod 2 failed: %v", err)
+	}
+	_ = delResp2.Body.Close()
+
+	if server.NodePool().ActiveNodeCount() != 0 {
+		t.Fatalf("expected node pool to be empty after last pod deleted, got %d", server.NodePool().ActiveNodeCount())
+	}
+}
+
+func TestServer_CreateIdempotency(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	payload := `{"pod": {"metadata": {"name": "idempotent-worker", "namespace": "default", "uid": "uid-idem-1"}, "spec": {"containers": [{"name": "worker", "image": "ubuntu:24.04"}]}}}`
+
+	resp1, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("first POST /create failed: %v", err)
+	}
+	var res1 CreateStruct
+	_ = json.NewDecoder(resp1.Body).Decode(&res1)
+	_ = resp1.Body.Close()
+
+	// Second POST /create with identical UID
+	resp2, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("second POST /create failed: %v", err)
+	}
+	var res2 CreateStruct
+	_ = json.NewDecoder(resp2.Body).Decode(&res2)
+	_ = resp2.Body.Close()
+
+	if res1.PodUID != res2.PodUID || res1.PodJID != res2.PodJID {
+		t.Fatalf("expected idempotent response, got res1=%+v res2=%+v", res1, res2)
+	}
+	if server.NodePool().ActiveNodeCount() != 1 {
+		t.Fatalf("expected exactly 1 node launched, got %d", server.NodePool().ActiveNodeCount())
 	}
 }

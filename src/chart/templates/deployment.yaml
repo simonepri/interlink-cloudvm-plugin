@@ -43,6 +43,8 @@ spec:
               value: "{{ .Values.provider.awsLaunchTemplateId }}"
             - name: AWS_LAUNCH_TEMPLATE_NAME
               value: "{{ .Values.provider.awsLaunchTemplateName }}"
+            - name: TOKEN_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/tokens.json"
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -57,3 +59,14 @@ spec:
               port: http
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}
+      volumes:
+        - name: data
+        {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "interlink-provider-cloudvm.fullname" . }}-data
+        {{- else }}
+          emptyDir: {}
+        {{- end }}

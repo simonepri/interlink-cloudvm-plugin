@@ -16,6 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func generateToken() (string, error) {
@@ -124,6 +127,47 @@ func (s *Server) SetReconciler(r *Reconciler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reconciler = r
+	if r != nil {
+		r.SetOnTerminated(func(id string) {
+			if s.tokenStore != nil {
+				_ = s.tokenStore.Delete(id)
+			}
+		})
+	}
+}
+
+// ProviderForType returns the provider registered for the given provider type, or the default provider.
+func (s *Server) ProviderForType(pt ProviderType) Provider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p, ok := s.providers[pt]; ok {
+		return p
+	}
+	return s.defaultProv
+}
+
+// TerminateIdleNode cleanly terminates an idle VM using its specific cloud provider
+// and prunes associated runner tokens and in-memory instance records.
+func (s *Server) TerminateIdleNode(ctx context.Context, node *CloudVMNode) {
+	if node == nil {
+		return
+	}
+	prov := s.ProviderForType(node.Provider)
+	cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
+	log.Printf("[cloudvm] Terminating expired idle node %s", cleanID) //nolint:gosec
+	if prov != nil {
+		_ = prov.Terminate(ctx, node.InstanceID)
+	}
+	if s.tokenStore != nil {
+		_ = s.tokenStore.Delete(node.InstanceID)
+	}
+	s.mu.Lock()
+	for k, inst := range s.instances {
+		if inst != nil && inst.ID == node.InstanceID {
+			delete(s.instances, k)
+		}
+	}
+	s.mu.Unlock()
 }
 
 // Routes returns the standard InterLink HTTP routing handler.
@@ -389,8 +433,46 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	spec := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
+
+	// Idempotency check: if pod is already created or active, return existing response immediately
+	s.mu.RLock()
+	existingInst := s.instances[spec.PodUID]
+	if existingInst == nil {
+		existingInst = s.instances[fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)]
+	}
+	s.mu.RUnlock()
+
+	if existingInst != nil {
+		podJID := existingInst.ID
+		if spec.PodUID != "" {
+			podJID = fmt.Sprintf("%s:%s", existingInst.ID, spec.PodUID)
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(CreateStruct{
+			PodUID: spec.PodUID,
+			PodJID: podJID,
+		})
+		return
+	}
+
 	prov := s.selectProvider(spec)
 	reqVec := ResourceVectorFromPod(pod)
+
+	var cpuLimitMilli int64
+	var memLimitBytes int64
+	if len(pod.Spec.Containers) > 0 {
+		c := pod.Spec.Containers[0]
+		if q, ok := c.Resources.Limits[string(corev1.ResourceCPU)]; ok {
+			if parsed, err := resource.ParseQuantity(q); err == nil {
+				cpuLimitMilli = parsed.MilliValue()
+			}
+		}
+		if q, ok := c.Resources.Limits[string(corev1.ResourceMemory)]; ok {
+			if parsed, err := resource.ParseQuantity(q); err == nil {
+				memLimitBytes = parsed.Value()
+			}
+		}
+	}
 
 	// 1. Try to bin-pack into an existing warm node
 	warmNode, assignedGPUs, assignedTPUs, err := s.nodePool.Allocate(reqVec, spec.Region, spec.PodUID, spec.PodNamespace, spec.PodName)
@@ -412,8 +494,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			Command:       spec.Command,
 			Args:          spec.Args,
 			Env:           spec.Env,
-			CPUMillicores: reqVec.CPU.MilliValue(),
-			MemoryBytes:   reqVec.Memory.Value(),
+			CPUMillicores: cpuLimitMilli,
+			MemoryBytes:   memLimitBytes,
 			AssignedGPUs:  assignedGPUs,
 			AssignedTPUs:  assignedTPUs,
 		})
@@ -604,12 +686,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prov := s.defaultProv
-	s.mu.RLock()
-	if p, ok := s.providers[inst.Provider]; ok {
-		prov = p
-	}
-	s.mu.RUnlock()
+	prov := s.ProviderForType(inst.Provider)
 
 	s.nodePool.UnregisterNode(inst.ID)
 	if s.tokenStore != nil {
@@ -647,12 +724,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type statusTarget struct {
-		name string
-		ns   string
-		uid  string
-		jid  string
-		inst *Instance
-		node *CloudVMNode
+		name  string
+		ns    string
+		uid   string
+		jid   string
+		inst  *Instance
+		node  *CloudVMNode
+		alloc *PodAllocation
 	}
 
 	var targets []statusTarget
@@ -721,11 +799,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 		jid := ""
 		var node *CloudVMNode
+		var alloc *PodAllocation
 		if exists && inst != nil {
 			if uid != "" {
 				jid = fmt.Sprintf("%s:%s", inst.ID, uid)
-				if n, _, found := s.nodePool.FindPodNode(uid); found {
+				if n, a, found := s.nodePool.FindPodNode(uid); found {
 					node = n
+					alloc = a
 				}
 			} else {
 				jid = inst.ID
@@ -733,28 +813,46 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 
 		targets = append(targets, statusTarget{
-			name: name,
-			ns:   ns,
-			uid:  uid,
-			jid:  jid,
-			inst: inst,
-			node: node,
+			name:  name,
+			ns:    ns,
+			uid:   uid,
+			jid:   jid,
+			inst:  inst,
+			node:  node,
+			alloc: alloc,
 		})
 	}
 	s.mu.RUnlock()
 
 	responses := make([]PodStatusResponse, len(targets))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
 
 	for i, target := range targets {
 		wg.Add(1)
 		go func(idx int, tgt statusTarget) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
 			status := ContainerStatus{
 				Name: "worker",
 			}
 
-			if tgt.inst != nil {
+			switch {
+			case tgt.alloc != nil && tgt.alloc.Completed:
+				status.Ready = false
+				finishedAt := time.Now()
+				if tgt.alloc.FinishedAt != nil {
+					finishedAt = *tgt.alloc.FinishedAt
+				}
+				status.State.Terminated = &ContainerTerminatedState{
+					ExitCode:   tgt.alloc.ExitCode,
+					Reason:     tgt.alloc.Reason,
+					Message:    tgt.alloc.Message,
+					FinishedAt: finishedAt,
+				}
+			case tgt.inst != nil:
 				switch tgt.inst.State {
 				case StateProvisioning:
 					status.State.Waiting = &ContainerWaitingState{
@@ -784,7 +882,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 									Message:    cResult.Message,
 									FinishedAt: cResult.FinishedAt,
 								}
-								s.nodePool.Release(tgt.uid)
+								s.nodePool.MarkPodCompleted(tgt.uid, cResult.ExitCode, cResult.Reason, cResult.Message, cResult.FinishedAt)
 							}
 						}
 					} else {
@@ -813,7 +911,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 						FinishedAt: time.Now(),
 					}
 				}
-			} else {
+			default:
 				status.State.Waiting = &ContainerWaitingState{
 					Reason:  "ContainerCreating",
 					Message: fmt.Sprintf("Pod %s/%s is provisioning or awaiting discovery", tgt.ns, tgt.name),
