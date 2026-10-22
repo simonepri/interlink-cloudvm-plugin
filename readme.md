@@ -44,15 +44,15 @@
 
 ## Feature Status & Implementation Roadmap
 
-| Subsystem / Capability | Status | Scope & Behavior |
+| Subsystem / Capability | Status | Scope & Implementation State |
 | :--- | :---: | :--- |
-| **AWS EC2 Fleet Engine** | **Implemented** | Instant weighted fleet requests, price-capacity-optimized allocation, collision-proof client tokens. |
-| **GCP Compute Engine Engine** | **Implemented** | `bulkInsert` multi-zone placement, spot preemption trap, cloud-init user-data injection. |
-| **Spend Rate Governors (Compute & Egress)** | **Implemented** | `cloudvm.vk.io/max-price` cap & `cloudvm.vk.io/max-egress-rate` token-bucket priority shaping. |
-| **In-VM Ephemeral Bootstrap & Watchdog** | **Implemented** | Fast DLAMI launch, 300s startup watchdog, 60s post-startup dead-man's switch, `terminate` on poweroff. |
-| **Spot Pricing Catalog Ticker** | **Standalone Chart** | Embedded mode with randomized jitter, or central `cloudvm-ticker` deployment with OTEL metrics. |
+| **AWS EC2 Fleet Engine** | **Implemented** | Instant weighted fleet requests (`CreateFleet`), price-capacity-optimized allocation, UID-first idempotent client tokens. |
+| **GCP Compute Engine** | **In Progress** | `bulkInsert` multi-zone placement structure, spot preemption trap, cloud-init user-data injection. |
+| **Spend Rate Governors** | **Implemented** | `cloudvm.vk.io/max-price` cap & `cloudvm.vk.io/max-egress-rate` 2-band priority token-bucket traffic shaping. |
+| **In-VM Bootstrap & Watchdogs** | **Implemented** | DLAMI fast-boot, post-launch readiness watcher, 60s dead-man process monitor, `terminate` shutdown behavior. |
+| **Spot Pricing Ticker & OTEL** | **Standalone Chart** | Embedded local ticker with jitter, or central `cloudvm-ticker` chart exporting Prometheus metrics. |
 | **OpenCost FinOps Attribution** | **Architected** | Cloud billing tags (`ManagedBy`, `ClusterTag`, `PodName`, `Namespace`) mapped to CUR / BigQuery exports. |
-| **Kueue Multi-Flavor Backpressure** | **Pattern** | Paired with Kueue `AdmissionCheck` / `ProvisioningRequest` for pre-binding capacity fallback. |
+| **Kueue Multi-Flavor Fallback** | **Pattern** | Recommended deployment paired with Kueue `AdmissionCheck` / `ProvisioningRequest` for pre-binding capacity checks. |
 
 ---
 
@@ -150,7 +150,7 @@ flowchart LR
 - **`locationPolicy: ANY_SINGLE_ZONE` (GCP Compute Engine)**: Automatically places distributed worker batches in whichever single availability zone has enough spot capacity to host the entire group, eliminating cross-zone egress latency and inter-zone networking fees.
 
 #### Request Idempotency & Hardware Pinning
-- **Idempotent Launches**: Every EC2 Fleet request passes a unique `ClientToken: <cluster>-<pod>` derived from the Pod UID and Cluster Tag. Retries triggered by network timeouts or controller restarts are idempotent and cannot spin up duplicate duplicate instances.
+- **Idempotent Launches**: Every EC2 Fleet request passes a unique `ClientToken: cvm-<uid>-<namespace>-<pod>` placing the Pod UID first. Retries triggered by network timeouts or controller restarts are idempotent and cannot spin up duplicate instances.
 - **Hardware Family Pinning**: When specific accelerator architectures are required (e.g. NVIDIA H100 vs A10G), users specify `cloudvm.vk.io/instance-type: "p4d.24xlarge"` or restrict candidate instance families. The solver only diversifies across user-approved families, preventing cheaper but incompatible GPUs from being selected.
 
 ---
@@ -214,7 +214,7 @@ metadata:
 
    $$\text{Sustained Rate} = \frac{\text{MaxEgressRate}}{\text{CostPerGB}} \times \frac{8\text{ bits}}{\text{Byte}}$$
 
-   For example, `\$0.90/hr` on AWS configures a sustained rate of **`22mbit`**.
+   For example, `$0.90/hr` on AWS configures a sustained rate of **`22mbit`**.
 2. **Instant Line-Rate Bursts**:
    The Token Bucket Filter is configured with a generous burst capacity (`100mb`). When a workload uploads periodic checkpoints or model weights, packets transfer at full **10 Gbps line speed** without penalty until tokens are depleted.
 3. **Pacing Sustained Streams**:
@@ -224,7 +224,7 @@ metadata:
    - **Band 1 (Unthrottled Priority)**: Kernel filters classify encapsulated WireGuard (`UDP 51820`) and Tailscale (`UDP 41641`) mesh packets directly into Band 1, allowing inter-node distributed training, Ray GCS communication, and P2P layer caching to operate at full wire speed.
    - **Band 2 (Spend Governed)**: All other outbound public internet packets flow through Band 2, governed by the Token Bucket Filter.
    > [!NOTE]
-   > Encapsulated mesh packets that leave the VM to cross cloud regions or the public internet still incur standard cloud inter-region data transfer fees ($0.01–$0.02/GB). To eliminate mesh transfer fees entirely, place communicating workers in the same availability zone or VPC peering domain.
+   > Encapsulated mesh packets that leave the VM to cross cloud regions or the public internet still incur standard cloud inter-region data transfer fees (\$0.01–\$0.02/GB). To eliminate mesh transfer fees entirely, place communicating workers in the same availability zone or VPC peering domain.
 
 #### Comparison with SkyPilot Egress Handling:
 SkyPilot addresses egress primarily via **smart placement** (co-locating compute in the region where data storage lives) and **application-level flags** (passing `--bwlimit` to `rsync` or `rclone`). SkyPilot does not provide host-level token bucket filters or dollar-based egress rate governance. `interlink-provider-cloudvm` combines native Kubernetes annotation compatibility with kernel-level traffic control.
@@ -314,7 +314,7 @@ flowchart TD
 
 ---
 
-## 4. Running Node Daemons on Ephemeral VMs
+## 4. Node Daemon Architecture (Observability & Security)
 
 In traditional Kubernetes, infrastructure tools run as cluster-wide **DaemonSets**. Because `interlink-provider-cloudvm` provisions pure 1:1 cloud instances without a local Kubelet, DaemonSets do not schedule on ephemeral VMs.
 
@@ -452,7 +452,7 @@ cloudvm_spot_price_usd_per_hour"]:::central
    - **Zero Rate Limits**: Cloud APIs see exactly 6 requests per hour for the entire company, regardless of cell count.
    - **OTEL Observability**: The ticker exports multidimensional Prometheus metrics (`cloudvm_spot_price_usd_per_hour`, `cloudvm_spot_discount_ratio`), enabling real-time Grafana/SigNoz spot arbitrage heatmaps and savings tracking.
 
-### OpenCost & FinOps Cost Allocation (Outside Kubernetes)
+### G. OpenCost & FinOps Cost Allocation (Outside Kubernetes)
 
 A major challenge with virtual nodes and off-cluster cloud VMs is that traditional Kubernetes cost monitoring tools (such as **OpenCost** and **Kubecost**) rely on Kubernetes metrics APIs (`cadvisor` / `kubelet`) running directly on physical worker nodes. Because CloudVM instances run outside the Kubernetes node boundary, standard daemonsets cannot scrape their container cgroups.
 
@@ -501,7 +501,7 @@ On a multi-tenant Kubernetes worker node, a compromised container sharing the no
 
 ---
 
-## 4. Operational Boundaries: When NOT to Use This
+## 5. Operational Boundaries: When NOT to Use This
 
 While `interlink-provider-cloudvm` is optimized for GPU-accelerated computing and large-scale batch processing, it is not suitable for every workload:
 
@@ -513,7 +513,7 @@ While `interlink-provider-cloudvm` is optimized for GPU-accelerated computing an
 
 ---
 
-## 5. Failure Modes & Resilience Matrix
+## 6. Failure Modes & Resilience Matrix
 
 | Failure Event | Detection Mechanism | Automated Reaction | System State & Recovery |
 | :--- | :--- | :--- | :--- |
@@ -524,7 +524,7 @@ While `interlink-provider-cloudvm` is optimized for GPU-accelerated computing an
 | **GPU Hardware / ECC Fault** | NVML background watcher polling Xid / uncorrected ECC | Emits `HARDWARE_FAULT` to `/dev/console`; triggers termination. | Reconciler flags hardware failure; scheduler avoids re-scheduling on faulty hardware. |
 | **Control Plane Network Partition** | Background reconciler tracking instance timestamps | If pod object vanishes from K8s API for longer than grace TTL (default 10m), reconciler terminates cloud VM. | Prevents orphaned VMs from running indefinitely during network splits. |
 
-## 6. Usage Examples
+## 7. Usage Examples
 
 ### Example 1: Spot GPU ML Worker (Fast-Boot)
 
@@ -584,7 +584,7 @@ spec:
 
 ---
 
-## 7. Installation via Helm
+## 8. Installation via Helm
 
 ```bash
 helm upgrade --install interlink-provider-cloudvm \
@@ -597,7 +597,7 @@ helm upgrade --install interlink-provider-cloudvm \
 
 ---
 
-## 8. Development
+## 9. Development
 
 ```bash
 # Install toolchain

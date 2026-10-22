@@ -144,7 +144,6 @@ echo "[cloudvm-bootstrap] Launching workload in native DLAMI environment..."
 PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || hostname -I | awk '{print $1}')
 {{if .RayHeadAddress}}
 /opt/pytorch/bin/pip install -q "ray[default]=={{if .RayVersion}}{{.RayVersion}}{{else}}2.44.0{{end}}"
-touch /tmp/workload-ready
 /opt/pytorch/bin/ray start \
   --address="{{.RayHeadAddress}}" \
   --node-ip-address="$PRIVATE_IP" \
@@ -152,9 +151,9 @@ touch /tmp/workload-ready
   --resources='{"opportunistic": 1, "region/{{.Region}}": 1, "instance/{{.InstanceType}}": 1}' \
   --block || true
 {{else}}
-touch /tmp/workload-ready
 {{range $k, $v := .Env}}export {{$k}}="{{$v}}"
 {{end}}
+( sleep 2 && touch /tmp/workload-ready ) &
 {{.RenderCommand}}
 {{end}}
 
@@ -166,8 +165,16 @@ GPU_FLAGS=""
 GPU_FLAGS="--gpus all"
 {{end}}
 
-touch /tmp/workload-ready
-docker run --rm \
+(
+  for i in $(seq 1 30); do
+    if docker ps 2>/dev/null | grep -q "cloudvm-workload"; then
+      touch /tmp/workload-ready
+      break
+    fi
+    sleep 1
+  done
+) &
+docker run --rm --name=cloudvm-workload \
   --net=host \
   --ipc=host \
   --pid=host \

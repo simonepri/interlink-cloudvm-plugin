@@ -136,7 +136,12 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		}
 	}
 
-	tokenBase := fmt.Sprintf("%s-%s-%s-%s", req.ClusterTag, req.PodNamespace, req.PodName, req.PodUID)
+	// Put UID first so truncation never cuts off uniqueness
+	uid := req.PodUID
+	if uid == "" {
+		uid = fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	tokenBase := fmt.Sprintf("cvm-%s-%s-%s", uid, req.PodNamespace, req.PodName)
 	if len(tokenBase) > 64 {
 		tokenBase = tokenBase[:64]
 	}

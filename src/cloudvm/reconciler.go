@@ -59,14 +59,29 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	for _, inst := range activeInstances {
 		podName := inst.Metadata["podName"]
 		if podName == "" {
+			podName = inst.Metadata["PodName"]
+		}
+		if podName == "" {
 			continue
 		}
 
-		_, podExists := activePods[podName]
-		if !podExists {
+		ns := inst.Metadata["namespace"]
+		if ns == "" {
+			ns = inst.Metadata["Namespace"]
+		}
+		if ns == "" {
+			ns = "default"
+		}
+
+		fullKey := fmt.Sprintf("%s/%s", ns, podName)
+		_, existsFull := activePods[fullKey]
+		_, existsBare := activePods[podName]
+
+		if !existsFull && !existsBare {
 			if now.Sub(inst.CreatedAt) > r.graceTTL {
 				log.Printf("[reconciler] Detected zombie instance for vanished pod. Terminating...")
 				result.TerminatedZombies = append(result.TerminatedZombies, inst.ID)
+				// In live provider: r.inventory or provider terminates
 			}
 		}
 	}
