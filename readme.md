@@ -48,14 +48,14 @@ flowchart LR
     classDef plugin fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
     classDef cloud fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
 
-    A["1. Kubernetes Pod
+    A["1. Kubernetes Pods
 (Ray / PyTorch / Batch)"]:::k8s 
     -->|"Schedules on
 virtual-node"| B["2. interlink-provider-cloudvm
-(InterLink Plugin)"]:::plugin
-    -->|"Launches 1:1 VM
-(AWS Fleet / GCP Bulk)"| C["3. Ephemeral Cloud VM
-(Runs workload & powers off)"]:::cloud
+(Bin-Packer & Fleet Solver)"]:::plugin
+    -->|"Slices warm VM or
+launches new Spot VM"| C["3. Ephemeral Cloud VM
+(1:1 or N:1 GPU/CPU Slicing)"]:::cloud
 ```
 
 ### In-Cluster Autoscaling vs. Virtual Bursting
@@ -71,7 +71,7 @@ Most setups run both side-by-side:
 | **Spot Pool Access** | ❌ Local AZs only | ✅ Cross-region price & capacity arbitrage |
 | **Node Bootstrap** | ⚠️ Kubelet join + CNI + DaemonSets | ✅ Boots straight into workload |
 | **Cluster Overhead** | ⚠️ `Node` object in etcd + VPC IPs | ✅ Single static virtual node, 0 VPC IPs |
-| **Isolation** | ⚠️ Shared host kernel across pods | ✅ Dedicated VM hypervisor per job |
+| **Packing & Isolation** | ⚠️ Shared host kernel across pods | ✅ 1:1 dedicated VM or N:1 GPU/CPU bin-packing |
 | **Persistent Volumes (CSI)** | ✅ Native EBS / CSI mounts | ❌ S3 / GCS / FUSE mounts only |
 | **Idle Cost** | Consolidation & scale-down cooldown | **`$0`** (VM powers off on process exit) |
 
@@ -88,22 +88,25 @@ flowchart LR
     --> S3["<b>3. Run</b><br>VM joins mesh, runs container,<br>and terminates on exit"]:::stage
 ```
 
-The provider consists of four main components:
+The provider consists of five main components:
 
-1. **Fleet Solver**: Maps pod resource requests (`nvidia.com/gpu`, CPU, memory) to equivalent cloud instance types (`CreateFleet` on AWS, `bulkInsert` on GCP) with optional hourly price caps (`cloudvm.vk.io/max-price`).
-2. **Backpressure Loop**: Returns capacity status (`CapacityExhausted`, `PriceCapExceeded`) to Kubernetes so job queues like Kueue can fall back to on-demand or another region.
-3. **Egress Spend Governor**: Converts an hourly dollar budget (`cloudvm.vk.io/max-egress-rate: "$0.50"`) into a Linux `tc` Token Bucket Filter on `eth0`, throttling public internet egress while leaving private mesh traffic untouched.
-4. **Reconciler & Cost Tagging**: Polls cloud APIs every 60s to clean up orphaned VMs, update pod states on spot preemption, and tag instances/EBS volumes for OpenCost billing reports.
+1. **Multi-Pod Bin-Packer (`NodePool`)**: Tracks free CPU, memory, and discrete GPU/TPU device slots across active VMs using `k8s.io/apimachinery/pkg/api/resource`. If a 4-GPU pod lands on an 8-GPU spot VM (`g5.48xlarge` or `p4d.24xlarge`), a second 4-GPU pod packs straight into the remaining 4 GPUs (`[4,5,6,7]`) without booting another VM.
+2. **Fleet Solver**: On a bin-pack miss, maps pod resource requests (`nvidia.com/gpu`, `google.com/tpu`, CPU, memory) to equivalent cloud instance types (`CreateFleet` on AWS, `bulkInsert` on GCP) with optional hourly price caps (`cloudvm.vk.io/max-price`).
+3. **Backpressure Loop**: Returns capacity status (`CapacityExhausted`, `PriceCapExceeded`) to Kubernetes so job queues like Kueue can fall back to on-demand or another region.
+4. **Egress Spend Governor**: Converts an hourly dollar budget (`cloudvm.vk.io/max-egress-rate: "$0.50"`) into a Linux `tc` Token Bucket Filter on `eth0`, throttling public internet egress while leaving private mesh traffic untouched.
+5. **Reconciler & Cost Tagging**: Polls cloud APIs every 60s to clean up orphaned VMs, update pod states on spot preemption, and tag instances/EBS volumes for OpenCost billing reports.
 
 ---
 
 ## Core Subsystems
 
-### 1. Spot Fleet Bidding
+### 1. Spot Fleet Bidding & Multi-Pod Bin-Packing (N Pods to 1 VM)
 
-Each pod scheduled onto the virtual node gets its own cloud VM (`TotalTargetCapacity = 1`).
+When a pod schedules onto the virtual node, the provider first checks its `NodePool` for an active VM in the target region with enough free CPU, memory, and discrete accelerator slots (`NodeResourcesMostAllocated` scoring):
 
-Rather than hardcoding a single instance type that might be out of stock, the solver builds a list of compatible shapes and asks the cloud API for a `price-capacity-optimized` allocation.
+- **Bin-Pack Hit (< 1s)**: If a previous 4-GPU pod triggered an 8-GPU spot instance (for example, when 4-GPU spot pools were empty and an 8-GPU `g5.48xlarge` was allocated), the provider assigns the free GPU slots (`NVIDIA_VISIBLE_DEVICES=4,5,6,7`) and starts the second pod on the same warm VM immediately.
+- **Bin-Pack Miss**: If no warm VM can fit the pod, the solver builds a list of compatible shapes and calls the cloud API for a `price-capacity-optimized` allocation (`TotalTargetCapacity = 1`).
+- **Co-Tenant Lifecycle**: Deleting one pod on a shared VM releases its GPU/CPU slots while keeping the VM alive for remaining co-tenants. The VM only terminates when the last pod on it exits (or after the 60s idle grace window).
 
 ```mermaid
 flowchart LR

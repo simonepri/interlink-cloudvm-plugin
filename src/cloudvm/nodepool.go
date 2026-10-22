@@ -243,16 +243,17 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 	return bestNode, bestGPUs, bestTPUs, nil
 }
 
-// Release frees resources held by podUID across any active node in the pool.
-func (np *NodePool) Release(podUID string) {
+// Release frees resources held by podUID across any active node in the pool and returns the remaining active pod count on that node.
+func (np *NodePool) Release(podUID string) int {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 
 	for _, node := range np.nodes {
 		if node.ReleasePod(podUID) {
-			return
+			return len(node.ActivePods)
 		}
 	}
+	return 0
 }
 
 // FindPodNode returns the node and allocation for a given podUID.

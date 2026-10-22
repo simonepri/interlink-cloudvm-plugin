@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -158,4 +159,60 @@ func (r ResourceVector) Fits(capacity ResourceVector) bool {
 
 func (r ResourceVector) String() string {
 	return fmt.Sprintf("CPU=%s, Mem=%s, GPUs=%d, TPUs=%d", r.CPU.String(), r.Memory.String(), r.GPUs, r.TPUs)
+}
+
+// CapacityForInstanceType returns the hardware capacity vector (CPU, Memory, GPUs, TPUs) for a given cloud instance type.
+func CapacityForInstanceType(itype string, fallback ResourceVector) ResourceVector {
+	gpus := GPUCountForInstanceType(itype)
+	var cpuStr, memStr string
+
+	switch {
+	case strings.HasSuffix(itype, ".48xlarge") || strings.HasSuffix(itype, ".metal"):
+		cpuStr, memStr = "192", "768Gi"
+	case strings.HasSuffix(itype, ".24xlarge"):
+		cpuStr, memStr = "96", "384Gi"
+	case strings.HasSuffix(itype, ".16xlarge"):
+		cpuStr, memStr = "64", "256Gi"
+	case strings.HasSuffix(itype, ".12xlarge"):
+		cpuStr, memStr = "48", "192Gi"
+	case strings.HasSuffix(itype, ".8xlarge"):
+		cpuStr, memStr = "32", "128Gi"
+	case strings.HasSuffix(itype, ".4xlarge"):
+		cpuStr, memStr = "16", "64Gi"
+	case strings.HasSuffix(itype, ".2xlarge"):
+		cpuStr, memStr = "8", "32Gi"
+	case strings.HasSuffix(itype, ".xlarge"):
+		cpuStr, memStr = "4", "16Gi"
+	default:
+		cpu := fallback.CPU.DeepCopy()
+		mem := fallback.Memory.DeepCopy()
+		if gpus < fallback.GPUs {
+			gpus = fallback.GPUs
+		}
+		return ResourceVector{
+			CPU:    cpu,
+			Memory: mem,
+			GPUs:   gpus,
+			TPUs:   fallback.TPUs,
+		}
+	}
+
+	cpu := resource.MustParse(cpuStr)
+	if fallback.CPU.Cmp(cpu) > 0 {
+		cpu = fallback.CPU.DeepCopy()
+	}
+	mem := resource.MustParse(memStr)
+	if fallback.Memory.Cmp(mem) > 0 {
+		mem = fallback.Memory.DeepCopy()
+	}
+	if gpus < fallback.GPUs {
+		gpus = fallback.GPUs
+	}
+
+	return ResourceVector{
+		CPU:    cpu,
+		Memory: mem,
+		GPUs:   gpus,
+		TPUs:   fallback.TPUs,
+	}
 }

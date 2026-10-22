@@ -2,6 +2,11 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -152,5 +157,103 @@ func TestNodePool_PodReleaseAndIdleCooldown(t *testing.T) {
 	// Active node count should now be 0
 	if pool.ActiveNodeCount() != 0 {
 		t.Errorf("expected active node count 0 after cleanup, got %d", pool.ActiveNodeCount())
+	}
+}
+
+func TestEndToEnd_Two4GPUPodsBinPackIntoOne8GPUVM(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	handler := server.Routes()
+
+	make4GPUPod := func(name, uid string) []byte {
+		pod := Pod{
+			Metadata: PodMeta{
+				Name:      name,
+				Namespace: "default",
+				UID:       uid,
+				Annotations: map[string]string{
+					"cloudvm.vk.io/capacity-type": "spot",
+					"cloudvm.vk.io/region":        "us-east-1",
+					"cloudvm.vk.io/instance-type": "g5.48xlarge", // 8-GPU shape
+				},
+			},
+			Spec: PodSpecWrapper{
+				Containers: []ContainerSpec{
+					{
+						Name:  "worker",
+						Image: "rayproject/ray:2.44.0",
+						Resources: ContainerResourceRequirements{
+							Limits: map[string]string{
+								"cpu":            "16",
+								"memory":         "64Gi",
+								"nvidia.com/gpu": "4",
+							},
+						},
+					},
+				},
+			},
+		}
+		b, _ := json.Marshal(pod)
+		return b
+	}
+
+	pod1Body := make4GPUPod("ray-worker-1", "uid-pod-1")
+	pod2Body := make4GPUPod("ray-worker-2", "uid-pod-2")
+
+	// 1. Create Pod 1 (4 GPUs on g5.48xlarge) -> Launches 1 VM (i-mock-0001)
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(pod1Body)))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("pod 1 create failed: %d %s", rec1.Code, rec1.Body.String())
+	}
+
+	// 2. Create Pod 2 (4 GPUs on g5.48xlarge) -> Bin-packs into warm VM i-mock-0001!
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(pod2Body)))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("pod 2 create failed: %d %s", rec2.Code, rec2.Body.String())
+	}
+
+	// Verify only 1 cloud VM was launched for both 4-GPU pods
+	activeVMs, _ := mock.ListActiveInstances(context.Background(), "test-cluster")
+	if len(activeVMs) != 1 {
+		t.Fatalf("expected both 4-GPU pods to share 1 8-GPU VM, but %d VMs were launched", len(activeVMs))
+	}
+
+	// Verify GPU slot isolation: Pod 1 -> [0,1,2,3], Pod 2 -> [4,5,6,7]
+	_, alloc1, ok1 := server.NodePool().FindPodNode("uid-pod-1")
+	_, alloc2, ok2 := server.NodePool().FindPodNode("uid-pod-2")
+	if !ok1 || !ok2 {
+		t.Fatalf("expected both pods to be tracked in NodePool")
+	}
+	if len(alloc1.AssignedGPUs) != 4 || alloc1.AssignedGPUs[0] != 0 || alloc1.AssignedGPUs[3] != 3 {
+		t.Errorf("unexpected GPUs for pod 1: %v", alloc1.AssignedGPUs)
+	}
+	if len(alloc2.AssignedGPUs) != 4 || alloc2.AssignedGPUs[0] != 4 || alloc2.AssignedGPUs[3] != 7 {
+		t.Errorf("unexpected GPUs for pod 2: %v", alloc2.AssignedGPUs)
+	}
+
+	// 3. Delete Pod 1 -> Must release Pod 1's 4 GPUs WITHOUT terminating the VM for Pod 2
+	recDel1 := httptest.NewRecorder()
+	handler.ServeHTTP(recDel1, httptest.NewRequest(http.MethodPost, "/delete", bytes.NewReader(pod1Body)))
+	if recDel1.Code != http.StatusOK {
+		t.Fatalf("pod 1 delete failed: %d", recDel1.Code)
+	}
+
+	activeVMsAfterDel1, _ := mock.ListActiveInstances(context.Background(), "test-cluster")
+	if len(activeVMsAfterDel1) != 1 {
+		t.Fatalf("deleting co-tenant Pod 1 must NOT terminate shared VM while Pod 2 is still running; active VMs: %d", len(activeVMsAfterDel1))
+	}
+
+	// 4. Delete Pod 2 -> Last pod on VM finishes -> VM is terminated
+	recDel2 := httptest.NewRecorder()
+	handler.ServeHTTP(recDel2, httptest.NewRequest(http.MethodPost, "/delete", bytes.NewReader(pod2Body)))
+	if recDel2.Code != http.StatusOK {
+		t.Fatalf("pod 2 delete failed: %d", recDel2.Code)
+	}
+
+	activeVMsAfterDel2, _ := mock.ListActiveInstances(context.Background(), "test-cluster")
+	if len(activeVMsAfterDel2) != 0 {
+		t.Fatalf("expected shared VM to be terminated after last pod exited, got %d active VMs", len(activeVMsAfterDel2))
 	}
 }

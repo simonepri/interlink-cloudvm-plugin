@@ -121,6 +121,9 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	if uid == "" {
 		uid = pod.Metadata.Annotations["kubernetes.io/pod-uid"]
 	}
+	if uid == "" {
+		uid = fmt.Sprintf("%s/%s", ns, name)
+	}
 
 	// 0. Cloud Provider selection
 	prov := pod.Metadata.Annotations["cloudvm.vk.io/provider"]
@@ -401,17 +404,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register new node in pool with capacity (in real provider, capacity comes from instance type specs)
-	nodeCapacity := ResourceVector{
-		CPU:    reqVec.CPU.DeepCopy(),
-		Memory: reqVec.Memory.DeepCopy(),
-		GPUs:   spec.NumGPUs,
+	// Register new node in pool with hardware capacity from instance type catalog
+	itype := inst.InstanceType
+	if itype == "" {
+		itype = spec.InstanceType
 	}
-	if nodeCapacity.GPUs < 8 && strings.Contains(inst.InstanceType, "48xlarge") {
-		nodeCapacity.GPUs = 8
-	} else if nodeCapacity.GPUs < 4 && strings.Contains(inst.InstanceType, "12xlarge") {
-		nodeCapacity.GPUs = 4
-	}
+	nodeCapacity := CapacityForInstanceType(itype, reqVec)
 
 	newNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, nodeCapacity)
 	s.nodePool.RegisterNode(newNode)
@@ -503,15 +501,20 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	delete(s.instances, podName)
 	s.mu.Unlock()
 
-	// Release resources from NodePool
-	if node, alloc, found := s.nodePool.FindPodNode(pod.Metadata.UID); found {
-		_ = s.runner.StopContainer(r.Context(), node, pod.Metadata.UID)
-		s.nodePool.Release(pod.Metadata.UID)
-		log.Printf("[cloudvm] Released resources for pod %s from node %s", pod.Metadata.UID, node.InstanceID)
-		_ = alloc
+	uid := pod.Metadata.UID
+	if uid == "" {
+		uid = key
 	}
 
-	if !exists || inst == nil {
+	// Release resources from NodePool
+	remainingPods := 0
+	if node, _, found := s.nodePool.FindPodNode(uid); found {
+		_ = s.runner.StopContainer(r.Context(), node, uid)
+		remainingPods = s.nodePool.Release(uid)
+		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
+	}
+
+	if !exists || inst == nil || remainingPods > 0 {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -526,6 +529,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if err := prov.Terminate(r.Context(), inst.ID); err != nil {
 		log.Printf("[cloudvm] Error terminating instance %s: %v", inst.ID, err)
 	}
+	s.nodePool.UnregisterNode(inst.ID)
 
 	w.WriteHeader(http.StatusOK)
 }
