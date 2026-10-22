@@ -84,6 +84,14 @@ flowchart LR
     --> S3["<b>3. Execution</b><br>VM boots in ~33s, runs task,<br>and terminates 2s after exit"]:::stage
 ```
 
+### Core Engines
+
+To deliver this, `interlink-provider-cloudvm` is built on three core internal engines:
+
+1. **Spot Portfolio Solver**: Translates pod resource requirements into multi-family weighted fleet requests (`CreateFleet` / `bulkInsert`) to bid at the lowest spot price without overprovisioning.
+2. **In-VM Ephemeral Bootstrap & Watchdogs**: A hardened cloud-init engine providing fast native boot (~33s), P2P WireGuard mesh networking, a 2-minute preemption watcher, and a self-destruct watchdog.
+3. **Bidirectional Reconciler**: A background garbage collector that terminates orphan/zombie cloud VMs if pods vanish, and evicts pods from Kubernetes if cloud instances are preempted.
+
 ---
 
 ## 3. Subsystem Deep Dives
@@ -223,7 +231,8 @@ flowchart TD
         
         subgraph Agents["In-VM Daemons (Pre-baked AMI / Cloud-Init)"]
             direction TB
-            OTEL["OTEL C-Agent / Sidecar\n(Host & GPU Metrics)"]:::daemon
+            OTEL["OTEL Host Agent\n(Host & GPU Metrics)"]:::daemon
+            OBI["OBI (OpenTelemetry eBPF)\n(L4 Socket & Network Flows)"]:::daemon
             Parca["Parca Agent\n(Kernel eBPF Continuous Profiling)"]:::daemon
             Falco["Falco Modern eBPF\n(Runtime Security & Syscall Audit)"]:::daemon
             Dragonfly["Dragonfly dfdaemon\n(P2P Image & Artifact Proxy)"]:::daemon
@@ -252,6 +261,7 @@ flowchart TD
 | Tool / Daemon | Traditional K8s DaemonSet | In Ephemeral CloudVM | Telemetry & Data Path |
 | :--- | :--- | :--- | :--- |
 | **OpenTelemetry (OTEL)** | OTEL DaemonSet scraping pods | Injected via pod env vars or host agent (`OTEL_EXPORTER_OTLP_ENDPOINT`) | OTLP gRPC over private mesh $\\to$ central in-cluster OTEL Collector. |
+| **OBI (OpenTelemetry eBPF)** | OBI DaemonSet (`preset: network`) | Runs as lightweight systemd service hooking kernel sockets | Exports `obi.network.flow.bytes` over mesh $\\to$ central OTEL Collector / SigNoz. |
 | **Parca** | Parca DaemonSet with host eBPF | Runs as systemd service with eBPF enabled on VM kernel | Continuously pushes pprof profiles over mesh $\\to$ central Parca server. |
 | **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP $\\to$ central `falcosidekick`. |
 | **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs $\\to$ avoids registry rate-limits. |
