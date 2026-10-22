@@ -63,7 +63,7 @@ flowchart LR
 
 | | Traditional Kubernetes (Cluster Autoscaler / Karpenter) | `interlink-provider-cloudvm` |
 | :--- | :--- | :--- |
-| **Execution Model** | Provisions full nodes $\→$ registers `kubelet` $\→$ pulls images $\→$ schedules pods | **1 Pod = 1 Dedicated Cloud VM** |
+| **Execution Model** | Provisions full nodes → registers `kubelet` → pulls images → schedules pods | **1 Pod = 1 Dedicated Cloud VM** |
 | **GPU Cold-Start** | 3–5 minutes (node bootstrap + pulling 15GB CUDA container images) | **~33 seconds** (native pre-baked DLAMI execution) |
 | **Geographic Scope** | Single VPC / Single Region | **Cross-Region & Multi-Cloud Fleet Arbitrage** |
 | **Idle Cost** | Keeps empty nodes warm; consolidation and scale-down delay | **\$0** (VM terminates 2 seconds after the task process exits) |
@@ -103,7 +103,7 @@ When bidding for spot capacity across diversified GPU instance families (`g4dn`,
 
 The solver computes **Weighted Capacity** based on physical accelerator counts:
 
-$$\\sum (\\text{count}_i \\times \\text{weight}_i) = \\text{TargetCapacity}$$
+$$\sum (\\text{count}_i \\times \\text{weight}_i) = \\text{TargetCapacity}$$
 
 ```mermaid
 flowchart LR
@@ -349,14 +349,14 @@ flowchart TD
 
 | Tool / Daemon | Traditional K8s DaemonSet | In Ephemeral CloudVM | Telemetry & Data Path |
 | :--- | :--- | :--- | :--- |
-| **OpenTelemetry (OTEL)** | OTEL DaemonSet scraping pods | Injected via pod env vars or host agent (`OTEL_EXPORTER_OTLP_ENDPOINT`) | OTLP gRPC over private mesh $\→$ central in-cluster OTEL Collector. |
-| **OBI (OpenTelemetry eBPF)** | OBI DaemonSet (`preset: network`) | Runs as lightweight systemd service hooking kernel sockets | Exports `obi.network.flow.bytes` over mesh $\→$ central OTEL Collector / SigNoz. |
-| **Parca** | Parca DaemonSet with host eBPF | Runs as systemd service with eBPF enabled on VM kernel | Continuously pushes pprof profiles over mesh $\→$ central Parca server. |
-| **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP $\→$ central `falcosidekick`. |
-| **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs $\→$ avoids registry rate-limits. |
-| **OpenCost / Kubecost** | cAdvisor / NodeExporter DaemonSet | Cloud resource tagging + CUR billing reconciliation + Virtual-Kubelet status pricing | Tags instances with `PodName`/`Namespace` $\→$ OpenCost attributes out-of-cluster cloud bills to K8s workloads. |
-| **NVIDIA DCGM Exporter** (`gpu_operator`) | DCGM Exporter DaemonSet | Bundled in DLAMI or host OTEL collector scraping NVML | Pushes GPU SM utilization, Tensor core activity, and VRAM over mesh $\→$ central Prometheus / SigNoz. |
-| **Node Problem Detector (NPD)** | Node Problem Detector DaemonSet | In-VM watchdog polling `dmesg` and NVML for GPU Xid / ECC errors | Emits structured `HARDWARE_FAULT` logs to serial console $\→$ provider evicts/reschedules pod. |
+| **OpenTelemetry (OTEL)** | OTEL DaemonSet scraping pods | Injected via pod env vars or host agent (`OTEL_EXPORTER_OTLP_ENDPOINT`) | OTLP gRPC over private mesh → central in-cluster OTEL Collector. |
+| **OBI (OpenTelemetry eBPF)** | OBI DaemonSet (`preset: network`) | Runs as lightweight systemd service hooking kernel sockets | Exports `obi.network.flow.bytes` over mesh → central OTEL Collector / SigNoz. |
+| **Parca** | Parca DaemonSet with host eBPF | Runs as systemd service with eBPF enabled on VM kernel | Continuously pushes pprof profiles over mesh → central Parca server. |
+| **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP → central `falcosidekick`. |
+| **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs → avoids registry rate-limits. |
+| **OpenCost / Kubecost** | cAdvisor / NodeExporter DaemonSet | Cloud resource tagging + CUR billing reconciliation + Virtual-Kubelet status pricing | Tags instances with `PodName`/`Namespace` → OpenCost attributes out-of-cluster cloud bills to K8s workloads. |
+| **NVIDIA DCGM Exporter** (`gpu_operator`) | DCGM Exporter DaemonSet | Bundled in DLAMI or host OTEL collector scraping NVML | Pushes GPU SM utilization, Tensor core activity, and VRAM over mesh → central Prometheus / SigNoz. |
+| **Node Problem Detector (NPD)** | Node Problem Detector DaemonSet | In-VM watchdog polling `dmesg` and NVML for GPU Xid / ECC errors | Emits structured `HARDWARE_FAULT` logs to serial console → provider evicts/reschedules pod. |
 | **Storage FUSE Driver** (`csi_rclone`) | CSI Node Driver DaemonSet | In-VM `cloud-init` FUSE mount (`rclone mount` / `s3fs` / `gcsfuse`) | Mounts object storage buckets directly to `/mnt/data` before workload container boots. |
 | **Torch Compile Cache** | Shared NFS or PVC compiler cache | S3/Dragonfly cache or pre-warmed Triton/Inductor kernel cache in Golden AMI | Eliminates 5–15 min CUDA compilation delays on every cold spot boot. |
 
