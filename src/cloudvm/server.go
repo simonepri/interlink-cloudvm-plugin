@@ -1783,8 +1783,8 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 	return nil
 }
 
-// MaxUnknownCoTenantRetries defines the retry budget before an unverified node is released for garbage collection.
-const MaxUnknownCoTenantRetries = 10
+// UnknownCoTenantTimeout defines the elapsed duration before an unverified node is released for garbage collection.
+var UnknownCoTenantTimeout = 30 * time.Minute
 
 // RetryUnknownCoTenants attempts to query the in-VM runner for nodes whose startup listing failed.
 func (s *Server) RetryUnknownCoTenants(ctx context.Context) {
@@ -1812,12 +1812,12 @@ func (s *Server) RetryUnknownCoTenants(ctx context.Context) {
 			cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
 			log.Printf("[cloudvm] Successfully resolved co-tenants for node %s via background reconciliation", cleanID) //nolint:gosec // cleanID sanitized
 		} else {
-			retries, exceeded := s.nodePool.IncrementUnknownCoTenantRetries(node.InstanceID, MaxUnknownCoTenantRetries)
+			retries, exceeded := s.nodePool.IncrementUnknownCoTenantRetries(node.InstanceID, UnknownCoTenantTimeout)
 			cleanID := strings.ReplaceAll(strings.ReplaceAll(node.InstanceID, "\n", ""), "\r", "")
 			if exceeded {
-				log.Printf("[cloudvm] ERROR: node %s exceeded %d co-tenant reconciliation retries (err: %v). Clearing unknown flag to allow garbage collection.", cleanID, retries, err) //nolint:gosec // cleanID sanitized
+				log.Printf("[cloudvm] ERROR: node %s exceeded %v co-tenant reconciliation timeout (%d attempts, err: %v). Clearing unknown flag to allow garbage collection.", cleanID, UnknownCoTenantTimeout, retries, err) //nolint:gosec // cleanID sanitized
 			} else {
-				log.Printf("[cloudvm] Retrying co-tenant discovery for node %s (attempt %d/%d): %v", cleanID, retries, MaxUnknownCoTenantRetries, err) //nolint:gosec // cleanID sanitized
+				log.Printf("[cloudvm] Retrying co-tenant discovery for node %s (attempt %d, elapsed %v): %v", cleanID, retries, time.Since(node.UnknownSince).Truncate(time.Second), err) //nolint:gosec // cleanID sanitized
 			}
 		}
 	}

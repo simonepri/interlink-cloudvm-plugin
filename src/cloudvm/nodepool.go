@@ -383,13 +383,13 @@ func (np *NodePool) NodesWithUnknownCoTenants() []*CloudVMNode {
 	return res
 }
 
-// IncrementUnknownCoTenantRetries increments retry counter and returns true if limit exceeded.
-func (np *NodePool) IncrementUnknownCoTenantRetries(instanceID string, maxRetries int) (int, bool) {
+// IncrementUnknownCoTenantRetries increments retry counter and returns true if timeout duration has elapsed.
+func (np *NodePool) IncrementUnknownCoTenantRetries(instanceID string, timeout time.Duration) (int, bool) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 	if node, ok := np.nodes[instanceID]; ok {
 		node.UnknownCoTenantsRetries++
-		if node.UnknownCoTenantsRetries >= maxRetries || (!node.UnknownSince.IsZero() && time.Since(node.UnknownSince) > 30*time.Minute) {
+		if !node.UnknownSince.IsZero() && time.Since(node.UnknownSince) >= timeout {
 			node.UnknownCoTenants = false
 			return node.UnknownCoTenantsRetries, true
 		}

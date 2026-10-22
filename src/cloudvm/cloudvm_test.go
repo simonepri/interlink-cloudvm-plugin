@@ -3173,22 +3173,28 @@ func TestNodePool_UnknownCoTenantsExceededRetriesClearedForGC(t *testing.T) {
 	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod1JSON))
 	srv.handleDelete(httptest.NewRecorder(), delReq)
 
-	// Simulate retries up to MaxUnknownCoTenantRetries
+	// Set short timeout for unit test
+	oldTimeout := UnknownCoTenantTimeout
+	UnknownCoTenantTimeout = 50 * time.Millisecond
+	defer func() { UnknownCoTenantTimeout = oldTimeout }()
+
 	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
-	for i := 0; i < MaxUnknownCoTenantRetries-1; i++ {
-		_, _ = reconciler.ReconcileOnce(ctx)
-		if !srv.nodePool.HasUnknownCoTenants(inst.ID) {
-			t.Fatalf("expected UnknownCoTenants still true on retry %d", i+1)
-		}
+	// First reconcile: node remains flagged
+	_, _ = reconciler.ReconcileOnce(ctx)
+	if !srv.nodePool.HasUnknownCoTenants(inst.ID) {
+		t.Fatalf("expected UnknownCoTenants still true before timeout")
 	}
 
-	// Final retry: limit exceeded -> flag cleared -> VM collected as zombie
+	// Advance past timeout
+	time.Sleep(60 * time.Millisecond)
+
+	// Reconcile after timeout: flag cleared -> VM collected as zombie
 	res, err := reconciler.ReconcileOnce(ctx)
 	if err != nil {
 		t.Fatalf("reconciler failed: %v", err)
 	}
 	if srv.nodePool.HasUnknownCoTenants(inst.ID) {
-		t.Fatalf("expected UnknownCoTenants cleared after exceeding retry limit")
+		t.Fatalf("expected UnknownCoTenants cleared after timeout elapsed")
 	}
 	if len(res.TerminatedZombies) != 1 || res.TerminatedZombies[0] != inst.ID {
 		t.Fatalf("expected VM %s terminated as zombie after retry limit exceeded, got: %v", inst.ID, res.TerminatedZombies)
