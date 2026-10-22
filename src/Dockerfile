@@ -1,4 +1,7 @@
-FROM golang:1.27.2-alpine3.23 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.23 AS build
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -7,7 +10,7 @@ RUN go mod download
 
 COPY cloudvm ./cloudvm
 
-RUN CGO_ENABLED=0 go build \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -trimpath \
     -ldflags="-s -w" \
     -o /out/interlink-provider-cloudvm \
