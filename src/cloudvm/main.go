@@ -174,6 +174,11 @@ func main() {
 				launchGrace = time.Duration(s) * time.Second
 			}
 		}
+		if sec := os.Getenv("UNKNOWN_COTENANT_TIMEOUT_SECONDS"); sec != "" {
+			if s, err := strconv.Atoi(sec); err == nil && s > 0 {
+				UnknownCoTenantTimeout = time.Duration(s) * time.Second
+			}
+		}
 		reconciler.SetLaunchGracePeriod(launchGrace)
 		server.SetReconciler(reconciler)
 

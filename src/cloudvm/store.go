@@ -14,9 +14,6 @@ import (
 // MaxStoreRecords prevents unbounded store growth across millions of pods.
 const MaxStoreRecords = 10000
 
-// MaxCompletedRecords is an alias for MaxStoreRecords for backward compatibility.
-const MaxCompletedRecords = MaxStoreRecords
-
 // CompletedPodRecord stores the terminal execution telemetry of a finished pod.
 type CompletedPodRecord struct {
 	PodUID     string    `json:"podUID"`
@@ -197,7 +194,7 @@ type CompletedStore struct {
 // NewCompletedStore initializes a CompletedStore with the given file path.
 func NewCompletedStore(filePath string) (*CompletedStore, error) {
 	dm, err := newDiskMap("completed store", filePath, "cloudvm-completed-pods.json", false, func(records map[string]*CompletedPodRecord) {
-		if len(records) <= MaxCompletedRecords {
+		if len(records) <= MaxStoreRecords {
 			return
 		}
 		var oldestUID string
