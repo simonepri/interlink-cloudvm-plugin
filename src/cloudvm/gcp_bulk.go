@@ -78,9 +78,12 @@ func (p *GCPProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance, 
 		State:        StateRunning,
 		CreatedAt:    time.Now(),
 		Metadata: map[string]string{
-			"marketType": spec.MarketType,
-			"cloud":      "gcp",
-			"podName":    spec.PodName,
+			"marketType":  spec.MarketType,
+			"cloud":       "gcp",
+			"podName":     spec.PodName,
+			"namespace":   spec.PodNamespace,
+			"podUID":      spec.PodUID,
+			"runnerToken": spec.RunnerAuthToken,
 		},
 	}, nil
 }

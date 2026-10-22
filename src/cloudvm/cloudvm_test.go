@@ -201,8 +201,11 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	if !bytes.Contains([]byte(script), []byte("ThreadingHTTPServer")) {
 		t.Errorf("cloud-init runner should use ThreadingHTTPServer for concurrent requests")
 	}
-	if !bytes.Contains([]byte(script), []byte("--gpus device=0,1")) {
-		t.Errorf("cloud-init missing discrete device slicing flags")
+	if !bytes.Contains([]byte(script), []byte(`--gpus '"device=0,1"'`)) {
+		t.Errorf("cloud-init missing discrete device slicing flags with CSV quotes")
+	}
+	if !bytes.Contains([]byte(script), []byte("--shm-size=16g")) {
+		t.Errorf("cloud-init missing shared memory limit for PyTorch DataLoader")
 	}
 	if !bytes.Contains([]byte(script), []byte(`docker run -d --name="cloudvm-pod-uid-456"`)) {
 		t.Errorf("cloud-init missing detached initial container launch with pod UID name, got script:\n%s", script)
@@ -467,12 +470,14 @@ func TestServer_RecoverActiveInstances(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed cloud instance
+	recToken := fmt.Sprintf("token-%d", time.Now().UnixNano())
 	inst, err := mock.Launch(ctx, &InstanceSpec{
-		PodName:      "recovered-pod",
-		PodNamespace: "custom-ns",
-		PodUID:       "recovered-uid-999",
-		ClusterTag:   "test-cluster",
-		Region:       "us-east-1",
+		PodName:         "recovered-pod",
+		PodNamespace:    "custom-ns",
+		PodUID:          "recovered-uid-999",
+		RunnerAuthToken: recToken,
+		ClusterTag:      "test-cluster",
+		Region:          "us-east-1",
 	})
 	if err != nil {
 		t.Fatalf("failed to launch: %v", err)
@@ -498,6 +503,9 @@ func TestServer_RecoverActiveInstances(t *testing.T) {
 	node, _, found := server.NodePool().FindPodNode("recovered-uid-999")
 	if !found || !node.Cordoned {
 		t.Fatalf("expected recovered node to be cordoned for safe restart")
+	}
+	if node.RunnerAuthToken != recToken {
+		t.Fatalf("expected recovered node to retain RunnerAuthToken %s, got %s", recToken, node.RunnerAuthToken)
 	}
 
 	// Verify that Allocate skips this cordoned recovered node

@@ -37,10 +37,11 @@ func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance,
 		State:        StateRunning,
 		CreatedAt:    time.Now(),
 		Metadata: map[string]string{
-			"podName":    spec.PodName,
-			"namespace":  spec.PodNamespace,
-			"podUID":     spec.PodUID,
-			"clusterTag": spec.ClusterTag,
+			"podName":     spec.PodName,
+			"namespace":   spec.PodNamespace,
+			"podUID":      spec.PodUID,
+			"clusterTag":  spec.ClusterTag,
+			"runnerToken": spec.RunnerAuthToken,
 		},
 	}
 	m.instances[id] = inst

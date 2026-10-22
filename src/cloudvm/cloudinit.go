@@ -50,12 +50,15 @@ func (c *CloudInitConfig) CPULimit() string {
 
 // GPUFlag returns the exact docker --gpus flag based on discrete device allocations.
 func (c *CloudInitConfig) GPUFlag() string {
-	if len(c.AssignedGPUs) > 0 {
+	if len(c.AssignedGPUs) > 1 {
 		var parts []string
 		for _, g := range c.AssignedGPUs {
 			parts = append(parts, fmt.Sprintf("%d", g))
 		}
-		return fmt.Sprintf("--gpus device=%s", strings.Join(parts, ","))
+		return fmt.Sprintf(`--gpus '"device=%s"'`, strings.Join(parts, ","))
+	}
+	if len(c.AssignedGPUs) == 1 {
+		return fmt.Sprintf("--gpus device=%d", c.AssignedGPUs[0])
 	}
 	if c.NumGPUs > 0 {
 		return "--gpus all"
@@ -113,6 +116,9 @@ INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.2
 if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
   aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --instance-initiated-shutdown-behavior terminate --region "{{.Region}}" 2>/dev/null || true
 fi
+
+# Block non-root container processes from reaching IMDS credentials
+iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
 
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
@@ -220,6 +226,7 @@ shutdown -h now || poweroff
 echo "[cloudvm-bootstrap] Starting in-VM micro-runner daemon on port 9090..."
 
 cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
+import hmac
 import http.server
 import json
 import subprocess
@@ -234,9 +241,14 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
     def check_auth(self):
         if not AUTH_TOKEN:
-            return True
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"error":"auth_token_not_configured"}')
+            return False
         auth_header = self.headers.get('Authorization', '')
-        if auth_header == f"Bearer {AUTH_TOKEN}":
+        expected = f"Bearer {AUTH_TOKEN}"
+        if hmac.compare_digest(auth_header, expected):
             return True
         self.send_response(401)
         self.send_header('Content-Type', 'application/json')
@@ -257,7 +269,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/containers/list':
-            res = subprocess.run(['docker', 'ps', '-a', '--filter', 'name=cloudvm-', '--format', '{{print "{{"}}.ID{{print "}}"}}\t{{print "{{"}}.Names{{print "}}"}}\t{{print "{{"}}.State{{print "}}"}}\t{{print "{{"}}.Status{{print "}}"}}'], capture_output=True, text=True)
+            res = subprocess.run(['docker', 'ps', '--filter', 'name=cloudvm-', '--filter', 'status=running', '--format', '{{print "{{"}}.ID{{print "}}"}}\t{{print "{{"}}.Names{{print "}}"}}\t{{print "{{"}}.State{{print "}}"}}\t{{print "{{"}}.Status{{print "}}"}}'], capture_output=True, text=True)
             results = []
             if res.returncode == 0:
                 for line in res.stdout.strip().split('\n'):
@@ -270,7 +282,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         uid = name.removeprefix('cloudvm-')
                         results.append({
                             "podUID": uid,
-                            "running": state == "running",
+                            "running": True,
                             "reason": state,
                         })
             self.send_response(200)
@@ -346,14 +358,15 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             container_name = f"cloudvm-{pod_uid}"
             subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True)
 
-            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host']
+            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host', '--shm-size=16g']
             if cpu_milli and cpu_milli > 0:
                 docker_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
             if mem_bytes and mem_bytes > 0:
                 docker_cmd.extend(['--memory', str(mem_bytes)])
             if gpus:
                 gpu_devs = ','.join(str(g) for g in gpus)
-                docker_cmd.extend(['--gpus', f"device={gpu_devs}"])
+                gpu_spec = f'"device={gpu_devs}"' if len(gpus) > 1 else f"device={gpu_devs}"
+                docker_cmd.extend(['--gpus', gpu_spec])
             for k, v in env.items():
                 docker_cmd.extend(['-e', f"{k}={v}"])
             docker_cmd.append(image)
@@ -393,6 +406,7 @@ if [ -n "{{.TargetContainerImage}}" ]; then
   docker rm -f "cloudvm-{{.EffectivePodUID}}" 2>/dev/null || true
   docker run -d --name="cloudvm-{{.EffectivePodUID}}" \
     --net=host \
+    --shm-size=16g \
     {{.GPUFlag}} \
     {{if .CPULimit}}--cpus {{.CPULimit}} \{{end}}
     {{if gt .MemoryBytes 0}}--memory {{.MemoryBytes}} \{{end}}
@@ -401,23 +415,13 @@ if [ -n "{{.TargetContainerImage}}" ]; then
     {{.RenderContainerCommand}} || true
 fi
 
-# 6. Multi-Pod Idle Watchdog: Shuts down VM only when all containers finish and idle grace period expires
-echo "[cloudvm-bootstrap] Workload started. Monitoring active containers for node shutdown..."
-while true; do
-  ACTIVE=$(docker ps -q --filter "name=cloudvm" 2>/dev/null | wc -l || echo 0)
-  if [ "$ACTIVE" -eq 0 ]; then
-    echo "[cloudvm-bootstrap] No active cloudvm containers running. Waiting 60s idle grace period..."
-    sleep 60
-    ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm" 2>/dev/null | wc -l || echo 0)
-    if [ "$ACTIVE_AFTER" -eq 0 ]; then
-      echo "[cloudvm-bootstrap] Node idle grace expired. Shutting down VM..."
-      echo "CLOUDVM_STATUS: {\"status\": \"COMPLETED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
-      shutdown -h now || poweroff
-      exit 0
-    fi
-  fi
-  sleep 10
-done
+# 6. Orphaned Node Fail-Safe Watchdog (2-hour dead-man's switch against orphan cloud billing)
+(
+  sleep 7200
+  echo "[cloudvm-bootstrap] Orphan safety timeout (2h) reached. Terminating VM..."
+  echo "CLOUDVM_STATUS: {\"status\": \"ORPHAN_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+  shutdown -h now || poweroff
+) &
 {{end}}
 `
 

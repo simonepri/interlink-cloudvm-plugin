@@ -93,6 +93,7 @@ type FleetRequest struct {
 	MarketType         string                  `json:"marketType,omitempty"`
 	MaxPrice           string                  `json:"maxPrice,omitempty"`
 	PricePolicy        string                  `json:"pricePolicy,omitempty"`
+	RunnerAuthToken    string                  `json:"runnerAuthToken,omitempty"`
 }
 
 // FleetResponse represents the result of a fleet launch.
@@ -201,6 +202,9 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		{Key: aws.String("PodName"), Value: aws.String(req.PodName)},
 		{Key: aws.String("Namespace"), Value: aws.String(req.PodNamespace)},
 		{Key: aws.String("PodUID"), Value: aws.String(req.PodUID)},
+	}
+	if req.RunnerAuthToken != "" {
+		tags = append(tags, ec2types.Tag{Key: aws.String("RunnerToken"), Value: aws.String(req.RunnerAuthToken)})
 	}
 	if req.CostCenter != "" {
 		tags = append(tags, ec2types.Tag{Key: aws.String("CostCenter"), Value: aws.String(req.CostCenter)})
@@ -396,6 +400,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		MaxPrice:           spec.MaxPrice,
 		PricePolicy:        spec.PricePolicy,
 		AllocationStrategy: StrategyPriceCapacityOptimized,
+		RunnerAuthToken:    spec.RunnerAuthToken,
 	}
 
 	overrides := BuildFleetOverrides(req.InstanceTypes, req.SubnetIDs)
@@ -409,6 +414,13 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}
 
 	inst := resp.Instances[0]
+	if inst.Metadata == nil {
+		inst.Metadata = make(map[string]string)
+	}
+	inst.Metadata["podName"] = spec.PodName
+	inst.Metadata["namespace"] = spec.PodNamespace
+	inst.Metadata["podUID"] = spec.PodUID
+	inst.Metadata["runnerToken"] = spec.RunnerAuthToken
 	p.mu.Lock()
 	if p.instanceRegions == nil {
 		p.instanceRegions = make(map[string]string)
@@ -515,6 +527,7 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 			podName := ""
 			podNamespace := "default"
 			podUID := ""
+			runnerToken := ""
 			for _, tag := range inst.Tags {
 				k := aws.ToString(tag.Key)
 				v := aws.ToString(tag.Value)
@@ -525,6 +538,8 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 					podNamespace = v
 				case "PodUID":
 					podUID = v
+				case "RunnerToken":
+					runnerToken = v
 				}
 			}
 			instID := aws.ToString(inst.InstanceId)
@@ -544,9 +559,10 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 				State:        StateRunning,
 				CreatedAt:    aws.ToTime(inst.LaunchTime),
 				Metadata: map[string]string{
-					"podName":   podName,
-					"namespace": podNamespace,
-					"podUID":    podUID,
+					"podName":     podName,
+					"namespace":   podNamespace,
+					"podUID":      podUID,
+					"runnerToken": runnerToken,
 				},
 			})
 		}

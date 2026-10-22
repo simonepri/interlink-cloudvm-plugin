@@ -16,12 +16,12 @@ import (
 	"time"
 )
 
-func generateToken() string {
+func generateToken() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "cloudvm-secret-token"
+		return "", fmt.Errorf("crypto rand failed: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // EgressRateToBandwidth converts an hourly budget in USD/hr to an equivalent network rate string (e.g. "22mbit").
@@ -438,7 +438,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[cloudvm] Bin-pack miss. Launching new VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
 		spec.PodNamespace, spec.PodName, spec.InstanceType, spec.NumGPUs, spec.Region)
 
-	spec.RunnerAuthToken = generateToken()
+	tok, err := generateToken()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	spec.RunnerAuthToken = tok
+
 	var preAssignedGPUs []int
 	for i := 0; i < spec.NumGPUs; i++ {
 		preAssignedGPUs = append(preAssignedGPUs, i)
@@ -471,6 +477,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	newNode.Namespace = spec.PodNamespace
 	newNode.RunnerAuthToken = spec.RunnerAuthToken
 	newNode.Spot = spec.MarketType != "on-demand"
+	if spec.AMIMode == "dlami" {
+		newNode.Cordoned = true // Native DLAMI runs single-tenant workload; exclude from bin-packing
+	}
 	gpus, tpus := s.nodePool.RegisterAndAllocate(newNode, reqVec, spec.PodUID, spec.PodNamespace, spec.PodName)
 
 	cName := "worker"
@@ -616,9 +625,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	type statusTarget struct {
+		name string
+		ns   string
+		uid  string
+		jid  string
+		inst *Instance
+		node *CloudVMNode
+	}
 
+	var targets []statusTarget
+
+	s.mu.RLock()
 	if len(pods) == 0 {
 		seen := make(map[string]bool)
 		for key, inst := range s.instances {
@@ -656,7 +674,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var responses []PodStatusResponse
 	for _, pod := range pods {
 		name := pod.Metadata.Name
 		ns := pod.Metadata.Namespace
@@ -676,55 +693,77 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			inst, exists = s.instances[name]
 		}
 
-		status := ContainerStatus{
-			Name: "worker",
-		}
-
 		uid := pod.Metadata.UID
 		if uid == "" && exists && inst != nil && inst.Metadata != nil {
 			uid = inst.Metadata["podUID"]
 		}
 
 		jid := ""
+		var node *CloudVMNode
 		if exists && inst != nil {
 			if uid != "" {
 				jid = fmt.Sprintf("%s:%s", inst.ID, uid)
+				if n, _, found := s.nodePool.FindPodNode(uid); found {
+					node = n
+				}
 			} else {
 				jid = inst.ID
 			}
-			switch inst.State {
+		}
+
+		targets = append(targets, statusTarget{
+			name: name,
+			ns:   ns,
+			uid:  uid,
+			jid:  jid,
+			inst: inst,
+			node: node,
+		})
+	}
+	s.mu.RUnlock()
+
+	var responses []PodStatusResponse
+	for _, target := range targets {
+		status := ContainerStatus{
+			Name: "worker",
+		}
+
+		if target.inst != nil {
+			switch target.inst.State {
 			case StateProvisioning:
 				status.State.Waiting = &ContainerWaitingState{
 					Reason:  "ContainerCreating",
-					Message: fmt.Sprintf("Provisioning cloud VM %s in %s...", inst.ID, inst.Region),
+					Message: fmt.Sprintf("Provisioning cloud VM %s in %s...", target.inst.ID, target.inst.Region),
 				}
 			case StateRunning:
-				runnerChecked := false
-				if s.runner != nil && uid != "" {
-					if node, _, found := s.nodePool.FindPodNode(uid); found && node != nil {
-						if cResult, err := s.runner.GetStatus(r.Context(), node, uid); err == nil && cResult != nil {
-							runnerChecked = true
-							if cResult.Running {
-								status.Ready = true
-								status.State.Running = &ContainerRunningState{
-									StartedAt: cResult.StartedAt,
-								}
-							} else {
-								status.Ready = false
-								status.State.Terminated = &ContainerTerminatedState{
-									ExitCode:   cResult.ExitCode,
-									Reason:     cResult.Reason,
-									Message:    cResult.Message,
-									FinishedAt: cResult.FinishedAt,
-								}
+				if s.runner != nil && target.node != nil && target.uid != "" {
+					cResult, err := s.runner.GetStatus(r.Context(), target.node, target.uid)
+					if err != nil {
+						status.Ready = false
+						status.State.Waiting = &ContainerWaitingState{
+							Reason:  "ContainerStatusUnknown",
+							Message: err.Error(),
+						}
+					} else if cResult != nil {
+						if cResult.Running {
+							status.Ready = true
+							status.State.Running = &ContainerRunningState{
+								StartedAt: cResult.StartedAt,
+							}
+						} else {
+							status.Ready = false
+							status.State.Terminated = &ContainerTerminatedState{
+								ExitCode:   cResult.ExitCode,
+								Reason:     cResult.Reason,
+								Message:    cResult.Message,
+								FinishedAt: cResult.FinishedAt,
 							}
 						}
 					}
-				}
-				if !runnerChecked {
+				} else {
 					status.Ready = true
 					status.State.Running = &ContainerRunningState{
-						StartedAt: inst.CreatedAt,
+						StartedAt: target.inst.CreatedAt,
 					}
 				}
 			case StateTerminating:
@@ -748,17 +787,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		} else {
-			status.State.Waiting = &ContainerWaitingState{
-				Reason:  "ContainerCreating",
-				Message: fmt.Sprintf("Instance for %s is pending discovery or provisioning", key),
+			status.State.Terminated = &ContainerTerminatedState{
+				ExitCode:   1,
+				Reason:     "InstanceNotFound",
+				Message:    fmt.Sprintf("Instance for %s/%s does not exist", target.ns, target.name),
+				FinishedAt: time.Now(),
 			}
 		}
 
 		responses = append(responses, PodStatusResponse{
-			PodUID:    uid,
-			Name:      name,
-			Namespace: ns,
-			JID:       jid,
+			PodUID:    target.uid,
+			Name:      target.name,
+			Namespace: target.ns,
+			JID:       target.jid,
 			Containers: []ContainerStatus{
 				status,
 			},
@@ -809,6 +850,11 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
 		recNode.Namespace = ns
 		recNode.Cordoned = true
+		tok := inst.Metadata["runnerToken"]
+		if tok == "" {
+			tok = inst.Metadata["cloudvm:runner-token"]
+		}
+		recNode.RunnerAuthToken = tok
 		s.nodePool.RegisterAndAllocate(recNode, defaultVec, podUID, ns, podName)
 
 		if s.runner != nil {
