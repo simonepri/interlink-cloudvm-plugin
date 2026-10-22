@@ -1,3 +1,4 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (
@@ -27,8 +28,7 @@ func main() {
 		providerType = "mock"
 	}
 
-	log.Printf("[interlink-provider-cloudvm] Starting server (provider=%s, clusterTag=%s, port=%s)...",
-		providerType, clusterTag, port)
+	log.Printf("[interlink-provider-cloudvm] Starting server...")
 
 	var defaultProvider Provider
 	mockProv := NewMockProvider()
@@ -104,7 +104,11 @@ func main() {
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[interlink-provider-cloudvm] Listening on :%s", port)
+		portNum, _ := strconv.Atoi(port)
+		if portNum <= 0 || portNum > 65535 {
+			portNum = 4040
+		}
+		log.Printf("[interlink-provider-cloudvm] Listening on port %d", portNum)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[interlink-provider-cloudvm] Server failed: %v", err)
 		}
@@ -114,10 +118,10 @@ func main() {
 	log.Printf("[interlink-provider-cloudvm] Shutting down gracefully...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("[interlink-provider-cloudvm] Shutdown error: %v", err)
+	err := httpServer.Shutdown(shutdownCtx)
+	shutdownCancel()
+	if err != nil {
+		log.Printf("[interlink-provider-cloudvm] Shutdown error: %v", err)
 	}
 
 	log.Printf("[interlink-provider-cloudvm] Server stopped.")

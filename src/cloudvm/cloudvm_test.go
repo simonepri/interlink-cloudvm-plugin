@@ -1,11 +1,14 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestServerCreateAndDelete(t *testing.T) {
@@ -129,5 +132,34 @@ func TestCloudInitGeneration(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(script), []byte("/dev/console")) {
 		t.Errorf("cloud-init missing serial console telemetry logging")
+	}
+}
+
+func TestReconcilerZombieDetection(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+
+	// Launch an instance via mock directly (pod not in server memory -> zombie)
+	ctx := context.Background()
+	inst, err := mock.Launch(ctx, &InstanceSpec{
+		PodName:    "vanished-pod",
+		ClusterTag: "test-cluster",
+		Region:     "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to launch mock instance: %v", err)
+	}
+
+	// Create reconciler with zero graceTTL so it triggers immediately
+	reconciler := NewReconciler(mock, server, "test-cluster", 1*time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+
+	res, err := reconciler.ReconcileOnce(ctx)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	if len(res.TerminatedZombies) != 1 || res.TerminatedZombies[0] != inst.ID {
+		t.Fatalf("expected zombie %s to be terminated, got %+v", inst.ID, res.TerminatedZombies)
 	}
 }

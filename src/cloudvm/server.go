@@ -1,3 +1,4 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (
@@ -344,17 +345,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(responses)
 }
 
-func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetLogs(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("InterLink CloudVM log streaming active.\n"))
 }
 
-func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
 }
 
-func (s *Server) GetActivePods(ctx context.Context) (map[string]string, error) {
+func (s *Server) GetActivePods(_ context.Context) (map[string]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -365,7 +366,7 @@ func (s *Server) GetActivePods(ctx context.Context) (map[string]string, error) {
 	return active, nil
 }
 
-func (s *Server) MarkPodFailed(ctx context.Context, podName string, reason string) error {
+func (s *Server) MarkPodFailed(_ context.Context, podName string, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

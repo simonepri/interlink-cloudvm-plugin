@@ -1,3 +1,4 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (
@@ -8,20 +9,20 @@ import (
 
 // GCPBulkInsertRequest represents the payload for compute.instances.bulkInsert.
 type GCPBulkInsertRequest struct {
-	Count               int               `json:"count"`
-	MinCount            int               `json:"minCount"`
-	NamePattern         string            `json:"namePattern"`
-	Zone                string            `json:"zone"`
-	MachineType         string            `json:"machineType"`
-	AcceleratorType     string            `json:"acceleratorType,omitempty"`
-	AcceleratorCount    int               `json:"acceleratorCount,omitempty"`
-	Preemptible         bool              `json:"preemptible"`
-	ProvisioningModel   string            `json:"provisioningModel"` // "SPOT"
-	LocationPolicy      string            `json:"locationPolicy"`    // "ANY_SINGLE_ZONE"
-	StartupScript       string            `json:"startupScript"`
-	ClusterTag          string            `json:"clusterTag"`
-	PodName             string            `json:"podName"`
-	ServiceAccountEmail string            `json:"serviceAccountEmail,omitempty"`
+	Count               int    `json:"count"`
+	MinCount            int    `json:"minCount"`
+	NamePattern         string `json:"namePattern"`
+	Zone                string `json:"zone"`
+	MachineType         string `json:"machineType"`
+	AcceleratorType     string `json:"acceleratorType,omitempty"`
+	AcceleratorCount    int    `json:"acceleratorCount,omitempty"`
+	Preemptible         bool   `json:"preemptible"`
+	ProvisioningModel   string `json:"provisioningModel"` // "SPOT"
+	LocationPolicy      string `json:"locationPolicy"`    // "ANY_SINGLE_ZONE"
+	StartupScript       string `json:"startupScript"`
+	ClusterTag          string `json:"clusterTag"`
+	PodName             string `json:"podName"`
+	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"`
 }
 
 // GCPProvider implements Provider and CloudInventory for Google Cloud Platform.
@@ -41,7 +42,7 @@ func NewGCPProvider(project, zone string) *GCPProvider {
 	}
 }
 
-func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
+func (p *GCPProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance, error) {
 	cloudInit, err := GenerateCloudInit(&CloudInitConfig{
 		PodName:              spec.PodName,
 		PodNamespace:         spec.PodNamespace,
@@ -79,11 +80,11 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}, nil
 }
 
-func (p *GCPProvider) Terminate(ctx context.Context, instanceID string) error {
+func (p *GCPProvider) Terminate(_ context.Context, _ string) error {
 	return nil
 }
 
-func (p *GCPProvider) Status(ctx context.Context, instanceID string) (*Instance, error) {
+func (p *GCPProvider) Status(_ context.Context, instanceID string) (*Instance, error) {
 	return &Instance{
 		ID:       instanceID,
 		Provider: ProviderGCP,
@@ -91,6 +92,6 @@ func (p *GCPProvider) Status(ctx context.Context, instanceID string) (*Instance,
 	}, nil
 }
 
-func (p *GCPProvider) ListActiveInstances(ctx context.Context, clusterTag string) ([]*Instance, error) {
+func (p *GCPProvider) ListActiveInstances(_ context.Context, _ string) ([]*Instance, error) {
 	return nil, nil
 }

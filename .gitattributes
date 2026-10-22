@@ -8,7 +8,6 @@ assets/*.png binary
 **/Chart.lock merge=binary linguist-language=YAML linguist-generated=true
 **/go.sum merge=binary linguist-language=Go-Checksums linguist-generated=true
 .config/release-please-manifest.json merge=binary linguist-language=JSON linguist-generated=true
-version.txt merge=binary linguist-generated=true
 src/chart/charts/*.tgz binary linguist-vendored=true
 
 # Generated or vendored build artifacts remain classified correctly if force-added.

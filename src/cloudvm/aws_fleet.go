@@ -1,3 +1,4 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (
@@ -112,7 +113,7 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 	input := &ec2.CreateFleetInput{
 		Type: ec2types.FleetTypeInstant,
 		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{
-			TotalTargetCapacity:       aws.Int32(int32(req.TargetCapacity)),
+			TotalTargetCapacity:       aws.Int32(int32(req.TargetCapacity & 0x7fffffff)),
 			DefaultTargetCapacityType: ec2types.DefaultTargetCapacityTypeSpot,
 		},
 		SpotOptions: &ec2types.SpotOptionsRequest{
@@ -248,22 +249,11 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	_ = base64.StdEncoding.EncodeToString([]byte(cloudInit))
 
 	resp, err := LaunchFleetWithClient(ctx, client, req, overrides)
-	if err != nil || len(resp.Instances) == 0 {
-		// Mock/Direct fallback if in test or single instance mode
-		instanceID := fmt.Sprintf("i-%s-%s", spec.Region, spec.PodName)
-		return &Instance{
-			ID:           instanceID,
-			Provider:     ProviderAWS,
-			Region:       spec.Region,
-			InstanceType: spec.InstanceType,
-			IP:           "100.64.0.88",
-			State:        StateRunning,
-			CreatedAt:    time.Now(),
-			Metadata: map[string]string{
-				"marketType": spec.MarketType,
-				"podName":    spec.PodName,
-			},
-		}, nil
+	if err != nil {
+		return nil, fmt.Errorf("launch fleet failed: %w", err)
+	}
+	if len(resp.Instances) == 0 {
+		return nil, fmt.Errorf("no instances launched by fleet in %s", spec.Region)
 	}
 
 	inst := resp.Instances[0]
@@ -299,6 +289,9 @@ func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance,
 
 	for _, res := range out.Reservations {
 		for _, inst := range res.Instances {
+			if aws.ToString(inst.InstanceId) != instanceID {
+				continue
+			}
 			state := StateRunning
 			if inst.State != nil {
 				switch inst.State.Name {

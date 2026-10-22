@@ -1,3 +1,4 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (

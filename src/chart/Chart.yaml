@@ -16,7 +16,7 @@ home: https://github.com/simonepri/interlink-provider-cloudvm
 icon: >-
   https://raw.githubusercontent.com/simonepri/interlink-provider-cloudvm/main/assets/logo.png
 maintainers:
-  - name: simonepri
+  - name: Simone Primarosa
     url: https://github.com/simonepri
 sources:
   - https://github.com/simonepri/interlink-provider-cloudvm

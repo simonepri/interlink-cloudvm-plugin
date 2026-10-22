@@ -1,3 +1,4 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (
@@ -21,7 +22,7 @@ func NewMockProvider() *MockProvider {
 	}
 }
 
-func (m *MockProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
+func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -44,7 +45,7 @@ func (m *MockProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instanc
 	return inst, nil
 }
 
-func (m *MockProvider) Terminate(ctx context.Context, instanceID string) error {
+func (m *MockProvider) Terminate(_ context.Context, instanceID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -58,7 +59,7 @@ func (m *MockProvider) Terminate(ctx context.Context, instanceID string) error {
 	return nil
 }
 
-func (m *MockProvider) Status(ctx context.Context, instanceID string) (*Instance, error) {
+func (m *MockProvider) Status(_ context.Context, instanceID string) (*Instance, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -69,7 +70,7 @@ func (m *MockProvider) Status(ctx context.Context, instanceID string) (*Instance
 	return inst, nil
 }
 
-func (m *MockProvider) ListActiveInstances(ctx context.Context, clusterTag string) ([]*Instance, error) {
+func (m *MockProvider) ListActiveInstances(_ context.Context, clusterTag string) ([]*Instance, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 

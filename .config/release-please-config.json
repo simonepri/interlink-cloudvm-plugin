@@ -3,29 +3,21 @@
   "group-pull-request-title-pattern": "chore: release ${version}",
   "packages": {
     ".": {
-      "component": "interlink-provider-cloudvm",
+      "release-type": "go",
+      "bump-minor-pre-major": true,
+      "initial-version": "0.1.0",
       "extra-files": [
         {
-          "jsonpath": "$.version",
+          "type": "yaml",
           "path": "src/chart/Chart.yaml",
-          "type": "yaml"
+          "jsonpath": "$.version"
         },
         {
-          "jsonpath": "$.appVersion",
+          "type": "yaml",
           "path": "src/chart/Chart.yaml",
-          "type": "yaml"
-        },
-        {
-          "path": "readme.md",
-          "type": "generic"
+          "jsonpath": "$.appVersion"
         }
-      ],
-      "include-component-in-tag": false,
-      "initial-version": "0.1.0",
-      "package-name": "interlink-provider-cloudvm",
-      "release-type": "simple",
-      "skip-changelog": true,
-      "version-file": "version.txt"
+      ]
     }
   }
 }

@@ -12,7 +12,7 @@ serviceAccount:
   name: ""
 
 provider:
-  type: "mock" # "aws" | "gcp" | "mock"
+  type: "mock"  # "aws" | "gcp" | "mock"
   clusterTag: "interlink-cloudvm"
   awsRegion: "us-east-1"
   gcpProject: ""

@@ -1,3 +1,4 @@
+// Package main implements the interlink-provider-cloudvm daemon.
 package main
 
 import (
@@ -64,8 +65,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		_, podExists := activePods[podName]
 		if !podExists {
 			if now.Sub(inst.CreatedAt) > r.graceTTL {
-				log.Printf("[reconciler] Detected zombie instance %s for vanished pod %s. Terminating...",
-					inst.ID, podName)
+				log.Printf("[reconciler] Detected zombie instance for vanished pod. Terminating...")
 				result.TerminatedZombies = append(result.TerminatedZombies, inst.ID)
 			}
 		}
