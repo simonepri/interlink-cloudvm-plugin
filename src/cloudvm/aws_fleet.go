@@ -288,6 +288,7 @@ type AWSProvider struct {
 	clients           map[string]EC2FleetClient
 	regionStore       *RegionStore
 	instanceRegions   map[string]string
+	missingCount      map[string]int
 	client            EC2FleetClient
 	mu                sync.RWMutex
 }
@@ -495,11 +496,16 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	inst.Metadata["namespace"] = spec.PodNamespace
 	inst.Metadata["podUID"] = spec.PodUID
 	inst.Metadata["runnerToken"] = spec.RunnerAuthToken
+	p.AddConfiguredRegions(spec.Region)
+	p.AddConfiguredRegions(spec.CandidateRegions...)
 	p.mu.Lock()
 	if p.instanceRegions == nil {
 		p.instanceRegions = make(map[string]string)
 	}
 	p.instanceRegions[inst.ID] = spec.Region
+	if p.missingCount != nil {
+		delete(p.missingCount, inst.ID)
+	}
 	p.mu.Unlock()
 	if p.regionStore != nil {
 		_ = p.regionStore.Set(inst.ID, spec.Region)
@@ -570,15 +576,30 @@ func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance,
 					state = StateTerminated
 				}
 			}
+			stateReasonCode := ""
+			stateReasonMsg := ""
+			if inst.StateReason != nil {
+				stateReasonCode = aws.ToString(inst.StateReason.Code)
+				stateReasonMsg = aws.ToString(inst.StateReason.Message)
+			}
+			marketType := "on-demand"
+			if inst.InstanceLifecycle == ec2types.InstanceLifecycleTypeSpot {
+				marketType = "spot"
+			}
 			ip := aws.ToString(inst.PrivateIpAddress)
 			return &Instance{
 				ID:           aws.ToString(inst.InstanceId),
 				Provider:     ProviderAWS,
-				Region:       p.Region,
+				Region:       region,
 				InstanceType: string(inst.InstanceType),
 				IP:           ip,
 				State:        state,
 				CreatedAt:    aws.ToTime(inst.LaunchTime),
+				Metadata: map[string]string{
+					"marketType":         marketType,
+					"stateReasonCode":    stateReasonCode,
+					"stateReasonMessage": stateReasonMsg,
+				},
 			}, nil
 		}
 	}
@@ -662,6 +683,10 @@ func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTa
 					stateReasonCode = aws.ToString(inst.StateReason.Code)
 					stateReasonMsg = aws.ToString(inst.StateReason.Message)
 				}
+				marketType := "on-demand"
+				if inst.InstanceLifecycle == ec2types.InstanceLifecycleTypeSpot {
+					marketType = "spot"
+				}
 
 				p.mu.Lock()
 				regChanged := false
@@ -689,6 +714,7 @@ func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTa
 						"podName":            podName,
 						"namespace":          podNamespace,
 						"podUID":             podUID,
+						"marketType":         marketType,
 						"clusterTag":         clusterTag,
 						"runnerToken":        runnerToken,
 						"stateReasonCode":    stateReasonCode,
@@ -699,16 +725,27 @@ func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTa
 		}
 		instancesByRegion[reg] = regionInstances
 
-		// Prune stale instance mappings that belonged to this region but are no longer active
+		// Prune stale instance mappings that belonged to this region only after >= 3 consecutive misses
 		p.mu.Lock()
+		if p.missingCount == nil {
+			p.missingCount = make(map[string]int)
+		}
 		var staleIDs []string
 		for id, mappedReg := range p.instanceRegions {
-			if mappedReg == reg && !seenInReg[id] {
-				staleIDs = append(staleIDs, id)
+			if mappedReg == reg {
+				if seenInReg[id] {
+					delete(p.missingCount, id)
+				} else {
+					p.missingCount[id]++
+					if p.missingCount[id] >= 3 {
+						staleIDs = append(staleIDs, id)
+					}
+				}
 			}
 		}
 		for _, id := range staleIDs {
 			delete(p.instanceRegions, id)
+			delete(p.missingCount, id)
 		}
 		p.mu.Unlock()
 		if p.regionStore != nil {

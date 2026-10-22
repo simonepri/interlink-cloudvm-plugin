@@ -1946,13 +1946,336 @@ func TestAWSProvider_StaleSpotReclaimedInstancesPrunedFromRegionStore(t *testing
 	}
 	awsProv.SetRegionClient("us-east-1", eastClient)
 
+	// Pass 1: lagging instance is NOT pruned immediately
 	_, _ = awsProv.ListActiveInstancesByRegion(context.Background(), "test-cluster")
+	if reg := awsProv.instanceRegions["i-spot-reclaimed"]; reg != "us-east-1" {
+		t.Fatalf("expected instance not pruned on pass 1, but got empty")
+	}
 
+	// Pass 2: still retained
+	_, _ = awsProv.ListActiveInstancesByRegion(context.Background(), "test-cluster")
+	if reg := awsProv.instanceRegions["i-spot-reclaimed"]; reg != "us-east-1" {
+		t.Fatalf("expected instance not pruned on pass 2, but got empty")
+	}
+
+	// Pass 3: confirmed missing for 3 consecutive passes -> pruned!
+	_, _ = awsProv.ListActiveInstancesByRegion(context.Background(), "test-cluster")
 	if reg := awsProv.instanceRegions["i-spot-reclaimed"]; reg != "" {
-		t.Fatalf("expected reclaimed instance pruned from instanceRegions, got %s", reg)
+		t.Fatalf("expected reclaimed instance pruned from instanceRegions after 3 misses, got %s", reg)
 	}
 	if reg := awsProv.regionStore.Get("i-spot-reclaimed"); reg != "" {
-		t.Fatalf("expected reclaimed instance pruned from regionStore, got %s", reg)
+		t.Fatalf("expected reclaimed instance pruned from regionStore after 3 misses, got %s", reg)
+	}
+}
+
+func TestAWSProvider_LaggingInstanceNotPrunedAndRegionRetained(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	awsProv := NewAWSProvider("us-east-1") // us-west-2 is NOT in default configured regions
+
+	// Simulate launching an instance in candidate region us-west-2
+	awsProv.AddConfiguredRegions("us-west-2")
+	awsProv.instanceRegions["i-new-lagging"] = "us-west-2"
+	_ = awsProv.regionStore.Set("i-new-lagging", "us-west-2")
+
+	// Pass 1: us-west-2 returns empty list (EC2 eventual consistency lagging)
+	westClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return &ec2.DescribeInstancesOutput{}, nil
+		},
+	}
+	awsProv.SetRegionClient("us-west-2", westClient)
+
+	byReg, _ := awsProv.ListActiveInstancesByRegion(context.Background(), "test-cluster")
+	// Verify us-west-2 WAS queried
+	if _, queried := byReg["us-west-2"]; !queried {
+		t.Fatalf("expected us-west-2 to be queried in pass 1")
+	}
+	// Verify mapping was NOT dropped
+	if reg := awsProv.instanceRegions["i-new-lagging"]; reg != "us-west-2" {
+		t.Fatalf("expected i-new-lagging mapping retained, got %s", reg)
+	}
+
+	// Pass 2: EC2 indexes the instance and returns it
+	westClient.describeInstancesFn = func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+		return &ec2.DescribeInstancesOutput{
+			Reservations: []ec2types.Reservation{
+				{
+					Instances: []ec2types.Instance{
+						{
+							InstanceId:   aws.String("i-new-lagging"),
+							InstanceType: ec2types.InstanceTypeG5Xlarge,
+							State: &ec2types.InstanceState{
+								Name: ec2types.InstanceStateNameRunning,
+							},
+							PrivateIpAddress: aws.String("10.0.2.20"),
+							LaunchTime:       aws.Time(time.Now()),
+							Tags: []ec2types.Tag{
+								{Key: aws.String("ClusterTag"), Value: aws.String("test-cluster")},
+								{Key: aws.String("PodUID"), Value: aws.String("uid-lagging")},
+								{Key: aws.String("PodName"), Value: aws.String("pod-lagging")},
+							},
+						},
+					},
+				},
+			},
+		}, nil
+	}
+
+	byReg2, _ := awsProv.ListActiveInstancesByRegion(context.Background(), "test-cluster")
+	if len(byReg2["us-west-2"]) != 1 || byReg2["us-west-2"][0].ID != "i-new-lagging" {
+		t.Fatalf("expected i-new-lagging visible in pass 2, got: %v", byReg2["us-west-2"])
+	}
+	if awsProv.missingCount["i-new-lagging"] != 0 {
+		t.Fatalf("expected missingCount reset to 0, got %d", awsProv.missingCount["i-new-lagging"])
+	}
+}
+
+func TestReconciler_RegionThrottledAtStartupAdoptsVMsInsteadOfKilling(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+
+	awsProv := NewAWSProvider("us-east-1", "us-west-2")
+	srv := NewServer(awsProv, "cluster-recovery-throttle")
+
+	// 1. Simulate startup recovery when us-west-2 is throttled/failing
+	eastClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return &ec2.DescribeInstancesOutput{}, nil
+		},
+	}
+	awsProv.SetRegionClient("us-east-1", eastClient)
+
+	westClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return nil, fmt.Errorf("RequestLimitExceeded: API throttled during startup")
+		},
+	}
+	awsProv.SetRegionClient("us-west-2", westClient)
+
+	// Startup recovery runs
+	_ = srv.RecoverActiveInstances(context.Background(), awsProv)
+
+	// Server state has NOT recovered i-west because us-west-2 failed
+	srv.mu.RLock()
+	_, hasWest := srv.instances["uid-west-active"]
+	srv.mu.RUnlock()
+	if hasWest {
+		t.Fatalf("expected uid-west-active not recovered during throttled startup")
+	}
+
+	// 2. Later in steady state, us-west-2 recovers and answers with the running VM
+	westClient.describeInstancesFn = func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+		return &ec2.DescribeInstancesOutput{
+			Reservations: []ec2types.Reservation{
+				{
+					Instances: []ec2types.Instance{
+						{
+							InstanceId:        aws.String("i-west-active"),
+							InstanceType:      ec2types.InstanceTypeG5Xlarge,
+							InstanceLifecycle: ec2types.InstanceLifecycleTypeSpot,
+							State: &ec2types.InstanceState{
+								Name: ec2types.InstanceStateNameRunning,
+							},
+							PrivateIpAddress: aws.String("10.0.2.15"),
+							LaunchTime:       aws.Time(time.Now().Add(-15 * time.Minute)), // older than graceTTL!
+							Tags: []ec2types.Tag{
+								{Key: aws.String("ClusterTag"), Value: aws.String("cluster-recovery-throttle")},
+								{Key: aws.String("PodUID"), Value: aws.String("uid-west-active")},
+								{Key: aws.String("PodName"), Value: aws.String("pod-west-active")},
+								{Key: aws.String("Namespace"), Value: aws.String("default")},
+							},
+						},
+					},
+				},
+			},
+		}, nil
+	}
+
+	reconciler := NewReconciler(awsProv, srv, awsProv, "cluster-recovery-throttle", 10*time.Minute)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+
+	// CRITICAL CHECK: i-west-active MUST NOT be terminated as a zombie!
+	if len(result.TerminatedZombies) != 0 {
+		t.Fatalf("CRITICAL BUG: active VM i-west-active was terminated as a zombie: %v", result.TerminatedZombies)
+	}
+
+	// Verify i-west-active was re-adopted into server tracked instances
+	srv.mu.RLock()
+	inst := srv.instances["uid-west-active"]
+	srv.mu.RUnlock()
+	if inst == nil {
+		t.Fatalf("expected i-west-active re-adopted into server instances")
+	}
+	if inst.ID != "i-west-active" {
+		t.Fatalf("expected re-adopted instance ID i-west-active, got %s", inst.ID)
+	}
+}
+
+func TestReconciler_EC2StateReasonQueriedFromStatus(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+
+	awsProv := NewAWSProvider("us-east-1")
+	mockTracker := &mockTrackerWrapper{
+		activePods: map[string]string{
+			"uid-spot-reclaimed": "i-spot-reclaimed",
+		},
+		podRegions: map[string]string{
+			"uid-spot-reclaimed": "us-east-1",
+		},
+	}
+
+	// ListActiveInstances returns empty (instance is terminated/missing from pending/running)
+	eastClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, params *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			if len(params.InstanceIds) > 0 && params.InstanceIds[0] == "i-spot-reclaimed" {
+				// By-ID describe returns terminated instance with StateReason
+				return &ec2.DescribeInstancesOutput{
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{
+									InstanceId: aws.String("i-spot-reclaimed"),
+									State: &ec2types.InstanceState{
+										Name: ec2types.InstanceStateNameTerminated,
+									},
+									StateReason: &ec2types.StateReason{
+										Code:    aws.String("Server.SpotInstanceTermination"),
+										Message: aws.String("Spot instance termination initiated by EC2"),
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			return &ec2.DescribeInstancesOutput{}, nil
+		},
+	}
+	awsProv.SetRegionClient("us-east-1", eastClient)
+
+	reconciler := NewReconciler(awsProv, mockTracker, nil, "test-cluster", 10*time.Minute)
+	reconciler.SetLaunchGracePeriod(0)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+	if len(result.EvictedPods) != 1 || result.EvictedPods[0] != "uid-spot-reclaimed" {
+		t.Fatalf("expected uid-spot-reclaimed evicted, got: %v", result.EvictedPods)
+	}
+}
+
+func TestServer_RecoveredOnDemandVMReportsNodeLost(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+
+	awsProv := NewAWSProvider("us-east-1")
+	srv := NewServer(awsProv, "cluster-ondemand-recover")
+
+	eastClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, params *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			if len(params.InstanceIds) > 0 {
+				// By-ID describe when vanished returns terminated on-demand instance
+				return &ec2.DescribeInstancesOutput{
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{
+									InstanceId:        aws.String("i-od-recovered"),
+									InstanceLifecycle: "", // empty means on-demand!
+									State: &ec2types.InstanceState{
+										Name: ec2types.InstanceStateNameTerminated,
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			// Bulk inventory returns running on-demand instance
+			return &ec2.DescribeInstancesOutput{
+				Reservations: []ec2types.Reservation{
+					{
+						Instances: []ec2types.Instance{
+							{
+								InstanceId:        aws.String("i-od-recovered"),
+								InstanceType:      ec2types.InstanceTypeG5Xlarge,
+								InstanceLifecycle: "", // on-demand!
+								State: &ec2types.InstanceState{
+									Name: ec2types.InstanceStateNameRunning,
+								},
+								PrivateIpAddress: aws.String("10.0.1.55"),
+								LaunchTime:       aws.Time(time.Now()),
+								Tags: []ec2types.Tag{
+									{Key: aws.String("ClusterTag"), Value: aws.String("cluster-ondemand-recover")},
+									{Key: aws.String("PodUID"), Value: aws.String("uid-od-recovered")},
+									{Key: aws.String("PodName"), Value: aws.String("pod-od-recovered")},
+									{Key: aws.String("Namespace"), Value: aws.String("default")},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+	awsProv.SetRegionClient("us-east-1", eastClient)
+
+	// 1. Recover active instances on restart
+	if err := srv.RecoverActiveInstances(context.Background(), awsProv); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	srv.mu.RLock()
+	recInst := srv.instances["uid-od-recovered"]
+	srv.mu.RUnlock()
+	if recInst == nil {
+		t.Fatalf("expected recovered instance entry")
+	}
+	if recInst.Metadata["marketType"] != "on-demand" {
+		t.Fatalf("expected recovered instance marketType on-demand, got %s", recInst.Metadata["marketType"])
+	}
+
+	// 2. Simulate instance vanishing from bulk active inventory
+	eastClient.describeInstancesFn = func(_ context.Context, params *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+		if len(params.InstanceIds) > 0 {
+			// By-ID status query
+			return &ec2.DescribeInstancesOutput{
+				Reservations: []ec2types.Reservation{
+					{
+						Instances: []ec2types.Instance{
+							{
+								InstanceId:        aws.String("i-od-recovered"),
+								InstanceLifecycle: "",
+								State: &ec2types.InstanceState{
+									Name: ec2types.InstanceStateNameTerminated,
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		}
+		return &ec2.DescribeInstancesOutput{}, nil
+	}
+
+	reconciler := NewReconciler(awsProv, srv, awsProv, "cluster-ondemand-recover", 10*time.Minute)
+	reconciler.SetLaunchGracePeriod(0)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if len(result.EvictedPods) != 1 {
+		t.Fatalf("expected 1 evicted pod, got %v", result.EvictedPods)
+	}
+
+	rec := srv.completedStore.Get("uid-od-recovered")
+	if rec == nil || rec.Reason != "NodeLost" {
+		t.Fatalf("expected recovered on-demand VM failure reason NodeLost, got: %+v", rec)
 	}
 }
 

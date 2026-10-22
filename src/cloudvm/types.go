@@ -146,6 +146,16 @@ type RegionInventory interface {
 	ListActiveInstancesByRegion(ctx context.Context, clusterTag string) (map[string][]*Instance, map[string]error)
 }
 
+// InstanceStatusChecker queries individual instance status by ID (including terminated instances).
+type InstanceStatusChecker interface {
+	Status(ctx context.Context, instanceID string) (*Instance, error)
+}
+
+// InstanceAdopter allows re-adopting active VMs that were missed during a transient startup recovery failure.
+type InstanceAdopter interface {
+	AdoptInstance(ctx context.Context, inst *Instance) bool
+}
+
 // Minimal Kubernetes Pod representation for InterLink Sidecar API without external k8s.io dependencies.
 type PodMeta struct {
 	Name        string            `json:"name"`

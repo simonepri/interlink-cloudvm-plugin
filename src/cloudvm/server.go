@@ -1228,6 +1228,66 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(responses)
 }
 
+// AdoptInstance re-adopts an active cloud VM into the server tracked state if it has valid pod tags
+// and has not been explicitly deleted or completed.
+func (s *Server) AdoptInstance(_ context.Context, inst *Instance) bool {
+	if inst == nil || inst.Metadata == nil {
+		return false
+	}
+	podUID := inst.Metadata["podUID"]
+	podName := inst.Metadata["podName"]
+	if podName == "" {
+		podName = inst.Metadata["PodName"]
+	}
+	ns := inst.Metadata["namespace"]
+	if ns == "" {
+		ns = inst.Metadata["Namespace"]
+	}
+	if ns == "" {
+		ns = "default"
+	}
+
+	if podUID == "" || podName == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// If this pod was already recorded as completed or terminated, do not re-adopt
+	if s.completedPods[podUID] != nil || (s.completedStore != nil && s.completedStore.Get(podUID) != nil) {
+		return false
+	}
+
+	// Check if already tracked
+	if s.instances[podUID] != nil || s.instances[inst.ID] != nil {
+		return true
+	}
+
+	marketType := inst.Metadata["marketType"]
+	if marketType == "" {
+		marketType = "on-demand"
+	}
+	inst.Metadata["marketType"] = marketType
+
+	key := fmt.Sprintf("%s/%s", ns, podName)
+	s.instances[key] = inst
+	s.instances[podUID] = inst
+	s.instances[inst.ID] = inst
+
+	if s.nodePool != nil {
+		defaultVec, _ := NewResourceVector("2", "4Gi", 0, 0)
+		capVec := CapacityForInstanceType(inst.InstanceType, defaultVec)
+		recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
+		recNode.Namespace = ns
+		recNode.RunnerAuthToken = inst.Metadata["runnerToken"]
+		recNode.Spot = (marketType == "spot")
+		s.nodePool.RegisterNode(recNode)
+	}
+
+	return true
+}
+
 // RecoverActiveInstances queries the cloud inventory to rebuild in-memory state on startup.
 func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory) error {
 	if inv == nil {
@@ -1255,6 +1315,12 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		if ns == "" {
 			ns = "default"
 		}
+		marketType := inst.Metadata["marketType"]
+		if marketType == "" {
+			marketType = "on-demand"
+		}
+		inst.Metadata["marketType"] = marketType
+
 		key := fmt.Sprintf("%s/%s", ns, podName)
 		s.instances[key] = inst
 		podUID := inst.Metadata["podUID"]
@@ -1263,10 +1329,12 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 		} else {
 			s.instances[podUID] = inst
 		}
+		s.instances[inst.ID] = inst
 		defaultVec, _ := NewResourceVector("2", "4Gi", 0, 0)
 		capVec := CapacityForInstanceType(inst.InstanceType, defaultVec)
 		recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
 		recNode.Namespace = ns
+		recNode.Spot = (marketType == "spot")
 		recNode.Cordoned = true
 		tok := ""
 		if s.tokenStore != nil {

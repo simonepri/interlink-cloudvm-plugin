@@ -151,8 +151,22 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		}
 
 		if !alive || (inst != nil && (inst.State == StateTerminated || inst.State == StateFailed)) {
-			log.Printf("[reconciler] Detected vanished/interrupted cloud VM %s for pod %s. Marking pod failed...", cleanID, cleanKey)
-			if err := r.tracker.MarkPodFailed(ctx, podKey, "SpotInterruption"); err != nil {
+			reason := "SpotInterruption"
+			if checker, ok := r.inventory.(InstanceStatusChecker); ok {
+				if st, err := checker.Status(ctx, instID); err == nil && st != nil && st.Metadata != nil {
+					if code := st.Metadata["stateReasonCode"]; code != "" {
+						if strings.Contains(code, "SpotInstanceTermination") {
+							reason = "SpotInterruption"
+						} else {
+							reason = code
+						}
+					} else if st.Metadata["marketType"] == "on-demand" {
+						reason = "NodeLost"
+					}
+				}
+			}
+			log.Printf("[reconciler] Detected vanished/interrupted cloud VM %s for pod %s (reason: %s). Marking pod failed...", cleanID, cleanKey, reason) //nolint:gosec // cleanID and cleanKey sanitized
+			if err := r.tracker.MarkPodFailed(ctx, podKey, reason); err != nil {
 				log.Printf("[reconciler] Error marking pod %s failed: %v", cleanKey, err)
 			} else {
 				result.EvictedPods = append(result.EvictedPods, podKey)
@@ -172,6 +186,16 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	for _, inst := range activeInstances {
 		if activeInstanceIDs[inst.ID] {
 			continue
+		}
+
+		// Re-adoption check: if this VM has valid pod tags and was missed during startup recovery, re-adopt it
+		if adopter, ok := r.tracker.(InstanceAdopter); ok {
+			if adopter.AdoptInstance(ctx, inst) {
+				cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
+				log.Printf("[reconciler] Re-adopted active VM %s with valid pod tags", cleanID) //nolint:gosec // cleanID sanitized
+				activeInstanceIDs[inst.ID] = true
+				continue
+			}
 		}
 
 		podName := inst.Metadata["podName"]
