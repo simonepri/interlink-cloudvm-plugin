@@ -56,6 +56,20 @@ func main() {
 	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
 	server.RegisterProvider(ProviderMock, mockProv)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Standalone or embedded spot price ticker
+	if os.Getenv("ENABLE_TICKER") == "true" || os.Getenv("SERVICE_MODE") == "ticker" {
+		tickerRegions := strings.Split(os.Getenv("TICKER_REGIONS"), ",")
+		if len(tickerRegions) == 1 && tickerRegions[0] == "" {
+			tickerRegions = []string{awsRegion}
+		}
+		spotTicker := NewSpotPriceTicker(tickerRegions, nil, 10*time.Minute)
+		go spotTicker.Start(ctx)
+		log.Printf("[cloudvm-ticker] Spot price poller started for %d regions", len(tickerRegions)) //nolint:gosec // log length is safe
+	}
+
 	// Background reconciler
 	reconcileInterval := 60 * time.Second
 	if intervalSec := os.Getenv("RECONCILE_INTERVAL_SECONDS"); intervalSec != "" {
@@ -72,9 +86,6 @@ func main() {
 	if term, ok := defaultProvider.(InstanceTerminator); ok {
 		terminator = term
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	if inventory != nil {
 		if err := server.RecoverActiveInstances(ctx, inventory); err != nil {

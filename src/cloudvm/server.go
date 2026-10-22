@@ -409,7 +409,15 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if itype == "" {
 		itype = spec.InstanceType
 	}
-	nodeCapacity := CapacityForInstanceType(itype, reqVec)
+	var describer InstanceTypeDescriber
+	if p, ok := prov.(*AWSProvider); ok {
+		if cl, err := p.getClient(r.Context(), spec.Region); err == nil {
+			if d, ok := cl.(InstanceTypeDescriber); ok {
+				describer = d
+			}
+		}
+	}
+	nodeCapacity := GlobalCatalog.ResolveCapacity(r.Context(), describer, itype, reqVec)
 
 	newNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, nodeCapacity)
 	newNode.Namespace = spec.PodNamespace
