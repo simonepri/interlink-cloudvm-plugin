@@ -36,20 +36,6 @@
 
 ---
 
-## Feature Status & Verification Roadmap
-
-| Subsystem / Capability | Maturity | Verification / Test Coverage | Scope & Implementation Notes |
-| :--- | :---: | :---: | :--- |
-| **AWS EC2 Fleet Engine** | **Prototype** | Unit Tests (`TestServerCreateAndDelete`, `TestFleetOverridesWeightedCapacity`) | Single-instance 1:1 fleet requests (`CreateFleet`), price-capacity-optimized allocation, UID-first idempotent client tokens, LaunchTemplate user-data injection. |
-| **GCP Compute Engine** | **Stub / Planned** | Compiles clean | Data structures and interface stubs for multi-zone bulk placement and preemption trap. Production API calls in roadmap. |
-| **Spend Rate Governors** | **Prototype** | Unit Tests (`TestCloudInit_EgressRateLimiting`, `TestEgressRateToBandwidthCalculation`) | Hourly price caps (`max-price`) and token-bucket egress rate shaping (`max-egress-rate`) with 2-band priority queue (unthrottled mesh UDP vs shaped public egress). |
-| **In-VM Bootstrap & Watchdogs** | **Prototype** | Unit Tests (`TestCloudInitGeneration`) | Two-phase watchdog (300s startup + 60s post-readiness dead-man monitor), native DLAMI fast-boot, `instance-initiated-shutdown-behavior: terminate`. |
-| **Spot Pricing Ticker & OTEL** | **Standalone Chart** | Chart Lint & Template Validation | Standalone `cloudvm-ticker` Helm chart in `src/charts/cloudvm-ticker/` exporting Prometheus metrics (`cloudvm_spot_price_usd_per_hour`), with optional in-cell embedded fallback. |
-| **OpenCost FinOps Attribution** | **Prototype** | Unit Tests (`TestPodToInstanceSpec_PriceCapAndEgress`) | Resource tag propagation on Instances and EBS volumes (`ManagedBy`, `ClusterTag`, `PodName`, `Namespace`, `CostCenter`, `JobID`) for AWS CUR and GCP Billing export reconciliation. |
-| **Kueue Multi-Flavor Fallback** | **Design Pattern** | Documented Specification | Recommended operational architecture pairing virtual-node pods with Kueue `AdmissionCheck` and multi-flavor queue policies. |
-
----
-
 ## 1. High-Level Concept
 
 `interlink-provider-cloudvm` is an open-source provider plugin for **[CNCF InterLink](https://github.com/interlink-hq/interLink)**.
