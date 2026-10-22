@@ -76,15 +76,12 @@ flowchart LR
 A workload progresses through three clean stages:
 
 ```mermaid
-flowchart TD
+flowchart LR
     classDef stage fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
-    classDef desc fill:#0F172A,stroke:#64748B,stroke-width:1px,color:#E2E8F0
 
-    S1["<b>Stage 1: Scheduling</b><br>Kubernetes schedules a Pod onto the virtual node (via Kueue, KubeRay, or nodeSelector)"]:::stage
-    S2["<b>Stage 2: Bidding</b><br>interlink-provider-cloudvm solves the GPU allocation knapsack using Weighted Capacity<br>and requests the lowest-cost spot instances across AWS EC2 Fleet or GCP Compute Engine"]:::stage
-    S3["<b>Stage 3: Execution</b><br>VM boots in ~33s, joins private mesh, runs the task, streams logs via serial console,<br>and automatically self-destructs upon completion or spot interruption"]:::stage
-
-    S1 --> S2 --> S3
+    S1["<b>1. Scheduling</b><br>Workload schedules onto<br>virtual-node via Kueue / Ray"]:::stage
+    --> S2["<b>2. Bidding</b><br>Solver calculates weights &<br>launches Spot Fleet API"]:::stage
+    --> S3["<b>3. Execution</b><br>VM boots in ~33s, runs task,<br>and terminates 2s after exit"]:::stage
 ```
 
 ---
