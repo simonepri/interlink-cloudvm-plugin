@@ -208,7 +208,70 @@ flowchart TD
 
 ---
 
-## 4. Usage Examples
+## 4. Running Node Daemons on Ephemeral VMs (OTEL, Falco, Parca, Dragonfly)
+
+In traditional Kubernetes, infrastructure tools run as cluster-wide **DaemonSets**. Because `interlink-provider-cloudvm` provisions pure 1:1 cloud instances without a local Kubelet, DaemonSets do not schedule on ephemeral VMs.
+
+Instead, the provider uses a **Split Observability & Security Architecture**:
+
+```mermaid
+flowchart TD
+    classDef vm fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
+    classDef daemon fill:#132E27,stroke:#10B981,stroke-width:1px,color:#E2E8F0
+    classDef mesh fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
+    classDef central fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
+
+    subgraph VM["Ephemeral Cloud VM Worker"]
+        Workload["Workload Process\n(Ray / PyTorch / Container)"]:::vm
+        
+        subgraph Agents["In-VM Daemons (Pre-baked AMI / Cloud-Init)"]
+            direction TB
+            OTEL["OTEL C-Agent / Sidecar\n(Host & GPU Metrics)"]:::daemon
+            Parca["Parca Agent\n(Kernel eBPF Continuous Profiling)"]:::daemon
+            Falco["Falco Modern eBPF\n(Runtime Security & Syscall Audit)"]:::daemon
+            Dragonfly["Dragonfly dfdaemon\n(P2P Image & Artifact Proxy)"]:::daemon
+        end
+    end
+
+    subgraph Mesh["Encrypted Private Mesh (Tailscale / WireGuard)"]
+        direction LR
+        M1["Secure P2P Overlay Net"]:::mesh
+    end
+
+    subgraph Cluster["Central Kubernetes Cluster Infrastructure"]
+        direction TB
+        C1["OTEL Collector Deployment\n(SigNoz / Prometheus / Datadog)"]:::central
+        C2["Parca Server\n(Continuous CPU/Memory Flamegraphs)"]:::central
+        C3["FalcoSidekick / SIEM\n(Security Alerts & Audit Log)"]:::central
+        C4["Dragonfly Supernode\n(Peer-to-Peer Distribution Seed)"]:::central
+    end
+
+    Agents -->|WireGuard / Tailscale| Mesh
+    Mesh --> Cluster
+```
+
+### How Standard Infrastructure Daemons Run:
+
+| Tool / Daemon | Traditional K8s DaemonSet | In Ephemeral CloudVM | Telemetry & Data Path |
+| :--- | :--- | :--- | :--- |
+| **OpenTelemetry (OTEL)** | OTEL DaemonSet scraping pods | Injected via pod env vars or host agent (`OTEL_EXPORTER_OTLP_ENDPOINT`) | OTLP gRPC over private mesh $\\to$ central in-cluster OTEL Collector. |
+| **Parca** | Parca DaemonSet with host eBPF | Runs as systemd service with eBPF enabled on VM kernel | Continuously pushes pprof profiles over mesh $\\to$ central Parca server. |
+| **Falco** | Falco DaemonSet with kernel driver | Runs `falco --modern-bpf` with VM-level hypervisor isolation | Syscall violations forward via gRPC/HTTP $\\to$ central `falcosidekick`. |
+| **Dragonfly** | Dragonfly Dfdaemon DaemonSet | Runs local `dfdaemon` proxy redirecting `/etc/docker/daemon.json` | P2P block distribution across global VMs $\\to$ avoids registry rate-limits. |
+
+### Golden AMI vs. Dynamic Cloud-Init Injection
+
+To maintain the **~33-second cold-start**, daemons can be packaged in two ways:
+1. **Pre-baked Golden AMI (Recommended for Production)**: Tools (Parca, Falco, Dragonfly) are pre-installed into custom AMIs via Packer. The VM boots with all binaries and kernel eBPF probes already on disk—zero network downloads at runtime.
+2. **Cloud-Init Systemd Hooks**: Lightweight binaries or systemd units are launched dynamically at boot through cloud-init user-data scripts.
+
+### Why Ephemeral VMs Offer Stronger Security (Falco & eBPF)
+On a multi-tenant Kubernetes worker node, a compromised container sharing the node kernel poses a risk to neighboring pods. With 1:1 ephemeral VMs:
+- Each task runs inside its own **isolated hardware virtual machine** (AWS Nitro / GCP KVM).
+- Falco and Parca monitor the dedicated kernel with zero interference from other tenants.
+- When the task completes, the VM and its file systems are permanently deleted.
+
+## 5. Usage Examples
 
 ### Example 1: Spot GPU ML Worker (Fast-Boot)
 
@@ -268,7 +331,7 @@ spec:
 
 ---
 
-## 5. Installation via Helm
+## 6. Installation via Helm
 
 ```bash
 helm upgrade --install interlink-provider-cloudvm \
@@ -281,7 +344,7 @@ helm upgrade --install interlink-provider-cloudvm \
 
 ---
 
-## 6. Development
+## 7. Development
 
 ```bash
 # Install toolchain
