@@ -48,39 +48,51 @@ func EgressRateToBandwidth(dollarPerHour float64, provider string) string {
 }
 
 // Server implements the InterLink REST API for the cloudvm provider plugin.
+type inFlightCreate struct {
+	done chan struct{}
+	resp *CreateStruct
+	err  error
+}
+
 type Server struct {
-	mu                sync.RWMutex
-	providers         map[ProviderType]Provider
-	defaultProv       Provider
-	instances         map[string]*Instance // key: UID and namespace/podName -> *Instance
-	clusterTag        string
-	defaultRegion     string
-	reconciler        *Reconciler
-	nodePool          *NodePool
-	runner            ContainerRunner
-	spotTicker        *SpotPriceTicker
-	tokenStore        *TokenStore
-	completedPods     map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
-	inProgressCreates map[string]string                    // podUID -> runnerToken (in-flight create deduplication)
+	mu              sync.RWMutex
+	providers       map[ProviderType]Provider
+	defaultProv     Provider
+	instances       map[string]*Instance // key: UID and namespace/podName -> *Instance
+	clusterTag      string
+	defaultRegion   string
+	reconciler      *Reconciler
+	nodePool        *NodePool
+	runner          ContainerRunner
+	spotTicker      *SpotPriceTicker
+	tokenStore      *TokenStore
+	completedStore  *CompletedStore
+	completedPods   map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
+	inFlightCreates map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
 }
 
 // NewServer initializes an InterLink Server with a default provider.
 func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	tokenPath := os.Getenv("TOKEN_STORE_PATH")
 	if tokenPath == "" {
-		tokenPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tokens-%s.json", clusterTag))
+		tokenPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-tokens-%s-%d.json", clusterTag, time.Now().UnixNano()))
+	}
+	completedPath := os.Getenv("COMPLETED_STORE_PATH")
+	if completedPath == "" {
+		completedPath = filepath.Join(os.TempDir(), fmt.Sprintf("cloudvm-completed-pods-%s-%d.json", clusterTag, time.Now().UnixNano()))
 	}
 	return &Server{
-		providers:         make(map[ProviderType]Provider),
-		defaultProv:       defaultProvider,
-		instances:         make(map[string]*Instance),
-		clusterTag:        clusterTag,
-		defaultRegion:     "us-east-1",
-		nodePool:          NewNodePool(60 * time.Second),
-		runner:            NewMockContainerRunner(),
-		tokenStore:        NewTokenStore(tokenPath),
-		completedPods:     make(map[string]*ContainerTerminatedState),
-		inProgressCreates: make(map[string]string),
+		providers:       make(map[ProviderType]Provider),
+		defaultProv:     defaultProvider,
+		instances:       make(map[string]*Instance),
+		clusterTag:      clusterTag,
+		defaultRegion:   "us-east-1",
+		nodePool:        NewNodePool(60 * time.Second),
+		runner:          NewMockContainerRunner(),
+		tokenStore:      NewTokenStore(tokenPath),
+		completedStore:  NewCompletedStore(completedPath),
+		completedPods:   make(map[string]*ContainerTerminatedState),
+		inFlightCreates: make(map[string]*inFlightCreate),
 	}
 }
 
@@ -89,6 +101,13 @@ func (s *Server) SetTokenStore(ts *TokenStore) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tokenStore = ts
+}
+
+// SetCompletedStore overrides the completed store for terminal pod execution records.
+func (s *Server) SetCompletedStore(cs *CompletedStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.completedStore = cs
 }
 
 // SetContainerRunner overrides the container runner (e.g. HTTPContainerRunner).
@@ -441,16 +460,50 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	spec := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
 
-	// Idempotency check: if pod is already completed or active, return existing response immediately
+	var flight *inFlightCreate
+	var finalResp *CreateStruct
+	var finalErr error
+
+	// Single-flight in-flight create check and idempotency under lock
 	s.mu.Lock()
-	if term, done := s.completedPods[spec.PodUID]; done && term != nil {
-		s.mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(CreateStruct{
-			PodUID: spec.PodUID,
-			PodJID: fmt.Sprintf("cvm-%s", spec.PodUID),
-		})
-		return
+	if spec.PodUID != "" {
+		if inFlightTracker, exists := s.inFlightCreates[spec.PodUID]; exists {
+			s.mu.Unlock()
+			select {
+			case <-inFlightTracker.done:
+				if inFlightTracker.err != nil {
+					http.Error(w, inFlightTracker.err.Error(), http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(inFlightTracker.resp)
+				return
+			case <-r.Context().Done():
+				http.Error(w, r.Context().Err().Error(), http.StatusGatewayTimeout)
+				return
+			}
+		}
+
+		if s.completedStore != nil {
+			if rec := s.completedStore.Get(spec.PodUID); rec != nil {
+				s.mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(CreateStruct{
+					PodUID: spec.PodUID,
+					PodJID: fmt.Sprintf("cvm-%s", spec.PodUID),
+				})
+				return
+			}
+		}
+		if term, done := s.completedPods[spec.PodUID]; done && term != nil {
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(CreateStruct{
+				PodUID: spec.PodUID,
+				PodJID: fmt.Sprintf("cvm-%s", spec.PodUID),
+			})
+			return
+		}
 	}
 
 	var existingInst *Instance
@@ -473,17 +526,22 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// In-progress create deduplication: if already being launched by a concurrent request, reuse token
-	if _, inFlight := s.inProgressCreates[spec.PodUID]; inFlight && spec.PodUID != "" {
-		s.mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(CreateStruct{
-			PodUID: spec.PodUID,
-			PodJID: fmt.Sprintf("cvm-%s", spec.PodUID),
-		})
-		return
+	if spec.PodUID != "" {
+		flight = &inFlightCreate{done: make(chan struct{})}
+		s.inFlightCreates[spec.PodUID] = flight
 	}
 	s.mu.Unlock()
+
+	if flight != nil {
+		defer func() {
+			s.mu.Lock()
+			delete(s.inFlightCreates, spec.PodUID)
+			s.mu.Unlock()
+			flight.resp = finalResp
+			flight.err = finalErr
+			close(flight.done)
+		}()
+	}
 
 	prov := s.selectProvider(spec)
 	reqVec := ResourceVectorFromPod(pod)
@@ -553,11 +611,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			podJID = warmNode.InstanceID
 		}
 
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(CreateStruct{
+		finalResp = &CreateStruct{
 			PodUID: spec.PodUID,
 			PodJID: podJID,
-		})
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(finalResp)
 		return
 	}
 
@@ -567,24 +626,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	tok, err := generateToken()
 	if err != nil {
+		finalErr = err
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	spec.RunnerAuthToken = tok
-
-	s.mu.Lock()
-	if spec.PodUID != "" {
-		s.inProgressCreates[spec.PodUID] = tok
-	}
-	s.mu.Unlock()
-
-	defer func() {
-		if spec.PodUID != "" {
-			s.mu.Lock()
-			delete(s.inProgressCreates, spec.PodUID)
-			s.mu.Unlock()
-		}
-	}()
 
 	var preAssignedGPUs []int
 	for i := 0; i < spec.NumGPUs; i++ {
@@ -595,7 +641,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	inst, err := prov.Launch(r.Context(), spec)
 	if err != nil {
 		log.Printf("[cloudvm] Failed to launch VM for %s: %v", spec.PodName, err)
-		http.Error(w, fmt.Sprintf("launch failed: %v", err), http.StatusInternalServerError)
+		finalErr = fmt.Errorf("launch failed: %w", err)
+		http.Error(w, finalErr.Error(), http.StatusInternalServerError)
 		return
 	}
 	if s.tokenStore != nil && spec.RunnerAuthToken != "" {
@@ -666,11 +713,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		podJID = inst.ID
 	}
 
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(CreateStruct{
+	finalResp = &CreateStruct{
 		PodUID: spec.PodUID,
 		PodJID: podJID,
-	})
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(finalResp)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -708,6 +756,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if pod.Metadata.UID != "" {
 		delete(s.instances, pod.Metadata.UID)
 		delete(s.completedPods, pod.Metadata.UID)
+		if s.completedStore != nil {
+			_ = s.completedStore.Delete(pod.Metadata.UID)
+		}
 	}
 	delete(s.instances, key)
 	delete(s.instances, podName)
@@ -886,12 +937,28 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				Name: "worker",
 			}
 
-			s.mu.RLock()
-			completedTerm := s.completedPods[tgt.uid]
-			if completedTerm == nil {
+			var completedTerm *ContainerTerminatedState
+			if tgt.uid != "" {
+				if s.completedStore != nil {
+					if rec := s.completedStore.Get(tgt.uid); rec != nil {
+						completedTerm = &ContainerTerminatedState{
+							ExitCode:   rec.ExitCode,
+							Reason:     rec.Reason,
+							Message:    rec.Message,
+							FinishedAt: rec.FinishedAt,
+						}
+					}
+				}
+				if completedTerm == nil {
+					s.mu.RLock()
+					completedTerm = s.completedPods[tgt.uid]
+					s.mu.RUnlock()
+				}
+			} else {
+				s.mu.RLock()
 				completedTerm = s.completedPods[fmt.Sprintf("%s/%s", tgt.ns, tgt.name)]
+				s.mu.RUnlock()
 			}
-			s.mu.RUnlock()
 
 			switch {
 			case completedTerm != nil:
@@ -932,13 +999,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								status.State.Running = &ContainerRunningState{
 									StartedAt: cResult.StartedAt,
 								}
-							case cResult.Status == "created":
+							case cResult.Status == "created" || cResult.Status == "starting":
 								status.Ready = false
 								status.State.Waiting = &ContainerWaitingState{
 									Reason:  "ContainerCreating",
 									Message: "Container created, starting up...",
 								}
-							default:
+							case cResult.Status == "restarting" || cResult.Status == "paused" || cResult.Status == "removing":
+								status.Ready = false
+								status.State.Waiting = &ContainerWaitingState{
+									Reason:  cResult.Reason,
+									Message: fmt.Sprintf("Container is %s", cResult.Status),
+								}
+							case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || cResult.Reason == "ErrImagePull" || (cResult.ExitCode != 0 && !cResult.Running):
 								status.Ready = false
 								term := &ContainerTerminatedState{
 									ExitCode:   cResult.ExitCode,
@@ -952,8 +1025,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								if tgt.uid != "" {
 									s.completedPods[tgt.uid] = term
 								}
-								s.completedPods[fmt.Sprintf("%s/%s", tgt.ns, tgt.name)] = term
 								s.mu.Unlock()
+								if tgt.uid != "" && s.completedStore != nil {
+									_ = s.completedStore.Set(tgt.uid, &CompletedPodRecord{
+										PodUID:     tgt.uid,
+										ExitCode:   cResult.ExitCode,
+										Reason:     cResult.Reason,
+										Message:    cResult.Message,
+										FinishedAt: cResult.FinishedAt,
+									})
+								}
+							default:
+								status.Ready = false
+								status.State.Waiting = &ContainerWaitingState{
+									Reason:  "ContainerStatusUnknown",
+									Message: fmt.Sprintf("Container status: %s", cResult.Status),
+								}
 							}
 						}
 					} else {

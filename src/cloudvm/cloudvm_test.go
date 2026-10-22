@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -904,7 +906,199 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	}
 
 	// Verify IMDS protection and runner port protection
-	if !strings.Contains(script, "cloudvm-poller") || !strings.Contains(script, "--dport 9090") {
-		t.Fatalf("cloud-init missing cloudvm-poller IMDS or runner port firewall rules")
+	if !strings.Contains(script, "169.254.169.254") || !strings.Contains(script, "--dport 9090") {
+		t.Fatalf("cloud-init missing IMDS or runner port firewall rules")
+	}
+
+	// Verify container capability isolation
+	if !strings.Contains(script, "--cap-drop=SETUID") || !strings.Contains(script, "--security-opt=no-new-privileges") || !strings.Contains(script, "--user=1000:1000") {
+		t.Fatalf("cloud-init missing container privilege isolation flags")
+	}
+}
+
+func TestServer_ConcurrentCreateSingleFlight(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-singleflight")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	payload := `{"pod": {"metadata": {"name": "singleflight-worker", "namespace": "default", "uid": "uid-sf-1"}, "spec": {"containers": [{"name": "worker", "image": "ubuntu:24.04"}]}}}`
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	results := make([]CreateStruct, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			resp, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(payload))
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				errs[idx] = fmt.Errorf("unexpected status %d", resp.StatusCode)
+				return
+			}
+			var res CreateStruct
+			if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+				errs[idx] = err
+				return
+			}
+			results[idx] = res
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent request %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all concurrent callers received the exact same response
+	expectedUID := "uid-sf-1"
+	expectedJID := results[0].PodJID
+	if expectedJID == "" {
+		t.Fatalf("expected non-empty PodJID in response")
+	}
+
+	for i, res := range results {
+		if res.PodUID != expectedUID {
+			t.Errorf("request %d: expected UID %s, got %s", i, expectedUID, res.PodUID)
+		}
+		if res.PodJID != expectedJID {
+			t.Errorf("request %d: expected JID %s, got %s", i, expectedJID, res.PodJID)
+		}
+	}
+
+	// Verify exactly 1 instance was launched by MockProvider
+	if mock.LaunchCount() != 1 {
+		t.Fatalf("expected exactly 1 instance launch, got %d launches across %d concurrent creates", mock.LaunchCount(), concurrency)
+	}
+	if server.NodePool().ActiveNodeCount() != 1 {
+		t.Fatalf("expected exactly 1 active node in pool, got %d", server.NodePool().ActiveNodeCount())
+	}
+}
+
+func TestCompletedStore_PersistenceAcrossReload(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "completed-test.json")
+	store1 := NewCompletedStore(tmpFile)
+
+	rec := &CompletedPodRecord{
+		PodUID:     "uid-persist-1",
+		ExitCode:   0,
+		Reason:     "Completed",
+		Message:    "job succeeded",
+		FinishedAt: time.Now().Round(time.Millisecond),
+	}
+
+	if err := store1.Set("uid-persist-1", rec); err != nil {
+		t.Fatalf("failed to set completed record: %v", err)
+	}
+
+	// Verify second store reloads the record from disk
+	store2 := NewCompletedStore(tmpFile)
+	loaded := store2.Get("uid-persist-1")
+	if loaded == nil {
+		t.Fatalf("expected record to survive reload from disk")
+	}
+	if loaded.PodUID != rec.PodUID || loaded.ExitCode != rec.ExitCode || loaded.Reason != rec.Reason {
+		t.Fatalf("mismatched record after reload: got %+v, expected %+v", loaded, rec)
+	}
+
+	// Test deletion persistence
+	if err := store2.Delete("uid-persist-1"); err != nil {
+		t.Fatalf("failed to delete record: %v", err)
+	}
+
+	store3 := NewCompletedStore(tmpFile)
+	if store3.Get("uid-persist-1") != nil {
+		t.Fatalf("expected record to remain deleted after reload")
+	}
+}
+
+func TestServer_ContainerStates_NotPrematurelyCompleted(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-states")
+	runner := NewMockContainerRunner()
+	server.SetContainerRunner(runner)
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	inst, err := mock.Launch(context.Background(), &InstanceSpec{
+		PodName:      "state-test",
+		PodNamespace: "default",
+		PodUID:       "uid-state-1",
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to launch mock instance: %v", err)
+	}
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode(inst.ID, ProviderMock, "us-east-1", "100.64.0.10", capVec)
+	reqVec, _ := NewResourceVector("1", "4Gi", 1, 0)
+	server.NodePool().RegisterAndAllocate(node, reqVec, "uid-state-1", "default", "state-test")
+
+	server.mu.Lock()
+	server.instances["uid-state-1"] = inst
+	server.mu.Unlock()
+
+	// 1. Container in restarting / paused state must be Waiting, NOT Terminated or Completed!
+	runner.SetStatus("uid-state-1", &ContainerStatusResult{
+		Running: false,
+		Status:  "restarting",
+		Reason:  "Restarting",
+	})
+
+	queryPayload := `[{"pod": {"metadata": {"name": "state-test", "namespace": "default", "uid": "uid-state-1"}}}]`
+	resp, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status failed: %v", err)
+	}
+	var statuses []PodStatusResponse
+	_ = json.NewDecoder(resp.Body).Decode(&statuses)
+	_ = resp.Body.Close()
+
+	if len(statuses) != 1 || statuses[0].Containers[0].State.Waiting == nil {
+		t.Fatalf("expected Waiting state for restarting container, got: %+v", statuses)
+	}
+	if statuses[0].Containers[0].State.Terminated != nil {
+		t.Fatalf("restarting container must NOT be marked Terminated!")
+	}
+
+	// Verify node allocation is NOT freed
+	_, alloc, found := server.NodePool().FindPodNode("uid-state-1")
+	if !found || alloc.Completed {
+		t.Fatalf("expected pod to remain active during container restart")
+	}
+
+	// 2. Container in exited state with code 0 is Completed
+	runner.SetStatus("uid-state-1", &ContainerStatusResult{
+		Running:    false,
+		Status:     "exited",
+		ExitCode:   0,
+		Reason:     "Completed",
+		FinishedAt: time.Now(),
+	})
+
+	resp2, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status 2 failed: %v", err)
+	}
+	var statuses2 []PodStatusResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&statuses2)
+	_ = resp2.Body.Close()
+
+	if len(statuses2) != 1 || statuses2[0].Containers[0].State.Terminated == nil {
+		t.Fatalf("expected Terminated state for exited container, got: %+v", statuses2)
+	}
+	if statuses2[0].Containers[0].State.Terminated.Reason != "Completed" {
+		t.Fatalf("expected Reason Completed, got %s", statuses2[0].Containers[0].State.Terminated.Reason)
 	}
 }

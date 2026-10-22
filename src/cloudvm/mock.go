@@ -87,3 +87,10 @@ func (m *MockProvider) ListActiveInstances(_ context.Context, clusterTag string)
 	}
 	return active, nil
 }
+
+// LaunchCount returns the total number of instance launches performed by MockProvider.
+func (m *MockProvider) LaunchCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.counter
+}

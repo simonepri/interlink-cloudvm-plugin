@@ -154,15 +154,17 @@ if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
   aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --instance-initiated-shutdown-behavior terminate --region "{{.Region}}" 2>/dev/null || true
 fi
 
-# Create dedicated system user for IMDS spot poller
-useradd -r -s /bin/bash cloudvm-poller 2>/dev/null || true
+# Prevent non-root container workloads from accessing cloud metadata services (IMDS)
+iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
 
-# Allow only the designated spot poller user to reach IMDS; drop all other processes (including root & containers)
-iptables -I OUTPUT -d 169.254.169.254 -m owner --uid-owner cloudvm-poller -j ACCEPT 2>/dev/null || true
-iptables -A OUTPUT -d 169.254.169.254 -j DROP 2>/dev/null || true
-
-# Runner port 9090 is accessible only over the WireGuard mesh (wg0) or loopback (127.0.0.1)
-iptables -I INPUT -p tcp --dport 9090 ! -i wg0 ! -s 127.0.0.1 -j DROP 2>/dev/null || true
+# Protect runner port 9090: allow loopback, tailscale mesh, and private network
+iptables -I INPUT -p tcp --dport 9090 -i lo -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 9090 -i tailscale0 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 9090 -s 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 9090 -s 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 9090 -s 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT -p tcp --dport 9090 -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || true
+iptables -A INPUT -p tcp --dport 9090 -j DROP 2>/dev/null || true
 
 # 2. Join Private Network Mesh (Tailscale / WireGuard)
 if [ -n "{{.MeshAuthKey}}" ]; then
@@ -217,7 +219,7 @@ while true; do
 done
 EOF
 chmod +x /usr/local/bin/spot-monitor.sh
-su -s /bin/bash cloudvm-poller -c "/usr/local/bin/spot-monitor.sh" > /var/log/spot-monitor.log 2>&1 &
+nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
 
 # 4. Asynchronous Readiness Watcher
 (
@@ -281,6 +283,10 @@ import urllib.parse
 PORT = 9090
 AUTH_TOKEN = "{{.RunnerAuthToken}}"
 
+start_lock = threading.Lock()
+starting_pods = set()
+start_failures = {}
+
 def record_heartbeat():
     try:
         with open('/tmp/cloudvm-heartbeat', 'w') as f:
@@ -323,13 +329,13 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/containers/list':
-            res = subprocess.run(['docker', 'ps', '--filter', 'name=cloudvm-', '--filter', 'status=running', '--format', '{{print "{{"}}.ID{{print "}}"}}\t{{print "{{"}}.Names{{print "}}"}}\t{{print "{{"}}.State{{print "}}"}}\t{{print "{{"}}.Status{{print "}}"}}'], capture_output=True, text=True)
+            res = subprocess.run(['docker', 'ps', '--filter', 'name=cloudvm-', '--filter', 'status=running', '--format', '{{print "{{"}}.ID{{print "}}"}}	{{print "{{"}}.Names{{print "}}"}}	{{print "{{"}}.State{{print "}}"}}	{{print "{{"}}.Status{{print "}}"}}'], capture_output=True, text=True)
             results = []
             if res.returncode == 0:
-                for line in res.stdout.strip().split('\n'):
+                for line in res.stdout.strip().splitlines():
                     if not line:
                         continue
-                    parts = line.split('\t')
+                    parts = line.split('	')
                     if len(parts) >= 3:
                         name = parts[1]
                         state = parts[2]
@@ -357,12 +363,17 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     status_str = state.get('Status', '')
                     running = state.get('Running', False)
                     exit_code = state.get('ExitCode', 0)
+                    reason = "Running" if running else (
+                        "ContainerCreating" if status_str in ("created", "starting") else (
+                            ("Completed" if exit_code == 0 else "Error") if status_str in ("exited", "dead") else status_str.capitalize()
+                        )
+                    )
                     resp = {
                         "podUID": pod_uid,
                         "running": running,
                         "status": status_str,
                         "exitCode": exit_code,
-                        "reason": "Running" if running else ("ContainerCreating" if status_str == "created" else ("Completed" if exit_code == 0 else "Error")),
+                        "reason": reason,
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -371,6 +382,37 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     return
                 except Exception:
                     pass
+
+            with start_lock:
+                if pod_uid in start_failures:
+                    resp = {
+                        "podUID": pod_uid,
+                        "running": False,
+                        "status": "dead",
+                        "exitCode": 1,
+                        "reason": "ErrImagePull",
+                        "message": start_failures[pod_uid],
+                    }
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode('utf-8'))
+                    return
+                if pod_uid in starting_pods:
+                    resp = {
+                        "podUID": pod_uid,
+                        "running": False,
+                        "status": "created",
+                        "exitCode": 0,
+                        "reason": "ContainerCreating",
+                        "message": "Pulling container image or initializing...",
+                    }
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(resp).encode('utf-8'))
+                    return
+
             self.send_response(404)
             self.end_headers()
             return
@@ -387,6 +429,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(parsed.query)
             pod_uid = params.get('podUID', [''])[0]
             if pod_uid:
+                with start_lock:
+                    starting_pods.discard(pod_uid)
+                    start_failures.pop(pod_uid, None)
                 subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
             self.send_response(200)
             self.end_headers()
@@ -403,6 +448,24 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             pod_uid = str(req.get('podUID', 'unknown'))
+            container_name = f"cloudvm-{pod_uid}"
+
+            with start_lock:
+                if pod_uid in starting_pods:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"already_starting"}')
+                    return
+
+            inspect_res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
+            if inspect_res.returncode == 0:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status":"already_exists"}')
+                return
+
             image = str(req.get('image', ''))
             gpus = req.get('assignedGPUs', [])
             env = req.get('env', {})
@@ -411,23 +474,21 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             cpu_milli = req.get('cpuMillicores', 0)
             mem_bytes = req.get('memoryBytes', 0)
 
-            container_name = f"cloudvm-{pod_uid}"
-            inspect_res = subprocess.run(['docker', 'inspect', '-f', '{{print "{{"}}.State.Running{{print "}}"}}', container_name], capture_output=True, text=True)
-            if inspect_res.returncode == 0 and inspect_res.stdout.strip() == 'true':
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"status":"already_running"}')
-                return
-
-            subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True)
-
             shm_flag = '--shm-size=16g'
             if mem_bytes and mem_bytes > 0:
                 shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
                 shm_flag = f"--shm-size={shm_bytes}"
 
-            docker_cmd = ['docker', 'run', '-d', '--name', container_name, '--net=host', shm_flag]
+            docker_cmd = [
+                'docker', 'run', '-d',
+                '--name', container_name,
+                '--net=host',
+                '--cap-drop=SETUID',
+                '--cap-drop=SETGID',
+                '--security-opt=no-new-privileges',
+                '--user=1000:1000',
+                shm_flag,
+            ]
             if cpu_milli and cpu_milli > 0:
                 docker_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
             if mem_bytes and mem_bytes > 0:
@@ -444,10 +505,19 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(args, list):
                 docker_cmd.extend(args)
 
-            def run_async(c):
-                subprocess.run(c, capture_output=True, text=True)
+            with start_lock:
+                starting_pods.add(pod_uid)
+                start_failures.pop(pod_uid, None)
 
-            threading.Thread(target=run_async, args=(docker_cmd,), daemon=True).start()
+            def run_async(uid, c):
+                res = subprocess.run(c, capture_output=True, text=True)
+                with start_lock:
+                    starting_pods.discard(uid)
+                    if res.returncode != 0:
+                        err_msg = res.stderr.strip() or "container start failed"
+                        start_failures[uid] = err_msg
+
+            threading.Thread(target=run_async, args=(pod_uid, docker_cmd), daemon=True).start()
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -462,7 +532,7 @@ if __name__ == '__main__':
     server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), RunnerHandler)
     server.serve_forever()
 RUNNER_EOF
-chmod +x /usr/local/bin/cloudvm-runner.py
+chmod 700 /usr/local/bin/cloudvm-runner.py
 if command -v python3 >/dev/null 2>&1; then
   nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
