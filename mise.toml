@@ -45,6 +45,15 @@ run = "govulncheck ./..."
 description = "Lint authored YAML files"
 run = "yamllint --config-file .config/yamllint.yaml .github/workflows src/chart/Chart.yaml src/chart/values.yaml"
 
+[tasks.lint-helm]
+description = "Lint Helm charts and validate template rendering"
+run = [
+  "helm lint src/chart",
+  "helm template src/chart > /dev/null",
+  "helm lint src/charts/cloudvm-ticker",
+  "helm template src/charts/cloudvm-ticker > /dev/null",
+]
+
 [tasks.lint]
 description = "Run every static repository check"
 depends = [
@@ -55,6 +64,7 @@ depends = [
   "lint-secrets",
   "lint-vulnerabilities",
   "lint-yaml",
+  "lint-helm",
 ]
 
 [tasks.test]

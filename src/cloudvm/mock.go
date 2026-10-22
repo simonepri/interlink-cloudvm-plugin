@@ -38,6 +38,8 @@ func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance,
 		CreatedAt:    time.Now(),
 		Metadata: map[string]string{
 			"podName":    spec.PodName,
+			"namespace":  spec.PodNamespace,
+			"podUID":     spec.PodUID,
 			"clusterTag": spec.ClusterTag,
 		},
 	}

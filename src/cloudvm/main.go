@@ -74,6 +74,10 @@ func main() {
 	defer cancel()
 
 	if inventory != nil {
+		if err := server.RecoverActiveInstances(ctx, inventory); err != nil {
+			log.Printf("[cloudvm] Warning: failed to recover active instances: %v", err)
+		}
+
 		reconciler := NewReconciler(inventory, server, terminator, clusterTag, 10*time.Minute)
 		server.SetReconciler(reconciler)
 

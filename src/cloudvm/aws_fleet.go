@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -277,14 +278,20 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 
 // AWSProvider implements Provider for AWS EC2 Fleet.
 type AWSProvider struct {
-	Region string
-	client EC2FleetClient
+	Region  string
+	mu      sync.RWMutex
+	clients map[string]EC2FleetClient
+	client  EC2FleetClient
 }
 
 // NewAWSProvider creates an AWS provider instance.
 func NewAWSProvider(region string) *AWSProvider {
+	if region == "" {
+		region = "us-east-1"
+	}
 	return &AWSProvider{
-		Region: region,
+		Region:  region,
+		clients: make(map[string]EC2FleetClient),
 	}
 }
 
@@ -293,16 +300,35 @@ func (p *AWSProvider) SetClient(c EC2FleetClient) {
 	p.client = c
 }
 
-func (p *AWSProvider) getClient(ctx context.Context) (EC2FleetClient, error) {
+func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetClient, error) {
 	if p.client != nil {
 		return p.client, nil
 	}
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(p.Region))
-	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config for %s: %w", p.Region, err)
+	if region == "" {
+		region = p.Region
 	}
-	p.client = ec2.NewFromConfig(cfg)
-	return p.client, nil
+	p.mu.RLock()
+	c, ok := p.clients[region]
+	p.mu.RUnlock()
+	if ok {
+		return c, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.clients[region]; ok {
+		return c, nil
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config for %s: %w", region, err)
+	}
+	cl := ec2.NewFromConfig(cfg)
+	if p.clients == nil {
+		p.clients = make(map[string]EC2FleetClient)
+	}
+	p.clients[region] = cl
+	return cl, nil
 }
 
 func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
@@ -326,7 +352,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		return nil, fmt.Errorf("failed to generate cloud-init: %w", err)
 	}
 
-	client, err := p.getClient(ctx)
+	client, err := p.getClient(ctx, spec.Region)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +406,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 }
 
 func (p *AWSProvider) Terminate(ctx context.Context, instanceID string) error {
-	client, err := p.getClient(ctx)
+	client, err := p.getClient(ctx, p.Region)
 	if err != nil {
 		return err
 	}
@@ -391,7 +417,7 @@ func (p *AWSProvider) Terminate(ctx context.Context, instanceID string) error {
 }
 
 func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance, error) {
-	client, err := p.getClient(ctx)
+	client, err := p.getClient(ctx, p.Region)
 	if err != nil {
 		return nil, err
 	}
@@ -436,7 +462,7 @@ func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance,
 }
 
 func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string) ([]*Instance, error) {
-	client, err := p.getClient(ctx)
+	client, err := p.getClient(ctx, p.Region)
 	if err != nil {
 		return nil, err
 	}

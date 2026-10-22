@@ -263,6 +263,23 @@ func (s *Server) selectProvider(spec *InstanceSpec) Provider {
 	return s.defaultProv
 }
 
+// parsePodFromPayload parses either InterLink standard RetrievedPodData ({"pod": ...}) or flat Pod JSON.
+func parsePodFromPayload(body []byte) (*Pod, error) {
+	var retrieved struct {
+		Pod Pod `json:"pod"`
+	}
+	if err := json.Unmarshal(body, &retrieved); err == nil && retrieved.Pod.Metadata.Name != "" {
+		return &retrieved.Pod, nil
+	}
+
+	var direct Pod
+	if err := json.Unmarshal(body, &direct); err == nil && direct.Metadata.Name != "" {
+		return &direct, nil
+	}
+
+	return nil, fmt.Errorf("invalid pod JSON payload")
+}
+
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -275,13 +292,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var pod Pod
-	if err := json.Unmarshal(body, &pod); err != nil {
-		http.Error(w, fmt.Sprintf("invalid pod JSON: %v", err), http.StatusBadRequest)
+	pod, err := parsePodFromPayload(body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid pod payload: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	spec := PodToInstanceSpec(&pod, s.clusterTag)
+	spec := PodToInstanceSpec(pod, s.clusterTag)
 	prov := s.selectProvider(spec)
 
 	log.Printf("[cloudvm] Launching opportunistic VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
@@ -300,7 +317,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(inst)
+	// Return InterLink CreateStruct contract
+	_ = json.NewEncoder(w).Encode(CreateStruct{
+		PodUID: spec.PodUID,
+		PodJID: inst.ID,
+	})
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -315,8 +336,8 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var pod Pod
-	if err := json.Unmarshal(body, &pod); err != nil {
+	pod, err := parsePodFromPayload(body)
+	if err != nil {
 		http.Error(w, "invalid pod JSON", http.StatusBadRequest)
 		return
 	}
@@ -356,31 +377,56 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
-		return
-	}
-
 	var pods []Pod
-	if err := json.Unmarshal(body, &pods); err != nil {
-		var single Pod
-		if err2 := json.Unmarshal(body, &single); err2 != nil {
-			http.Error(w, "invalid status request JSON", http.StatusBadRequest)
-			return
+	body, _ := io.ReadAll(r.Body)
+	if len(body) > 0 {
+		var retrievedList []struct {
+			Pod Pod `json:"pod"`
 		}
-		pods = append(pods, single)
+		if err := json.Unmarshal(body, &retrievedList); err == nil && len(retrievedList) > 0 && retrievedList[0].Pod.Metadata.Name != "" {
+			for _, item := range retrievedList {
+				pods = append(pods, item.Pod)
+			}
+		} else if err := json.Unmarshal(body, &pods); err != nil {
+			var single Pod
+			if err2 := json.Unmarshal(body, &single); err2 == nil && single.Metadata.Name != "" {
+				pods = append(pods, single)
+			}
+		}
 	}
 
-	var responses []PodStatusResponse
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if len(pods) == 0 {
+		for key, inst := range s.instances {
+			parts := strings.SplitN(key, "/", 2)
+			ns := "default"
+			name := key
+			if len(parts) == 2 {
+				ns = parts[0]
+				name = parts[1]
+			}
+			uid := ""
+			if inst.Metadata != nil {
+				uid = inst.Metadata["podUID"]
+			}
+			pods = append(pods, Pod{
+				Metadata: PodMeta{
+					Name:      name,
+					Namespace: ns,
+					UID:       uid,
+				},
+			})
+		}
+	}
+
+	var responses []PodStatusResponse
 	for _, pod := range pods {
 		name := pod.Metadata.Name
 		ns := pod.Metadata.Namespace
@@ -397,15 +443,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			Name: "worker",
 		}
 
-		if !exists {
-			// Do NOT report Completed with ExitCode 0 if pod is unknown.
-			// Virtual-kubelet interprets ExitCode 0 as successful workload completion.
-			// Report Waiting state with ContainerCreating to signal pending discovery.
-			status.State.Waiting = &ContainerWaitingState{
-				Reason:  "ContainerCreating",
-				Message: fmt.Sprintf("Instance for %s is pending discovery or provisioning", key),
-			}
-		} else {
+		jid := ""
+		if exists && inst != nil {
+			jid = inst.ID
 			switch inst.State {
 			case StateProvisioning:
 				status.State.Waiting = &ContainerWaitingState{
@@ -437,12 +477,23 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					FinishedAt: time.Now(),
 				}
 			}
+		} else {
+			status.State.Waiting = &ContainerWaitingState{
+				Reason:  "ContainerCreating",
+				Message: fmt.Sprintf("Instance for %s is pending discovery or provisioning", key),
+			}
+		}
+
+		uid := pod.Metadata.UID
+		if uid == "" && exists && inst.Metadata != nil {
+			uid = inst.Metadata["podUID"]
 		}
 
 		responses = append(responses, PodStatusResponse{
-			PodUID:    pod.Metadata.UID,
+			PodUID:    uid,
 			Name:      name,
 			Namespace: ns,
+			JID:       jid,
 			Containers: []ContainerStatus{
 				status,
 			},
@@ -451,6 +502,42 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(responses)
+}
+
+// RecoverActiveInstances queries the cloud inventory to rebuild in-memory state on startup.
+func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory) error {
+	if inv == nil {
+		return nil
+	}
+	instances, err := inv.ListActiveInstances(ctx, s.clusterTag)
+	if err != nil {
+		return fmt.Errorf("failed to recover cloud instances: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, inst := range instances {
+		podName := inst.Metadata["podName"]
+		if podName == "" {
+			podName = inst.Metadata["PodName"]
+		}
+		if podName == "" {
+			continue
+		}
+		ns := inst.Metadata["namespace"]
+		if ns == "" {
+			ns = inst.Metadata["Namespace"]
+		}
+		if ns == "" {
+			ns = "default"
+		}
+		key := fmt.Sprintf("%s/%s", ns, podName)
+		s.instances[key] = inst
+		cleanID := strings.ReplaceAll(strings.ReplaceAll(inst.ID, "\n", ""), "\r", "")
+		cleanKey := strings.ReplaceAll(strings.ReplaceAll(key, "\n", ""), "\r", "")
+		log.Printf("[cloudvm] Recovered existing cloud VM %s for pod %s", cleanID, cleanKey)
+	}
+	return nil
 }
 
 func (s *Server) handleGetLogs(w http.ResponseWriter, _ *http.Request) {

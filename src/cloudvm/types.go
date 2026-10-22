@@ -198,10 +198,18 @@ type ContainerStatus struct {
 	Ready bool                 `json:"ready"`
 }
 
+// CreateStruct represents the response contract sent back to InterLink for /create.
+type CreateStruct struct {
+	PodUID string `json:"PodUID"`
+	PodJID string `json:"PodJID"`
+}
+
 // PodStatusResponse represents the status response contract sent back to InterLink.
+// Matches CNCF InterLink pkg/interlink/types.go PodStatus definition.
 type PodStatusResponse struct {
-	PodUID     string            `json:"podUID,omitempty"`
+	PodUID     string            `json:"PodUID"`
 	Name       string            `json:"name"`
 	Namespace  string            `json:"namespace"`
+	JID        string            `json:"JID"`
 	Containers []ContainerStatus `json:"containers"`
 }

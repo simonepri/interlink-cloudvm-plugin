@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -293,5 +294,133 @@ func TestPodToInstanceSpec_MaxEgressRateDollarConversion(t *testing.T) {
 	}
 	if spec.EgressBurst != "100mb" {
 		t.Errorf("expected default burst 100mb, got %s", spec.EgressBurst)
+	}
+}
+
+func TestInterLinkAPIContract_NestedPodAndStatus(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	// 1. Test POST /create with InterLink RetrievedPodData format ({"pod": {...}})
+	nestedPayload := `{
+		"pod": {
+			"metadata": {
+				"name": "interlink-worker-1",
+				"namespace": "production",
+				"uid": "pod-uid-abcdef-12345"
+			},
+			"spec": {
+				"containers": [
+					{
+						"name": "main",
+						"image": "ubuntu:24.04",
+						"resources": {
+							"limits": {"nvidia.com/gpu": "1"}
+						}
+					}
+				]
+			}
+		}
+	}`
+
+	resp, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(nestedPayload))
+	if err != nil {
+		t.Fatalf("POST /create failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /create, got %d", resp.StatusCode)
+	}
+
+	var created CreateStruct
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode CreateStruct response: %v", err)
+	}
+
+	if created.PodUID != "pod-uid-abcdef-12345" {
+		t.Errorf("expected PodUID pod-uid-abcdef-12345, got %s", created.PodUID)
+	}
+	if created.PodJID == "" {
+		t.Errorf("expected non-empty PodJID")
+	}
+
+	// 2. Test GET /status (standard InterLink method)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/status", nil)
+	if err != nil {
+		t.Fatalf("failed to create GET /status request: %v", err)
+	}
+	statusResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /status failed: %v", err)
+	}
+	defer statusResp.Body.Close()
+
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from GET /status, got %d", statusResp.StatusCode)
+	}
+
+	var statuses []PodStatusResponse
+	if err := json.NewDecoder(statusResp.Body).Decode(&statuses); err != nil {
+		t.Fatalf("failed to decode PodStatusResponse: %v", err)
+	}
+
+	if len(statuses) != 1 {
+		t.Fatalf("expected 1 status response, got %d", len(statuses))
+	}
+
+	st := statuses[0]
+	if st.PodUID != "pod-uid-abcdef-12345" || st.Name != "interlink-worker-1" || st.Namespace != "production" {
+		t.Errorf("status mismatch: %+v", st)
+	}
+	if st.JID != created.PodJID {
+		t.Errorf("expected JID %s, got %s", created.PodJID, st.JID)
+	}
+
+	// 3. Test POST /delete with nested format
+	delResp, err := http.Post(ts.URL+"/delete", "application/json", strings.NewReader(nestedPayload))
+	if err != nil {
+		t.Fatalf("POST /delete failed: %v", err)
+	}
+	defer delResp.Body.Close()
+
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from /delete, got %d", delResp.StatusCode)
+	}
+}
+
+func TestServer_RecoverActiveInstances(t *testing.T) {
+	mock := NewMockProvider()
+	ctx := context.Background()
+
+	// Seed cloud instance
+	inst, err := mock.Launch(ctx, &InstanceSpec{
+		PodName:      "recovered-pod",
+		PodNamespace: "custom-ns",
+		PodUID:       "recovered-uid-999",
+		ClusterTag:   "test-cluster",
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to launch: %v", err)
+	}
+
+	// Create new server instance simulating provider restart
+	server := NewServer(mock, "test-cluster")
+	if len(server.ActiveInstances()) != 0 {
+		t.Fatalf("expected empty server instances on cold start")
+	}
+
+	// Recover state from cloud inventory
+	if err := server.RecoverActiveInstances(ctx, mock); err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+
+	active := server.ActiveInstances()
+	key := "custom-ns/recovered-pod"
+	if rec, ok := active[key]; !ok || rec.ID != inst.ID {
+		t.Fatalf("expected recovered instance %s under %s, got %+v", inst.ID, key, active)
 	}
 }
