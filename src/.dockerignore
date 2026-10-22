@@ -1,0 +1,9 @@
+.local/
+bin/
+dist/
+/tmp/
+.DS_Store
+*.log
+*.out
+chart/
+tests/
