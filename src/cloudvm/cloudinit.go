@@ -11,35 +11,35 @@ import (
 
 // CloudInitConfig contains the parameters needed to render the VM bootstrap script.
 type CloudInitConfig struct {
-	PodName              string
-	PodNamespace         string
-	PodUID               string
-	RayHeadAddress       string
-	RayVersion           string
-	TargetContainerImage string
-	Command              []string
-	Args                 []string
-	Env                  map[string]string
-	UseNativeDLAMI       bool // When true, runs native Python/Ray from DLAMI instead of pulling Docker container
-	NumGPUs              int
-	AssignedGPUs         []int
-	CPUMillicores        int64
-	MemoryBytes          int64
-	RunnerAuthToken      string
-	KMSEncryptedToken    bool
-	KMSKeyID             string
-	KMSCiphertext        string
-	MeshAuthKey          string
-	Region               string
-	InstanceType         string
-	EgressBandwidth      string
-	EgressBurst          string
-	RunAsUser            *int64
-	RunAsGroup           *int64
-	DockerConfigJSON     string
-	RegistryMirrors      []string
-	OtelEndpoint         string
-	NodeProblemDetector  bool
+	PodName               string
+	PodNamespace          string
+	PodUID                string
+	RayHeadAddress        string
+	RayVersion            string
+	TargetContainerImage  string
+	Command               []string
+	Args                  []string
+	Env                   map[string]string
+	UseNativeDLAMI        bool // When true, runs native Python/Ray from DLAMI instead of pulling Docker container
+	NumGPUs               int
+	AssignedGPUs          []int
+	CPUMillicores         int64
+	MemoryBytes           int64
+	RunnerAuthToken       string
+	KMSEncryptedToken     bool
+	KMSKeyID              string
+	KMSCiphertext         string
+	MeshAuthKey           string
+	Region                string
+	InstanceType          string
+	EgressBandwidth       string
+	EgressBurst           string
+	RunAsUser             *int64
+	RunAsGroup            *int64
+	DockerConfigJSON      string
+	RegistryMirrors       []string
+	OtelEndpoint          string
+	NodeProblemDetector   bool
 	CustomBootstrapScript string
 }
 

@@ -38,32 +38,32 @@ type inFlightCreate struct {
 }
 
 type Server struct {
-	mu              sync.RWMutex
-	providers       map[ProviderType]Provider
-	defaultProv     Provider
-	instances       map[string]*Instance // key: UID and namespace/podName -> *Instance
-	clusterTag      string
-	defaultRegion   string
-	reconciler      *Reconciler
-	nodePool        *NodePool
-	kmsClient       KMSClient
-	kmsKeyID        string
-	secretResolver  SecretResolver
-	runner          ContainerRunner
-	spotTicker      *SpotPriceTicker
-	tokenStore      *TokenStore
-	completedStore  *CompletedStore
-	tombstoneStore  *TombstoneStore
+	mu                    sync.RWMutex
+	providers             map[ProviderType]Provider
+	defaultProv           Provider
+	instances             map[string]*Instance // key: UID and namespace/podName -> *Instance
+	clusterTag            string
+	defaultRegion         string
+	reconciler            *Reconciler
+	nodePool              *NodePool
+	kmsClient             KMSClient
+	kmsKeyID              string
+	secretResolver        SecretResolver
+	runner                ContainerRunner
+	spotTicker            *SpotPriceTicker
+	tokenStore            *TokenStore
+	completedStore        *CompletedStore
+	tombstoneStore        *TombstoneStore
 	registryMirrors       []string
 	otelEndpoint          string
 	enableNPD             bool
 	customBootstrapScript string
-	tombstones      map[string]time.Time                 // podUID or instanceID -> deletion timestamp
-	activeSightings map[string]time.Time                 // podUID -> last seen in /status or /create
-	statusPolled    bool                                 // set true when first /status query is received
-	launchTokens    map[string]string                    // podUID -> runnerAuthToken (reused across retries)
-	completedPods   map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
-	inFlightCreates map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
+	tombstones            map[string]time.Time                 // podUID or instanceID -> deletion timestamp
+	activeSightings       map[string]time.Time                 // podUID -> last seen in /status or /create
+	statusPolled          bool                                 // set true when first /status query is received
+	launchTokens          map[string]string                    // podUID -> runnerAuthToken (reused across retries)
+	completedPods         map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
+	inFlightCreates       map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
 }
 
 // NewServer initializes an InterLink Server with a default provider.

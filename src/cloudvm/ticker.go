@@ -143,7 +143,6 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 	}
 }
 
-
 // PollPlacementScores queries AWS GetSpotPlacementScores for configured instance types.
 func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 	for _, reg := range t.regions {
@@ -161,7 +160,7 @@ func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 		})
 		if err != nil {
 			cleanReg := sanitizeLog(reg)
-			log.Printf("[cloudvm-ticker] Error querying spot placement scores in %s: %v", cleanReg, err)
+			log.Printf("[cloudvm-ticker] Error querying spot placement scores in %s: %v", cleanReg, err) //nolint:gosec // region sanitized
 			continue
 		}
 

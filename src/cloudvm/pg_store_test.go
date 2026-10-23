@@ -543,7 +543,7 @@ func TestPGStore_Tombstones(t *testing.T) {
 		WithArgs("tomb-missing").
 		WillReturnError(sql.ErrNoRows)
 
-	tsTime, found, err = store.GetTombstone(ctx, "tomb-missing")
+	_, found, err = store.GetTombstone(ctx, "tomb-missing")
 	if err != nil || found {
 		t.Fatalf("expected not found without error, got found=%v, err=%v", found, err)
 	}

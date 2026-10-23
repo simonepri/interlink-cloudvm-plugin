@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -24,6 +25,12 @@ func parseCommaList(val string) []string {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatalf("[cloudvm] %v", err)
+	}
+}
+
+func run() error {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "4040"
@@ -88,19 +95,24 @@ func main() {
 		stopChan := make(chan os.Signal, 1)
 		signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
+		tickerErrChan := make(chan error, 1)
 		go func() {
 			if err := tickerServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("[cloudvm-ticker] Server failed: %v", err)
+				tickerErrChan <- err
 			}
 		}()
 
-		<-stopChan
-		log.Printf("[cloudvm-ticker] Shutting down gracefully...")
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = tickerServer.Shutdown(shutdownCtx)
-		shutdownCancel()
-		log.Printf("[cloudvm-ticker] Server stopped.")
-		return
+		select {
+		case <-stopChan:
+			log.Printf("[cloudvm-ticker] Shutting down gracefully...")
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = tickerServer.Shutdown(shutdownCtx)
+			shutdownCancel()
+			log.Printf("[cloudvm-ticker] Server stopped.")
+			return nil
+		case err := <-tickerErrChan:
+			return fmt.Errorf("ticker server failed: %w", err)
+		}
 	}
 
 	switch providerType {
@@ -120,7 +132,7 @@ func main() {
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		pgStore, err := NewPGStore(dbURL)
 		if err != nil {
-			log.Fatalf("[cloudvm] Failed to initialize PostgreSQL store: %v", err)
+			return fmt.Errorf("failed to initialize PostgreSQL store: %w", err)
 		}
 		defer pgStore.Close()
 		server.SetTokenStore(pgStore.TokenStore())
@@ -273,6 +285,7 @@ func main() {
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
+	httpErrChan := make(chan error, 1)
 	go func() {
 		portNum, _ := strconv.Atoi(port)
 		if portNum <= 0 || portNum > 65535 {
@@ -280,19 +293,22 @@ func main() {
 		}
 		log.Printf("[interlink-cloudvm-plugin] Listening on port %d", portNum)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[interlink-cloudvm-plugin] Server failed: %v", err)
+			httpErrChan <- err
 		}
 	}()
 
-	<-stopChan
-	log.Printf("[interlink-cloudvm-plugin] Shutting down gracefully...")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := httpServer.Shutdown(shutdownCtx)
-	shutdownCancel()
-	if err != nil {
-		log.Printf("[interlink-cloudvm-plugin] Shutdown error: %v", err)
+	select {
+	case <-stopChan:
+		log.Printf("[interlink-cloudvm-plugin] Shutting down gracefully...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := httpServer.Shutdown(shutdownCtx)
+		shutdownCancel()
+		if err != nil {
+			log.Printf("[interlink-cloudvm-plugin] Shutdown error: %v", err)
+		}
+		log.Printf("[interlink-cloudvm-plugin] Server stopped.")
+		return nil
+	case err := <-httpErrChan:
+		return fmt.Errorf("http server failed: %w", err)
 	}
-
-	log.Printf("[interlink-cloudvm-plugin] Server stopped.")
 }

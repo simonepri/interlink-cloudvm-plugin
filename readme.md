@@ -263,9 +263,9 @@ but VM gone in cloud?"}
 
 ---
 
-### 6. Spot Price Ticker (`cloudvm-ticker`)
+### 6. Spot Price Ticker, Placement Scores, and Cost Metrics (`cloudvm-ticker`)
 
-To avoid hitting AWS/GCP API rate limits when running multiple provider instances, spot price polling can be separated into a standalone `cloudvm-ticker` deployment:
+To avoid hitting AWS/GCP API rate limits when running multiple provider instances, spot price polling, placement score analysis, and cost benchmarking can be separated into a standalone `cloudvm-ticker` deployment:
 
 ```mermaid
 flowchart TD
@@ -275,13 +275,16 @@ flowchart TD
 
     subgraph Central["Management Cluster"]
         Ticker["cloudvm-ticker
-Polls Spot Price History (10m)"]:::central
+Polls Spot Price History & Placement Scores (10m)"]:::central
         Ticker --> HTTP["GET /prices"]:::central
         Ticker --> Metrics["GET /metrics
-cloudvm_spot_price_usd_per_hour"]:::central
+cloudvm_spot_price_usd_per_hour
+cloudvm_ondemand_price_usd_per_hour
+cloudvm_spot_savings_percentage
+cloudvm_spot_placement_score"]:::central
     end
 
-    Metrics --> OTEL["Prometheus / Grafana"]:::otel
+    Metrics --> OTEL["Prometheus / SigNoz / Grafana"]:::otel
 
     subgraph Cells["Worker Clusters"]
         HTTP --> Cell1["Provider 1
@@ -291,8 +294,13 @@ cloudvm_spot_price_usd_per_hour"]:::central
     end
 ```
 
-- **Embedded Mode (Default)**: The provider polls spot prices directly every `10m ± 2m`.
+- **Embedded Mode (Default)**: The provider polls spot prices and placement scores directly every `10m ± 2m`.
 - **Central Ticker Mode**: Deploy the `cloudvm-ticker` Helm chart once and point providers at `--ticker-url=http://cloudvm-ticker.monitoring.svc:8080`.
+- **Exposed Prometheus Metrics**:
+  - `cloudvm_spot_price_usd_per_hour{region, instance_type}`: Current AWS EC2 Spot price per hour.
+  - `cloudvm_ondemand_price_usd_per_hour{region, instance_type}`: Baseline AWS EC2 On-Demand list price per hour.
+  - `cloudvm_spot_savings_percentage{region, instance_type}`: Percentage savings of Spot compared to On-Demand ((OnDemand - Spot) / OnDemand * 100).
+  - `cloudvm_spot_placement_score{region, instance_type}`: Real-time AWS Spot Placement Score (1 to 10 scale) indicating likelihood of successful spot instance fulfillment with low preemption risk.
 
 ---
 
@@ -319,8 +327,10 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 | :--- | :--- | :--- | :--- |
 | **CSI FUSE Driver** (`csi-rclone`) | `rclone mount` / `s3fs` / `gcsfuse` | `cloud-init` service | Mounts S3/GCS buckets to `/mnt/data` before the container starts. |
 | **Torch Compile Cache** | Pre-populated kernel cache in AMI | Local disk / S3 | Avoids 5-15 minute Triton/Inductor compilation on cold boot. |
-| **Node Problem Detector** | NVML health check script | Host cron / systemd | Checks for GPU Xid/ECC errors and exits the VM if a card fails. |
-| **DCGM Exporter** | Host OTEL / DCGM agent | Systemd service | Pushes GPU utilization and memory metrics over the WireGuard mesh. |
+| **Node Problem Detector** (`ENABLE_NPD=true`) | Embedded standalone NPD agent | Host systemd service | Checks GPU Xid/ECC errors, kernel deadlocks, and driver faults; terminates unhealthy VMs cleanly. |
+| **DCGM Exporter / OTEL** (`OTEL_ENDPOINT`) | Host OTEL Collector / Vector | Systemd service | Ships GPU telemetry, container logs, and system metrics directly to central SigNoz/Honeycomb. |
+| **Pull-Through Cache** (`REGISTRY_MIRRORS`) | Docker / containerd registry mirrors | Host daemon config | Pulls container images via local cluster caches (Harbor, Spegel) avoiding Docker Hub limits. |
+| **Custom Bootstrap** (`CUSTOM_BOOTSTRAP_SCRIPT`) | Shell script execution hook | `cloud-init` execution | Allows mounting NFS/EFS/FSx shares, enrolling security agents, or injecting custom CA certs. |
 
 ---
 
@@ -481,13 +491,21 @@ mise run build
 
 ## Known Production Architecture Notes
 
-1. Single Replica Provider Daemon:
-The cloudvm provider maintains local state caches (runner tokens, completed pod termination records, tombstones, and multi-region instance mappings) backed by an atomic fsync store on persistent volume storage (ReadWriteOnce PVC). To ensure lock integrity and state consistency across pod restarts, deploy the provider with replica count 1.
+### High Availability and Storage Options
 
-2. In-VM Runner Token Delivery:
+1. Active-Active High Availability (PostgreSQL Store):
+When `DATABASE_URL` is configured, `interlink-cloudvm-plugin` persists runner tokens, completed pod termination records, tombstones, and multi-region instance mappings directly in PostgreSQL.
+- Supports multi-replica deployments (`replicas: 2+`) with Kubernetes `RollingUpdate` strategy.
+- Eliminates single points of failure and allows zero-downtime control-plane upgrades.
+- Shared state prevents duplicate instance creation and guarantees idempotent cleanup across replicas.
+
+2. Single Replica Standalone (Local Disk Store):
+When `DATABASE_URL` is omitted, the provider maintains state caches backed by an atomic fsync store on persistent volume storage (`ReadWriteOnce` PVC via `DATA_DIR`). To ensure lock integrity and state consistency across pod restarts, deploy with `replicas: 1` (`Recreate` strategy).
+
+3. In-VM Runner Token Delivery:
 Runner authorization tokens are generated securely per instance and passed through cloud instance launch user-data templates. Runner credentials are never exposed via cloud provider metadata tags or external APIs.
 
-3. Co-tenant Discovery Timeout:
+4. Co-tenant Discovery Timeout:
 When the provider restarts while an in-VM runner is unreachable, the node is flagged with unverified co-tenants and protected from idle collection and zombie cleanup. Background reconciliation retries container discovery on each reconcile pass for up to 30 minutes before releasing the node for garbage collection.
 
 

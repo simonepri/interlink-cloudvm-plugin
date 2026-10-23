@@ -502,11 +502,11 @@ func TestCloudInit_CustomBootstrapScript(t *testing.T) {
 func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
 	customCode := "echo 'all features combined' > /etc/combined-test.txt"
 	cfg := &CloudInitConfig{
-		PodName:               "combined-pod",
-		PodNamespace:          "prod-ml",
-		PodUID:                "uid-combined-999",
-		RunnerAuthToken:       "secret-token-xyz",
-		TargetContainerImage:  "nvcr.io/nvidia/pytorch:23.10-py3",
+		PodName:              "combined-pod",
+		PodNamespace:         "prod-ml",
+		PodUID:               "uid-combined-999",
+		RunnerAuthToken:      "secret-token-xyz",
+		TargetContainerImage: "nvcr.io/nvidia/pytorch:23.10-py3",
 		RegistryMirrors: []string{
 			"https://mirror.gcr.io",
 			"https://dockerhub.internal.mirror",
@@ -551,7 +551,7 @@ func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
 	idxRunner := strings.Index(script, "cloudvm-runner.py")
 	idxCustom := strings.Index(script, customCode)
 
-	if !(idxMirrors < idxOtel && idxOtel < idxNPD && idxNPD < idxRunner && idxRunner < idxCustom) {
+	if idxMirrors >= idxOtel || idxOtel >= idxNPD || idxNPD >= idxRunner || idxRunner >= idxCustom {
 		t.Errorf("unexpected section ordering: mirrors=%d, otel=%d, npd=%d, runner=%d, custom=%d",
 			idxMirrors, idxOtel, idxNPD, idxRunner, idxCustom)
 	}

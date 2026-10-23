@@ -18,14 +18,14 @@ type mockEC2TickerFetcher struct {
 	err           error
 }
 
-func (m *mockEC2TickerFetcher) DescribeSpotPriceHistory(ctx context.Context, params *ec2.DescribeSpotPriceHistoryInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
+func (m *mockEC2TickerFetcher) DescribeSpotPriceHistory(_ context.Context, _ *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
 	return m.historyOutput, nil
 }
 
-func (m *mockEC2TickerFetcher) GetSpotPlacementScores(ctx context.Context, params *ec2.GetSpotPlacementScoresInput, optFns ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error) {
+func (m *mockEC2TickerFetcher) GetSpotPlacementScores(_ context.Context, _ *ec2.GetSpotPlacementScoresInput, _ ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -70,7 +70,7 @@ func TestSpotPriceTicker_PlacementScoresAndSavings(t *testing.T) {
 	}
 
 	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"g5.xlarge"}, time.Minute)
-	ticker.SetFetcherFactory(func(ctx context.Context, region string) (SpotPriceFetcher, error) {
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) {
 		return fetcher, nil
 	})
 
