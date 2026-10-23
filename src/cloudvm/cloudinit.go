@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"text/template"
@@ -36,6 +37,10 @@ type CloudInitConfig struct {
 	RunAsUser            *int64
 	RunAsGroup           *int64
 	DockerConfigJSON     string
+	RegistryMirrors      []string
+	OtelEndpoint         string
+	NodeProblemDetector  bool
+	CustomBootstrapScript string
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -99,6 +104,18 @@ func (c *CloudInitConfig) RenderCommand() string {
 		return "true"
 	}
 	return strings.Join(parts, " ")
+}
+
+// RegistryMirrorsJSON returns the JSON array representation of RegistryMirrors.
+func (c *CloudInitConfig) RegistryMirrorsJSON() string {
+	if len(c.RegistryMirrors) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(c.RegistryMirrors)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }
 
 // RenderContainerCommand formats Command and Args for docker run.
@@ -260,6 +277,177 @@ nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
   done
 ) &
 
+{{if .RegistryMirrors}}
+# Configure Docker registry mirrors
+echo "[cloudvm-bootstrap] Configuring container registry mirrors..."
+mkdir -p /etc/docker
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c '
+import json, os
+path = "/etc/docker/daemon.json"
+mirrors = {{.RegistryMirrorsJSON}}
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+data["registry-mirrors"] = mirrors
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+'
+else
+  if [ -f /etc/docker/daemon.json ]; then
+    grep -v '"registry-mirrors"' /etc/docker/daemon.json | grep -v '^}' > /tmp/daemon.json.tmp || true
+    echo '  "registry-mirrors": {{.RegistryMirrorsJSON}}' >> /tmp/daemon.json.tmp
+    echo '}' >> /tmp/daemon.json.tmp
+    mv /tmp/daemon.json.tmp /etc/docker/daemon.json
+  else
+    echo '{"registry-mirrors": {{.RegistryMirrorsJSON}}}' > /etc/docker/daemon.json
+  fi
+fi
+if systemctl is-active --quiet docker 2>/dev/null; then
+  systemctl restart docker 2>/dev/null || true
+fi
+{{end}}
+
+{{if .OtelEndpoint}}
+# Configure OpenTelemetry host metrics forwarding
+echo "[cloudvm-bootstrap] Configuring OpenTelemetry metrics forwarder for {{.OtelEndpoint}}..."
+cat << 'OTEL_EOF' > /usr/local/bin/cloudvm-otel-forwarder.sh
+#!/usr/bin/env bash
+ENDPOINT="{{.OtelEndpoint}}"
+if [[ "$ENDPOINT" != http://* && "$ENDPOINT" != https://* ]]; then
+  TARGET_URL="http://${ENDPOINT}/v1/metrics"
+else
+  TARGET_URL="${ENDPOINT}/v1/metrics"
+fi
+
+while true; do
+  TIMESTAMP_NS=$(date +%s%N 2>/dev/null || echo "$(date +%s)000000000")
+  MEM_TOTAL=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  MEM_AVAIL=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  MEM_USED_KB=$(( MEM_TOTAL - MEM_AVAIL ))
+  if [ "$MEM_USED_KB" -lt 0 ]; then MEM_USED_KB=0; fi
+  LOAD_1M=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+
+  read -r -d '' PAYLOAD << JSON_EOF
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "host.name", "value": {"stringValue": "$(hostname)"}},
+          {"key": "k8s.pod.name", "value": {"stringValue": "{{.PodName}}"}},
+          {"key": "service.name", "value": {"stringValue": "cloudvm-host"}}
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "system.memory.usage",
+              "unit": "By",
+              "gauge": {
+                "dataPoints": [
+                  {"timeUnixNano": "${TIMESTAMP_NS}", "asInt": "$(( MEM_USED_KB * 1024 ))"}
+                ]
+              }
+            },
+            {
+              "name": "system.cpu.load_average.1m",
+              "unit": "1",
+              "gauge": {
+                "dataPoints": [
+                  {"timeUnixNano": "${TIMESTAMP_NS}", "asDouble": ${LOAD_1M:-0}}
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+JSON_EOF
+
+  curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$TARGET_URL" --connect-timeout 2 --max-time 5 >/dev/null 2>&1 || true
+  sleep 15
+done
+OTEL_EOF
+chmod +x /usr/local/bin/cloudvm-otel-forwarder.sh
+
+cat << 'SERVICE_EOF' > /etc/systemd/system/cloudvm-otel.service
+[Unit]
+Description=CloudVM OpenTelemetry Host Metrics Forwarder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="OTEL_EXPORTER_OTLP_ENDPOINT={{.OtelEndpoint}}"
+ExecStart=/usr/local/bin/cloudvm-otel-forwarder.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now cloudvm-otel.service 2>/dev/null || true
+fi
+if ! systemctl is-active --quiet cloudvm-otel.service 2>/dev/null; then
+  nohup /usr/local/bin/cloudvm-otel-forwarder.sh > /var/log/cloudvm-otel.log 2>&1 &
+fi
+{{end}}
+
+{{if .NodeProblemDetector}}
+# Node Problem Detector (NPD) standalone mode
+echo "[cloudvm-bootstrap] Launching node-problem-detector standalone container..."
+mkdir -p /etc/node-problem-detector
+cat << 'NPD_GPU_EOF' > /etc/node-problem-detector/gpu-monitor.json
+{
+  "plugin": "kmsg",
+  "logPath": "/dev/kmsg",
+  "lookback": "5m",
+  "bufferSize": 10,
+  "source": "gpu-monitor",
+  "conditions": [
+    {
+      "type": "GPUProblem",
+      "reason": "GPUHealthy",
+      "message": "NVIDIA GPUs are functioning normally"
+    }
+  ],
+  "rules": [
+    {
+      "type": "permanent",
+      "condition": "GPUProblem",
+      "reason": "GPUFallenOffBus",
+      "pattern": ".*(GPU has fallen off the bus|RmInitAdapter failed|NVRM: Xid.*: (79|92)).*"
+    },
+    {
+      "type": "permanent",
+      "condition": "GPUProblem",
+      "reason": "GPUECCUncorrectableError",
+      "pattern": ".*(NVRM: Xid.*: (48|63|64)).*"
+    }
+  ]
+}
+NPD_GPU_EOF
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl start docker 2>/dev/null || true
+elif command -v service >/dev/null 2>&1; then
+  service docker start 2>/dev/null || true
+fi
+
+docker run -d   --name node-problem-detector   --restart always   --net=host   --privileged   -v /dev:/dev   -v /dev/kmsg:/dev/kmsg   -v /var/log:/var/log:ro   -v /etc/node-problem-detector:/config/custom:ro   registry.k8s.io/node-problem-detector/node-problem-detector:v0.8.20   --enable-k8s-exporter=false   --address=0.0.0.0   --port=20256   --config.system-log-monitor=/config/kernel-monitor.json,/config/custom/gpu-monitor.json || true
+{{end}}
+
 {{if .UseNativeDLAMI}}
 # 5. Native DLAMI Mode (Fast PyTorch/Ray cold start ~20-30s)
 echo "[cloudvm-bootstrap] Launching workload in native DLAMI environment..."
@@ -278,11 +466,6 @@ PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/n
 ( sleep 5 && touch /tmp/workload-ready ) &
 {{.RenderCommand}}
 {{end}}
-
-# Clean self-shutdown on normal process exit for native DLAMI mode
-echo "[cloudvm-bootstrap] Workload process completed. Shutting down VM..."
-echo "CLOUDVM_STATUS: {\"status\": \"COMPLETED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
-shutdown -h now || poweroff
 
 {{else}}
 # 5. Container Execution Mode with In-VM Micro-Runner Daemon (:9090)
@@ -719,6 +902,20 @@ fi
     sleep 30
   done
 ) &
+{{end}}
+
+{{if .CustomBootstrapScript}}
+# Custom user bootstrap script
+echo "[cloudvm-bootstrap] Executing custom bootstrap script..."
+{{.CustomBootstrapScript}}
+
+{{end}}
+
+{{if .UseNativeDLAMI}}
+# Clean self-shutdown on normal process exit for native DLAMI mode
+echo "[cloudvm-bootstrap] Workload process completed. Shutting down VM..."
+echo "CLOUDVM_STATUS: {\"status\": \"COMPLETED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+shutdown -h now || poweroff
 {{end}}
 `
 

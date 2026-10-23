@@ -27,6 +27,16 @@ provider:
   reconcileIntervalSeconds: 60
   reconcileLaunchGraceSeconds: 120
 
+database:
+  url: ""
+  existingSecret: ""
+
+registryMirrors: []
+otelEndpoint: ""
+nodeProblemDetector:
+  enabled: false
+customBootstrapScript: ""
+
 service:
   type: ClusterIP
   port: 4040

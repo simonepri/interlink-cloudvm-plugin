@@ -54,6 +54,10 @@ type Server struct {
 	tokenStore      *TokenStore
 	completedStore  *CompletedStore
 	tombstoneStore  *TombstoneStore
+	registryMirrors       []string
+	otelEndpoint          string
+	enableNPD             bool
+	customBootstrapScript string
 	tombstones      map[string]time.Time                 // podUID or instanceID -> deletion timestamp
 	activeSightings map[string]time.Time                 // podUID -> last seen in /status or /create
 	statusPolled    bool                                 // set true when first /status query is received
@@ -123,7 +127,61 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	if sr, err := NewKubeSecretResolverFromConfig(); err == nil {
 		s.secretResolver = sr
 	}
+	var regMirrors []string
+	if raw := os.Getenv("REGISTRY_MIRRORS"); raw != "" {
+		for _, m := range strings.Split(raw, ",") {
+			if trimmed := strings.TrimSpace(m); trimmed != "" {
+				regMirrors = append(regMirrors, trimmed)
+			}
+		}
+	}
+	s.registryMirrors = regMirrors
+	s.otelEndpoint = os.Getenv("OTEL_ENDPOINT")
+	s.enableNPD = os.Getenv("ENABLE_NPD") == "true" || os.Getenv("ENABLE_NPD") == "1"
+	s.customBootstrapScript = os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT")
 	return s
+}
+
+// SetRegistryMirrors configures default container registry mirror endpoints.
+func (s *Server) SetRegistryMirrors(mirrors []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registryMirrors = mirrors
+}
+
+// SetOtelEndpoint configures default OpenTelemetry collector endpoint.
+func (s *Server) SetOtelEndpoint(endpoint string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.otelEndpoint = endpoint
+}
+
+// SetEnableNPD enables or disables Node Problem Detector on provisioned VMs.
+func (s *Server) SetEnableNPD(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enableNPD = enabled
+}
+
+// SetCustomBootstrapScript sets a custom bootstrap script appended to cloud-init.
+func (s *Server) SetCustomBootstrapScript(script string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.customBootstrapScript = script
+}
+
+// SetRegionStore overrides the region store for instance-to-region mapping persistence.
+func (s *Server) SetRegionStore(rs *RegionStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if setter, ok := s.defaultProv.(interface{ SetRegionStore(*RegionStore) }); ok {
+		setter.SetRegionStore(rs)
+	}
+	for _, prov := range s.providers {
+		if setter, ok := prov.(interface{ SetRegionStore(*RegionStore) }); ok {
+			setter.SetRegionStore(rs)
+		}
+	}
 }
 
 // SetTokenStore overrides the token store for runner credentials.
@@ -403,8 +461,21 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Single-flight in-flight create check and idempotency under lock
 	s.mu.Lock()
+	if len(spec.RegistryMirrors) == 0 && len(s.registryMirrors) > 0 {
+		spec.RegistryMirrors = s.registryMirrors
+	}
+	if spec.OtelEndpoint == "" && s.otelEndpoint != "" {
+		spec.OtelEndpoint = s.otelEndpoint
+	}
+	if !spec.NodeProblemDetector && s.enableNPD {
+		spec.NodeProblemDetector = true
+	}
+	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
+		spec.CustomBootstrapScript = s.customBootstrapScript
+	}
+
+	// Single-flight in-flight create check and idempotency under lock
 	if spec.PodUID != "" {
 		s.activeSightings[spec.PodUID] = time.Now()
 		delete(s.tombstones, spec.PodUID)

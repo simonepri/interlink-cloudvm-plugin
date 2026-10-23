@@ -1,3 +1,7 @@
+{{- $isPostgres := false }}
+{{- if or (and .Values.database .Values.database.url) (and .Values.database .Values.database.existingSecret) }}
+{{- $isPostgres = true }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,9 +10,9 @@ metadata:
     app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicaCount | default (ternary 2 1 $isPostgres) }}
   strategy:
-    type: Recreate
+    type: {{ ternary "RollingUpdate" "Recreate" $isPostgres }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
@@ -65,6 +69,32 @@ spec:
               value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/completed-pods.json"
             - name: TOMBSTONE_STORE_PATH
               value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/tombstones.json"
+            {{- if and .Values.database .Values.database.url }}
+            - name: DATABASE_URL
+              value: {{ .Values.database.url | quote }}
+            {{- else if and .Values.database .Values.database.existingSecret }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.secretKey | default "DATABASE_URL" }}
+            {{- end }}
+            {{- if .Values.registryMirrors }}
+            - name: REGISTRY_MIRRORS
+              value: {{ join "," .Values.registryMirrors | quote }}
+            {{- end }}
+            {{- if .Values.otelEndpoint }}
+            - name: OTEL_ENDPOINT
+              value: {{ .Values.otelEndpoint | quote }}
+            {{- end }}
+            {{- if and .Values.nodeProblemDetector .Values.nodeProblemDetector.enabled }}
+            - name: ENABLE_NPD
+              value: "true"
+            {{- end }}
+            {{- if .Values.customBootstrapScript }}
+            - name: CUSTOM_BOOTSTRAP_SCRIPT
+              value: {{ .Values.customBootstrapScript | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -84,7 +114,7 @@ spec:
               mountPath: {{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}
       volumes:
         - name: data
-        {{- if .Values.persistence.enabled }}
+        {{- if and .Values.persistence.enabled (not $isPostgres) }}
           persistentVolumeClaim:
             claimName: {{ include "interlink-cloudvm-plugin.fullname" . }}-data
         {{- else }}

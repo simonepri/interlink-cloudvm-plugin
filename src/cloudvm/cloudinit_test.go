@@ -300,3 +300,259 @@ func TestPodToInstanceSpec_LimitsOnly(t *testing.T) {
 		t.Fatalf("expected MemoryBytes to be 0 when only requests are set, got %d", spec.MemoryBytes)
 	}
 }
+
+func TestCloudInit_RegistryMirrors(t *testing.T) {
+	t.Run("configured mirrors", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:         "mirror-pod",
+			PodNamespace:    "default",
+			RunnerAuthToken: "token-1",
+			RegistryMirrors: []string{
+				"https://mirror.gcr.io",
+				"https://dockerhub.mirror.local",
+			},
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if !strings.Contains(script, "/etc/docker/daemon.json") {
+			t.Errorf("cloud-init missing /etc/docker/daemon.json configuration")
+		}
+		if !strings.Contains(script, "registry-mirrors") {
+			t.Errorf("cloud-init missing registry-mirrors key")
+		}
+		if !strings.Contains(script, "https://mirror.gcr.io") || !strings.Contains(script, "https://dockerhub.mirror.local") {
+			t.Errorf("cloud-init missing configured mirror URLs in script")
+		}
+		if !strings.Contains(script, "systemctl restart docker") {
+			t.Errorf("cloud-init missing docker restart command after updating daemon.json")
+		}
+	})
+
+	t.Run("omitted when empty", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:         "no-mirror-pod",
+			PodNamespace:    "default",
+			RunnerAuthToken: "token-2",
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if strings.Contains(script, "registry-mirrors") {
+			t.Errorf("cloud-init should not contain registry-mirrors when RegistryMirrors is empty")
+		}
+	})
+}
+
+func TestCloudInit_OtelEndpoint(t *testing.T) {
+	t.Run("configured otel endpoint", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:         "otel-pod",
+			PodNamespace:    "default",
+			RunnerAuthToken: "token-3",
+			OtelEndpoint:    "otel-collector.monitoring.svc:4317",
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if !strings.Contains(script, "/usr/local/bin/cloudvm-otel-forwarder.sh") {
+			t.Errorf("cloud-init missing otel forwarder script")
+		}
+		if !strings.Contains(script, "/etc/systemd/system/cloudvm-otel.service") {
+			t.Errorf("cloud-init missing cloudvm-otel.service unit")
+		}
+		if !strings.Contains(script, "OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector.monitoring.svc:4317") {
+			t.Errorf("cloud-init missing OTEL_EXPORTER_OTLP_ENDPOINT environment definition")
+		}
+		if !strings.Contains(script, "systemctl enable --now cloudvm-otel.service") {
+			t.Errorf("cloud-init missing systemd unit activation for otel forwarder")
+		}
+		if !strings.Contains(script, "/v1/metrics") {
+			t.Errorf("cloud-init missing /v1/metrics target path")
+		}
+	})
+
+	t.Run("omitted when empty", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:         "no-otel-pod",
+			PodNamespace:    "default",
+			RunnerAuthToken: "token-4",
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if strings.Contains(script, "cloudvm-otel.service") {
+			t.Errorf("cloud-init should not configure otel service when OtelEndpoint is empty")
+		}
+	})
+}
+
+func TestCloudInit_NodeProblemDetector(t *testing.T) {
+	t.Run("enabled node-problem-detector", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:             "npd-pod",
+			PodNamespace:        "default",
+			RunnerAuthToken:     "token-5",
+			NodeProblemDetector: true,
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if !strings.Contains(script, "registry.k8s.io/node-problem-detector/node-problem-detector:v0.8.20") {
+			t.Errorf("cloud-init missing upstream node-problem-detector image")
+		}
+		if !strings.Contains(script, "--enable-k8s-exporter=false") {
+			t.Errorf("cloud-init missing standalone mode flag --enable-k8s-exporter=false")
+		}
+		if !strings.Contains(script, "--port=20256") {
+			t.Errorf("cloud-init missing NPD standalone port 20256")
+		}
+		if !strings.Contains(script, "/dev/kmsg") {
+			t.Errorf("cloud-init missing /dev/kmsg mount or check")
+		}
+		if !strings.Contains(script, "/etc/node-problem-detector/gpu-monitor.json") {
+			t.Errorf("cloud-init missing GPU problem detector config")
+		}
+		if !strings.Contains(script, "GPUProblem") {
+			t.Errorf("cloud-init missing GPUProblem condition in NPD config")
+		}
+		if !strings.Contains(script, "GPUFallenOffBus") {
+			t.Errorf("cloud-init missing GPUFallenOffBus rule in NPD config")
+		}
+	})
+
+	t.Run("disabled node-problem-detector", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:             "no-npd-pod",
+			PodNamespace:        "default",
+			RunnerAuthToken:     "token-6",
+			NodeProblemDetector: false,
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if strings.Contains(script, "node-problem-detector") {
+			t.Errorf("cloud-init should not configure NPD when NodeProblemDetector is false")
+		}
+	})
+}
+
+func TestCloudInit_CustomBootstrapScript(t *testing.T) {
+	t.Run("appends custom script at end of user-data", func(t *testing.T) {
+		customCode := "echo 'custom bootstrap running' >> /var/log/custom.log\ninstall -d /opt/custom\n"
+		cfg := &CloudInitConfig{
+			PodName:               "custom-script-pod",
+			PodNamespace:          "default",
+			RunnerAuthToken:       "token-7",
+			CustomBootstrapScript: customCode,
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if !strings.Contains(script, customCode) {
+			t.Errorf("cloud-init missing custom bootstrap script contents")
+		}
+
+		idxCustom := strings.Index(script, customCode)
+		idxRunner := strings.Index(script, "cloudvm-runner.py")
+		if idxCustom < idxRunner {
+			t.Errorf("custom bootstrap script should appear after cloudvm-runner setup, got idxCustom=%d, idxRunner=%d", idxCustom, idxRunner)
+		}
+	})
+
+	t.Run("omitted when empty", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:         "no-custom-pod",
+			PodNamespace:    "default",
+			RunnerAuthToken: "token-8",
+		}
+
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+
+		if strings.Contains(script, "Executing custom bootstrap script") {
+			t.Errorf("cloud-init should not contain custom bootstrap header when empty")
+		}
+	})
+}
+
+func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
+	customCode := "echo 'all features combined' > /etc/combined-test.txt"
+	cfg := &CloudInitConfig{
+		PodName:               "combined-pod",
+		PodNamespace:          "prod-ml",
+		PodUID:                "uid-combined-999",
+		RunnerAuthToken:       "secret-token-xyz",
+		TargetContainerImage:  "nvcr.io/nvidia/pytorch:23.10-py3",
+		RegistryMirrors: []string{
+			"https://mirror.gcr.io",
+			"https://dockerhub.internal.mirror",
+		},
+		OtelEndpoint:          "otel.telemetry.svc.cluster.local:4317",
+		NodeProblemDetector:   true,
+		CustomBootstrapScript: customCode,
+	}
+
+	script, err := GenerateCloudInit(cfg)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit failed: %v", err)
+	}
+
+	// Verify all features are present
+	if !strings.Contains(script, "registry-mirrors") {
+		t.Errorf("combined cloud-init missing registry-mirrors")
+	}
+	if !strings.Contains(script, "https://dockerhub.internal.mirror") {
+		t.Errorf("combined cloud-init missing dockerhub.internal.mirror")
+	}
+	if !strings.Contains(script, "cloudvm-otel.service") {
+		t.Errorf("combined cloud-init missing cloudvm-otel.service")
+	}
+	if !strings.Contains(script, "otel.telemetry.svc.cluster.local:4317") {
+		t.Errorf("combined cloud-init missing OtelEndpoint")
+	}
+	if !strings.Contains(script, "node-problem-detector") {
+		t.Errorf("combined cloud-init missing node-problem-detector")
+	}
+	if !strings.Contains(script, "GPUProblem") {
+		t.Errorf("combined cloud-init missing GPUProblem check")
+	}
+	if !strings.Contains(script, customCode) {
+		t.Errorf("combined cloud-init missing custom bootstrap script")
+	}
+
+	// Verify sequential ordering of sections
+	idxMirrors := strings.Index(script, "registry-mirrors")
+	idxOtel := strings.Index(script, "cloudvm-otel.service")
+	idxNPD := strings.Index(script, "node-problem-detector")
+	idxRunner := strings.Index(script, "cloudvm-runner.py")
+	idxCustom := strings.Index(script, customCode)
+
+	if !(idxMirrors < idxOtel && idxOtel < idxNPD && idxNPD < idxRunner && idxRunner < idxCustom) {
+		t.Errorf("unexpected section ordering: mirrors=%d, otel=%d, npd=%d, runner=%d, custom=%d",
+			idxMirrors, idxOtel, idxNPD, idxRunner, idxCustom)
+	}
+}

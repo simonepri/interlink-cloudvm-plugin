@@ -117,6 +117,33 @@ func main() {
 	server := NewServer(defaultProvider, clusterTag)
 	server.SetDefaultRegion(awsRegion)
 
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		pgStore, err := NewPGStore(dbURL)
+		if err != nil {
+			log.Fatalf("[cloudvm] Failed to initialize PostgreSQL store: %v", err)
+		}
+		defer pgStore.Close()
+		server.SetTokenStore(pgStore.TokenStore())
+		server.SetCompletedStore(pgStore.CompletedStore())
+		server.SetTombstoneStore(pgStore.TombstoneStore())
+		server.SetRegionStore(pgStore.RegionStore())
+		awsProv.SetRegionStore(pgStore.RegionStore())
+		log.Printf("[cloudvm] Initialized PostgreSQL HA stores")
+	}
+
+	if mirrors := os.Getenv("REGISTRY_MIRRORS"); mirrors != "" {
+		server.SetRegistryMirrors(parseCommaList(mirrors))
+	}
+	if otel := os.Getenv("OTEL_ENDPOINT"); otel != "" {
+		server.SetOtelEndpoint(otel)
+	}
+	if npd := os.Getenv("ENABLE_NPD"); npd == "true" || npd == "1" {
+		server.SetEnableNPD(true)
+	}
+	if script := os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT"); script != "" {
+		server.SetCustomBootstrapScript(script)
+	}
+
 	idleGrace := 60 * time.Second
 	if raw := os.Getenv("IDLE_GRACE_PERIOD"); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {

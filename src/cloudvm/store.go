@@ -2,8 +2,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -186,13 +188,336 @@ func atomicSaveWithFsync(path string, data []byte) error {
 	return nil
 }
 
-// CompletedStore persists terminal pod status records locally on PVC storage.
-type CompletedStore struct {
-	*diskMap[*CompletedPodRecord]
+// ----------------------------------------------------------------------------
+// Backend Interfaces
+// ----------------------------------------------------------------------------
+
+// CompletedStoreBackend defines the storage operations for completed pod records.
+type CompletedStoreBackend interface {
+	Get(podUID string) *CompletedPodRecord
+	Set(podUID string, rec *CompletedPodRecord) error
+	Delete(podUID string) error
+	GetAll() map[string]*CompletedPodRecord
 }
 
-// NewCompletedStore initializes a CompletedStore with the given file path.
-func NewCompletedStore(filePath string) (*CompletedStore, error) {
+// RegionStoreBackend defines the storage operations for instance-to-region mappings.
+type RegionStoreBackend interface {
+	Get(instanceID string) string
+	Set(instanceID, region string) error
+	Delete(instanceID string) error
+	GetAll() map[string]string
+}
+
+// TokenStoreBackend defines the storage operations for runner tokens.
+type TokenStoreBackend interface {
+	Get(instanceID string) string
+	Set(instanceID, token string) error
+	Delete(instanceID string) error
+	GetAll() map[string]string
+}
+
+// TombstoneStoreBackend defines the storage operations for tombstones.
+type TombstoneStoreBackend interface {
+	Has(id string) bool
+	Get(id string) (time.Time, bool)
+	Set(id string) error
+	Delete(id string) error
+	GetAll() map[string]time.Time
+}
+
+// ----------------------------------------------------------------------------
+// Connection Pooling Cache and Connection String Resolver
+// ----------------------------------------------------------------------------
+
+var (
+	globalPGStoresMu sync.Mutex
+	globalPGStores   = make(map[string]*PGStore)
+)
+
+func resolveConnStr(connStr ...string) string {
+	if len(connStr) > 0 {
+		return connStr[0]
+	}
+	return os.Getenv("DATABASE_URL")
+}
+
+func getOrCreatePGStore(connStr string) (*PGStore, error) {
+	globalPGStoresMu.Lock()
+	defer globalPGStoresMu.Unlock()
+
+	if store, ok := globalPGStores[connStr]; ok {
+		return store, nil
+	}
+
+	store, err := NewPGStore(connStr)
+	if err != nil {
+		return nil, err
+	}
+	globalPGStores[connStr] = store
+	return store, nil
+}
+
+// ResetGlobalPGStores closes all active cached PGStore connections and resets the cache.
+func ResetGlobalPGStores() {
+	globalPGStoresMu.Lock()
+	defer globalPGStoresMu.Unlock()
+	for _, s := range globalPGStores {
+		_ = s.Close()
+	}
+	globalPGStores = make(map[string]*PGStore)
+}
+
+// ----------------------------------------------------------------------------
+// diskMap Backend Implementations
+// ----------------------------------------------------------------------------
+
+type diskMapCompletedBackend struct {
+	dm *diskMap[*CompletedPodRecord]
+}
+
+func (b *diskMapCompletedBackend) Get(podUID string) *CompletedPodRecord {
+	rec, _ := b.dm.get(podUID)
+	return rec
+}
+
+func (b *diskMapCompletedBackend) Set(podUID string, rec *CompletedPodRecord) error {
+	if rec == nil {
+		return nil
+	}
+	return b.dm.set(podUID, rec, false)
+}
+
+func (b *diskMapCompletedBackend) Delete(podUID string) error {
+	return b.dm.delete(podUID, false)
+}
+
+func (b *diskMapCompletedBackend) GetAll() map[string]*CompletedPodRecord {
+	return b.dm.getAll()
+}
+
+type diskMapRegionBackend struct {
+	dm *diskMap[string]
+}
+
+func (b *diskMapRegionBackend) Get(instanceID string) string {
+	reg, _ := b.dm.get(instanceID)
+	return reg
+}
+
+func (b *diskMapRegionBackend) Set(instanceID, region string) error {
+	if region == "" {
+		return nil
+	}
+	return b.dm.set(instanceID, region, true)
+}
+
+func (b *diskMapRegionBackend) Delete(instanceID string) error {
+	return b.dm.delete(instanceID, true)
+}
+
+func (b *diskMapRegionBackend) GetAll() map[string]string {
+	return b.dm.getAll()
+}
+
+type diskMapTokenBackend struct {
+	dm *diskMap[string]
+}
+
+func (b *diskMapTokenBackend) Get(instanceID string) string {
+	tok, _ := b.dm.get(instanceID)
+	return tok
+}
+
+func (b *diskMapTokenBackend) Set(instanceID, token string) error {
+	if token == "" {
+		return nil
+	}
+	return b.dm.set(instanceID, token, false)
+}
+
+func (b *diskMapTokenBackend) Delete(instanceID string) error {
+	return b.dm.delete(instanceID, false)
+}
+
+func (b *diskMapTokenBackend) GetAll() map[string]string {
+	return b.dm.getAll()
+}
+
+type diskMapTombstoneBackend struct {
+	dm *diskMap[time.Time]
+}
+
+func (b *diskMapTombstoneBackend) Has(id string) bool {
+	_, exists := b.dm.get(id)
+	return exists
+}
+
+func (b *diskMapTombstoneBackend) Get(id string) (time.Time, bool) {
+	return b.dm.get(id)
+}
+
+func (b *diskMapTombstoneBackend) Set(id string) error {
+	return b.dm.set(id, time.Now(), false)
+}
+
+func (b *diskMapTombstoneBackend) Delete(id string) error {
+	return b.dm.delete(id, false)
+}
+
+func (b *diskMapTombstoneBackend) GetAll() map[string]time.Time {
+	return b.dm.getAll()
+}
+
+// ----------------------------------------------------------------------------
+// DBStore Generic Backend Implementations
+// ----------------------------------------------------------------------------
+
+type dbStoreCompletedBackend struct {
+	db DBStore
+}
+
+func (b *dbStoreCompletedBackend) Get(podUID string) *CompletedPodRecord {
+	rec, err := b.db.GetCompletedPod(context.Background(), podUID)
+	if err != nil {
+		log.Printf("[store] GetCompletedPod failed for %s: %v", podUID, err)
+	}
+	return rec
+}
+
+func (b *dbStoreCompletedBackend) Set(podUID string, rec *CompletedPodRecord) error {
+	return b.db.SetCompletedPod(context.Background(), podUID, rec)
+}
+
+func (b *dbStoreCompletedBackend) Delete(podUID string) error {
+	return b.db.DeleteCompletedPod(context.Background(), podUID)
+}
+
+func (b *dbStoreCompletedBackend) GetAll() map[string]*CompletedPodRecord {
+	all, err := b.db.GetAllCompletedPods(context.Background())
+	if err != nil {
+		log.Printf("[store] GetAllCompletedPods failed: %v", err)
+		return make(map[string]*CompletedPodRecord)
+	}
+	return all
+}
+
+type dbStoreRegionBackend struct {
+	db DBStore
+}
+
+func (b *dbStoreRegionBackend) Get(instanceID string) string {
+	reg, err := b.db.GetRegion(context.Background(), instanceID)
+	if err != nil {
+		log.Printf("[store] GetRegion failed for %s: %v", instanceID, err)
+	}
+	return reg
+}
+
+func (b *dbStoreRegionBackend) Set(instanceID, region string) error {
+	return b.db.SetRegion(context.Background(), instanceID, region)
+}
+
+func (b *dbStoreRegionBackend) Delete(instanceID string) error {
+	return b.db.DeleteRegion(context.Background(), instanceID)
+}
+
+func (b *dbStoreRegionBackend) GetAll() map[string]string {
+	all, err := b.db.GetAllRegions(context.Background())
+	if err != nil {
+		log.Printf("[store] GetAllRegions failed: %v", err)
+		return make(map[string]string)
+	}
+	return all
+}
+
+type dbStoreTokenBackend struct {
+	db DBStore
+}
+
+func (b *dbStoreTokenBackend) Get(instanceID string) string {
+	tok, err := b.db.GetToken(context.Background(), instanceID)
+	if err != nil {
+		log.Printf("[store] GetToken failed for %s: %v", instanceID, err)
+	}
+	return tok
+}
+
+func (b *dbStoreTokenBackend) Set(instanceID, token string) error {
+	return b.db.SetToken(context.Background(), instanceID, token)
+}
+
+func (b *dbStoreTokenBackend) Delete(instanceID string) error {
+	return b.db.DeleteToken(context.Background(), instanceID)
+}
+
+func (b *dbStoreTokenBackend) GetAll() map[string]string {
+	all, err := b.db.GetAllTokens(context.Background())
+	if err != nil {
+		log.Printf("[store] GetAllTokens failed: %v", err)
+		return make(map[string]string)
+	}
+	return all
+}
+
+type dbStoreTombstoneBackend struct {
+	db DBStore
+}
+
+func (b *dbStoreTombstoneBackend) Has(id string) bool {
+	exists, err := b.db.HasTombstone(context.Background(), id)
+	if err != nil {
+		log.Printf("[store] HasTombstone failed for %s: %v", id, err)
+	}
+	return exists
+}
+
+func (b *dbStoreTombstoneBackend) Get(id string) (time.Time, bool) {
+	t, exists, err := b.db.GetTombstone(context.Background(), id)
+	if err != nil {
+		log.Printf("[store] GetTombstone failed for %s: %v", id, err)
+	}
+	return t, exists
+}
+
+func (b *dbStoreTombstoneBackend) Set(id string) error {
+	return b.db.SetTombstone(context.Background(), id)
+}
+
+func (b *dbStoreTombstoneBackend) Delete(id string) error {
+	return b.db.DeleteTombstone(context.Background(), id)
+}
+
+func (b *dbStoreTombstoneBackend) GetAll() map[string]time.Time {
+	all, err := b.db.GetAllTombstones(context.Background())
+	if err != nil {
+		log.Printf("[store] GetAllTombstones failed: %v", err)
+		return make(map[string]time.Time)
+	}
+	return all
+}
+
+// ----------------------------------------------------------------------------
+// CompletedStore
+// ----------------------------------------------------------------------------
+
+// CompletedStore persists terminal pod status records locally on PVC storage or remotely in PostgreSQL.
+type CompletedStore struct {
+	*diskMap[*CompletedPodRecord]
+	backend CompletedStoreBackend
+}
+
+// NewCompletedStore initializes a CompletedStore with the given file path or connection string.
+// If connStr is provided and non-empty (or DATABASE_URL is set), it uses PostgreSQL;
+// otherwise it falls back to diskMap persistence.
+func NewCompletedStore(filePath string, connStr ...string) (*CompletedStore, error) {
+	targetConn := resolveConnStr(connStr...)
+	if targetConn != "" {
+		pg, err := getOrCreatePGStore(targetConn)
+		if err != nil {
+			return nil, err
+		}
+		return NewCompletedStoreFromDB(pg), nil
+	}
 	dm, err := newDiskMap("completed store", filePath, "cloudvm-completed-pods.json", false, func(records map[string]*CompletedPodRecord) {
 		if len(records) <= MaxStoreRecords {
 			return
@@ -213,100 +538,212 @@ func NewCompletedStore(filePath string) (*CompletedStore, error) {
 			delete(records, oldestUID)
 		}
 	})
-	return &CompletedStore{diskMap: dm}, err
+	return &CompletedStore{
+		backend: &diskMapCompletedBackend{dm: dm},
+		diskMap: dm,
+	}, err
+}
+
+// NewCompletedStoreFromDB initializes a CompletedStore backed by a DBStore.
+func NewCompletedStoreFromDB(db DBStore) *CompletedStore {
+	if pg, ok := db.(*PGStore); ok && pg != nil {
+		return &CompletedStore{backend: pg.Completed}
+	}
+	return &CompletedStore{backend: &dbStoreCompletedBackend{db: db}}
 }
 
 // Get returns the terminal record for a given podUID, or nil if not found.
 func (cs *CompletedStore) Get(podUID string) *CompletedPodRecord {
-	rec, _ := cs.get(podUID)
-	return rec
-}
-
-// Set commits a completed pod record to memory and disk.
-func (cs *CompletedStore) Set(podUID string, rec *CompletedPodRecord) error {
-	if rec == nil {
+	if cs == nil || cs.backend == nil {
 		return nil
 	}
-	return cs.set(podUID, rec, false)
+	return cs.backend.Get(podUID)
+}
+
+// Set commits a completed pod record to memory and disk or database.
+func (cs *CompletedStore) Set(podUID string, rec *CompletedPodRecord) error {
+	if cs == nil || cs.backend == nil || rec == nil {
+		return nil
+	}
+	return cs.backend.Set(podUID, rec)
 }
 
 // Delete removes a completed pod record upon explicit /delete.
 func (cs *CompletedStore) Delete(podUID string) error {
-	return cs.delete(podUID, false)
+	if cs == nil || cs.backend == nil {
+		return nil
+	}
+	return cs.backend.Delete(podUID)
 }
 
-// RegionStore safely persists instance-to-region mappings locally on PVC storage.
+// GetAll returns a copy of all completed pod records.
+func (cs *CompletedStore) GetAll() map[string]*CompletedPodRecord {
+	if cs == nil || cs.backend == nil {
+		return nil
+	}
+	return cs.backend.GetAll()
+}
+
+// ----------------------------------------------------------------------------
+// RegionStore
+// ----------------------------------------------------------------------------
+
+// RegionStore safely persists instance-to-region mappings locally on PVC storage or remotely in PostgreSQL.
 type RegionStore struct {
 	*diskMap[string]
+	backend RegionStoreBackend
 }
 
-// NewRegionStore initializes a RegionStore with the given file path.
-func NewRegionStore(filePath string) (*RegionStore, error) {
+// NewRegionStore initializes a RegionStore with the given file path or connection string.
+// If connStr is provided and non-empty (or DATABASE_URL is set), it uses PostgreSQL;
+// otherwise it falls back to diskMap persistence.
+func NewRegionStore(filePath string, connStr ...string) (*RegionStore, error) {
+	targetConn := resolveConnStr(connStr...)
+	if targetConn != "" {
+		pg, err := getOrCreatePGStore(targetConn)
+		if err != nil {
+			return nil, err
+		}
+		return NewRegionStoreFromDB(pg), nil
+	}
 	dm, err := newDiskMap[string]("region store", filePath, "cloudvm-instance-regions.json", true, nil)
-	return &RegionStore{diskMap: dm}, err
+	return &RegionStore{
+		backend: &diskMapRegionBackend{dm: dm},
+		diskMap: dm,
+	}, err
 }
 
-// Get returns the AWS region for the specified instance ID, or empty string if not found.
+// NewRegionStoreFromDB initializes a RegionStore backed by a DBStore.
+func NewRegionStoreFromDB(db DBStore) *RegionStore {
+	if pg, ok := db.(*PGStore); ok && pg != nil {
+		return &RegionStore{backend: pg.Regions}
+	}
+	return &RegionStore{backend: &dbStoreRegionBackend{db: db}}
+}
+
+// Get returns the cloud region for the specified instance ID, or empty string if not found.
 func (rs *RegionStore) Get(instanceID string) string {
-	reg, _ := rs.get(instanceID)
-	return reg
+	if rs == nil || rs.backend == nil {
+		return ""
+	}
+	return rs.backend.Get(instanceID)
 }
 
 // GetAll returns a thread-safe copy of all tracked instance-to-region mappings.
 func (rs *RegionStore) GetAll() map[string]string {
-	return rs.getAll()
-}
-
-// Set stores and persists the AWS region for the specified instance ID.
-func (rs *RegionStore) Set(instanceID, region string) error {
-	if region == "" {
+	if rs == nil || rs.backend == nil {
 		return nil
 	}
-	return rs.set(instanceID, region, true)
+	return rs.backend.GetAll()
+}
+
+// Set stores and persists the cloud region for the specified instance ID.
+func (rs *RegionStore) Set(instanceID, region string) error {
+	if rs == nil || rs.backend == nil || region == "" {
+		return nil
+	}
+	return rs.backend.Set(instanceID, region)
 }
 
 // Delete removes and persists the deletion of the specified instance ID.
 func (rs *RegionStore) Delete(instanceID string) error {
-	return rs.delete(instanceID, true)
+	if rs == nil || rs.backend == nil {
+		return nil
+	}
+	return rs.backend.Delete(instanceID)
 }
 
-// TokenStore safely persists in-VM runner authorization tokens locally.
+// ----------------------------------------------------------------------------
+// TokenStore
+// ----------------------------------------------------------------------------
+
+// TokenStore safely persists in-VM runner authorization tokens locally on PVC storage or remotely in PostgreSQL.
 type TokenStore struct {
 	*diskMap[string]
+	backend TokenStoreBackend
 }
 
-// NewTokenStore initializes a TokenStore with the given file path.
-func NewTokenStore(filePath string) (*TokenStore, error) {
+// NewTokenStore initializes a TokenStore with the given file path or connection string.
+// If connStr is provided and non-empty (or DATABASE_URL is set), it uses PostgreSQL;
+// otherwise it falls back to diskMap persistence.
+func NewTokenStore(filePath string, connStr ...string) (*TokenStore, error) {
+	targetConn := resolveConnStr(connStr...)
+	if targetConn != "" {
+		pg, err := getOrCreatePGStore(targetConn)
+		if err != nil {
+			return nil, err
+		}
+		return NewTokenStoreFromDB(pg), nil
+	}
 	dm, err := newDiskMap[string]("token store", filePath, "cloudvm-tokens.json", false, nil)
-	return &TokenStore{diskMap: dm}, err
+	return &TokenStore{
+		backend: &diskMapTokenBackend{dm: dm},
+		diskMap: dm,
+	}, err
+}
+
+// NewTokenStoreFromDB initializes a TokenStore backed by a DBStore.
+func NewTokenStoreFromDB(db DBStore) *TokenStore {
+	if pg, ok := db.(*PGStore); ok && pg != nil {
+		return &TokenStore{backend: pg.Tokens}
+	}
+	return &TokenStore{backend: &dbStoreTokenBackend{db: db}}
 }
 
 // Get returns the runner token for the specified instance ID, or empty string if not found.
 func (ts *TokenStore) Get(instanceID string) string {
-	tok, _ := ts.get(instanceID)
-	return tok
+	if ts == nil || ts.backend == nil {
+		return ""
+	}
+	return ts.backend.Get(instanceID)
 }
 
 // Set stores and persists the runner token for the specified instance ID.
 func (ts *TokenStore) Set(instanceID, token string) error {
-	if token == "" {
+	if ts == nil || ts.backend == nil || token == "" {
 		return nil
 	}
-	return ts.set(instanceID, token, false)
+	return ts.backend.Set(instanceID, token)
 }
 
 // Delete removes and persists the token deletion for the specified instance ID.
 func (ts *TokenStore) Delete(instanceID string) error {
-	return ts.delete(instanceID, false)
+	if ts == nil || ts.backend == nil {
+		return nil
+	}
+	return ts.backend.Delete(instanceID)
 }
 
-// TombstoneStore safely persists explicitly deleted pod UIDs and instance IDs locally.
+// GetAll returns all stored runner tokens mapped by instance ID.
+func (ts *TokenStore) GetAll() map[string]string {
+	if ts == nil || ts.backend == nil {
+		return nil
+	}
+	return ts.backend.GetAll()
+}
+
+// ----------------------------------------------------------------------------
+// TombstoneStore
+// ----------------------------------------------------------------------------
+
+// TombstoneStore safely persists explicitly deleted pod UIDs and instance IDs locally or remotely in PostgreSQL.
 type TombstoneStore struct {
 	*diskMap[time.Time]
+	backend TombstoneStoreBackend
 }
 
-// NewTombstoneStore initializes a TombstoneStore with the given file path.
-func NewTombstoneStore(filePath string) (*TombstoneStore, error) {
+// NewTombstoneStore initializes a TombstoneStore with the given file path or connection string.
+// If connStr is provided and non-empty (or DATABASE_URL is set), it uses PostgreSQL;
+// otherwise it falls back to diskMap persistence.
+func NewTombstoneStore(filePath string, connStr ...string) (*TombstoneStore, error) {
+	targetConn := resolveConnStr(connStr...)
+	if targetConn != "" {
+		pg, err := getOrCreatePGStore(targetConn)
+		if err != nil {
+			return nil, err
+		}
+		return NewTombstoneStoreFromDB(pg), nil
+	}
 	dm, err := newDiskMap("tombstone store", filePath, "cloudvm-tombstones.json", false, func(tombstones map[string]time.Time) {
 		if len(tombstones) <= MaxStoreRecords {
 			return
@@ -318,26 +755,56 @@ func NewTombstoneStore(filePath string) (*TombstoneStore, error) {
 			}
 		}
 	})
-	return &TombstoneStore{diskMap: dm}, err
+	return &TombstoneStore{
+		backend: &diskMapTombstoneBackend{dm: dm},
+		diskMap: dm,
+	}, err
+}
+
+// NewTombstoneStoreFromDB initializes a TombstoneStore backed by a DBStore.
+func NewTombstoneStoreFromDB(db DBStore) *TombstoneStore {
+	if pg, ok := db.(*PGStore); ok && pg != nil {
+		return &TombstoneStore{backend: pg.Tombstones}
+	}
+	return &TombstoneStore{backend: &dbStoreTombstoneBackend{db: db}}
 }
 
 // Has returns true if the specified ID is recorded in the tombstone store.
 func (ts *TombstoneStore) Has(id string) bool {
-	_, exists := ts.get(id)
-	return exists
+	if ts == nil || ts.backend == nil {
+		return false
+	}
+	return ts.backend.Has(id)
 }
 
-// Set commits a tombstone to memory and disk.
+// Get returns the creation timestamp and presence flag for the given ID.
+func (ts *TombstoneStore) Get(id string) (time.Time, bool) {
+	if ts == nil || ts.backend == nil {
+		return time.Time{}, false
+	}
+	return ts.backend.Get(id)
+}
+
+// Set commits a tombstone to memory and disk or database.
 func (ts *TombstoneStore) Set(id string) error {
-	return ts.set(id, time.Now(), false)
+	if ts == nil || ts.backend == nil {
+		return nil
+	}
+	return ts.backend.Set(id)
 }
 
-// Delete removes a tombstone from memory and disk.
+// Delete removes a tombstone from memory and disk or database.
 func (ts *TombstoneStore) Delete(id string) error {
-	return ts.delete(id, false)
+	if ts == nil || ts.backend == nil {
+		return nil
+	}
+	return ts.backend.Delete(id)
 }
 
 // GetAll returns a thread-safe copy of all tombstones.
 func (ts *TombstoneStore) GetAll() map[string]time.Time {
-	return ts.getAll()
+	if ts == nil || ts.backend == nil {
+		return nil
+	}
+	return ts.backend.GetAll()
 }

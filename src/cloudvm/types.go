@@ -126,6 +126,14 @@ type InstanceSpec struct {
 	AssignedGPUs []int `json:"assignedGPUs,omitempty"`
 	// DockerConfigJSON holds the serialized .dockerconfigjson for private container registry authentication.
 	DockerConfigJSON string `json:"dockerConfigJSON,omitempty"`
+	// RegistryMirrors specifies custom container registry mirror URLs.
+	RegistryMirrors []string `json:"registryMirrors,omitempty"`
+	// OtelEndpoint specifies the OpenTelemetry metrics/traces exporter target.
+	OtelEndpoint string `json:"otelEndpoint,omitempty"`
+	// NodeProblemDetector enables standalone node-problem-detector daemon on the VM.
+	NodeProblemDetector bool `json:"nodeProblemDetector,omitempty"`
+	// CustomBootstrapScript holds arbitrary bash or systemd bootstrap commands appended to cloud-init.
+	CustomBootstrapScript string `json:"customBootstrapScript,omitempty"`
 }
 
 // Instance represents an active or terminating cloud VM instance.

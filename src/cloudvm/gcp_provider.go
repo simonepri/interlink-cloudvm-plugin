@@ -350,6 +350,11 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		MemoryBytes:          spec.MemoryBytes,
 		RunAsUser:            spec.RunAsUser,
 		RunAsGroup:           spec.RunAsGroup,
+		DockerConfigJSON:     spec.DockerConfigJSON,
+		RegistryMirrors:      spec.RegistryMirrors,
+		OtelEndpoint:         spec.OtelEndpoint,
+		NodeProblemDetector:  spec.NodeProblemDetector,
+		CustomBootstrapScript: spec.CustomBootstrapScript,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate gcp startup script: %w", err)

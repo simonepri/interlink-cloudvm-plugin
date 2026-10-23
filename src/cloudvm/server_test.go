@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestMain(m *testing.M) {
@@ -1171,5 +1173,132 @@ func TestServer_WarmNodeReuseAcrossPodDeletions(t *testing.T) {
 
 	if srv.NodePool().ActiveNodeCount() != 0 {
 		t.Fatalf("expected 0 active nodes after idle termination, got %d", srv.NodePool().ActiveNodeCount())
+	}
+}
+
+func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
+	mockProv := NewMockProvider()
+	srv := NewServer(mockProv, "test-cluster")
+
+	srv.SetRegistryMirrors([]string{"mirror1.example.com", "mirror2.example.com"})
+	srv.SetOtelEndpoint("otel-collector:4317")
+	srv.SetEnableNPD(true)
+	srv.SetCustomBootstrapScript("echo global-bootstrap")
+
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// 1. Pod without annotations should inherit server generic daemon options
+	payload1 := `{"pod": {"metadata": {"name": "daemon-pod-1", "namespace": "default", "uid": "uid-daemon-1"}}}`
+	resp1, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(payload1))
+	if err != nil {
+		t.Fatalf("POST /create failed: %v", err)
+	}
+	_ = resp1.Body.Close()
+
+	spec1 := mockProv.LastSpec()
+	if spec1 == nil {
+		t.Fatalf("expected LastSpec to be populated")
+	}
+	if len(spec1.RegistryMirrors) != 2 || spec1.RegistryMirrors[0] != "mirror1.example.com" {
+		t.Errorf("expected inherited RegistryMirrors, got: %v", spec1.RegistryMirrors)
+	}
+	if spec1.OtelEndpoint != "otel-collector:4317" {
+		t.Errorf("expected inherited OtelEndpoint, got: %s", spec1.OtelEndpoint)
+	}
+	if !spec1.NodeProblemDetector {
+		t.Errorf("expected NodeProblemDetector to be true")
+	}
+	if spec1.CustomBootstrapScript != "echo global-bootstrap" {
+		t.Errorf("expected inherited CustomBootstrapScript, got: %s", spec1.CustomBootstrapScript)
+	}
+
+	// 2. Pod with custom annotations should override server generic daemon options
+	mockProv2 := NewMockProvider()
+	srv2 := NewServer(mockProv2, "test-cluster")
+	srv2.SetRegistryMirrors([]string{"mirror1.example.com", "mirror2.example.com"})
+	srv2.SetOtelEndpoint("otel-collector:4317")
+	srv2.SetEnableNPD(false)
+	srv2.SetCustomBootstrapScript("echo global-bootstrap")
+
+	ts2 := httptest.NewServer(srv2.Routes())
+	defer ts2.Close()
+
+	payload2 := `{
+		"pod": {
+			"metadata": {
+				"name": "daemon-pod-2",
+				"namespace": "default",
+				"uid": "uid-daemon-2",
+				"annotations": {
+					"cloudvm.vk.io/registry-mirrors": "override.mirror.io,backup.mirror.io",
+					"cloudvm.vk.io/otel-endpoint": "custom-otel:4317",
+					"cloudvm.vk.io/enable-npd": "true",
+					"cloudvm.vk.io/custom-bootstrap-script": "echo pod-bootstrap"
+				}
+			}
+		}
+	}`
+	resp2, err := http.Post(ts2.URL+"/create", "application/json", strings.NewReader(payload2))
+	if err != nil {
+		t.Fatalf("POST /create for pod 2 failed: %v", err)
+	}
+	_ = resp2.Body.Close()
+
+	spec2 := mockProv2.LastSpec()
+	if spec2 == nil {
+		t.Fatalf("expected LastSpec to be populated for pod 2")
+	}
+	if len(spec2.RegistryMirrors) != 2 || spec2.RegistryMirrors[0] != "override.mirror.io" {
+		t.Errorf("expected overridden RegistryMirrors, got: %v", spec2.RegistryMirrors)
+	}
+	if spec2.OtelEndpoint != "custom-otel:4317" {
+		t.Errorf("expected overridden OtelEndpoint, got: %s", spec2.OtelEndpoint)
+	}
+	if spec2.CustomBootstrapScript != "echo pod-bootstrap" {
+		t.Errorf("expected overridden CustomBootstrapScript, got: %s", spec2.CustomBootstrapScript)
+	}
+}
+
+func TestServer_PostgresHAStoresWiring(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("failed to create sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	pg := NewPGStoreWithDB(db)
+	mockProv := NewMockProvider()
+	srv := NewServer(mockProv, "test-cluster")
+
+	// SetTombstoneStore populates initial tombstones cache via GetAll
+	mock.ExpectQuery("SELECT id, created_at FROM cloudvm_tombstones").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}))
+
+	srv.SetTokenStore(pg.TokenStore())
+	srv.SetCompletedStore(pg.CompletedStore())
+	srv.SetTombstoneStore(pg.TombstoneStore())
+	srv.SetRegionStore(pg.RegionStore())
+
+	// Verify token operations through server wired store
+	mock.ExpectExec("INSERT INTO cloudvm_tokens").
+		WithArgs("inst-123", "tok-secret", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := srv.tokenStore.Set("inst-123", "tok-secret"); err != nil {
+		t.Fatalf("tokenStore.Set failed: %v", err)
+	}
+
+	// Verify tombstone operations through server wired store
+	mock.ExpectQuery("SELECT 1 FROM cloudvm_tombstones WHERE id = \\$1").
+		WithArgs("tomb-123").
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+
+	if !srv.tombstoneStore.Has("tomb-123") {
+		t.Fatalf("expected tombstoneStore.Has to return true")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unfulfilled sqlmock expectations: %v", err)
 	}
 }
