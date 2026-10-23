@@ -198,3 +198,9 @@ func TestSpotPriceTicker_AZKeyingAndTimestampOrdering(t *testing.T) {
 		t.Fatalf("expected cheapest price 0.3800 across region, got %+v", cheapest)
 	}
 }
+func (m *mockSpotPriceFetcher) GetSpotPlacementScores(ctx context.Context, params *ec2.GetSpotPlacementScoresInput, optFns ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error) {
+	return &ec2.GetSpotPlacementScoresOutput{}, nil
+}
+func (m *mockMultiAZSpotFetcher) GetSpotPlacementScores(ctx context.Context, params *ec2.GetSpotPlacementScoresInput, optFns ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error) {
+	return &ec2.GetSpotPlacementScoresOutput{}, nil
+}

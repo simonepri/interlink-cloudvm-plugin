@@ -20,9 +20,18 @@ import (
 // SpotPriceFetcher abstracts AWS DescribeSpotPriceHistory for testing.
 type SpotPriceFetcher interface {
 	DescribeSpotPriceHistory(ctx context.Context, params *ec2.DescribeSpotPriceHistoryInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error)
+	GetSpotPlacementScores(ctx context.Context, params *ec2.GetSpotPlacementScoresInput, optFns ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error)
 }
 
 // SpotPriceEntry represents a real-time spot price record.
+type PlacementScoreEntry struct {
+	Region           string    `json:"region"`
+	AvailabilityZone string    `json:"availabilityZone,omitempty"`
+	InstanceType     string    `json:"instanceType"`
+	Score            int32     `json:"score"`
+	Timestamp        time.Time `json:"timestamp"`
+}
+
 type SpotPriceEntry struct {
 	Region           string    `json:"region"`
 	AvailabilityZone string    `json:"availabilityZone,omitempty"`
@@ -38,7 +47,8 @@ func tickerKey(region, az, instanceType string) string {
 // SpotPriceTicker maintains a live cache of spot prices and exports Prometheus metrics.
 type SpotPriceTicker struct {
 	mu             sync.RWMutex
-	prices         map[string]*SpotPriceEntry // key: "region/instanceType"
+	prices         map[string]*SpotPriceEntry
+	scores         map[string]*PlacementScoreEntry
 	regions        []string
 	instanceTypes  []string
 	scrapeInterval time.Duration
@@ -59,6 +69,7 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 
 	return &SpotPriceTicker{
 		prices:         make(map[string]*SpotPriceEntry),
+		scores:         make(map[string]*PlacementScoreEntry),
 		regions:        regions,
 		instanceTypes:  instanceTypes,
 		scrapeInterval: scrapeInterval,
@@ -132,9 +143,86 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 	}
 }
 
+
+// PollPlacementScores queries AWS GetSpotPlacementScores for configured instance types.
+func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
+	for _, reg := range t.regions {
+		fetcher, err := t.fetcherFactory(ctx, reg)
+		if err != nil {
+			continue
+		}
+
+		targetCapacity := int32(1)
+		out, err := fetcher.GetSpotPlacementScores(ctx, &ec2.GetSpotPlacementScoresInput{
+			InstanceTypes:          t.instanceTypes,
+			RegionNames:            []string{reg},
+			TargetCapacity:         &targetCapacity,
+			SingleAvailabilityZone: aws.Bool(false),
+		})
+		if err != nil {
+			cleanReg := sanitizeLog(reg)
+			log.Printf("[cloudvm-ticker] Error querying spot placement scores in %s: %v", cleanReg, err)
+			continue
+		}
+
+		now := time.Now()
+		t.mu.Lock()
+		for _, item := range out.SpotPlacementScores {
+			score := aws.ToInt32(item.Score)
+			regionName := aws.ToString(item.Region)
+			az := aws.ToString(item.AvailabilityZoneId)
+			for _, itype := range t.instanceTypes {
+				key := tickerKey(regionName, az, itype)
+				t.scores[key] = &PlacementScoreEntry{
+					Region:           regionName,
+					AvailabilityZone: az,
+					InstanceType:     itype,
+					Score:            score,
+					Timestamp:        now,
+				}
+			}
+		}
+		t.mu.Unlock()
+	}
+}
+
+// AllScores returns a snapshot of all tracked placement scores.
+func (t *SpotPriceTicker) AllScores() map[string]*PlacementScoreEntry {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make(map[string]*PlacementScoreEntry, len(t.scores))
+	for k, v := range t.scores {
+		out[k] = v
+	}
+	return out
+}
+
+// OnDemandBaselineUSD returns standard AWS on-demand pricing baseline for known shapes.
+func OnDemandBaselineUSD(instanceType string) float64 {
+	switch instanceType {
+	case "g5.xlarge":
+		return 1.006
+	case "g5.2xlarge":
+		return 1.212
+	case "g5.12xlarge":
+		return 5.672
+	case "g5.48xlarge":
+		return 16.288
+	case "g6.xlarge":
+		return 0.804
+	case "g6.2xlarge":
+		return 0.977
+	case "p4d.24xlarge":
+		return 32.7726
+	default:
+		return 1.000
+	}
+}
+
 // Start runs the background polling loop until ctx is canceled.
 func (t *SpotPriceTicker) Start(ctx context.Context) {
 	t.PollOnce(ctx)
+	t.PollPlacementScores(ctx)
 	ticker := time.NewTicker(t.scrapeInterval)
 	defer ticker.Stop()
 
@@ -144,6 +232,7 @@ func (t *SpotPriceTicker) Start(ctx context.Context) {
 			return
 		case <-ticker.C:
 			t.PollOnce(ctx)
+			t.PollPlacementScores(ctx)
 		}
 	}
 }
@@ -200,13 +289,37 @@ func (t *SpotPriceTicker) Routes() http.Handler {
 		_, _ = fmt.Fprintln(w, "# HELP cloudvm_spot_price_usd_per_hour Current spot price in USD per hour")
 		_, _ = fmt.Fprintln(w, "# TYPE cloudvm_spot_price_usd_per_hour gauge")
 		for _, entry := range t.AllPrices() {
+			ondemand := OnDemandBaselineUSD(entry.InstanceType)
+			_, _ = fmt.Fprintf(w, "cloudvm_ondemand_price_usd_per_hour{region=\"%s\",instance_type=\"%s\"} %.4f\n",
+				entry.Region, entry.InstanceType, ondemand)
+
+			savingsPct := 0.0
+			if ondemand > 0 && entry.SpotPriceUSD > 0 && entry.SpotPriceUSD < ondemand {
+				savingsPct = ((ondemand - entry.SpotPriceUSD) / ondemand) * 100.0
+			}
+
 			if entry.AvailabilityZone != "" {
 				_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %.4f\n",
 					entry.Region, entry.AvailabilityZone, entry.InstanceType, entry.SpotPriceUSD)
+				_, _ = fmt.Fprintf(w, "cloudvm_spot_savings_percentage{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %.2f\n",
+					entry.Region, entry.AvailabilityZone, entry.InstanceType, savingsPct)
 			} else {
 				_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",instance_type=\"%s\"} %.4f\n",
 					entry.Region, entry.InstanceType, entry.SpotPriceUSD)
+				_, _ = fmt.Fprintf(w, "cloudvm_spot_savings_percentage{region=\"%s\",instance_type=\"%s\"} %.2f\n",
+					entry.Region, entry.InstanceType, savingsPct)
 			}
+		}
+
+		_, _ = fmt.Fprintln(w, "# HELP cloudvm_spot_placement_score Current AWS spot placement score (1-10) indicating capacity depth")
+		_, _ = fmt.Fprintln(w, "# TYPE cloudvm_spot_placement_score gauge")
+		for _, entry := range t.AllScores() {
+			az := entry.AvailabilityZone
+			if az == "" {
+				az = "all"
+			}
+			_, _ = fmt.Fprintf(w, "cloudvm_spot_placement_score{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %d\n",
+				entry.Region, az, entry.InstanceType, entry.Score)
 		}
 	})
 
