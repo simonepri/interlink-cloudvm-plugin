@@ -3,9 +3,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"strings"
@@ -51,6 +53,8 @@ type NodePoolProvider interface {
 }
 
 // Reconciler handles background garbage collection for opportunistic VMs.
+const defaultMaxPingConcurrency = 20
+
 type Reconciler struct {
 	inventory         CloudInventory
 	tracker           PodStateTracker
@@ -62,6 +66,8 @@ type Reconciler struct {
 	nodePool          *NodePool
 	httpClient        *http.Client
 	pingInterval      time.Duration
+	pingConcurrency   int
+	pingJitter        time.Duration
 }
 
 // SetOnTerminated registers a callback invoked when a zombie instance is terminated.
@@ -94,6 +100,8 @@ func NewReconciler(inventory CloudInventory, tracker PodStateTracker, terminator
 		graceTTL:          graceTTL,
 		launchGracePeriod: 2 * time.Minute,
 		pingInterval:      30 * time.Second,
+		pingConcurrency:   defaultMaxPingConcurrency,
+		pingJitter:        5 * time.Millisecond,
 		httpClient:        &http.Client{Timeout: 5 * time.Second},
 	}
 	if p, ok := tracker.(NodePoolProvider); ok {
@@ -117,6 +125,16 @@ func (r *Reconciler) SetPingInterval(d time.Duration) {
 	if d > 0 {
 		r.pingInterval = d
 	}
+}
+
+// SetPingConcurrency configures the maximum concurrent keep-alive pings.
+func (r *Reconciler) SetPingConcurrency(n int) {
+	r.pingConcurrency = n
+}
+
+// SetPingJitter configures the per-node keep-alive ping jitter.
+func (r *Reconciler) SetPingJitter(d time.Duration) {
+	r.pingJitter = d
 }
 
 func (r *Reconciler) getNodePool() *NodePool {
@@ -150,12 +168,23 @@ func (r *Reconciler) pingActiveNodes(ctx context.Context) {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
 
+	limit := r.pingConcurrency
+	if limit <= 0 {
+		limit = defaultMaxPingConcurrency
+	}
+	sem := make(chan struct{}, limit)
+
 	var wg sync.WaitGroup
+NodeLoop:
 	for _, n := range nodes {
 		if n == nil {
 			continue
 		}
 		if n.IsCordoned() || n.Cordoned {
+			continue
+		}
+		// Only ping idle nodes! Running workloads keep the VM alive without provider pings.
+		if n.AllocatedPods > 0 || len(n.Pods) > 0 || n.ActivePodCount() > 0 {
 			continue
 		}
 
@@ -170,9 +199,28 @@ func (r *Reconciler) pingActiveNodes(ctx context.Context) {
 			continue
 		}
 
+		select {
+		case <-ctx.Done():
+			break NodeLoop
+		case sem <- struct{}{}:
+		}
+
 		wg.Add(1)
 		go func(node *CloudVMNode, nodeIP string) {
 			defer wg.Done()
+			defer func() { <-sem }()
+
+			if r.pingJitter > 0 {
+				jitter := cryptoRandDuration(r.pingJitter)
+				if jitter > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(jitter):
+					}
+				}
+			}
+
 			r.pingSingleNode(ctx, client, node, nodeIP)
 		}(n, ip)
 	}
@@ -217,6 +265,17 @@ func (r *Reconciler) pingSingleNode(ctx context.Context, client *http.Client, no
 	}
 }
 
+func cryptoRandDuration(maxDuration time.Duration) time.Duration {
+	if maxDuration <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxDuration)))
+	if err != nil {
+		return 0
+	}
+	return time.Duration(n.Int64())
+}
+
 // Start runs the keep-alive ping ticker loop (every 30 seconds by default) until ctx is cancelled.
 func (r *Reconciler) Start(ctx context.Context) {
 	interval := r.pingInterval
@@ -227,14 +286,18 @@ func (r *Reconciler) Start(ctx context.Context) {
 	// Dispatch initial ping immediately
 	r.pingActiveNodes(ctx)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	for {
+		var jitter time.Duration
+		if interval > 10*time.Millisecond {
+			jitter = cryptoRandDuration(interval / 10)
+		}
+		timer := time.NewTimer(interval + jitter)
+
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			r.pingActiveNodes(ctx)
 		}
 	}

@@ -667,3 +667,164 @@ func TestReconciler_KeepAliveStartTickerLoop(t *testing.T) {
 		t.Fatalf("expected at least 2 pings in ticker loop, got %d", got)
 	}
 }
+
+func TestReconciler_KeepAlivePingsSkipBusyNodes(t *testing.T) {
+	var pingReceivedTokens sync.Map
+	var pingCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		token := strings.TrimPrefix(auth, "Bearer ")
+		pingReceivedTokens.Store(token, true)
+		pingCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	hostPort := ts.Listener.Addr().String()
+	np := NewNodePool(60 * time.Second)
+
+	// Node 1: Idle node (0 allocated pods) -> MUST be pinged
+	nodeIdle := NewCloudVMNode("i-idle-1", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+	nodeIdle.RunnerAuthToken = "token-idle-1" //nolint:gosec // test token
+	np.RegisterNode(nodeIdle)
+
+	// Node 2: Busy node with AllocatedPods > 0 -> MUST be skipped
+	nodeBusyAlloc := NewCloudVMNode("i-busy-alloc-2", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+	nodeBusyAlloc.RunnerAuthToken = "token-busy-alloc" //nolint:gosec // test token
+	nodeBusyAlloc.AllocatedPods = 1
+	np.RegisterNode(nodeBusyAlloc)
+
+	// Node 3: Busy node with Pods slice non-empty -> MUST be skipped
+	nodeBusyPods := NewCloudVMNode("i-busy-pods-3", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+	nodeBusyPods.RunnerAuthToken = "token-busy-pods" //nolint:gosec // test token
+	nodeBusyPods.Pods = []string{"pod-test-1"}
+	np.RegisterNode(nodeBusyPods)
+
+	// Node 4: Busy node with active assigned pod -> MUST be skipped
+	nodeBusyActive := NewCloudVMNode("i-busy-active-4", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+	nodeBusyActive.RunnerAuthToken = "token-busy-active" //nolint:gosec // test token
+	nodeBusyActive.AssignPod(&PodAllocation{
+		PodUID: "pod-uid-4",
+	})
+	np.RegisterNode(nodeBusyActive)
+
+	mock := NewMockProvider()
+	reconciler := NewReconciler(mock, nil, mock, "test-cluster", 10*time.Minute)
+	reconciler.SetNodePool(np)
+	reconciler.SetPingJitter(0)
+
+	reconciler.PingActiveNodes(context.Background())
+
+	if got := pingCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 ping to idle node, got %d", got)
+	}
+
+	if _, ok := pingReceivedTokens.Load("token-idle-1"); !ok {
+		t.Errorf("expected idle node to receive ping")
+	}
+	if _, ok := pingReceivedTokens.Load("token-busy-alloc"); ok {
+		t.Errorf("expected busy node with AllocatedPods > 0 to be skipped")
+	}
+	if _, ok := pingReceivedTokens.Load("token-busy-pods"); ok {
+		t.Errorf("expected busy node with len(Pods) > 0 to be skipped")
+	}
+	if _, ok := pingReceivedTokens.Load("token-busy-active"); ok {
+		t.Errorf("expected busy node with active assigned pod to be skipped")
+	}
+}
+
+func TestReconciler_KeepAlivePingsConcurrencyClamped(t *testing.T) {
+	var currentConcurrent atomic.Int32
+	var peakConcurrent atomic.Int32
+	var totalPings atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		curr := currentConcurrent.Add(1)
+		defer currentConcurrent.Add(-1)
+
+		for {
+			peak := peakConcurrent.Load()
+			if curr <= peak || peakConcurrent.CompareAndSwap(peak, curr) {
+				break
+			}
+		}
+
+		totalPings.Add(1)
+		time.Sleep(20 * time.Millisecond)
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	hostPort := ts.Listener.Addr().String()
+
+	t.Run("DefaultBound20", func(t *testing.T) {
+		np := NewNodePool(60 * time.Second)
+		totalNodes := 50
+		for i := 0; i < totalNodes; i++ {
+			node := NewCloudVMNode(fmt.Sprintf("i-node-%d", i), ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+			node.RunnerAuthToken = fmt.Sprintf("token-%d", i) //nolint:gosec // test token
+			np.RegisterNode(node)
+		}
+
+		mock := NewMockProvider()
+		reconciler := NewReconciler(mock, nil, mock, "test-cluster", 10*time.Minute)
+		reconciler.SetNodePool(np)
+		reconciler.SetPingJitter(0)
+
+		currentConcurrent.Store(0)
+		peakConcurrent.Store(0)
+		totalPings.Store(0)
+
+		reconciler.PingActiveNodes(context.Background())
+
+		if got := totalPings.Load(); got != int32(totalNodes) {
+			t.Fatalf("expected %d total pings, got %d", totalNodes, got)
+		}
+
+		peak := peakConcurrent.Load()
+		if peak > 20 {
+			t.Fatalf("peak concurrency %d exceeded semaphore bound of 20", peak)
+		}
+		if peak < 2 {
+			t.Fatalf("expected concurrent pings, got peak concurrency %d", peak)
+		}
+	})
+
+	t.Run("CustomBoundClamped", func(t *testing.T) {
+		np := NewNodePool(60 * time.Second)
+		totalNodes := 20
+		for i := 0; i < totalNodes; i++ {
+			node := NewCloudVMNode(fmt.Sprintf("i-custom-%d", i), ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+			node.RunnerAuthToken = fmt.Sprintf("token-custom-%d", i) //nolint:gosec // test token
+			np.RegisterNode(node)
+		}
+
+		mock := NewMockProvider()
+		reconciler := NewReconciler(mock, nil, mock, "test-cluster", 10*time.Minute)
+		reconciler.SetNodePool(np)
+		reconciler.SetPingConcurrency(5)
+		reconciler.SetPingJitter(0)
+
+		currentConcurrent.Store(0)
+		peakConcurrent.Store(0)
+		totalPings.Store(0)
+
+		reconciler.PingActiveNodes(context.Background())
+
+		if got := totalPings.Load(); got != int32(totalNodes) {
+			t.Fatalf("expected %d total pings, got %d", totalNodes, got)
+		}
+
+		peak := peakConcurrent.Load()
+		if peak > 5 {
+			t.Fatalf("peak concurrency %d exceeded custom semaphore bound of 5", peak)
+		}
+		if peak < 2 {
+			t.Fatalf("expected concurrent pings, got peak concurrency %d", peak)
+		}
+	})
+}
