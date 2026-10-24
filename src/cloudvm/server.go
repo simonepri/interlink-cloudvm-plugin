@@ -58,6 +58,8 @@ type Server struct {
 	otelEndpoint          string
 	enableNPD             bool
 	customBootstrapScript string
+	launchTimeout         time.Duration
+	podSightingTimeout    time.Duration
 	tombstones            map[string]time.Time                 // podUID or instanceID -> deletion timestamp
 	activeSightings       map[string]time.Time                 // podUID -> last seen in /status or /create
 	statusPolled          bool                                 // set true when first /status query is received
@@ -93,21 +95,23 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		log.Printf("[cloudvm] ERROR loading tombstone store: %v", err)
 	}
 	s := &Server{
-		providers:       make(map[ProviderType]Provider),
-		defaultProv:     defaultProvider,
-		instances:       make(map[string]*Instance),
-		clusterTag:      clusterTag,
-		defaultRegion:   "us-east-1",
-		nodePool:        NewNodePool(0),
-		runner:          NewMockContainerRunner(),
-		tokenStore:      tokStore,
-		completedStore:  compStore,
-		tombstoneStore:  tombStore,
-		tombstones:      make(map[string]time.Time),
-		activeSightings: make(map[string]time.Time),
-		launchTokens:    make(map[string]string),
-		completedPods:   make(map[string]*ContainerTerminatedState),
-		inFlightCreates: make(map[string]*inFlightCreate),
+		providers:          make(map[ProviderType]Provider),
+		defaultProv:        defaultProvider,
+		instances:          make(map[string]*Instance),
+		clusterTag:         clusterTag,
+		defaultRegion:      "us-east-1",
+		launchTimeout:      5 * time.Minute,
+		podSightingTimeout: 10 * time.Minute,
+		nodePool:           NewNodePool(0),
+		runner:             NewMockContainerRunner(),
+		tokenStore:         tokStore,
+		completedStore:     compStore,
+		tombstoneStore:     tombStore,
+		tombstones:         make(map[string]time.Time),
+		activeSightings:    make(map[string]time.Time),
+		launchTokens:       make(map[string]string),
+		completedPods:      make(map[string]*ContainerTerminatedState),
+		inFlightCreates:    make(map[string]*inFlightCreate),
 	}
 	if tombStore != nil {
 		for k, v := range tombStore.GetAll() {
@@ -292,6 +296,20 @@ func (s *Server) NodePool() *NodePool {
 func (s *Server) SetIdleGracePeriod(d time.Duration) {
 	if s.nodePool != nil {
 		s.nodePool.SetIdleGracePeriod(d)
+	}
+}
+
+// SetLaunchTimeout overrides the maximum allowed duration for bare VM creation and bootstrap.
+func (s *Server) SetLaunchTimeout(d time.Duration) {
+	if d > 0 {
+		s.launchTimeout = d
+	}
+}
+
+// SetPodSightingTimeout overrides the TTL for keeping active pod sightings before garbage collection.
+func (s *Server) SetPodSightingTimeout(d time.Duration) {
+	if d > 0 {
+		s.podSightingTimeout = d
 	}
 }
 
@@ -732,7 +750,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	spec.AssignedGPUs = preAssignedGPUs
 
 	// Detach from client HTTP request context so client timeouts or cancellations do not abort in-flight VM launch
-	launchCtx, launchCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
+	launchTimeout := s.launchTimeout
+	if launchTimeout <= 0 {
+		launchTimeout = 5 * time.Minute
+	}
+	launchCtx, launchCancel := context.WithTimeout(context.WithoutCancel(r.Context()), launchTimeout)
 	defer launchCancel()
 
 	inst, err := prov.Launch(launchCtx, spec)
@@ -1007,7 +1029,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		// Prune expired sightings older than 10 minutes
 		for uid, seenAt := range s.activeSightings {
-			if now.Sub(seenAt) > 10*time.Minute {
+			sightingTTL := s.podSightingTimeout
+			if sightingTTL <= 0 {
+				sightingTTL = 10 * time.Minute
+			}
+			if now.Sub(seenAt) > sightingTTL {
 				delete(s.activeSightings, uid)
 			}
 		}

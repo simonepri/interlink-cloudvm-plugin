@@ -3,7 +3,9 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -27,12 +29,59 @@ type MarketOffer struct {
 	ProbeLimit      bool    `json:"probeLimit"`      // True if provider refused probe
 }
 
-// Fixed ladder probing tiers as specified in the design document.
+// Default ladder probing tiers.
 var (
-	LadderSizes       = []int{8, 64, 256, 1000}
-	LadderMemoryTiers = []int{24, 40, 80}
-	LadderRegionCaps  = []string{"1", "2", "unlimited"}
+	DefaultLadderSizes       = []int{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}
+	DefaultLadderMemoryTiers = []int{24, 40, 80}
+	DefaultLadderRegionCaps  = []string{"1", "2", "unlimited"}
+
+	LadderSizes       = DefaultLadderSizes
+	LadderMemoryTiers = DefaultLadderMemoryTiers
+	LadderRegionCaps  = DefaultLadderRegionCaps
 )
+
+func parseIntList(val string) []int {
+	var out []int
+	for _, item := range strings.Split(val, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			if n, err := strconv.Atoi(item); err == nil && n > 0 {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// LoadLadderConfigFromEnv initializes ladder parameters from environment variables if present.
+func LoadLadderConfigFromEnv() {
+	if raw := os.Getenv("LADDER_SIZES"); raw != "" {
+		if sizes := parseIntList(raw); len(sizes) > 0 {
+			LadderSizes = sizes
+		}
+	}
+	if raw := os.Getenv("LADDER_MEMORY_TIERS"); raw != "" {
+		if tiers := parseIntList(raw); len(tiers) > 0 {
+			LadderMemoryTiers = tiers
+		}
+	}
+	if raw := os.Getenv("LADDER_REGION_CAPS"); raw != "" {
+		var caps []string
+		for _, c := range strings.Split(raw, ",") {
+			c = strings.TrimSpace(c)
+			if c != "" {
+				caps = append(caps, c)
+			}
+		}
+		if len(caps) > 0 {
+			LadderRegionCaps = caps
+		}
+	}
+}
+
+func init() {
+	LoadLadderConfigFromEnv()
+}
 
 // FillResult describes the outcome of solving a fill request.
 type FillResult struct {
@@ -48,8 +97,32 @@ type FillResult struct {
 
 // FillSolver evaluates market offers against target capacity ladders.
 type FillSolver struct {
-	mu     sync.RWMutex
-	offers []*MarketOffer
+	mu          sync.RWMutex
+	offers      []*MarketOffer
+	sizes       []int
+	memoryTiers []int
+	regionCaps  []string
+}
+
+// SetLadderSizes overrides target ladder sizes for this solver.
+func (s *FillSolver) SetLadderSizes(sizes []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sizes = sizes
+}
+
+// SetMemoryTiers overrides target memory tiers for this solver.
+func (s *FillSolver) SetMemoryTiers(tiers []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.memoryTiers = tiers
+}
+
+// SetRegionCaps overrides target region caps for this solver.
+func (s *FillSolver) SetRegionCaps(caps []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.regionCaps = caps
 }
 
 // NewFillSolver initializes a fill solver.
@@ -78,11 +151,24 @@ func (s *FillSolver) SolveAll(metrics *ObservabilityMetrics) []FillResult {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	memTiers := s.memoryTiers
+	if len(memTiers) == 0 {
+		memTiers = LadderMemoryTiers
+	}
+	sizes := s.sizes
+	if len(sizes) == 0 {
+		sizes = LadderSizes
+	}
+	regCaps := s.regionCaps
+	if len(regCaps) == 0 {
+		regCaps = LadderRegionCaps
+	}
+
 	var results []FillResult
-	for _, minMem := range LadderMemoryTiers {
-		for _, size := range LadderSizes {
+	for _, minMem := range memTiers {
+		for _, size := range sizes {
 			for _, capType := range []string{"spot", "on-demand"} {
-				for _, maxReg := range LadderRegionCaps {
+				for _, maxReg := range regCaps {
 					res := s.solveOne(minMem, size, maxReg, capType)
 					results = append(results, res)
 					if metrics != nil {

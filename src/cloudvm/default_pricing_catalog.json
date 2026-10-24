@@ -1,0 +1,109 @@
+{
+  "aws": {
+    "g5.xlarge": 1.006,
+    "g5.2xlarge": 1.212,
+    "g5.12xlarge": 5.672,
+    "g5.48xlarge": 16.288,
+    "g6.xlarge": 0.804,
+    "g6.2xlarge": 0.977,
+    "p4d.24xlarge": 32.7726
+  },
+  "gcp": {
+    "g2-standard-4": {
+      "onDemandUSD": 0.7024,
+      "spotUSD": 0.2308
+    },
+    "g2-standard-8": {
+      "onDemandUSD": 0.8066,
+      "spotUSD": 0.2642
+    },
+    "g2-standard-12": {
+      "onDemandUSD": 0.9109,
+      "spotUSD": 0.2976
+    },
+    "g2-standard-16": {
+      "onDemandUSD": 1.0152,
+      "spotUSD": 0.3311
+    },
+    "g2-standard-24": {
+      "onDemandUSD": 1.7217,
+      "spotUSD": 0.5619
+    },
+    "g2-standard-32": {
+      "onDemandUSD": 2.0304,
+      "spotUSD": 0.6622
+    },
+    "g2-standard-48": {
+      "onDemandUSD": 3.4435,
+      "spotUSD": 1.1238
+    },
+    "g2-standard-96": {
+      "onDemandUSD": 6.8869,
+      "spotUSD": 2.2475
+    },
+    "a2-highgpu-1g": {
+      "onDemandUSD": 3.6732,
+      "spotUSD": 1.102
+    },
+    "a2-highgpu-2g": {
+      "onDemandUSD": 7.3464,
+      "spotUSD": 2.204
+    },
+    "a2-highgpu-4g": {
+      "onDemandUSD": 14.6928,
+      "spotUSD": 4.408
+    },
+    "a2-highgpu-8g": {
+      "onDemandUSD": 29.3856,
+      "spotUSD": 8.816
+    },
+    "a2-megagpu-16g": {
+      "onDemandUSD": 58.7712,
+      "spotUSD": 17.632
+    },
+    "a2-ultragpu-1g": {
+      "onDemandUSD": 5.0361,
+      "spotUSD": 1.5108
+    },
+    "a2-ultragpu-2g": {
+      "onDemandUSD": 10.0722,
+      "spotUSD": 3.0216
+    },
+    "a2-ultragpu-4g": {
+      "onDemandUSD": 20.1444,
+      "spotUSD": 6.0432
+    },
+    "a2-ultragpu-8g": {
+      "onDemandUSD": 40.2888,
+      "spotUSD": 12.0864
+    },
+    "a3-highgpu-8g": {
+      "onDemandUSD": 31.2184,
+      "spotUSD": 9.3655
+    },
+    "a3-megagpu-8g": {
+      "onDemandUSD": 31.2184,
+      "spotUSD": 9.3655
+    },
+    "a3-edgegpu-8g": {
+      "onDemandUSD": 31.2184,
+      "spotUSD": 9.3655
+    },
+    "n1-standard-4-1t4": {
+      "onDemandUSD": 0.54,
+      "spotUSD": 0.162
+    },
+    "n1-standard-8-1t4": {
+      "onDemandUSD": 0.73,
+      "spotUSD": 0.219
+    },
+    "n1-standard-16-2t4": {
+      "onDemandUSD": 1.46,
+      "spotUSD": 0.438
+    },
+    "n1-standard-32-4t4": {
+      "onDemandUSD": 2.92,
+      "spotUSD": 0.876
+    }
+  }
+}
