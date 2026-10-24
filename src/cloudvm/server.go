@@ -591,7 +591,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
 			cName = pod.Spec.Containers[0].Name
 		}
-		_ = s.runner.StartContainer(r.Context(), warmNode, &StartContainerRequest{
+		startReq := &StartContainerRequest{
 			PodUID:           spec.PodUID,
 			Namespace:        spec.PodNamespace,
 			PodName:          spec.PodName,
@@ -607,7 +607,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			RunAsUser:        spec.RunAsUser,
 			RunAsGroup:       spec.RunAsGroup,
 			DockerConfigJSON: spec.DockerConfigJSON,
-		})
+		}
+		startErr := s.runner.StartContainer(r.Context(), warmNode, startReq)
+		if startErr != nil {
+			log.Printf("[cloudvm] Initial StartContainer call for bin-pack slice returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
+			go s.retryStartContainer(context.WithoutCancel(r.Context()), warmNode, startReq) //nolint:gosec // detached background retry outlives HTTP request
+		}
 
 		marketType := "on-demand"
 		if warmNode.Spot {
