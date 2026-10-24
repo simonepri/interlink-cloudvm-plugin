@@ -1113,6 +1113,12 @@ func TestServer_WarmNodeReuseAcrossPodDeletions(t *testing.T) {
 	if node.IdleSince == nil {
 		t.Fatalf("expected IdleSince timestamp recorded on warm node")
 	}
+	if !node.Cordoned {
+		t.Fatalf("expected warm node to be cordoned upon reaching 0 active pods")
+	}
+
+	// Explicitly uncordon node to re-enable pod allocation
+	srv.NodePool().Uncordon(originalInstanceID)
 
 	// 3. Launch Pod 2 within idle grace period -> Should reuse the existing warm VM!
 	p2Payload := `{

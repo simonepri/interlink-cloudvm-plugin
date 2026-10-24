@@ -236,6 +236,14 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	if !strings.Contains(script, "--cap-drop=SETUID") || !strings.Contains(script, "--security-opt=no-new-privileges") || !strings.Contains(script, "--user=65532:65532") {
 		t.Fatalf("cloud-init missing container privilege isolation flags")
 	}
+
+	// Verify runner concurrency throttle and shutdown check
+	if !strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(8)") {
+		t.Fatalf("cloud-init runner missing DOCKER_SEMAPHORE definition")
+	}
+	if !strings.Contains(script, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
+		t.Fatalf("cloud-init runner missing shutting-down check")
+	}
 }
 
 func TestPodToInstanceSpec_RootUIDRejected(t *testing.T) {
@@ -580,5 +588,106 @@ func TestCloudInit_DockerInstallAndHeartbeatBootstrap(t *testing.T) {
 	}
 	if !strings.Contains(script, "HB_AGE=0") {
 		t.Errorf("cloud-init watchdog missing safe HB_AGE default 0")
+	}
+}
+
+func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
+	t.Run("default_when_zero", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:         "idle-default-pod",
+			PodNamespace:    "default",
+			RunnerAuthToken: "token-idle-1",
+		}
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+		if cfg.IdleGracePeriodSeconds != 600 {
+			t.Errorf("expected IdleGracePeriodSeconds to default to 600, got %d", cfg.IdleGracePeriodSeconds)
+		}
+		if !strings.Contains(script, "no provider heartbeat for >600s") {
+			t.Errorf("expected watchdog comment to reflect 600s grace period")
+		}
+		if !strings.Contains(script, `[ "$HB_AGE" -gt 600 ]`) {
+			t.Errorf("expected watchdog age check to reflect 600s grace period")
+		}
+		if !strings.Contains(script, "no provider heartbeat for >600s. Terminating VM...") {
+			t.Errorf("expected watchdog log message to reflect 600s grace period")
+		}
+	})
+
+	t.Run("custom_grace_period", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:                "idle-custom-pod",
+			PodNamespace:           "default",
+			RunnerAuthToken:        "token-idle-2",
+			IdleGracePeriodSeconds: 1200,
+		}
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+		if cfg.IdleGracePeriodSeconds != 1200 {
+			t.Errorf("expected IdleGracePeriodSeconds to remain 1200, got %d", cfg.IdleGracePeriodSeconds)
+		}
+		if !strings.Contains(script, "no provider heartbeat for >1200s") {
+			t.Errorf("expected watchdog comment to reflect 1200s grace period")
+		}
+		if !strings.Contains(script, `[ "$HB_AGE" -gt 1200 ]`) {
+			t.Errorf("expected watchdog age check to reflect 1200s grace period")
+		}
+		if !strings.Contains(script, "no provider heartbeat for >1200s. Terminating VM...") {
+			t.Errorf("expected watchdog log message to reflect 1200s grace period")
+		}
+	})
+
+	t.Run("default_when_negative", func(t *testing.T) {
+		cfg := &CloudInitConfig{
+			PodName:                "idle-neg-pod",
+			PodNamespace:           "default",
+			RunnerAuthToken:        "token-idle-3",
+			IdleGracePeriodSeconds: -50,
+		}
+		script, err := GenerateCloudInit(cfg)
+		if err != nil {
+			t.Fatalf("GenerateCloudInit failed: %v", err)
+		}
+		if cfg.IdleGracePeriodSeconds != 600 {
+			t.Errorf("expected IdleGracePeriodSeconds to default to 600 on negative input, got %d", cfg.IdleGracePeriodSeconds)
+		}
+		if !strings.Contains(script, `[ "$HB_AGE" -gt 600 ]`) {
+			t.Errorf("expected watchdog age check to reflect 600s grace period")
+		}
+	})
+}
+
+func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
+	cfg := &CloudInitConfig{
+		PodName:         "concurrency-pod",
+		PodNamespace:    "default",
+		RunnerAuthToken: "token-conc-1",
+	}
+	script, err := GenerateCloudInit(cfg)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit failed: %v", err)
+	}
+
+	// Verify semaphore definition and usage
+	if !strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(8)") {
+		t.Errorf("cloud-init runner missing DOCKER_SEMAPHORE definition")
+	}
+	if !strings.Contains(script, "with DOCKER_SEMAPHORE:") {
+		t.Errorf("cloud-init runner missing with DOCKER_SEMAPHORE acquisition around container launch")
+	}
+
+	// Verify shutdown fail-fast check
+	if !strings.Contains(script, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
+		t.Errorf("cloud-init runner missing /tmp/cloudvm-shutting-down check")
+	}
+	if !strings.Contains(script, "self.send_response(503)") {
+		t.Errorf("cloud-init runner missing 503 response on shutting-down check")
+	}
+	if !strings.Contains(script, `{"error": "node is shutting down"}`) {
+		t.Errorf("cloud-init runner missing shutdown error payload")
 	}
 }

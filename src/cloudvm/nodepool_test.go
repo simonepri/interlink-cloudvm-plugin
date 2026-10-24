@@ -136,11 +136,17 @@ func TestNodePool_PodReleaseAndIdleCooldown(t *testing.T) {
 	if node.IdleSince != nil {
 		t.Errorf("node should not be idle while Pod B is still running")
 	}
+	if node.Cordoned {
+		t.Errorf("node should not be cordoned while Pod B is still running")
+	}
 
-	// Release Pod B: Node has 0 active pods -> IdleSince recorded
+	// Release Pod B: Node has 0 active pods -> IdleSince recorded and cordoned
 	pool.Release("pod-b")
 	if node.IdleSince == nil {
 		t.Fatalf("node should record IdleSince timestamp once all pods finish")
+	}
+	if !node.Cordoned {
+		t.Fatalf("node should be cordoned automatically upon reaching 0 active pods")
 	}
 
 	// Immediate collection should return empty because grace period (100ms) has not elapsed
@@ -384,4 +390,158 @@ func TestNodePool_OnDemandPodNeverPacksOntoSpotVM(t *testing.T) {
 	if instOD2.Metadata["marketType"] != "on-demand" {
 		t.Fatalf("expected packed on-demand pod to inherit marketType on-demand, got %s", instOD2.Metadata["marketType"])
 	}
+}
+
+func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
+	pool := NewNodePool(60 * time.Second)
+	if pool.MaxPodsPerNode() != 100 {
+		t.Fatalf("expected default MaxPodsPerNode to be 100, got %d", pool.MaxPodsPerNode())
+	}
+
+	// Set a tight limit to test density cap
+	pool.SetMaxPodsPerNode(2)
+	if pool.MaxPodsPerNode() != 2 {
+		t.Fatalf("expected MaxPodsPerNode to be 2, got %d", pool.MaxPodsPerNode())
+	}
+
+	// Node 1 with abundant capacity
+	capacity := ResourceVector{
+		CPU:    resource.MustParse("64"),
+		Memory: resource.MustParse("256Gi"),
+	}
+	node1 := NewCloudVMNode("i-density-node-01", ProviderAWS, "us-east-1", "10.42.0.11", capacity)
+	pool.RegisterNode(node1)
+
+	req := ResourceVector{
+		CPU:    resource.MustParse("1"),
+		Memory: resource.MustParse("2Gi"),
+	}
+
+	// 1. Allocate Pod 1
+	n1, _, _, err := pool.Allocate(req, "us-east-1", "pod-d-1", "default", "worker-1")
+	if err != nil || n1.InstanceID != "i-density-node-01" {
+		t.Fatalf("failed to allocate pod 1: %v", err)
+	}
+	if node1.ActivePodCount() != 1 {
+		t.Fatalf("expected 1 active pod on node 1, got %d", node1.ActivePodCount())
+	}
+
+	// 2. Allocate Pod 2 (reaches density limit of 2)
+	n2, _, _, err := pool.Allocate(req, "us-east-1", "pod-d-2", "default", "worker-2")
+	if err != nil || n2.InstanceID != "i-density-node-01" {
+		t.Fatalf("failed to allocate pod 2: %v", err)
+	}
+	if node1.ActivePodCount() != 2 {
+		t.Fatalf("expected 2 active pods on node 1, got %d", node1.ActivePodCount())
+	}
+
+	// 3. Allocate Pod 3: must be rejected even though node 1 has plenty of CPU/memory
+	_, _, _, err = pool.Allocate(req, "us-east-1", "pod-d-3", "default", "worker-3")
+	if err == nil {
+		t.Fatalf("expected pod 3 allocation to be rejected due to maxPodsPerNode limit")
+	}
+
+	// 4. Register Node 2: Pod 3 should now succeed by fanning out onto Node 2
+	node2 := NewCloudVMNode("i-density-node-02", ProviderAWS, "us-east-1", "10.42.0.12", capacity)
+	pool.RegisterNode(node2)
+
+	n3, _, _, err := pool.Allocate(req, "us-east-1", "pod-d-3", "default", "worker-3")
+	if err != nil || n3.InstanceID != "i-density-node-02" {
+		t.Fatalf("expected pod 3 to fan out to node 2, got node %v, err: %v", n3, err)
+	}
+	if node2.ActivePodCount() != 1 {
+		t.Fatalf("expected 1 active pod on node 2, got %d", node2.ActivePodCount())
+	}
+}
+
+func TestNodePool_PreTerminationCordonOnZeroActivePods(t *testing.T) {
+	pool := NewNodePool(60 * time.Second)
+
+	capacity := ResourceVector{
+		CPU:    resource.MustParse("32"),
+		Memory: resource.MustParse("128Gi"),
+	}
+	node := NewCloudVMNode("i-cordon-test-01", ProviderAWS, "us-east-1", "10.42.0.21", capacity)
+	pool.RegisterNode(node)
+
+	req := ResourceVector{
+		CPU:    resource.MustParse("2"),
+		Memory: resource.MustParse("4Gi"),
+	}
+
+	// 1. Allocate Pod 1
+	_, _, _, err := pool.Allocate(req, "us-east-1", "uid-cordon-1", "default", "task-1")
+	if err != nil {
+		t.Fatalf("failed to allocate pod 1: %v", err)
+	}
+	if node.Cordoned {
+		t.Fatalf("expected node to not be cordoned with 1 active pod")
+	}
+
+	// 2. Release Pod 1: active count reaches 0 -> node must be automatically cordoned
+	remaining := pool.Release("uid-cordon-1")
+	if remaining != 0 {
+		t.Fatalf("expected remaining active pods 0, got %d", remaining)
+	}
+	if !node.Cordoned {
+		t.Fatalf("expected node to be automatically cordoned upon reaching 0 active pods")
+	}
+
+	// 3. New allocation must reject cordoned idle node counting down to self-destruct
+	_, _, _, err = pool.Allocate(req, "us-east-1", "uid-cordon-2", "default", "task-2")
+	if err == nil {
+		t.Fatalf("expected allocation to fail when only warm node is cordoned")
+	}
+
+	// 4. Uncordon the node and verify allocations are accepted again
+	pool.Uncordon(node.InstanceID)
+	if node.Cordoned {
+		t.Fatalf("expected node to be uncordoned after Uncordon call")
+	}
+
+	nAlloc, _, _, err := pool.Allocate(req, "us-east-1", "uid-cordon-2", "default", "task-2")
+	if err != nil || nAlloc.InstanceID != "i-cordon-test-01" {
+		t.Fatalf("expected allocation to succeed on uncordoned node, got: %v", err)
+	}
+
+	// 5. Test MarkPodCompleted: when container finishes and active count reaches 0 -> cordoned
+	pool.MarkPodCompleted("uid-cordon-2", 0, "Completed", "Done", time.Now())
+	if node.ActivePodCount() != 0 {
+		t.Fatalf("expected active pod count 0 after MarkPodCompleted, got %d", node.ActivePodCount())
+	}
+	if !node.Cordoned {
+		t.Fatalf("expected node to be automatically cordoned after MarkPodCompleted reached 0 active pods")
+	}
+}
+
+func TestNodePool_ServerMaxPodsPerNodeEnv(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	t.Run("configured_valid_env", func(t *testing.T) {
+		t.Setenv("MAX_PODS_PER_NODE", "42")
+		mock := NewMockProvider()
+		srv := NewServer(mock, "cluster-env-density")
+		if srv.NodePool().MaxPodsPerNode() != 42 {
+			t.Fatalf("expected MaxPodsPerNode 42 from env, got %d", srv.NodePool().MaxPodsPerNode())
+		}
+	})
+
+	t.Run("default_when_unset", func(t *testing.T) {
+		t.Setenv("MAX_PODS_PER_NODE", "")
+		mock := NewMockProvider()
+		srv := NewServer(mock, "cluster-env-default")
+		if srv.NodePool().MaxPodsPerNode() != 100 {
+			t.Fatalf("expected default MaxPodsPerNode 100 when unset, got %d", srv.NodePool().MaxPodsPerNode())
+		}
+	})
+
+	t.Run("default_when_zero_or_negative", func(t *testing.T) {
+		t.Setenv("MAX_PODS_PER_NODE", "-5")
+		mock := NewMockProvider()
+		srv := NewServer(mock, "cluster-env-neg")
+		if srv.NodePool().MaxPodsPerNode() != 100 {
+			t.Fatalf("expected default MaxPodsPerNode 100 when negative, got %d", srv.NodePool().MaxPodsPerNode())
+		}
+	})
 }

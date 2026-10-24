@@ -33,6 +33,7 @@ type CloudVMNode struct {
 	Spot                    bool           `json:"spot"`
 	Zone                    string         `json:"zone,omitempty"`
 	MeshIP                  string         `json:"meshIp"`
+	IP                      string         `json:"ip,omitempty"`
 	Capacity                ResourceVector `json:"capacity"`
 	Allocated               ResourceVector `json:"allocated"`
 	CreatedAt               time.Time      `json:"createdAt"`
@@ -59,7 +60,33 @@ func (node *CloudVMNode) GetMeshIP() string {
 	}
 	node.mu.RLock()
 	defer node.mu.RUnlock()
+	if node.MeshIP != "" {
+		return node.MeshIP
+	}
+	return node.IP
+}
+
+// GetInternalIP thread-safely returns the internal/mesh IP of the node.
+func (node *CloudVMNode) GetInternalIP() string {
+	if node == nil {
+		return ""
+	}
+	node.mu.RLock()
+	defer node.mu.RUnlock()
+	if node.IP != "" {
+		return node.IP
+	}
 	return node.MeshIP
+}
+
+// IsCordoned thread-safely returns whether the node is cordoned.
+func (node *CloudVMNode) IsCordoned() bool {
+	if node == nil {
+		return false
+	}
+	node.mu.RLock()
+	defer node.mu.RUnlock()
+	return node.Cordoned
 }
 
 // SetMeshIP thread-safely updates the mesh IP of the node.
@@ -218,6 +245,7 @@ func (node *CloudVMNode) MarkPodCompleted(podUID string, exitCode int32, reason,
 	if node.ActivePodCount() == 0 {
 		now := time.Now()
 		node.IdleSince = &now
+		node.Cordoned = true
 	}
 	return true
 }
@@ -247,6 +275,7 @@ func (node *CloudVMNode) ReleasePod(podUID string) bool {
 	if node.ActivePodCount() == 0 {
 		now := time.Now()
 		node.IdleSince = &now
+		node.Cordoned = true
 	}
 	return true
 }
@@ -256,6 +285,7 @@ type NodePool struct {
 	mu              sync.RWMutex
 	nodes           map[string]*CloudVMNode
 	idleGracePeriod time.Duration
+	maxPodsPerNode  int
 }
 
 // NewNodePool initializes a NodePool with a default idle grace period before node termination.
@@ -266,6 +296,7 @@ func NewNodePool(idleGracePeriod time.Duration) *NodePool {
 	return &NodePool{
 		nodes:           make(map[string]*CloudVMNode),
 		idleGracePeriod: idleGracePeriod,
+		maxPodsPerNode:  100,
 	}
 }
 
@@ -274,6 +305,24 @@ func (np *NodePool) IdleGracePeriod() time.Duration {
 	np.mu.RLock()
 	defer np.mu.RUnlock()
 	return np.idleGracePeriod
+}
+
+// MaxPodsPerNode returns the maximum number of active pods allowed on a single node.
+func (np *NodePool) MaxPodsPerNode() int {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	return np.maxPodsPerNode
+}
+
+// SetMaxPodsPerNode updates the maximum number of active pods allowed on a single node.
+func (np *NodePool) SetMaxPodsPerNode(n int) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	if n <= 0 {
+		np.maxPodsPerNode = 100
+		return
+	}
+	np.maxPodsPerNode = n
 }
 
 // SetIdleGracePeriod updates the idle grace period for the node pool.
@@ -320,6 +369,9 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 			continue
 		}
 		if node.Namespace != "" && namespace != "" && node.Namespace != namespace {
+			continue
+		}
+		if np.maxPodsPerNode > 0 && node.ActivePodCount() >= np.maxPodsPerNode {
 			continue
 		}
 
@@ -476,6 +528,22 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	return expired
 }
 
+// ActiveNodes returns a slice of all active nodes currently tracked in the pool.
+func (np *NodePool) ActiveNodes() []*CloudVMNode {
+	if np == nil {
+		return nil
+	}
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	res := make([]*CloudVMNode, 0, len(np.nodes))
+	for _, node := range np.nodes {
+		if node != nil {
+			res = append(res, node)
+		}
+	}
+	return res
+}
+
 // ActiveNodeCount returns total nodes currently tracked in the pool.
 func (np *NodePool) ActiveNodeCount() int {
 	np.mu.RLock()
@@ -512,5 +580,14 @@ func (np *NodePool) Cordon(instanceID string) {
 	defer np.mu.Unlock()
 	if node, exists := np.nodes[instanceID]; exists && node != nil {
 		node.Cordoned = true
+	}
+}
+
+// Uncordon unmarks an instance as cordoned, allowing future bin-pack allocations.
+func (np *NodePool) Uncordon(instanceID string) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	if node, exists := np.nodes[instanceID]; exists && node != nil {
+		node.Cordoned = false
 	}
 }

@@ -11,36 +11,37 @@ import (
 
 // CloudInitConfig contains the parameters needed to render the VM bootstrap script.
 type CloudInitConfig struct {
-	PodName               string
-	PodNamespace          string
-	PodUID                string
-	RayHeadAddress        string
-	RayVersion            string
-	TargetContainerImage  string
-	Command               []string
-	Args                  []string
-	Env                   map[string]string
-	UseNativeDLAMI        bool // When true, runs native Python/Ray from DLAMI instead of pulling Docker container
-	NumGPUs               int
-	AssignedGPUs          []int
-	CPUMillicores         int64
-	MemoryBytes           int64
-	RunnerAuthToken       string
-	KMSEncryptedToken     bool
-	KMSKeyID              string
-	KMSCiphertext         string
-	MeshAuthKey           string
-	Region                string
-	InstanceType          string
-	EgressBandwidth       string
-	EgressBurst           string
-	RunAsUser             *int64
-	RunAsGroup            *int64
-	DockerConfigJSON      string
-	RegistryMirrors       []string
-	OtelEndpoint          string
-	NodeProblemDetector   bool
-	CustomBootstrapScript string
+	PodName                string
+	PodNamespace           string
+	PodUID                 string
+	RayHeadAddress         string
+	RayVersion             string
+	TargetContainerImage   string
+	Command                []string
+	Args                   []string
+	Env                    map[string]string
+	UseNativeDLAMI         bool // When true, runs native Python/Ray from DLAMI instead of pulling Docker container
+	NumGPUs                int
+	AssignedGPUs           []int
+	CPUMillicores          int64
+	MemoryBytes            int64
+	RunnerAuthToken        string
+	KMSEncryptedToken      bool
+	KMSKeyID               string
+	KMSCiphertext          string
+	MeshAuthKey            string
+	Region                 string
+	InstanceType           string
+	EgressBandwidth        string
+	EgressBurst            string
+	RunAsUser              *int64
+	RunAsGroup             *int64
+	DockerConfigJSON       string
+	RegistryMirrors        []string
+	OtelEndpoint           string
+	NodeProblemDetector    bool
+	CustomBootstrapScript  string
+	IdleGracePeriodSeconds int `json:"idleGracePeriodSeconds,omitempty"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -51,6 +52,9 @@ func (c *CloudInitConfig) Ciphertext() string {
 
 // Validate ensures cloud-init configuration integrity.
 func (c *CloudInitConfig) Validate() error {
+	if c.IdleGracePeriodSeconds <= 0 {
+		c.IdleGracePeriodSeconds = 600
+	}
 	if c.IsKMSEncrypted() && c.KMSCiphertext == "" {
 		return fmt.Errorf("KMS token encryption is enabled but KMSCiphertext is empty")
 	}
@@ -530,6 +534,7 @@ pod_locks = {}
 pod_locks_guard = threading.Lock()
 starting_pods = set()
 start_failures = {}
+DOCKER_SEMAPHORE = threading.Semaphore(8)
 
 def get_pod_lock(uid):
     with pod_locks_guard:
@@ -575,7 +580,10 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == '/healthz':
+        if parsed.path in ('/healthz', '/status'):
+            if self.headers.get('Authorization', ''):
+                if not self.check_auth():
+                    return
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -709,6 +717,13 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/containers/start':
+            if os.path.exists('/tmp/cloudvm-shutting-down'):
+                self.send_response(503)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"error": "node is shutting down"}')
+                return
+
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length)
             try:
@@ -887,7 +902,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
                 # 2. Run container
                 try:
-                    res = subprocess.run(c, capture_output=True, text=True)
+                    with DOCKER_SEMAPHORE:
+                        res = subprocess.run(c, capture_output=True, text=True)
                     with get_pod_lock(uid):
                         starting_pods.discard(uid)
                         if res.returncode != 0:
@@ -920,7 +936,7 @@ fi
 
 
 # 6. Orphaned Node Idle Fail-Safe Watchdog
-# Powers off only after the node has had zero active containers AND no provider heartbeat for >300s
+# Powers off only after the node has had zero active containers AND no provider heartbeat for >{{if .IdleGracePeriodSeconds}}{{.IdleGracePeriodSeconds}}{{else}}600{{end}}s
 (
   while true; do
     ACTIVE=0
@@ -937,7 +953,7 @@ fi
           HB_AGE=$(( NOW - HB_INT ))
         fi
       fi
-      if [ "$HB_AGE" -gt 300 ]; then
+      if [ "$HB_AGE" -gt {{if .IdleGracePeriodSeconds}}{{.IdleGracePeriodSeconds}}{{else}}600{{end}} ]; then
         sleep 60
         ACTIVE_AFTER=0
         if command -v docker >/dev/null 2>&1; then
@@ -950,8 +966,8 @@ fi
             HB_AGE=$(( $(date +%s) - HB_INT ))
           fi
         fi
-        if [ "$ACTIVE_AFTER" -eq 0 ] && [ "$HB_AGE" -gt 300 ]; then
-          echo "[cloudvm-bootstrap] Node has been idle with zero active containers and no provider heartbeat for >300s. Terminating VM..."
+        if [ "$ACTIVE_AFTER" -eq 0 ] && [ "$HB_AGE" -gt {{if .IdleGracePeriodSeconds}}{{.IdleGracePeriodSeconds}}{{else}}600{{end}} ]; then
+          echo "[cloudvm-bootstrap] Node has been idle with zero active containers and no provider heartbeat for >{{if .IdleGracePeriodSeconds}}{{.IdleGracePeriodSeconds}}{{else}}600{{end}}s. Terminating VM..."
           echo "CLOUDVM_STATUS: {\"status\": \"IDLE_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
           shutdown -h now || poweroff
           exit 0
@@ -982,6 +998,9 @@ shutdown -h now || poweroff
 func RenderCloudInit(cfg *CloudInitConfig) (string, error) {
 	if cfg == nil {
 		return "", fmt.Errorf("cloud-init config is nil")
+	}
+	if cfg.IdleGracePeriodSeconds <= 0 {
+		cfg.IdleGracePeriodSeconds = 600
 	}
 	if err := cfg.Validate(); err != nil {
 		return "", err

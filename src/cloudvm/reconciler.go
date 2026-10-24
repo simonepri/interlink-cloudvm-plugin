@@ -4,8 +4,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,6 +45,11 @@ type InstanceTerminator interface {
 	Terminate(ctx context.Context, instanceID string) error
 }
 
+// NodePoolProvider retrieves a NodePool if implemented by a tracker or server.
+type NodePoolProvider interface {
+	NodePool() *NodePool
+}
+
 // Reconciler handles background garbage collection for opportunistic VMs.
 type Reconciler struct {
 	inventory         CloudInventory
@@ -50,6 +59,9 @@ type Reconciler struct {
 	graceTTL          time.Duration
 	launchGracePeriod time.Duration
 	onTerminate       func(instanceID string)
+	nodePool          *NodePool
+	httpClient        *http.Client
+	pingInterval      time.Duration
 }
 
 // SetOnTerminated registers a callback invoked when a zombie instance is terminated.
@@ -74,13 +86,157 @@ func NewReconciler(inventory CloudInventory, tracker PodStateTracker, terminator
 	if graceTTL <= 0 {
 		graceTTL = 10 * time.Minute
 	}
-	return &Reconciler{
+	r := &Reconciler{
 		inventory:         inventory,
 		tracker:           tracker,
 		terminator:        terminator,
 		clusterTag:        clusterTag,
 		graceTTL:          graceTTL,
 		launchGracePeriod: 2 * time.Minute,
+		pingInterval:      30 * time.Second,
+		httpClient:        &http.Client{Timeout: 5 * time.Second},
+	}
+	if p, ok := tracker.(NodePoolProvider); ok {
+		r.nodePool = p.NodePool()
+	}
+	return r
+}
+
+// SetNodePool configures the active NodePool for keep-alive pings.
+func (r *Reconciler) SetNodePool(np *NodePool) {
+	r.nodePool = np
+}
+
+// SetHTTPClient configures a custom HTTP client for keep-alive pings.
+func (r *Reconciler) SetHTTPClient(client *http.Client) {
+	r.httpClient = client
+}
+
+// SetPingInterval configures the keep-alive ping interval.
+func (r *Reconciler) SetPingInterval(d time.Duration) {
+	if d > 0 {
+		r.pingInterval = d
+	}
+}
+
+func (r *Reconciler) getNodePool() *NodePool {
+	if r.nodePool != nil {
+		return r.nodePool
+	}
+	if p, ok := r.tracker.(NodePoolProvider); ok {
+		return p.NodePool()
+	}
+	return nil
+}
+
+// PingActiveNodes sends authenticated keep-alive pings to all active, non-cordoned nodes in the pool.
+func (r *Reconciler) PingActiveNodes(ctx context.Context) {
+	r.pingActiveNodes(ctx)
+}
+
+func (r *Reconciler) pingActiveNodes(ctx context.Context) {
+	np := r.getNodePool()
+	if np == nil {
+		return
+	}
+
+	nodes := np.ActiveNodes()
+	if len(nodes) == 0 {
+		return
+	}
+
+	client := r.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+
+	var wg sync.WaitGroup
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		if n.IsCordoned() || n.Cordoned {
+			continue
+		}
+
+		ip := n.GetInternalIP()
+		if ip == "" {
+			ip = n.GetMeshIP()
+		}
+		if ip == "" {
+			ip = n.IP
+		}
+		if ip == "" {
+			continue
+		}
+
+		wg.Add(1)
+		go func(node *CloudVMNode, nodeIP string) {
+			defer wg.Done()
+			r.pingSingleNode(ctx, client, node, nodeIP)
+		}(n, ip)
+	}
+	wg.Wait()
+}
+
+func (r *Reconciler) pingSingleNode(ctx context.Context, client *http.Client, node *CloudVMNode, ip string) {
+	var hostPort string
+	if strings.Contains(ip, ":") && !strings.HasPrefix(ip, "[") {
+		if h, p, err := net.SplitHostPort(ip); err == nil {
+			hostPort = net.JoinHostPort(h, p)
+		} else {
+			hostPort = net.JoinHostPort(ip, "9090")
+		}
+	} else {
+		hostPort = net.JoinHostPort(ip, "9090")
+	}
+
+	url := fmt.Sprintf("http://%s/healthz", hostPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		log.Printf("[reconciler] Debug: failed to build keep-alive ping request for node %s: %v", sanitizeLog(node.InstanceID), err)
+		return
+	}
+
+	token := node.RunnerAuthToken
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[reconciler] Debug: keep-alive ping failed for node %s (%s): %v", sanitizeLog(node.InstanceID), sanitizeLog(ip), err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[reconciler] Debug: keep-alive ping returned unexpected status %d for node %s (%s)", resp.StatusCode, sanitizeLog(node.InstanceID), sanitizeLog(ip))
+		return
+	}
+}
+
+// Start runs the keep-alive ping ticker loop (every 30 seconds by default) until ctx is cancelled.
+func (r *Reconciler) Start(ctx context.Context) {
+	interval := r.pingInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	// Dispatch initial ping immediately
+	r.pingActiveNodes(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.pingActiveNodes(ctx)
+		}
 	}
 }
 
