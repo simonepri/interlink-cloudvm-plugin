@@ -619,7 +619,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			ID:        warmNode.InstanceID,
 			Provider:  warmNode.Provider,
 			Region:    warmNode.Region,
-			IP:        warmNode.MeshIP,
+			IP:        warmNode.GetMeshIP(),
 			State:     StateRunning,
 			CreatedAt: warmNode.CreatedAt,
 			Metadata: map[string]string{
@@ -1173,10 +1173,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					}
 				case StateRunning:
 					if s.runner != nil && tgt.node != nil && tgt.uid != "" {
-						if tgt.node.MeshIP == "" {
+						if tgt.node.GetMeshIP() == "" {
 							if prov := s.ProviderForType(tgt.node.Provider); prov != nil {
 								if st, err := prov.Status(r.Context(), tgt.node.InstanceID); err == nil && st != nil && st.IP != "" {
-									tgt.node.MeshIP = st.IP
+									tgt.node.SetMeshIP(st.IP)
 									if tgt.inst != nil {
 										tgt.inst.IP = st.IP
 									}
@@ -1193,7 +1193,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 							status.Ready = false
 							status.State.Waiting = &ContainerWaitingState{
 								Reason:  "ContainerCreating",
-								Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", tgt.node.InstanceID, tgt.node.MeshIP),
+								Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", tgt.node.InstanceID, tgt.node.GetMeshIP()),
 							}
 						} else if cResult != nil {
 							switch {
@@ -1355,11 +1355,11 @@ func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req
 				return
 			}
 
-			if node.MeshIP == "" {
+			if node.GetMeshIP() == "" {
 				if prov := s.ProviderForType(node.Provider); prov != nil {
 					st, err := prov.Status(ctx, node.InstanceID)
 					if err == nil && st != nil && st.IP != "" {
-						node.MeshIP = st.IP
+						node.SetMeshIP(st.IP)
 						log.Printf("[cloudvm] Discovered IP %s for node %s during retryStartContainer", st.IP, node.InstanceID)
 						s.mu.Lock()
 						if inst, ok := s.instances[req.PodUID]; ok && inst != nil {

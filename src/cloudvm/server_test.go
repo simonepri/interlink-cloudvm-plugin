@@ -1360,13 +1360,13 @@ func TestServer_RetryStartContainerDiscoversIP(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if node.MeshIP == "10.136.5.99" {
+		if node.GetMeshIP() == "10.136.5.99" {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	if node.MeshIP != "10.136.5.99" {
-		t.Fatalf("expected node.MeshIP to be discovered as 10.136.5.99, got %q", node.MeshIP)
+	if node.GetMeshIP() != "10.136.5.99" {
+		t.Fatalf("expected node.MeshIP to be discovered as 10.136.5.99, got %q", node.GetMeshIP())
 	}
 }

@@ -78,10 +78,10 @@ func (h *HTTPContainerRunner) setAuthHeader(httpReq *http.Request, node *CloudVM
 }
 
 func (h *HTTPContainerRunner) endpoint(node *CloudVMNode, path string) (string, error) {
-	if node == nil || node.MeshIP == "" {
+	if node == nil || node.GetMeshIP() == "" {
 		return "", fmt.Errorf("node has no mesh or internal IP assigned")
 	}
-	return fmt.Sprintf("http://%s:%d%s", node.MeshIP, h.port, path), nil
+	return fmt.Sprintf("http://%s:%d%s", node.GetMeshIP(), h.port, path), nil
 }
 
 func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) error {

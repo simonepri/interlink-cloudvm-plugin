@@ -25,6 +25,7 @@ type PodAllocation struct {
 
 // CloudVMNode represents a live ephemeral cloud VM capable of hosting one or more pods.
 type CloudVMNode struct {
+	mu                      sync.RWMutex
 	InstanceID              string         `json:"instanceId"`
 	Provider                ProviderType   `json:"provider"`
 	Region                  string         `json:"region"`
@@ -51,6 +52,26 @@ type CloudVMNode struct {
 }
 
 // NewCloudVMNode creates an initialized CloudVMNode.
+// GetMeshIP thread-safely returns the mesh IP of the node.
+func (n *CloudVMNode) GetMeshIP() string {
+	if n == nil {
+		return ""
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.MeshIP
+}
+
+// SetMeshIP thread-safely updates the mesh IP of the node.
+func (n *CloudVMNode) SetMeshIP(ip string) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.MeshIP = ip
+}
+
 func NewCloudVMNode(instanceID string, provider ProviderType, region, meshIP string, capacity ResourceVector) *CloudVMNode {
 	gpuSlots := make(map[int]string, capacity.GPUs)
 	for i := 0; i < capacity.GPUs; i++ {
