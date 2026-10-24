@@ -1581,3 +1581,133 @@ func TestServer_BinPackHitRetriesStartContainerWhenBooting(t *testing.T) {
 		t.Fatalf("expected background retry worker to start container for sliced pod, but request was not found")
 	}
 }
+
+func TestServer_HandleStatus_3000Pods(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	// 1. Setup a running instance for pod 100
+	server.mu.Lock()
+	server.instances["uid-100"] = &Instance{
+		ID:        "i-scale-100",
+		Provider:  ProviderMock,
+		Region:    "us-east-1",
+		State:     StateRunning,
+		CreatedAt: time.Now(),
+	}
+	// 2. Setup a completed pod record in completedPods for pod 200
+	server.completedPods["uid-200"] = &ContainerTerminatedState{
+		ExitCode:   0,
+		Reason:     "Completed",
+		Message:    "job completed successfully",
+		FinishedAt: time.Now(),
+	}
+	server.mu.Unlock()
+
+	// 3. Setup a completed store record for pod 300
+	if server.completedStore != nil {
+		_ = server.completedStore.Set("uid-300", &CompletedPodRecord{
+			PodUID:     "uid-300",
+			ExitCode:   0,
+			Reason:     "Completed",
+			FinishedAt: time.Now(),
+		})
+	}
+
+	// 4. Construct a batch payload containing 3,000 pods with specs
+	var buf bytes.Buffer
+	buf.WriteString("[")
+	for i := 0; i < 3000; i++ {
+		if i > 0 {
+			buf.WriteString(",")
+		}
+		fmt.Fprintf(&buf, `{"pod":{"metadata":{"name":"scale-pod-%d","namespace":"default","uid":"uid-%d","labels":{"app":"scale","batch":"test"}},"spec":{"containers":[{"name":"worker","image":"ubuntu:24.04","resources":{"limits":{"cpu":"1","memory":"2Gi"}}}]}}}`, i, i)
+	}
+	buf.WriteString("]")
+
+	resp, err := http.Post(ts.URL+"/status", "application/json", bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("POST /status for 3,000 pods failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from /status, got %d", resp.StatusCode)
+	}
+
+	var statuses []PodStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&statuses); err != nil {
+		t.Fatalf("failed to decode 3,000 pod status responses: %v", err)
+	}
+
+	if len(statuses) != 3000 {
+		t.Fatalf("expected 3,000 status responses, got %d", len(statuses))
+	}
+
+	// Verify pod 100 is Running
+	st100 := statuses[100]
+	if len(st100.Containers) != 1 || st100.Containers[0].State.Running == nil || !st100.Containers[0].Ready {
+		t.Errorf("expected pod 100 to be Running and Ready, got: %+v", st100)
+	}
+
+	// Verify pod 200 is Terminated (Completed) from server.completedPods
+	st200 := statuses[200]
+	if len(st200.Containers) != 1 || st200.Containers[0].State.Terminated == nil || st200.Containers[0].State.Terminated.Reason != "Completed" {
+		t.Errorf("expected pod 200 to be Completed, got: %+v", st200)
+	}
+
+	// Verify pod 300 is Terminated (Completed) from completedStore
+	st300 := statuses[300]
+	if len(st300.Containers) != 1 || st300.Containers[0].State.Terminated == nil || st300.Containers[0].State.Terminated.Reason != "Completed" {
+		t.Errorf("expected pod 300 to be Completed, got: %+v", st300)
+	}
+
+	// Verify pod 500 is Waiting (ContainerCreating)
+	st500 := statuses[500]
+	if len(st500.Containers) != 1 || st500.Containers[0].State.Waiting == nil || st500.Containers[0].State.Waiting.Reason != "ContainerCreating" {
+		t.Errorf("expected pod 500 to be ContainerCreating, got: %+v", st500)
+	}
+
+	// Verify sightings map recorded all pod UIDs
+	server.mu.RLock()
+	seen100 := server.activeSightings["uid-100"]
+	seen500 := server.activeSightings["uid-500"]
+	server.mu.RUnlock()
+	if seen100.IsZero() || seen500.IsZero() {
+		t.Errorf("expected active sightings to be recorded for queried pods")
+	}
+}
+
+func BenchmarkServer_HandleStatus_3000Pods(b *testing.B) {
+	b.ReportAllocs()
+	mock := NewMockProvider()
+	server := NewServer(mock, "bench-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	var buf bytes.Buffer
+	buf.WriteString("[")
+	for i := 0; i < 3000; i++ {
+		if i > 0 {
+			buf.WriteString(",")
+		}
+		fmt.Fprintf(&buf, `{"pod":{"metadata":{"name":"scale-pod-%d","namespace":"default","uid":"uid-%d"}}}`, i, i)
+	}
+	buf.WriteString("]")
+	payload := buf.Bytes()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := http.Post(ts.URL+"/status", "application/json", bytes.NewReader(payload))
+		if err != nil {
+			b.Fatalf("POST /status failed: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+}

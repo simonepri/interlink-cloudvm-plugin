@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -15,7 +16,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -63,6 +66,7 @@ type Server struct {
 	podSightingTimeout    time.Duration
 	tombstones            map[string]time.Time                 // podUID or instanceID -> deletion timestamp
 	activeSightings       map[string]time.Time                 // podUID -> last seen in /status or /create
+	lastSightingsPrune    time.Time                            // last timestamp activeSightings was pruned
 	statusPolled          bool                                 // set true when first /status query is received
 	launchTokens          map[string]string                    // podUID -> runnerAuthToken (reused across retries)
 	completedPods         map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
@@ -1117,66 +1121,136 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+type statusPodMetadata struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	UID       string `json:"uid"`
+}
+
+type statusPodItem struct {
+	Pod *struct {
+		Metadata statusPodMetadata `json:"metadata"`
+	} `json:"pod"`
+	Metadata statusPodMetadata `json:"metadata"`
+}
+
+type statusPodRef struct {
+	Name      string
+	Namespace string
+	UID       string
+}
+
+func extractPodRef(item *statusPodItem) *statusPodRef {
+	if item == nil {
+		return nil
+	}
+	if item.Pod != nil && (item.Pod.Metadata.Name != "" || item.Pod.Metadata.UID != "") {
+		return &statusPodRef{
+			Name:      item.Pod.Metadata.Name,
+			Namespace: item.Pod.Metadata.Namespace,
+			UID:       item.Pod.Metadata.UID,
+		}
+	}
+	if item.Metadata.Name != "" || item.Metadata.UID != "" {
+		return &statusPodRef{
+			Name:      item.Metadata.Name,
+			Namespace: item.Metadata.Namespace,
+			UID:       item.Metadata.UID,
+		}
+	}
+	return nil
+}
+
+func decodeStatusPods(r io.Reader) []*statusPodRef {
+	if r == nil {
+		return nil
+	}
+	br := bufio.NewReader(r)
+	var firstByte byte
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return nil
+		}
+		if !unicode.IsSpace(rune(b)) {
+			firstByte = b
+			_ = br.UnreadByte()
+			break
+		}
+	}
+
+	dec := json.NewDecoder(br)
+	var pods []*statusPodRef
+
+	if firstByte == '[' {
+		tok, err := dec.Token()
+		if err != nil || tok != json.Delim('[') {
+			return nil
+		}
+		for dec.More() {
+			var item statusPodItem
+			if err := dec.Decode(&item); err != nil {
+				break
+			}
+			if ref := extractPodRef(&item); ref != nil {
+				pods = append(pods, ref)
+			}
+		}
+		_, _ = dec.Token()
+	} else if firstByte == '{' {
+		var item statusPodItem
+		if err := dec.Decode(&item); err == nil {
+			if ref := extractPodRef(&item); ref != nil {
+				pods = append(pods, ref)
+			}
+		}
+	}
+	return pods
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var pods []Pod
-	body, _ := io.ReadAll(r.Body)
-	if len(body) > 0 {
-		var retrievedList []struct {
-			Pod Pod `json:"pod"`
-		}
-		if err := json.Unmarshal(body, &retrievedList); err == nil && len(retrievedList) > 0 && retrievedList[0].Pod.Metadata.Name != "" {
-			for _, item := range retrievedList {
-				pods = append(pods, item.Pod)
-			}
-		} else if err := json.Unmarshal(body, &pods); err != nil {
-			var single Pod
-			if err2 := json.Unmarshal(body, &single); err2 == nil && single.Metadata.Name != "" {
-				pods = append(pods, single)
-			}
-		}
+	var pods []*statusPodRef
+	if r.Body != nil {
+		pods = decodeStatusPods(r.Body)
 	}
 
+	now := time.Now()
 	s.mu.Lock()
 	s.statusPolled = true
+	if len(pods) > 0 {
+		for _, p := range pods {
+			if p.UID != "" {
+				s.activeSightings[p.UID] = now
+			}
+		}
+		sightingTTL := s.podSightingTimeout
+		if sightingTTL <= 0 {
+			sightingTTL = 10 * time.Minute
+		}
+		if s.lastSightingsPrune.IsZero() || now.Sub(s.lastSightingsPrune) > time.Minute {
+			s.lastSightingsPrune = now
+			for uid, seenAt := range s.activeSightings {
+				if now.Sub(seenAt) > sightingTTL {
+					delete(s.activeSightings, uid)
+				}
+			}
+		}
+	}
 	s.mu.Unlock()
 
-	if len(pods) > 0 {
-		s.mu.Lock()
-		now := time.Now()
-		for _, p := range pods {
-			if p.Metadata.UID != "" {
-				s.activeSightings[p.Metadata.UID] = now
-			}
-		}
-		// Prune expired sightings older than 10 minutes
-		for uid, seenAt := range s.activeSightings {
-			sightingTTL := s.podSightingTimeout
-			if sightingTTL <= 0 {
-				sightingTTL = 10 * time.Minute
-			}
-			if now.Sub(seenAt) > sightingTTL {
-				delete(s.activeSightings, uid)
-			}
-		}
-		s.mu.Unlock()
-	}
-
 	type statusTarget struct {
-		name  string
-		ns    string
-		uid   string
-		jid   string
-		inst  *Instance
-		node  *CloudVMNode
-		alloc PodAllocation
+		name          string
+		ns            string
+		uid           string
+		jid           string
+		inst          *Instance
+		completedTerm *ContainerTerminatedState
 	}
-
-	var targets []statusTarget
 
 	s.mu.RLock()
 	if len(pods) == 0 {
@@ -1206,253 +1280,272 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			pods = append(pods, Pod{
-				Metadata: PodMeta{
-					Name:      name,
-					Namespace: ns,
-					UID:       uid,
-				},
+			pods = append(pods, &statusPodRef{
+				Name:      name,
+				Namespace: ns,
+				UID:       uid,
 			})
 		}
 	}
 
-	for _, pod := range pods {
-		name := pod.Metadata.Name
-		ns := pod.Metadata.Namespace
+	targets := make([]*statusTarget, len(pods))
+	for i, pod := range pods {
+		name := pod.Name
+		ns := pod.Namespace
 		if ns == "" {
 			ns = "default"
 		}
-		key := fmt.Sprintf("%s/%s", ns, name)
 		var inst *Instance
 		var exists bool
-		if pod.Metadata.UID != "" {
-			inst, exists = s.instances[pod.Metadata.UID]
+		if pod.UID != "" {
+			inst, exists = s.instances[pod.UID]
 		}
+		var key string
 		if !exists || inst == nil {
+			key = ns + "/" + name
 			inst, exists = s.instances[key]
-		}
-		if !exists || inst == nil {
-			inst, exists = s.instances[name]
+			if !exists || inst == nil {
+				inst, exists = s.instances[name]
+			}
 		}
 
-		uid := pod.Metadata.UID
+		uid := pod.UID
 		if uid == "" && exists && inst != nil && inst.Metadata != nil {
 			uid = inst.Metadata["podUID"]
 		}
 
 		jid := ""
-		var node *CloudVMNode
-		var alloc PodAllocation
 		if exists && inst != nil {
 			if uid != "" {
-				jid = fmt.Sprintf("%s:%s", inst.ID, uid)
-				if n, a, found := s.nodePool.FindPodNode(uid); found {
-					node = n
-					alloc = a
-				}
+				jid = inst.ID + ":" + uid
 			} else {
 				jid = inst.ID
 			}
 		}
 
-		targets = append(targets, statusTarget{
-			name:  name,
-			ns:    ns,
-			uid:   uid,
-			jid:   jid,
-			inst:  inst,
-			node:  node,
-			alloc: alloc,
-		})
+		var completedTerm *ContainerTerminatedState
+		if uid != "" {
+			completedTerm = s.completedPods[uid]
+		} else {
+			if key == "" {
+				key = ns + "/" + name
+			}
+			completedTerm = s.completedPods[key]
+		}
+
+		targets[i] = &statusTarget{
+			name:          name,
+			ns:            ns,
+			uid:           uid,
+			jid:           jid,
+			inst:          inst,
+			completedTerm: completedTerm,
+		}
 	}
 	s.mu.RUnlock()
 
 	responses := make([]PodStatusResponse, len(targets))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 16)
+	if len(targets) > 0 {
+		numWorkers := 16
+		if s.runnerConcurrency > numWorkers {
+			numWorkers = s.runnerConcurrency
+		}
+		if numWorkers > len(targets) {
+			numWorkers = len(targets)
+		}
+		if numWorkers <= 0 {
+			numWorkers = 1
+		}
 
-	for i, target := range targets {
-		wg.Add(1)
-		go func(idx int, tgt statusTarget) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+		var curIdx atomic.Int64
+		var wg sync.WaitGroup
 
-			status := ContainerStatus{
-				Name: "worker",
-			}
-
-			var completedTerm *ContainerTerminatedState
-			if tgt.uid != "" {
-				if s.completedStore != nil {
-					if rec := s.completedStore.Get(tgt.uid); rec != nil {
-						completedTerm = &ContainerTerminatedState{
-							ExitCode:   rec.ExitCode,
-							Reason:     rec.Reason,
-							Message:    rec.Message,
-							FinishedAt: rec.FinishedAt,
-						}
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					idx := int(curIdx.Add(1) - 1)
+					if idx >= len(targets) {
+						return
 					}
-				}
-				if completedTerm == nil {
-					s.mu.RLock()
-					completedTerm = s.completedPods[tgt.uid]
-					s.mu.RUnlock()
-				}
-			} else {
-				s.mu.RLock()
-				completedTerm = s.completedPods[fmt.Sprintf("%s/%s", tgt.ns, tgt.name)]
-				s.mu.RUnlock()
-			}
+					tgt := targets[idx]
 
-			switch {
-			case completedTerm != nil:
-				status.Ready = false
-				status.State.Terminated = completedTerm
-			case tgt.alloc.Completed:
-				status.Ready = false
-				finishedAt := time.Now()
-				if tgt.alloc.FinishedAt != nil {
-					finishedAt = *tgt.alloc.FinishedAt
-				}
-				status.State.Terminated = &ContainerTerminatedState{
-					ExitCode:   tgt.alloc.ExitCode,
-					Reason:     tgt.alloc.Reason,
-					Message:    tgt.alloc.Message,
-					FinishedAt: finishedAt,
-				}
-			case tgt.inst != nil:
-				switch tgt.inst.State {
-				case StateProvisioning:
-					status.State.Waiting = &ContainerWaitingState{
-						Reason:  "ContainerCreating",
-						Message: fmt.Sprintf("Provisioning cloud VM %s in %s...", tgt.inst.ID, tgt.inst.Region),
+					status := ContainerStatus{
+						Name: "worker",
 					}
-				case StateRunning:
-					if s.runner != nil && tgt.node != nil && tgt.uid != "" {
-						if tgt.node.GetMeshIP() == "" {
-							if prov := s.ProviderForType(tgt.node.Provider); prov != nil {
-								if st, err := prov.Status(r.Context(), tgt.node.InstanceID); err == nil && st != nil && st.IP != "" {
-									tgt.node.SetMeshIP(st.IP)
-									if tgt.inst != nil {
-										tgt.inst.IP = st.IP
-									}
-									s.mu.Lock()
-									if inst, ok := s.instances[tgt.uid]; ok && inst != nil {
-										inst.IP = st.IP
-									}
-									s.mu.Unlock()
-								}
+
+					completedTerm := tgt.completedTerm
+					if completedTerm == nil && tgt.uid != "" && s.completedStore != nil {
+						if rec := s.completedStore.Get(tgt.uid); rec != nil {
+							completedTerm = &ContainerTerminatedState{
+								ExitCode:   rec.ExitCode,
+								Reason:     rec.Reason,
+								Message:    rec.Message,
+								FinishedAt: rec.FinishedAt,
 							}
 						}
-						cResult, err := s.runner.GetStatus(r.Context(), tgt.node, tgt.uid)
-						if err != nil {
-							status.Ready = false
+					}
+
+					var node *CloudVMNode
+					var alloc *PodAllocation
+					if completedTerm == nil && tgt.inst != nil && s.nodePool != nil && tgt.uid != "" {
+						if n, a, found := s.nodePool.FindPodNode(tgt.uid); found {
+							node = n
+							alloc = &a
+						}
+					}
+
+					switch {
+					case completedTerm != nil:
+						status.Ready = false
+						status.State.Terminated = completedTerm
+					case alloc != nil && alloc.Completed:
+						status.Ready = false
+						finishedAt := time.Now()
+						if alloc.FinishedAt != nil {
+							finishedAt = *alloc.FinishedAt
+						}
+						status.State.Terminated = &ContainerTerminatedState{
+							ExitCode:   alloc.ExitCode,
+							Reason:     alloc.Reason,
+							Message:    alloc.Message,
+							FinishedAt: finishedAt,
+						}
+					case tgt.inst != nil:
+						switch tgt.inst.State {
+						case StateProvisioning:
 							status.State.Waiting = &ContainerWaitingState{
 								Reason:  "ContainerCreating",
-								Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", tgt.node.InstanceID, tgt.node.GetMeshIP()),
+								Message: fmt.Sprintf("Provisioning cloud VM %s in %s...", tgt.inst.ID, tgt.inst.Region),
 							}
-						} else if cResult != nil {
-							switch {
-							case cResult.Running:
+						case StateRunning:
+							if s.runner != nil && node != nil && tgt.uid != "" {
+								if node.GetMeshIP() == "" {
+									if prov := s.ProviderForType(node.Provider); prov != nil {
+										if st, err := prov.Status(r.Context(), node.InstanceID); err == nil && st != nil && st.IP != "" {
+											node.SetMeshIP(st.IP)
+											if tgt.inst != nil {
+												tgt.inst.IP = st.IP
+											}
+											s.mu.Lock()
+											if inst, ok := s.instances[tgt.uid]; ok && inst != nil {
+												inst.IP = st.IP
+											}
+											s.mu.Unlock()
+										}
+									}
+								}
+								cResult, err := s.runner.GetStatus(r.Context(), node, tgt.uid)
+								if err != nil {
+									status.Ready = false
+									status.State.Waiting = &ContainerWaitingState{
+										Reason:  "ContainerCreating",
+										Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", node.InstanceID, node.GetMeshIP()),
+									}
+								} else if cResult != nil {
+									switch {
+									case cResult.Running:
+										status.Ready = true
+										status.State.Running = &ContainerRunningState{
+											StartedAt: cResult.StartedAt,
+										}
+									case cResult.Status == "created" || cResult.Status == "starting":
+										status.Ready = false
+										status.State.Waiting = &ContainerWaitingState{
+											Reason:  "ContainerCreating",
+											Message: "Container created, starting up...",
+										}
+									case cResult.Status == "restarting" || cResult.Status == "paused" || cResult.Status == "removing":
+										status.Ready = false
+										status.State.Waiting = &ContainerWaitingState{
+											Reason:  cResult.Reason,
+											Message: fmt.Sprintf("Container is %s", cResult.Status),
+										}
+									case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || cResult.Reason == "ErrImagePull" || cResult.Reason == "StartError" || (cResult.ExitCode != 0 && !cResult.Running):
+										status.Ready = false
+										finAt := cResult.FinishedAt
+										if finAt.IsZero() {
+											finAt = time.Now()
+										}
+										term := &ContainerTerminatedState{
+											ExitCode:   cResult.ExitCode,
+											Reason:     cResult.Reason,
+											Message:    cResult.Message,
+											FinishedAt: finAt,
+										}
+										status.State.Terminated = term
+										s.nodePool.MarkPodCompleted(tgt.uid, cResult.ExitCode, cResult.Reason, cResult.Message, finAt)
+										s.mu.Lock()
+										if tgt.uid != "" {
+											s.completedPods[tgt.uid] = term
+										}
+										s.mu.Unlock()
+										if tgt.uid != "" && s.completedStore != nil {
+											_ = s.completedStore.Set(tgt.uid, &CompletedPodRecord{
+												PodUID:     tgt.uid,
+												PodJID:     tgt.jid,
+												ExitCode:   cResult.ExitCode,
+												Reason:     cResult.Reason,
+												Message:    cResult.Message,
+												FinishedAt: finAt,
+											})
+										}
+									default:
+										status.Ready = false
+										status.State.Waiting = &ContainerWaitingState{
+											Reason:  "ContainerStatusUnknown",
+											Message: fmt.Sprintf("Container status: %s", cResult.Status),
+										}
+									}
+								}
+							} else {
 								status.Ready = true
 								status.State.Running = &ContainerRunningState{
-									StartedAt: cResult.StartedAt,
-								}
-							case cResult.Status == "created" || cResult.Status == "starting":
-								status.Ready = false
-								status.State.Waiting = &ContainerWaitingState{
-									Reason:  "ContainerCreating",
-									Message: "Container created, starting up...",
-								}
-							case cResult.Status == "restarting" || cResult.Status == "paused" || cResult.Status == "removing":
-								status.Ready = false
-								status.State.Waiting = &ContainerWaitingState{
-									Reason:  cResult.Reason,
-									Message: fmt.Sprintf("Container is %s", cResult.Status),
-								}
-							case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || cResult.Reason == "ErrImagePull" || cResult.Reason == "StartError" || (cResult.ExitCode != 0 && !cResult.Running):
-								status.Ready = false
-								finAt := cResult.FinishedAt
-								if finAt.IsZero() {
-									finAt = time.Now()
-								}
-								term := &ContainerTerminatedState{
-									ExitCode:   cResult.ExitCode,
-									Reason:     cResult.Reason,
-									Message:    cResult.Message,
-									FinishedAt: finAt,
-								}
-								status.State.Terminated = term
-								s.nodePool.MarkPodCompleted(tgt.uid, cResult.ExitCode, cResult.Reason, cResult.Message, finAt)
-								s.mu.Lock()
-								if tgt.uid != "" {
-									s.completedPods[tgt.uid] = term
-								}
-								s.mu.Unlock()
-								if tgt.uid != "" && s.completedStore != nil {
-									_ = s.completedStore.Set(tgt.uid, &CompletedPodRecord{
-										PodUID:     tgt.uid,
-										PodJID:     tgt.jid,
-										ExitCode:   cResult.ExitCode,
-										Reason:     cResult.Reason,
-										Message:    cResult.Message,
-										FinishedAt: finAt,
-									})
-								}
-							default:
-								status.Ready = false
-								status.State.Waiting = &ContainerWaitingState{
-									Reason:  "ContainerStatusUnknown",
-									Message: fmt.Sprintf("Container status: %s", cResult.Status),
+									StartedAt: tgt.inst.CreatedAt,
 								}
 							}
+						case StateTerminating:
+							status.State.Terminated = &ContainerTerminatedState{
+								ExitCode:   0,
+								Reason:     "Terminating",
+								FinishedAt: time.Now(),
+							}
+						case StateTerminated:
+							status.State.Terminated = &ContainerTerminatedState{
+								ExitCode:   0,
+								Reason:     "Completed",
+								FinishedAt: time.Now(),
+							}
+						case StateFailed:
+							status.State.Terminated = &ContainerTerminatedState{
+								ExitCode:   1,
+								Reason:     "Failed",
+								Message:    "Cloud instance failed",
+								FinishedAt: time.Now(),
+							}
 						}
-					} else {
-						status.Ready = true
-						status.State.Running = &ContainerRunningState{
-							StartedAt: tgt.inst.CreatedAt,
+					default:
+						status.State.Waiting = &ContainerWaitingState{
+							Reason:  "ContainerCreating",
+							Message: fmt.Sprintf("Pod %s/%s is provisioning or awaiting discovery", tgt.ns, tgt.name),
 						}
 					}
-				case StateTerminating:
-					status.State.Terminated = &ContainerTerminatedState{
-						ExitCode:   0,
-						Reason:     "Terminating",
-						FinishedAt: time.Now(),
-					}
-				case StateTerminated:
-					status.State.Terminated = &ContainerTerminatedState{
-						ExitCode:   0,
-						Reason:     "Completed",
-						FinishedAt: time.Now(),
-					}
-				case StateFailed:
-					status.State.Terminated = &ContainerTerminatedState{
-						ExitCode:   1,
-						Reason:     "Failed",
-						Message:    "Cloud instance failed",
-						FinishedAt: time.Now(),
-					}
-				}
-			default:
-				status.State.Waiting = &ContainerWaitingState{
-					Reason:  "ContainerCreating",
-					Message: fmt.Sprintf("Pod %s/%s is provisioning or awaiting discovery", tgt.ns, tgt.name),
-				}
-			}
 
-			responses[idx] = PodStatusResponse{
-				PodUID:    tgt.uid,
-				Name:      tgt.name,
-				Namespace: tgt.ns,
-				JID:       tgt.jid,
-				Containers: []ContainerStatus{
-					status,
-				},
-			}
-		}(i, target)
+					responses[idx] = PodStatusResponse{
+						PodUID:    tgt.uid,
+						Name:      tgt.name,
+						Namespace: tgt.ns,
+						JID:       tgt.jid,
+						Containers: []ContainerStatus{
+							status,
+						},
+					}
+				}
+			}()
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(responses)
