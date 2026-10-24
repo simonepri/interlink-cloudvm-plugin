@@ -375,6 +375,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/getLogs", s.handleGetLogs)
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/pinglink", s.handleHealthz)
 
 	// Deprecated / compat endpoints
 	mux.HandleFunc("/pods/create", s.handleCreate)

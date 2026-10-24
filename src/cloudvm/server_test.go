@@ -1302,3 +1302,30 @@ func TestServer_PostgresHAStoresWiring(t *testing.T) {
 		t.Fatalf("unfulfilled sqlmock expectations: %v", err)
 	}
 }
+
+func TestServerPinglinkAndHealthz(t *testing.T) {
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	for _, path := range []string{"/healthz", "/pinglink"} {
+		res, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("failed to GET %s: %v", path, err)
+		}
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("GET %s status = %d, want 200", path, res.StatusCode)
+		}
+		_ = res.Body.Close()
+
+		postRes, err := http.Post(ts.URL+path, "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatalf("failed to POST %s: %v", path, err)
+		}
+		if postRes.StatusCode != http.StatusOK {
+			t.Errorf("POST %s status = %d, want 200", path, postRes.StatusCode)
+		}
+		_ = postRes.Body.Close()
+	}
+}
