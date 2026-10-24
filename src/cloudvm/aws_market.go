@@ -49,7 +49,7 @@ type SpotAdvisorData struct {
 // SpotAdvisorCollector fetches and caches the AWS Spot Advisor interruption frequency feed.
 type SpotAdvisorCollector struct {
 	mu           sync.RWMutex
-	lastData     *SpotAdvisorData
+	lastData     map[string]map[string]SpotAdvisorEntry // region -> instanceType -> entry
 	lastModified time.Time
 	feedURL      string
 	httpClient   HTTPGetter
@@ -104,9 +104,34 @@ func (c *SpotAdvisorCollector) Poll(_ context.Context) error {
 		return fmt.Errorf("failed to read spot advisor feed body: %w", err)
 	}
 
-	var data SpotAdvisorData
-	if err := json.Unmarshal(body, &data); err != nil {
+	var raw struct {
+		SpotAdvisor map[string]map[string]json.RawMessage `json:"spot_advisor"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return fmt.Errorf("failed to decode spot advisor json: %w", err)
+	}
+
+	normalized := make(map[string]map[string]SpotAdvisorEntry)
+	for region, subMap := range raw.SpotAdvisor {
+		regionEntries := make(map[string]SpotAdvisorEntry)
+		if linuxRaw, ok := subMap["Linux"]; ok {
+			var linuxEntries map[string]SpotAdvisorEntry
+			if err := json.Unmarshal(linuxRaw, &linuxEntries); err == nil {
+				for itype, entry := range linuxEntries {
+					regionEntries[itype] = entry
+				}
+			}
+		} else {
+			for itype, entryRaw := range subMap {
+				var entry SpotAdvisorEntry
+				if err := json.Unmarshal(entryRaw, &entry); err == nil {
+					regionEntries[itype] = entry
+				}
+			}
+		}
+		if len(regionEntries) > 0 {
+			normalized[region] = regionEntries
+		}
 	}
 
 	lastMod := time.Now()
@@ -117,7 +142,7 @@ func (c *SpotAdvisorCollector) Poll(_ context.Context) error {
 	}
 
 	c.mu.Lock()
-	c.lastData = &data
+	c.lastData = normalized
 	c.lastModified = lastMod
 	c.mu.Unlock()
 
@@ -129,10 +154,10 @@ func (c *SpotAdvisorCollector) GetEntry(region, instanceType string) (SpotAdviso
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.lastData == nil || c.lastData.SpotAdvisor == nil {
+	if c.lastData == nil {
 		return SpotAdvisorEntry{}, false
 	}
-	regData, ok := c.lastData.SpotAdvisor[region]
+	regData, ok := c.lastData[region]
 	if !ok {
 		return SpotAdvisorEntry{}, false
 	}

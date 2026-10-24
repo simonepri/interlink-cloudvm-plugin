@@ -119,6 +119,59 @@ func TestSpotAdvisorCollector_PollAndMapUptime(t *testing.T) {
 	}
 }
 
+func TestSpotAdvisorCollector_PollAndMapUptime_NestedOS(t *testing.T) {
+	ctx := context.Background()
+	sampleJSON := `{
+		"spot_advisor": {
+			"us-west-2": {
+				"Linux": {
+					"g5.xlarge": {"s": 46, "r": 4},
+					"g6.xlarge": {"s": 41, "r": 0}
+				},
+				"Windows": {
+					"g5.xlarge": {"s": 30, "r": 4}
+				}
+			}
+		}
+	}`
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewBufferString(sampleJSON)),
+		Header:     http.Header{"Last-Modified": []string{"Tue, 24 Oct 2026 12:00:00 GMT"}},
+	}
+
+	collector := NewSpotAdvisorCollector("http://example.com/feed.json", &mockHTTPClient{resp: resp})
+	if err := collector.Poll(ctx); err != nil {
+		t.Fatalf("unexpected poll error: %v", err)
+	}
+
+	entry, ok := collector.GetEntry("us-west-2", "g5.xlarge")
+	if !ok {
+		t.Fatalf("expected entry for us-west-2 g5.xlarge")
+	}
+	if entry.SavingsPct != 46 || entry.RangeIndex != 4 {
+		t.Errorf("expected s=46 r=4, got %+v", entry)
+	}
+
+	uptime := UptimeSecondsForAdvisorRange(entry.RangeIndex)
+	if uptime != 10800 {
+		t.Errorf("expected 10800s uptime, got %f", uptime)
+	}
+
+	entryG6, ok := collector.GetEntry("us-west-2", "g6.xlarge")
+	if !ok {
+		t.Fatalf("expected entry for us-west-2 g6.xlarge")
+	}
+	if entryG6.SavingsPct != 41 || entryG6.RangeIndex != 0 {
+		t.Errorf("expected s=41 r=0, got %+v", entryG6)
+	}
+	uptimeG6 := UptimeSecondsForAdvisorRange(entryG6.RangeIndex)
+	if uptimeG6 != 86400 {
+		t.Errorf("expected 86400s uptime, got %f", uptimeG6)
+	}
+}
+
 type mockServiceQuotasClient struct {
 	val float64
 	err error
