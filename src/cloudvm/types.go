@@ -136,6 +136,8 @@ type InstanceSpec struct {
 	NodeProblemDetector bool `json:"nodeProblemDetector,omitempty"`
 	// CustomBootstrapScript holds arbitrary bash or systemd bootstrap commands appended to cloud-init.
 	CustomBootstrapScript string `json:"customBootstrapScript,omitempty"`
+	// RunnerConcurrency specifies the max concurrent containers executed by runner.
+	RunnerConcurrency int `json:"runnerConcurrency,omitempty"`
 }
 
 // Instance represents an active or terminating cloud VM instance.
