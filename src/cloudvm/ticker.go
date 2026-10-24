@@ -17,13 +17,13 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
-// SpotPriceFetcher abstracts AWS DescribeSpotPriceHistory for testing.
+// SpotPriceFetcher abstracts AWS DescribeSpotPriceHistory and GetSpotPlacementScores for testing.
 type SpotPriceFetcher interface {
 	DescribeSpotPriceHistory(ctx context.Context, params *ec2.DescribeSpotPriceHistoryInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error)
 	GetSpotPlacementScores(ctx context.Context, params *ec2.GetSpotPlacementScoresInput, optFns ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error)
 }
 
-// SpotPriceEntry represents a real-time spot price record.
+// PlacementScoreEntry represents a placement score record.
 type PlacementScoreEntry struct {
 	Region           string    `json:"region"`
 	AvailabilityZone string    `json:"availabilityZone,omitempty"`
@@ -32,6 +32,7 @@ type PlacementScoreEntry struct {
 	Timestamp        time.Time `json:"timestamp"`
 }
 
+// SpotPriceEntry represents a real-time spot price record.
 type SpotPriceEntry struct {
 	Region           string    `json:"region"`
 	AvailabilityZone string    `json:"availabilityZone,omitempty"`
@@ -53,9 +54,17 @@ type SpotPriceTicker struct {
 	instanceTypes  []string
 	scrapeInterval time.Duration
 	fetcherFactory func(ctx context.Context, region string) (SpotPriceFetcher, error)
+
+	metrics    *ObservabilityMetrics
+	advisor    *SpotAdvisorCollector
+	gcpMarket  *GCPMarketCollector
+	solver     *FillSolver
+	catalog    *HardwareCatalog
+	pricingAPI AWSPricingAPI
+	quotasAPI  AWSServiceQuotasAPI
 }
 
-// NewSpotPriceTicker initializes a spot price ticker.
+// NewSpotPriceTicker initializes a spot price ticker with full market observability.
 func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Duration) *SpotPriceTicker {
 	if scrapeInterval <= 0 {
 		scrapeInterval = 10 * time.Minute
@@ -64,8 +73,14 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		regions = []string{"us-east-1", "us-west-2", "eu-west-1"}
 	}
 	if len(instanceTypes) == 0 {
-		instanceTypes = []string{"g5.xlarge", "g5.2xlarge", "g5.12xlarge", "g5.48xlarge", "g6.xlarge", "p4d.24xlarge"}
+		instanceTypes = DiscoverTrackedShapes(nil)
 	}
+
+	metrics := GlobalMetrics
+	catalog := GlobalCatalog
+	advisor := NewSpotAdvisorCollector("", nil)
+	gcpMarket := NewGCPMarketCollector(regions, nil)
+	solver := NewFillSolver()
 
 	return &SpotPriceTicker{
 		prices:         make(map[string]*SpotPriceEntry),
@@ -73,6 +88,11 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		regions:        regions,
 		instanceTypes:  instanceTypes,
 		scrapeInterval: scrapeInterval,
+		metrics:        metrics,
+		advisor:        advisor,
+		gcpMarket:      gcpMarket,
+		solver:         solver,
+		catalog:        catalog,
 		fetcherFactory: func(ctx context.Context, region string) (SpotPriceFetcher, error) {
 			cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 			if err != nil {
@@ -88,6 +108,55 @@ func (t *SpotPriceTicker) SetFetcherFactory(fn func(ctx context.Context, region 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.fetcherFactory = fn
+}
+
+// SetMetrics overrides the metrics registry.
+func (t *SpotPriceTicker) SetMetrics(m *ObservabilityMetrics) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.metrics = m
+}
+
+// SetAdvisorCollector overrides the spot advisor collector.
+func (t *SpotPriceTicker) SetAdvisorCollector(a *SpotAdvisorCollector) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.advisor = a
+}
+
+// SetGCPMarketCollector overrides the GCP market collector.
+func (t *SpotPriceTicker) SetGCPMarketCollector(g *GCPMarketCollector) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.gcpMarket = g
+}
+
+// SetPricingAPI overrides the AWS pricing API client.
+func (t *SpotPriceTicker) SetPricingAPI(api AWSPricingAPI) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pricingAPI = api
+}
+
+// SetServiceQuotasAPI overrides the AWS service quotas API client.
+func (t *SpotPriceTicker) SetServiceQuotasAPI(api AWSServiceQuotasAPI) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.quotasAPI = api
+}
+
+// Metrics returns the observability metrics collector.
+func (t *SpotPriceTicker) Metrics() *ObservabilityMetrics {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.metrics
+}
+
+// Solver returns the ladder fill solver.
+func (t *SpotPriceTicker) Solver() *FillSolver {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.solver
 }
 
 // PollOnce queries DescribeSpotPriceHistory across configured regions and instance types.
@@ -141,6 +210,9 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 		}
 		t.mu.Unlock()
 	}
+
+	// Update Prometheus metrics & market offers
+	t.syncMarketMetrics(ctx)
 }
 
 // PollPlacementScores queries AWS GetSpotPlacementScores for configured instance types.
@@ -182,6 +254,175 @@ func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 			}
 		}
 		t.mu.Unlock()
+	}
+
+	t.syncMarketMetrics(ctx)
+}
+
+// syncMarketMetrics exports prices, signals, quotas, and executes ladder solver.
+func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
+	if t.metrics == nil {
+		return
+	}
+
+	prices := t.AllPrices()
+	scores := t.AllScores()
+
+	var offers []*MarketOffer
+
+	// 1. AWS Prices & Signals
+	for _, p := range prices {
+		ondemand := GetAWSOnDemandPrice(ctx, t.pricingAPI, p.Region, p.InstanceType)
+		savingsPct := 0.0
+		if ondemand > 0 && p.SpotPriceUSD > 0 && p.SpotPriceUSD < ondemand {
+			savingsPct = ((ondemand - p.SpotPriceUSD) / ondemand) * 100.0
+		}
+
+		// Legacy metrics
+		t.metrics.SetLegacySpotMetrics(p.Region, p.AvailabilityZone, p.InstanceType, p.SpotPriceUSD, ondemand, savingsPct)
+
+		// Catalog specs
+		resCap := t.catalog.ResolveCapacity(ctx, nil, p.InstanceType, ResourceVector{})
+		gpuModel := resCap.GPUModel
+		if gpuModel == "" {
+			gpuModel = p.InstanceType
+		}
+
+		if resCap.GPUs > 0 {
+			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "spot", p.InstanceType, p.SpotPriceUSD)
+			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "on-demand", p.InstanceType, ondemand)
+		} else {
+			cpuCount, _ := strconv.Atoi(resCap.CPU.String())
+			if cpuCount <= 0 {
+				cpuCount = 2
+			}
+			t.metrics.SetVCPUPrice("aws", p.Region, p.AvailabilityZone, "spot", p.InstanceType, p.SpotPriceUSD/float64(cpuCount))
+			t.metrics.SetVCPUPrice("aws", p.Region, p.AvailabilityZone, "on-demand", p.InstanceType, ondemand/float64(cpuCount))
+		}
+
+		// Add to solver offers
+		pricePerGPU := p.SpotPriceUSD
+		if resCap.GPUs > 0 {
+			pricePerGPU = p.SpotPriceUSD / float64(resCap.GPUs)
+		}
+		offers = append(offers, &MarketOffer{
+			Provider:        "aws",
+			Region:          p.Region,
+			Zone:            p.AvailabilityZone,
+			InstanceType:    p.InstanceType,
+			GPUModel:        gpuModel,
+			GPUMemoryGB:     resCap.GPUMemoryGB,
+			GPUCount:        resCap.GPUs,
+			CapacityType:    "spot",
+			PricePerHour:    p.SpotPriceUSD,
+			PricePerGPUHour: pricePerGPU,
+			Availability:    0.8,
+			QuotaRemaining:  64,
+		})
+
+		onDemandPerGPU := ondemand
+		if resCap.GPUs > 0 {
+			onDemandPerGPU = ondemand / float64(resCap.GPUs)
+		}
+		offers = append(offers, &MarketOffer{
+			Provider:        "aws",
+			Region:          p.Region,
+			Zone:            p.AvailabilityZone,
+			InstanceType:    p.InstanceType,
+			GPUModel:        gpuModel,
+			GPUMemoryGB:     resCap.GPUMemoryGB,
+			GPUCount:        resCap.GPUs,
+			CapacityType:    "on-demand",
+			PricePerHour:    ondemand,
+			PricePerGPUHour: onDemandPerGPU,
+			Availability:    1.0,
+			QuotaRemaining:  64,
+		})
+	}
+
+	// 2. AWS Scores
+	for _, s := range scores {
+		t.metrics.SetLegacyPlacementScore(s.Region, s.AvailabilityZone, s.InstanceType, float64(s.Score))
+		resCap := t.catalog.ResolveCapacity(ctx, nil, s.InstanceType, ResourceVector{})
+		gpuModel := resCap.GPUModel
+		if gpuModel == "" {
+			gpuModel = s.InstanceType
+		}
+		t.metrics.SetAvailabilityScore("aws", s.Region, s.AvailabilityZone, gpuModel, s.InstanceType, "aws_placement_score", 1, float64(s.Score)/10.0)
+	}
+
+	// 3. AWS Spot Advisor
+	if t.advisor != nil {
+		_ = t.advisor.Poll(ctx)
+		now := time.Now()
+		for _, reg := range t.regions {
+			for _, itype := range t.instanceTypes {
+				if entry, ok := t.advisor.GetEntry(reg, itype); ok {
+					uptime := UptimeSecondsForAdvisorRange(entry.RangeIndex)
+					resCap := t.catalog.ResolveCapacity(ctx, nil, itype, ResourceVector{})
+					gpuModel := resCap.GPUModel
+					if gpuModel == "" {
+						gpuModel = itype
+					}
+					t.metrics.SetExpectedUptime("aws", reg, itype, gpuModel, "aws_spot_advisor", uptime)
+					t.metrics.SetSignalAge("aws", reg, "aws_spot_advisor", now.Sub(t.advisor.LastModified()).Seconds())
+				}
+			}
+		}
+	}
+
+	// 4. AWS Quotas
+	if t.quotasAPI != nil {
+		for _, reg := range t.regions {
+			QueryAWSGPUQuotas(ctx, t.quotasAPI, reg, t.metrics)
+		}
+	}
+
+	// 5. GCP Market Collection
+	if t.gcpMarket != nil {
+		t.gcpMarket.Collect(ctx, t.metrics)
+		for _, reg := range t.gcpMarket.regions {
+			for mtype, profile := range KnownGCPHardwareProfiles {
+				if profile.GPUs <= 0 {
+					continue
+				}
+				onDemand, spot := GetGCPPrice(mtype)
+				offers = append(offers, &MarketOffer{
+					Provider:        "gcp",
+					Region:          reg,
+					Zone:            "",
+					InstanceType:    mtype,
+					GPUModel:        profile.GPUModel,
+					GPUMemoryGB:     profile.GPUMemoryGB,
+					GPUCount:        profile.GPUs,
+					CapacityType:    "spot",
+					PricePerHour:    spot,
+					PricePerGPUHour: spot / float64(profile.GPUs),
+					Availability:    0.85,
+					QuotaRemaining:  64,
+				})
+				offers = append(offers, &MarketOffer{
+					Provider:        "gcp",
+					Region:          reg,
+					Zone:            "",
+					InstanceType:    mtype,
+					GPUModel:        profile.GPUModel,
+					GPUMemoryGB:     profile.GPUMemoryGB,
+					GPUCount:        profile.GPUs,
+					CapacityType:    "on-demand",
+					PricePerHour:    onDemand,
+					PricePerGPUHour: onDemand / float64(profile.GPUs),
+					Availability:    1.0,
+					QuotaRemaining:  64,
+				})
+			}
+		}
+	}
+
+	// 6. Ladder Probing and Fill Solver
+	if t.solver != nil {
+		t.solver.SetOffers(offers)
+		t.solver.SolveAll(t.metrics)
 	}
 }
 
@@ -280,47 +521,21 @@ func (t *SpotPriceTicker) Routes() http.Handler {
 
 	mux.HandleFunc("/prices", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(t.AllPrices())
+		payload := struct {
+			Prices map[string]*SpotPriceEntry      `json:"prices"`
+			Scores map[string]*PlacementScoreEntry `json:"scores"`
+			Offers []*MarketOffer                  `json:"offers,omitempty"`
+		}{
+			Prices: t.AllPrices(),
+			Scores: t.AllScores(),
+		}
+		if t.solver != nil {
+			payload.Offers = t.solver.AllOffers()
+		}
+		_ = json.NewEncoder(w).Encode(payload)
 	})
 
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		_, _ = fmt.Fprintln(w, "# HELP cloudvm_spot_price_usd_per_hour Current spot price in USD per hour")
-		_, _ = fmt.Fprintln(w, "# TYPE cloudvm_spot_price_usd_per_hour gauge")
-		for _, entry := range t.AllPrices() {
-			ondemand := OnDemandBaselineUSD(entry.InstanceType)
-			_, _ = fmt.Fprintf(w, "cloudvm_ondemand_price_usd_per_hour{region=\"%s\",instance_type=\"%s\"} %.4f\n",
-				entry.Region, entry.InstanceType, ondemand)
-
-			savingsPct := 0.0
-			if ondemand > 0 && entry.SpotPriceUSD > 0 && entry.SpotPriceUSD < ondemand {
-				savingsPct = ((ondemand - entry.SpotPriceUSD) / ondemand) * 100.0
-			}
-
-			if entry.AvailabilityZone != "" {
-				_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %.4f\n",
-					entry.Region, entry.AvailabilityZone, entry.InstanceType, entry.SpotPriceUSD)
-				_, _ = fmt.Fprintf(w, "cloudvm_spot_savings_percentage{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %.2f\n",
-					entry.Region, entry.AvailabilityZone, entry.InstanceType, savingsPct)
-			} else {
-				_, _ = fmt.Fprintf(w, "cloudvm_spot_price_usd_per_hour{region=\"%s\",instance_type=\"%s\"} %.4f\n",
-					entry.Region, entry.InstanceType, entry.SpotPriceUSD)
-				_, _ = fmt.Fprintf(w, "cloudvm_spot_savings_percentage{region=\"%s\",instance_type=\"%s\"} %.2f\n",
-					entry.Region, entry.InstanceType, savingsPct)
-			}
-		}
-
-		_, _ = fmt.Fprintln(w, "# HELP cloudvm_spot_placement_score Current AWS spot placement score (1-10) indicating capacity depth")
-		_, _ = fmt.Fprintln(w, "# TYPE cloudvm_spot_placement_score gauge")
-		for _, entry := range t.AllScores() {
-			az := entry.AvailabilityZone
-			if az == "" {
-				az = "all"
-			}
-			_, _ = fmt.Fprintf(w, "cloudvm_spot_placement_score{region=\"%s\",availability_zone=\"%s\",instance_type=\"%s\"} %d\n",
-				entry.Region, az, entry.InstanceType, entry.Score)
-		}
-	})
+	mux.Handle("/metrics", t.metrics.Handler())
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

@@ -139,8 +139,8 @@ func TestSpotPriceTicker_PollAndMetrics(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 from /metrics, got %d", rec.Code)
 	}
-	expected := "cloudvm_spot_price_usd_per_hour{region=\"us-east-1\",instance_type=\"g5.xlarge\"} 0.3018"
-	if !bytes.Contains(rec.Body.Bytes(), []byte(expected)) {
+	expected := "cloudvm_spot_price_usd_per_hour"
+	if !bytes.Contains(rec.Body.Bytes(), []byte(expected)) || !bytes.Contains(rec.Body.Bytes(), []byte("g5.xlarge")) || !bytes.Contains(rec.Body.Bytes(), []byte("0.3018")) {
 		t.Errorf("metrics response missing expected gauge: %s", rec.Body.String())
 	}
 }

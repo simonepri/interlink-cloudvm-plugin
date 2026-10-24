@@ -309,6 +309,11 @@ func mapGCPStatusToState(gcpStatus string) InstanceState {
 
 // Launch provisions a Google Compute Engine VM worker and configures its startup script.
 func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
+	startTime := time.Now()
+	capType := "spot"
+	if spec != nil && spec.MarketType == "on-demand" {
+		capType = "on-demand"
+	}
 	if spec != nil {
 		itype := strings.ToLower(strings.TrimSpace(spec.InstanceType))
 		if spec.NumTPUs > 0 || strings.HasPrefix(itype, "v4-") || strings.HasPrefix(itype, "v5e-") || strings.HasPrefix(itype, "v5litepod-") || strings.HasPrefix(itype, "tpu-") {
@@ -509,16 +514,19 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 
 	op, err := client.Insert(ctx, project, zone, gcpInstance)
 	if err != nil {
+		GlobalFleetTracker.RecordLaunchAttempt("gcp", region, spec.InstanceType, capType, ClassifyGCPError(err))
 		return nil, fmt.Errorf("failed to insert gcp instance %s: %w", instName, err)
 	}
 	if op != nil && op.Name != "" {
 		if err := client.WaitZoneOperation(ctx, project, zone, op.Name); err != nil {
+			GlobalFleetTracker.RecordLaunchAttempt("gcp", region, spec.InstanceType, capType, ClassifyGCPError(err))
 			return nil, fmt.Errorf("gcp instance creation failed for %s: %w", instName, err)
 		}
 	}
 
 	createdInst, err := client.Get(ctx, project, zone, instName)
 	if err != nil {
+		GlobalFleetTracker.RecordLaunchAttempt("gcp", region, spec.InstanceType, capType, ClassifyGCPError(err))
 		return nil, fmt.Errorf("failed to get created gcp instance %s: %w", instName, err)
 	}
 
@@ -544,7 +552,7 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		marketType = "on-demand"
 	}
 
-	return &Instance{
+	inst := &Instance{
 		ID:           instName,
 		Provider:     ProviderGCP,
 		Region:       region,
@@ -562,7 +570,10 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 			"clusterTag":  spec.ClusterTag,
 			"zone":        zone,
 		},
-	}, nil
+	}
+	GlobalFleetTracker.RecordLaunchAttempt("gcp", region, spec.InstanceType, capType, "ok")
+	GlobalFleetTracker.RecordLaunchDuration("gcp", region, spec.InstanceType, capType, time.Since(startTime))
+	return inst, nil
 }
 
 // Terminate deletes a Google Compute Engine VM worker.

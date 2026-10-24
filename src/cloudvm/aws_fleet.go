@@ -412,6 +412,11 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 }
 
 func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
+	startTime := time.Now()
+	capType := "spot"
+	if spec != nil && spec.MarketType == "on-demand" {
+		capType = "on-demand"
+	}
 	runnerToken := spec.RunnerAuthToken
 	if spec.KMSEncryptedToken || spec.KMSCiphertext != "" {
 		runnerToken = ""
@@ -517,6 +522,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 
 	resp, err := LaunchFleetWithClient(ctx, client, req, overrides)
 	if err != nil {
+		GlobalFleetTracker.RecordLaunchAttempt("aws", spec.Region, spec.InstanceType, capType, ClassifyAWSError(err))
 		return nil, fmt.Errorf("launch fleet failed: %w", err)
 	}
 	if len(resp.Instances) == 0 {
@@ -524,6 +530,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		if len(resp.Errors) > 0 {
 			errMsg = fmt.Sprintf("%s (fleet errors: %s)", errMsg, strings.Join(resp.Errors, "; "))
 		}
+		GlobalFleetTracker.RecordLaunchAttempt("aws", spec.Region, spec.InstanceType, capType, "no_capacity")
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
@@ -561,6 +568,8 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	if p.regionStore != nil {
 		_ = p.regionStore.Set(inst.ID, spec.Region)
 	}
+	GlobalFleetTracker.RecordLaunchAttempt("aws", spec.Region, spec.InstanceType, capType, "ok")
+	GlobalFleetTracker.RecordLaunchDuration("aws", spec.Region, spec.InstanceType, capType, time.Since(startTime))
 	return inst, nil
 }
 
