@@ -139,7 +139,7 @@ func TestInterLinkAPIContract_NestedPodAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /create failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 from /create, got %d", resp.StatusCode)
@@ -235,7 +235,7 @@ func TestServer_HandleStatus_InFlightAndFinished(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /status failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var statuses []PodStatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&statuses); err != nil {
@@ -611,7 +611,7 @@ func TestServer_ConcurrentCreateSingleFlight(t *testing.T) {
 				errs[idx] = err
 				return
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != http.StatusOK {
 				errs[idx] = fmt.Errorf("unexpected status %d", resp.StatusCode)
 				return
@@ -1634,7 +1634,7 @@ func TestServer_HandleStatus_3000Pods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /status for 3,000 pods failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK from /status, got %d", resp.StatusCode)
@@ -1709,5 +1709,60 @@ func BenchmarkServer_HandleStatus_3000Pods(b *testing.B) {
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
+	}
+}
+
+func TestServer_HandleStatus_NetworkMetrics(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	mock := NewMockProvider()
+	server := NewServer(mock, "test-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	runner := NewMockContainerRunner()
+	runner.SetStatus("uid-net-pod", &ContainerStatusResult{
+		Running:        true,
+		Status:         "running",
+		StartedAt:      time.Now(),
+		NetworkRxBytes: 1048576,
+		NetworkTxBytes: 2097152,
+	})
+	server.SetContainerRunner(runner)
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode("i-net-node", ProviderAWS, "us-west-2", "100.64.0.50", capVec)
+	node.InstanceType = "g5.xlarge"
+	reqVec, _ := NewResourceVector("1", "4Gi", 1, 0)
+	server.NodePool().RegisterAndAllocate(node, reqVec, "uid-net-pod", "default", "net-pod")
+
+	server.mu.Lock()
+	server.instances["uid-net-pod"] = &Instance{
+		ID:           "i-net-node",
+		Provider:     ProviderAWS,
+		Region:       "us-west-2",
+		InstanceType: "g5.xlarge",
+		State:        StateRunning,
+		CreatedAt:    time.Now(),
+	}
+	server.mu.Unlock()
+
+	queryPayload := `[{"pod": {"metadata": {"name": "net-pod", "namespace": "default", "uid": "uid-net-pod"}}}]`
+	resp, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Verify metrics were updated in GlobalMetrics
+	rec := httptest.NewRecorder()
+	GlobalMetrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "cloudvm_network_receive_bytes_total") {
+		t.Errorf("expected cloudvm_network_receive_bytes_total in metrics")
+	}
+	if !strings.Contains(body, "cloudvm_network_transmit_bytes_total") {
+		t.Errorf("expected cloudvm_network_transmit_bytes_total in metrics")
 	}
 }

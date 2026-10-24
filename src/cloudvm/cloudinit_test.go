@@ -733,3 +733,32 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 		t.Errorf("cloud-init runner missing shutdown error payload")
 	}
 }
+
+func TestCloudInit_NetworkMetricsScript(t *testing.T) {
+	cfg := &CloudInitConfig{
+		PodName:         "net-test-pod",
+		PodNamespace:    "default",
+		RunnerAuthToken: "token-net-123",
+	}
+
+	script, err := GenerateCloudInit(cfg)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit failed: %v", err)
+	}
+
+	if !strings.Contains(script, "def get_network_bytes():") {
+		t.Errorf("cloud-init runner missing get_network_bytes function")
+	}
+	if !strings.Contains(script, "/proc/net/dev") {
+		t.Errorf("cloud-init runner missing /proc/net/dev file check")
+	}
+	if !strings.Contains(script, "networkRxBytes") {
+		t.Errorf("cloud-init runner missing networkRxBytes field")
+	}
+	if !strings.Contains(script, "networkTxBytes") {
+		t.Errorf("cloud-init runner missing networkTxBytes field")
+	}
+	if !strings.Contains(script, "/host/stats") {
+		t.Errorf("cloud-init runner missing /host/stats endpoint")
+	}
+}

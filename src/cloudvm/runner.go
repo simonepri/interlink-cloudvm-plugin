@@ -34,14 +34,22 @@ type StartContainerRequest struct {
 
 // ContainerStatusResult encapsulates container execution telemetry from the in-VM runner.
 type ContainerStatusResult struct {
-	PodUID     string    `json:"podUID"`
-	Running    bool      `json:"running"`
-	Status     string    `json:"status,omitempty"` // "created", "running", "exited", "dead"
-	ExitCode   int32     `json:"exitCode"`
-	Reason     string    `json:"reason,omitempty"`
-	Message    string    `json:"message,omitempty"`
-	StartedAt  time.Time `json:"startedAt"`
-	FinishedAt time.Time `json:"finishedAt,omitempty"`
+	PodUID         string    `json:"podUID"`
+	Running        bool      `json:"running"`
+	Status         string    `json:"status,omitempty"` // "created", "running", "exited", "dead"
+	ExitCode       int32     `json:"exitCode"`
+	Reason         string    `json:"reason,omitempty"`
+	Message        string    `json:"message,omitempty"`
+	StartedAt      time.Time `json:"startedAt"`
+	FinishedAt     time.Time `json:"finishedAt,omitempty"`
+	NetworkRxBytes int64     `json:"networkRxBytes,omitempty"`
+	NetworkTxBytes int64     `json:"networkTxBytes,omitempty"`
+}
+
+// HostStatsResult encapsulates VM host-level telemetry from the in-VM runner.
+type HostStatsResult struct {
+	NetworkRxBytes int64 `json:"networkRxBytes"`
+	NetworkTxBytes int64 `json:"networkTxBytes"`
 }
 
 // ContainerRunner abstracts remote container lifecycle execution on a warm cloud node.
@@ -50,6 +58,7 @@ type ContainerRunner interface {
 	GetStatus(ctx context.Context, node *CloudVMNode, podUID string) (*ContainerStatusResult, error)
 	StopContainer(ctx context.Context, node *CloudVMNode, podUID string) error
 	ListContainers(ctx context.Context, node *CloudVMNode) ([]*ContainerStatusResult, error)
+	GetHostStats(ctx context.Context, node *CloudVMNode) (*HostStatsResult, error)
 }
 
 // HTTPContainerRunner connects to the in-VM micro-runner daemon over the private WireGuard mesh.
@@ -113,7 +122,7 @@ func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMN
 	if err != nil {
 		return fmt.Errorf("failed to contact in-VM runner at %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
@@ -138,7 +147,7 @@ func (h *HTTPContainerRunner) GetStatus(ctx context.Context, node *CloudVMNode, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to query in-VM runner at %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var result ContainerStatusResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -163,7 +172,7 @@ func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNo
 	if err != nil {
 		return fmt.Errorf("failed to stop container on VM at %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return nil
 }
 
@@ -182,7 +191,7 @@ func (h *HTTPContainerRunner) ListContainers(ctx context.Context, node *CloudVMN
 	if err != nil {
 		return nil, fmt.Errorf("failed to query in-VM runner list at %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("in-VM runner list error: status %d", resp.StatusCode)
@@ -195,11 +204,40 @@ func (h *HTTPContainerRunner) ListContainers(ctx context.Context, node *CloudVMN
 	return results, nil
 }
 
+func (h *HTTPContainerRunner) GetHostStats(ctx context.Context, node *CloudVMNode) (*HostStatsResult, error) {
+	url, err := h.endpoint(node, "/host/stats")
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // internal mesh call
+	if err != nil {
+		return nil, err
+	}
+	h.setAuthHeader(httpReq, node)
+
+	resp, err := h.client.Do(httpReq) //nolint:gosec // internal mesh call
+	if err != nil {
+		return nil, fmt.Errorf("failed to query in-VM runner host stats at %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("in-VM runner host stats error: status %d", resp.StatusCode)
+	}
+
+	var result HostStatsResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // MockContainerRunner simulates in-VM container execution for tests and mock environments.
 type MockContainerRunner struct {
 	mu         sync.RWMutex
 	containers map[string]*ContainerStatusResult
 	requests   map[string]*StartContainerRequest
+	hostStats  *HostStatsResult
 }
 
 // NewMockContainerRunner initializes an in-memory mock container runner.
@@ -270,4 +308,19 @@ func (m *MockContainerRunner) SetStatus(podUID string, res *ContainerStatusResul
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.containers[podUID] = res
+}
+
+func (m *MockContainerRunner) SetHostStats(stats *HostStatsResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hostStats = stats
+}
+
+func (m *MockContainerRunner) GetHostStats(_ context.Context, _ *CloudVMNode) (*HostStatsResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.hostStats != nil {
+		return m.hostStats, nil
+	}
+	return &HostStatsResult{}, nil
 }

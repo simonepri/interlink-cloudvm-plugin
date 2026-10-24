@@ -555,6 +555,26 @@ def record_heartbeat():
     except Exception:
         pass
 
+def get_network_bytes():
+    rx_bytes = 0
+    tx_bytes = 0
+    try:
+        with open('/proc/net/dev', 'r') as f:
+            for line in f:
+                if ':' not in line:
+                    continue
+                iface, data = line.split(':', 1)
+                iface = iface.strip()
+                if iface == 'lo':
+                    continue
+                fields = data.split()
+                if len(fields) >= 9:
+                    rx_bytes += int(fields[0])
+                    tx_bytes += int(fields[8])
+    except Exception:
+        pass
+    return rx_bytes, tx_bytes
+
 class RunnerHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -599,6 +619,19 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
+        if parsed.path in ('/host/stats', '/pinglink'):
+            rx_bytes, tx_bytes = get_network_bytes()
+            resp = {
+                "status": "ok",
+                "networkRxBytes": rx_bytes,
+                "networkTxBytes": tx_bytes,
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
+            return
+
         if parsed.path == '/containers/list':
             results = []
             try:
@@ -629,6 +662,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(parsed.query)
             pod_uid = params.get('podUID', [''])[0]
             container_name = f"cloudvm-{pod_uid}"
+            rx_bytes, tx_bytes = get_network_bytes()
             try:
                 res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
                 if res.returncode == 0:
@@ -652,6 +686,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "reason": reason,
                         "startedAt": started_at,
                         "finishedAt": finished_at,
+                        "networkRxBytes": rx_bytes,
+                        "networkTxBytes": tx_bytes,
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -673,6 +709,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "reason": reason_val,
                         "message": err_val,
                         "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "networkRxBytes": rx_bytes,
+                        "networkTxBytes": tx_bytes,
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -687,6 +725,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "exitCode": 0,
                         "reason": "ContainerCreating",
                         "message": "Pulling container image or initializing...",
+                        "networkRxBytes": rx_bytes,
+                        "networkTxBytes": tx_bytes,
                     }
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
