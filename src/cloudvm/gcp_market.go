@@ -101,6 +101,13 @@ func NewGCPMarketCollector(regions []string, adviceClient GCPAdviceCapacityClien
 	}
 }
 
+// SetRegions updates the target GCP regions.
+func (c *GCPMarketCollector) SetRegions(regions []string) {
+	if len(regions) > 0 {
+		c.regions = regions
+	}
+}
+
 // KnownGCPGPUQuotas maps standard GCP GPU quota names.
 var KnownGCPGPUQuotas = map[string]float64{
 	"NVIDIA_L4_GPUS":               64.0,

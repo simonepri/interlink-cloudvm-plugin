@@ -34,7 +34,10 @@ type ObservabilityMetrics struct {
 
 	// Fleet Metrics
 	instancesRunning *prometheus.GaugeVec
+	vcpusRunning     *prometheus.GaugeVec
+	memoryGiBRunning *prometheus.GaugeVec
 	gpusRunning      *prometheus.GaugeVec
+	vramGBRunning    *prometheus.GaugeVec
 	spendPerHour     *prometheus.GaugeVec
 	launchAttempts   *prometheus.CounterVec
 	launchDuration   *prometheus.HistogramVec
@@ -121,9 +124,24 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 			Help: "Current number of running cloud VM instances",
 		}, fleetLabels),
 
+		vcpusRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_vcpus_running",
+			Help: "Current number of running vCPUs across all cloud VM instances",
+		}, fleetLabels),
+
+		memoryGiBRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_memory_gib_running",
+			Help: "Current number of running system memory in GiB across all cloud VM instances",
+		}, fleetLabels),
+
 		gpusRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_gpus_running",
 			Help: "Current number of running GPUs across all cloud VM instances",
+		}, fleetLabels),
+
+		vramGBRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_vram_gb_running",
+			Help: "Current number of running GPU VRAM in GB across all cloud VM instances",
 		}, fleetLabels),
 
 		spendPerHour: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -187,7 +205,10 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.fillGPUs,
 		m.fillLimited,
 		m.instancesRunning,
+		m.vcpusRunning,
+		m.memoryGiBRunning,
 		m.gpusRunning,
+		m.vramGBRunning,
 		m.spendPerHour,
 		m.launchAttempts,
 		m.launchDuration,
@@ -270,17 +291,23 @@ func (m *ObservabilityMetrics) SetFillGPUAllocation(minGPUMemoryGB, gpus int, ma
 	m.fillGPUs.WithLabelValues(memStr, gpusStr, maxRegions, capacityType, provider, region, gpuModel).Set(count)
 }
 
-// ResetFleetGauges resets running instance, GPU, and spend gauges before a fresh reconciliation pass.
+// ResetFleetGauges resets running instance, vCPU, memory, GPU, VRAM, and spend gauges before a fresh reconciliation pass.
 func (m *ObservabilityMetrics) ResetFleetGauges() {
 	m.instancesRunning.Reset()
+	m.vcpusRunning.Reset()
+	m.memoryGiBRunning.Reset()
 	m.gpusRunning.Reset()
+	m.vramGBRunning.Reset()
 	m.spendPerHour.Reset()
 }
 
-// SetFleetGauges sets live instance, GPU count, and run-rate spend.
-func (m *ObservabilityMetrics) SetFleetGauges(provider, region, gpuModel, capacityType string, instances, gpus, spendPerHour float64) {
+// SetFleetGauges sets live instance, vCPU, memory, GPU, VRAM count, and run-rate spend.
+func (m *ObservabilityMetrics) SetFleetGauges(provider, region, gpuModel, capacityType string, instances, vcpus, memGiB, gpus, vramGB, spendPerHour float64) {
 	m.instancesRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(instances)
+	m.vcpusRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(vcpus)
+	m.memoryGiBRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(memGiB)
 	m.gpusRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(gpus)
+	m.vramGBRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(vramGB)
 	m.spendPerHour.WithLabelValues(provider, region, gpuModel, capacityType).Set(spendPerHour)
 }
 
