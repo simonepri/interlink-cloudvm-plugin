@@ -137,6 +137,10 @@ exec > /var/log/cloudvm-bootstrap.log 2>&1
 echo "=== INTERLINK CLOUDVM BOOTSTRAP: $(date) ==="
 echo "CLOUDVM_STATUS: {\"status\": \"BOOTING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\", \"type\": \"{{.InstanceType}}\"}" > /dev/console 2>/dev/null || true
 
+# Initialize heartbeat file with boot timestamp so new nodes are not considered idle prematurely
+touch /tmp/cloudvm-heartbeat 2>/dev/null || true
+echo "$(date +%s)" > /tmp/cloudvm-heartbeat 2>/dev/null || true
+
 # 1. Arm Self-Destruct Startup Watchdog (terminates VM if workload fails to reach ready within 600s)
 cat << 'EOF' > /usr/local/bin/bootstrap-watchdog.sh
 #!/usr/bin/env bash
@@ -468,6 +472,24 @@ PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/n
 {{end}}
 
 {{else}}
+# Ensure Docker and Python 3 are installed on base Linux distributions
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[cloudvm-bootstrap] Installing Docker and Python 3..."
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y docker python3 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y docker python3 || true
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y && apt-get install -y docker.io python3 || true
+  fi
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl enable --now docker 2>/dev/null || systemctl start docker 2>/dev/null || true
+elif command -v service >/dev/null 2>&1; then
+  service docker start 2>/dev/null || true
+fi
+
 # 5. Container Execution Mode with In-VM Micro-Runner Daemon (:9090)
 echo "[cloudvm-bootstrap] Starting in-VM micro-runner daemon on port 9090..."
 
@@ -564,22 +586,25 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/containers/list':
-            res = subprocess.run(['docker', 'ps', '--filter', 'name=cloudvm-', '--filter', 'status=running', '--format', '{{print "{{"}}.ID{{print "}}"}}	{{print "{{"}}.Names{{print "}}"}}	{{print "{{"}}.State{{print "}}"}}	{{print "{{"}}.Status{{print "}}"}}'], capture_output=True, text=True)
             results = []
-            if res.returncode == 0:
-                for line in res.stdout.strip().splitlines():
-                    if not line:
-                        continue
-                    parts = line.split('	')
-                    if len(parts) >= 3:
-                        name = parts[1]
-                        state = parts[2]
-                        uid = name.removeprefix('cloudvm-')
-                        results.append({
-                            "podUID": uid,
-                            "running": True,
-                            "reason": state,
-                        })
+            try:
+                res = subprocess.run(['docker', 'ps', '--filter', 'name=cloudvm-', '--filter', 'status=running', '--format', '{{print "{{"}}.ID{{print "}}"}}	{{print "{{"}}.Names{{print "}}"}}	{{print "{{"}}.State{{print "}}"}}	{{print "{{"}}.Status{{print "}}"}}'], capture_output=True, text=True)
+                if res.returncode == 0:
+                    for line in res.stdout.strip().splitlines():
+                        if not line:
+                            continue
+                        parts = line.split('	')
+                        if len(parts) >= 3:
+                            name = parts[1]
+                            state = parts[2]
+                            uid = name.removeprefix('cloudvm-')
+                            results.append({
+                                "podUID": uid,
+                                "running": True,
+                                "reason": state,
+                            })
+            except Exception:
+                pass
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -590,9 +615,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(parsed.query)
             pod_uid = params.get('podUID', [''])[0]
             container_name = f"cloudvm-{pod_uid}"
-            res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
-            if res.returncode == 0:
-                try:
+            try:
+                res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
+                if res.returncode == 0:
                     data = json.loads(res.stdout)[0]
                     state = data.get('State', {})
                     status_str = state.get('Status', '')
@@ -619,8 +644,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(json.dumps(resp).encode('utf-8'))
                     return
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
             plock = get_pod_lock(pod_uid)
             with plock:
@@ -675,7 +700,10 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 with plock:
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
-                subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
+                try:
+                    subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
+                except Exception:
+                    pass
             self.send_response(200)
             self.end_headers()
             return
@@ -740,13 +768,16 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b'{"status":"already_starting"}')
                     return
 
-                inspect_res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
-                if inspect_res.returncode == 0:
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"already_exists"}')
-                    return
+                try:
+                    inspect_res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
+                    if inspect_res.returncode == 0:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(b'{"status":"already_exists"}')
+                        return
+                except Exception:
+                    pass
 
                 starting_pods.add(pod_uid)
                 start_failures.pop(pod_uid, None)
@@ -823,11 +854,23 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         cfg_dir = None
 
                 # 1. Pull container image using isolated ephemeral docker config
-                pull_cmd = ['docker']
-                if cfg_dir:
-                    pull_cmd.extend(['--config', cfg_dir])
-                pull_cmd.extend(['pull', img])
-                pull_res = subprocess.run(pull_cmd, capture_output=True, text=True)
+                pull_res = None
+                try:
+                    pull_cmd = ['docker']
+                    if cfg_dir:
+                        pull_cmd.extend(['--config', cfg_dir])
+                    pull_cmd.extend(['pull', img])
+                    pull_res = subprocess.run(pull_cmd, capture_output=True, text=True)
+                except Exception as e:
+                    with get_pod_lock(uid):
+                        starting_pods.discard(uid)
+                        start_failures[uid] = ("ErrImagePull", str(e))
+                    if cfg_dir:
+                        try:
+                            shutil.rmtree(cfg_dir)
+                        except Exception:
+                            pass
+                    return
 
                 # Clean up isolated credentials directory immediately
                 if cfg_dir:
@@ -843,12 +886,17 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     return
 
                 # 2. Run container
-                res = subprocess.run(c, capture_output=True, text=True)
-                with get_pod_lock(uid):
-                    starting_pods.discard(uid)
-                    if res.returncode != 0:
-                        err_msg = res.stderr.strip() or res.stdout.strip() or "container start failed"
-                        start_failures[uid] = ("StartError", err_msg)
+                try:
+                    res = subprocess.run(c, capture_output=True, text=True)
+                    with get_pod_lock(uid):
+                        starting_pods.discard(uid)
+                        if res.returncode != 0:
+                            err_msg = res.stderr.strip() or res.stdout.strip() or "container start failed"
+                            start_failures[uid] = ("StartError", err_msg)
+                except Exception as e:
+                    with get_pod_lock(uid):
+                        starting_pods.discard(uid)
+                        start_failures[uid] = ("StartError", str(e))
 
             threading.Thread(target=run_async, args=(pod_uid, image, docker_cmd, docker_cfg), daemon=True).start()
 
@@ -875,23 +923,34 @@ fi
 # Powers off only after the node has had zero active containers AND no provider heartbeat for >300s
 (
   while true; do
-    ACTIVE=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+    ACTIVE=0
+    if command -v docker >/dev/null 2>&1; then
+      ACTIVE=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+    fi
     if [ "$ACTIVE" -eq 0 ]; then
-      HB_AGE=9999
+      NOW=$(date +%s)
+      HB_AGE=0
       if [ -f /tmp/cloudvm-heartbeat ]; then
         HB_TIME=$(cat /tmp/cloudvm-heartbeat 2>/dev/null | tr -dc '0-9.' || echo "")
-        if [ -n "$HB_TIME" ]; then
-          NOW=$(date +%s)
-          HB_INT=${HB_TIME%.*}
-          if [ -n "$HB_INT" ] && [ "$HB_INT" -gt 0 ] 2>/dev/null; then
-            HB_AGE=$(( NOW - HB_INT ))
-          fi
+        HB_INT=${HB_TIME%.*}
+        if [ -n "$HB_INT" ] && [ "$HB_INT" -gt 0 ] 2>/dev/null; then
+          HB_AGE=$(( NOW - HB_INT ))
         fi
       fi
       if [ "$HB_AGE" -gt 300 ]; then
         sleep 60
-        ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
-        if [ "$ACTIVE_AFTER" -eq 0 ]; then
+        ACTIVE_AFTER=0
+        if command -v docker >/dev/null 2>&1; then
+          ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+        fi
+        if [ -f /tmp/cloudvm-heartbeat ]; then
+          HB_TIME=$(cat /tmp/cloudvm-heartbeat 2>/dev/null | tr -dc '0-9.' || echo "")
+          HB_INT=${HB_TIME%.*}
+          if [ -n "$HB_INT" ] && [ "$HB_INT" -gt 0 ] 2>/dev/null; then
+            HB_AGE=$(( $(date +%s) - HB_INT ))
+          fi
+        fi
+        if [ "$ACTIVE_AFTER" -eq 0 ] && [ "$HB_AGE" -gt 300 ]; then
           echo "[cloudvm-bootstrap] Node has been idle with zero active containers and no provider heartbeat for >300s. Terminating VM..."
           echo "CLOUDVM_STATUS: {\"status\": \"IDLE_TIMEOUT\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
           shutdown -h now || poweroff

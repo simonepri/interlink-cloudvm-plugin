@@ -556,3 +556,29 @@ func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
 			idxMirrors, idxOtel, idxNPD, idxRunner, idxCustom)
 	}
 }
+
+func TestCloudInit_DockerInstallAndHeartbeatBootstrap(t *testing.T) {
+	cfg := &CloudInitConfig{
+		PodName:         "boot-test-pod",
+		PodNamespace:    "default",
+		RunnerAuthToken: "token-boot-123",
+	}
+
+	script, err := GenerateCloudInit(cfg)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit failed: %v", err)
+	}
+
+	if !strings.Contains(script, "touch /tmp/cloudvm-heartbeat") {
+		t.Errorf("cloud-init missing boot heartbeat initialization touch")
+	}
+	if !strings.Contains(script, "Installing Docker and Python 3") {
+		t.Errorf("cloud-init missing Docker and Python 3 automated installation block")
+	}
+	if !strings.Contains(script, "systemctl enable --now docker") {
+		t.Errorf("cloud-init missing docker enable/start command")
+	}
+	if !strings.Contains(script, "HB_AGE=0") {
+		t.Errorf("cloud-init watchdog missing safe HB_AGE default 0")
+	}
+}
