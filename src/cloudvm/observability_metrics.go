@@ -60,8 +60,8 @@ var GlobalMetrics = NewObservabilityMetrics()
 func NewObservabilityMetrics() *ObservabilityMetrics {
 	reg := prometheus.NewRegistry()
 
-	marketLabels := []string{"provider", "region", "zone", "gpu_model", "gpu_memory_gb", "gpu_count", "capacity_type", "instance_type"}
-	fleetLabels := []string{"provider", "region", "gpu_model", "capacity_type"}
+	marketLabels := []string{"provider", "region", "zone", "accelerator", "gpu_model", "gpu_memory_gb", "gpu_count", "capacity_type", "instance_type"}
+	fleetLabels := []string{"provider", "region", "accelerator", "instance_type", "gpu_model", "capacity_type"}
 
 	m := &ObservabilityMetrics{
 		Registry: reg,
@@ -74,7 +74,7 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		vcpuPrice: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_vcpu_price_usd_per_hour",
 			Help: "Current price in USD per vCPU-hour for CPU-only shapes",
-		}, []string{"provider", "region", "zone", "capacity_type", "instance_type"}),
+		}, []string{"provider", "region", "zone", "accelerator", "capacity_type", "instance_type"}),
 
 		instancePrice: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_instance_price_usd_per_hour",
@@ -84,12 +84,12 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		availScore: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_availability_score",
 			Help: "Current availability score between 0.0 and 1.0 indicating capacity depth",
-		}, []string{"provider", "region", "zone", "gpu_model", "instance_type", "source", "target_gpus"}),
+		}, []string{"provider", "region", "zone", "accelerator", "gpu_model", "instance_type", "source", "target_gpus"}),
 
 		expectedUptime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_expected_uptime_seconds",
 			Help: "Expected uptime in seconds before preemption or spot interruption",
-		}, []string{"provider", "region", "instance_type", "gpu_model", "source"}),
+		}, []string{"provider", "region", "accelerator", "instance_type", "gpu_model", "source"}),
 
 		signalAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_signal_age_seconds",
@@ -99,12 +99,12 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		quotaLimit: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_quota_gpus",
 			Help: "Configured GPU quota limit",
-		}, []string{"provider", "region", "quota"}),
+		}, []string{"provider", "region", "accelerator", "quota"}),
 
 		quotaUsed: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_quota_used_gpus",
 			Help: "Currently utilized GPU quota",
-		}, []string{"provider", "region", "quota"}),
+		}, []string{"provider", "region", "accelerator", "quota"}),
 
 		fillPrice: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_fill_price_usd_per_gpu_hour",
@@ -164,7 +164,7 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		launchAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cloudvm_launch_attempts_total",
 			Help: "Total number of instance launch attempts classified by outcome result",
-		}, []string{"provider", "region", "gpu_model", "capacity_type", "result"}),
+		}, []string{"provider", "region", "accelerator", "instance_type", "gpu_model", "capacity_type", "result"}),
 
 		launchDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cloudvm_launch_duration_seconds",
@@ -245,32 +245,41 @@ func (m *ObservabilityMetrics) Handler() http.Handler {
 }
 
 // SetGPUPrice exports all-in price per GPU-hour and full instance price.
-func (m *ObservabilityMetrics) SetGPUPrice(provider, region, zone, gpuModel string, gpuMemoryGB, gpuCount int, capacityType, instanceType string, instancePriceUSD float64) {
+func (m *ObservabilityMetrics) SetGPUPrice(provider, region, zone, accelerator, gpuModel string, gpuMemoryGB, gpuCount int, capacityType, instanceType string, instancePriceUSD float64) {
 	if gpuCount <= 0 {
 		return
+	}
+	if accelerator == "" {
+		accelerator = "gpu"
 	}
 	pricePerGPU := instancePriceUSD / float64(gpuCount)
 	memGBStr := fmt.Sprintf("%d", gpuMemoryGB)
 	countStr := fmt.Sprintf("%d", gpuCount)
 
-	m.gpuPrice.WithLabelValues(provider, region, zone, gpuModel, memGBStr, countStr, capacityType, instanceType).Set(pricePerGPU)
-	m.instancePrice.WithLabelValues(provider, region, zone, gpuModel, memGBStr, countStr, capacityType, instanceType).Set(instancePriceUSD)
+	m.gpuPrice.WithLabelValues(provider, region, zone, accelerator, gpuModel, memGBStr, countStr, capacityType, instanceType).Set(pricePerGPU)
+	m.instancePrice.WithLabelValues(provider, region, zone, accelerator, gpuModel, memGBStr, countStr, capacityType, instanceType).Set(instancePriceUSD)
 }
 
 // SetVCPUPrice exports price per vCPU-hour for CPU-only shapes.
 func (m *ObservabilityMetrics) SetVCPUPrice(provider, region, zone, capacityType, instanceType string, vcpuPriceUSD float64) {
-	m.vcpuPrice.WithLabelValues(provider, region, zone, capacityType, instanceType).Set(vcpuPriceUSD)
+	m.vcpuPrice.WithLabelValues(provider, region, zone, "none", capacityType, instanceType).Set(vcpuPriceUSD)
 }
 
 // SetAvailabilityScore exports availability score (0.0 to 1.0).
-func (m *ObservabilityMetrics) SetAvailabilityScore(provider, region, zone, gpuModel, instanceType, source string, targetGPUs int, score float64) {
+func (m *ObservabilityMetrics) SetAvailabilityScore(provider, region, zone, accelerator, gpuModel, instanceType, source string, targetGPUs int, score float64) {
+	if accelerator == "" {
+		accelerator = "gpu"
+	}
 	targetStr := fmt.Sprintf("%d", targetGPUs)
-	m.availScore.WithLabelValues(provider, region, zone, gpuModel, instanceType, source, targetStr).Set(score)
+	m.availScore.WithLabelValues(provider, region, zone, accelerator, gpuModel, instanceType, source, targetStr).Set(score)
 }
 
 // SetExpectedUptime exports expected uptime in seconds before interruption.
-func (m *ObservabilityMetrics) SetExpectedUptime(provider, region, instanceType, gpuModel, source string, uptimeSeconds float64) {
-	m.expectedUptime.WithLabelValues(provider, region, instanceType, gpuModel, source).Set(uptimeSeconds)
+func (m *ObservabilityMetrics) SetExpectedUptime(provider, region, accelerator, instanceType, gpuModel, source string, uptimeSeconds float64) {
+	if accelerator == "" {
+		accelerator = "gpu"
+	}
+	m.expectedUptime.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, source).Set(uptimeSeconds)
 }
 
 // SetSignalAge exports signal age in seconds.
@@ -279,9 +288,12 @@ func (m *ObservabilityMetrics) SetSignalAge(provider, region, source string, age
 }
 
 // SetQuota exports GPU quota limits and utilized GPUs.
-func (m *ObservabilityMetrics) SetQuota(provider, region, quota string, limitGPUs, usedGPUs float64) {
-	m.quotaLimit.WithLabelValues(provider, region, quota).Set(limitGPUs)
-	m.quotaUsed.WithLabelValues(provider, region, quota).Set(usedGPUs)
+func (m *ObservabilityMetrics) SetQuota(provider, region, accelerator, quota string, limitGPUs, usedGPUs float64) {
+	if accelerator == "" {
+		accelerator = "gpu"
+	}
+	m.quotaLimit.WithLabelValues(provider, region, accelerator, quota).Set(limitGPUs)
+	m.quotaUsed.WithLabelValues(provider, region, accelerator, quota).Set(usedGPUs)
 }
 
 // SetFillQuote exports solver fill quotes for a specific request.
@@ -318,39 +330,84 @@ func (m *ObservabilityMetrics) ResetFleetGauges() {
 }
 
 // SetFleetGauges sets live instance, vCPU, memory, GPU, VRAM count, run-rate spend, pods, and baseline spend.
-func (m *ObservabilityMetrics) SetFleetGauges(provider, region, gpuModel, capacityType string, instances, vcpus, memGiB, gpus, vramGB, spendPerHour float64, extras ...float64) {
-	m.instancesRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(instances)
-	m.vcpusRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(vcpus)
-	m.memoryGiBRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(memGiB)
-	m.gpusRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(gpus)
-	m.vramGBRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(vramGB)
-	m.spendPerHour.WithLabelValues(provider, region, gpuModel, capacityType).Set(spendPerHour)
+func (m *ObservabilityMetrics) SetFleetGauges(provider, region, accelerator, instanceType, gpuModel, capacityType string, instances, vcpus, memGiB, gpus, vramGB, spendPerHour float64, extras ...float64) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if gpuModel == "" {
+		gpuModel = "none"
+	}
+	m.instancesRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(instances)
+	m.vcpusRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(vcpus)
+	m.memoryGiBRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(memGiB)
+	m.gpusRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(gpus)
+	m.vramGBRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(vramGB)
+	m.spendPerHour.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(spendPerHour)
 	if len(extras) > 0 {
-		m.podsRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(extras[0])
+		m.podsRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(extras[0])
 	}
 	if len(extras) > 1 {
-		m.spendBaselinePerHour.WithLabelValues(provider, region, gpuModel, capacityType).Set(extras[1])
+		m.spendBaselinePerHour.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(extras[1])
 	}
 }
 
 // RecordLaunchAttempt increments launch attempt counters classified by outcome result.
-func (m *ObservabilityMetrics) RecordLaunchAttempt(provider, region, gpuModel, capacityType, result string) {
-	m.launchAttempts.WithLabelValues(provider, region, gpuModel, capacityType, result).Inc()
+func (m *ObservabilityMetrics) RecordLaunchAttempt(provider, region, accelerator, instanceType, gpuModel, capacityType, result string) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if gpuModel == "" {
+		gpuModel = "none"
+	}
+	m.launchAttempts.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType, result).Inc()
 }
 
 // RecordLaunchDuration records the launch duration histogram observation.
-func (m *ObservabilityMetrics) RecordLaunchDuration(provider, region, gpuModel, capacityType string, seconds float64) {
-	m.launchDuration.WithLabelValues(provider, region, gpuModel, capacityType).Observe(seconds)
+func (m *ObservabilityMetrics) RecordLaunchDuration(provider, region, accelerator, instanceType, gpuModel, capacityType string, seconds float64) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if gpuModel == "" {
+		gpuModel = "none"
+	}
+	m.launchDuration.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Observe(seconds)
 }
 
 // RecordInterruption increments the unexpected interruption counter.
-func (m *ObservabilityMetrics) RecordInterruption(provider, region, gpuModel, capacityType string) {
-	m.interruptions.WithLabelValues(provider, region, gpuModel, capacityType).Inc()
+func (m *ObservabilityMetrics) RecordInterruption(provider, region, accelerator, instanceType, gpuModel, capacityType string) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if gpuModel == "" {
+		gpuModel = "none"
+	}
+	m.interruptions.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Inc()
 }
 
 // AddInstanceSeconds increments cumulative instance seconds.
-func (m *ObservabilityMetrics) AddInstanceSeconds(provider, region, gpuModel, capacityType string, seconds float64) {
-	m.instanceSeconds.WithLabelValues(provider, region, gpuModel, capacityType).Add(seconds)
+func (m *ObservabilityMetrics) AddInstanceSeconds(provider, region, accelerator, instanceType, gpuModel, capacityType string, seconds float64) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if gpuModel == "" {
+		gpuModel = "none"
+	}
+	m.instanceSeconds.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Add(seconds)
 }
 
 // SetLegacySpotMetrics updates legacy gauges for backward compatibility.

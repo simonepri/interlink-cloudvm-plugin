@@ -115,4 +115,22 @@ func TestFleetTracker_LiveFleetAndInterruption(t *testing.T) {
 	if !strings.Contains(body, "cloudvm_spend_ondemand_baseline_usd_per_hour") {
 		t.Errorf("expected cloudvm_spend_ondemand_baseline_usd_per_hour in metrics: %s", body)
 	}
+	if !strings.Contains(body, `accelerator="gpu"`) {
+		t.Errorf("expected accelerator=gpu in metrics: %s", body)
+	}
+
+	// Test idle fleet emits zero gauges
+	tracker.UpdateLiveFleet([]*Instance{})
+	recIdle := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(recIdle, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	bodyIdle := recIdle.Body.String()
+	if !strings.Contains(bodyIdle, "cloudvm_instances_running") {
+		t.Errorf("expected cloudvm_instances_running in idle metrics: %s", bodyIdle)
+	}
+	if !strings.Contains(bodyIdle, `accelerator="none"`) {
+		t.Errorf("expected accelerator=none in idle metrics: %s", bodyIdle)
+	}
+	if !strings.Contains(bodyIdle, "cloudvm_pods_running") {
+		t.Errorf("expected cloudvm_pods_running in idle metrics: %s", bodyIdle)
+	}
 }

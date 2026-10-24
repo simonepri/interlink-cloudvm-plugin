@@ -353,9 +353,16 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			gpuModel = p.InstanceType
 		}
 
+		accelerator := "none"
+		if resCap.TPUs > 0 {
+			accelerator = "tpu"
+		} else if resCap.GPUs > 0 {
+			accelerator = "gpu"
+		}
+
 		if resCap.GPUs > 0 {
-			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "spot", p.InstanceType, p.SpotPriceUSD)
-			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "on-demand", p.InstanceType, ondemand)
+			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, accelerator, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "spot", p.InstanceType, p.SpotPriceUSD)
+			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, accelerator, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "on-demand", p.InstanceType, ondemand)
 		} else {
 			cpuCount, _ := strconv.Atoi(resCap.CPU.String())
 			if cpuCount <= 0 {
@@ -413,7 +420,13 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 		if gpuModel == "" {
 			gpuModel = s.InstanceType
 		}
-		t.metrics.SetAvailabilityScore("aws", s.Region, s.AvailabilityZone, gpuModel, s.InstanceType, "aws_placement_score", 1, float64(s.Score)/10.0)
+		accelerator := "gpu"
+		if resCap.TPUs > 0 {
+			accelerator = "tpu"
+		} else if resCap.GPUs == 0 {
+			accelerator = "none"
+		}
+		t.metrics.SetAvailabilityScore("aws", s.Region, s.AvailabilityZone, accelerator, gpuModel, s.InstanceType, "aws_placement_score", 1, float64(s.Score)/10.0)
 	}
 
 	// 3. AWS Spot Advisor
@@ -429,7 +442,13 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 					if gpuModel == "" {
 						gpuModel = itype
 					}
-					t.metrics.SetExpectedUptime("aws", reg, itype, gpuModel, "aws_spot_advisor", uptime)
+					accelerator := "gpu"
+					if resCap.TPUs > 0 {
+						accelerator = "tpu"
+					} else if resCap.GPUs == 0 {
+						accelerator = "none"
+					}
+					t.metrics.SetExpectedUptime("aws", reg, accelerator, itype, gpuModel, "aws_spot_advisor", uptime)
 					t.metrics.SetSignalAge("aws", reg, "aws_spot_advisor", now.Sub(t.advisor.LastModified()).Seconds())
 				}
 			}

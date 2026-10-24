@@ -292,7 +292,7 @@ func QueryAWSGPUQuotas(ctx context.Context, client AWSServiceQuotasAPI, region s
 			if strings.HasPrefix(name, "p_") {
 				gpus = val / AWSVCPUPerGPUP
 			}
-			metrics.SetQuota("aws", region, name, gpus, 0)
+			metrics.SetQuota("aws", region, "gpu", name, gpus, 0)
 		}
 	}
 }
