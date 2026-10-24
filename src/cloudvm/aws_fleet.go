@@ -500,7 +500,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 			}
 			return StrategyPriceCapacityOptimized
 		}(),
-		RunnerAuthToken:    spec.RunnerAuthToken,
+		RunnerAuthToken: spec.RunnerAuthToken,
 	}
 
 	overrides := BuildFleetOverrides(req.InstanceTypes, req.SubnetIDs)

@@ -4,8 +4,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"os"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -156,7 +156,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		if envSubnets != "" {
 			for _, s := range strings.Split(envSubnets, ",") {
 				if trimmed := strings.TrimSpace(s); trimmed != "" {
-				subnetIDs = append(subnetIDs, trimmed)
+					subnetIDs = append(subnetIDs, trimmed)
 				}
 			}
 		}
@@ -174,7 +174,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		if envTypes := os.Getenv("AWS_INSTANCE_TYPES"); envTypes != "" {
 			for _, t := range strings.Split(envTypes, ",") {
 				if trimmed := strings.TrimSpace(t); trimmed != "" {
-				candidateInstanceTypes = append(candidateInstanceTypes, trimmed)
+					candidateInstanceTypes = append(candidateInstanceTypes, trimmed)
 				}
 			}
 		}
@@ -293,42 +293,42 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	}
 
 	return &InstanceSpec{
-		PodName:               name,
-		PodNamespace:          ns,
-		PodUID:                uid,
-		Provider:              prov,
-		CostCenter:            costCenter,
-		JobID:                 jobID,
-		LaunchTemplateID:      launchTemplateID,
-		LaunchTemplateName:    launchTemplateName,
-		Region:                region,
-		CandidateRegions:      candidateRegions,
-		InstanceType:          instanceType,
-		MarketType:            marketType,
-		AMIMode:               amiMode,
-		MaxPrice:              maxPrice,
-		MaxSpotPrice:          maxPrice,
-		PricePolicy:           pricePolicy,
-		MaxEgressRate:         maxEgressRate,
-		EgressBandwidth:       egressBandwidth,
-		EgressBurst:           egressBurst,
-		NumGPUs:               numGPUs,
-		NumTPUs:               numTPUs,
-		TargetContainerImage:  targetImage,
-		Command:               command,
-		Args:                  args,
-		Env:                   envMap,
-		RayHeadAddress:        rayHeadAddress,
-		MeshAuthKey:           meshAuthKey,
-		RunAsUser:             runAsUser,
-		RunAsGroup:            runAsGroup,
-		CPUMillicores:         cpuMillicores,
-		MemoryBytes:           memoryBytes,
-		ClusterTag:            defaultClusterTag,
-		RegistryMirrors:       registryMirrors,
-		OtelEndpoint:          otelEndpoint,
-		NodeProblemDetector:   enableNPD,
-		CustomBootstrapScript: customBootstrapScript,
+		PodName:                name,
+		PodNamespace:           ns,
+		PodUID:                 uid,
+		Provider:               prov,
+		CostCenter:             costCenter,
+		JobID:                  jobID,
+		LaunchTemplateID:       launchTemplateID,
+		LaunchTemplateName:     launchTemplateName,
+		Region:                 region,
+		CandidateRegions:       candidateRegions,
+		InstanceType:           instanceType,
+		MarketType:             marketType,
+		AMIMode:                amiMode,
+		MaxPrice:               maxPrice,
+		MaxSpotPrice:           maxPrice,
+		PricePolicy:            pricePolicy,
+		MaxEgressRate:          maxEgressRate,
+		EgressBandwidth:        egressBandwidth,
+		EgressBurst:            egressBurst,
+		NumGPUs:                numGPUs,
+		NumTPUs:                numTPUs,
+		TargetContainerImage:   targetImage,
+		Command:                command,
+		Args:                   args,
+		Env:                    envMap,
+		RayHeadAddress:         rayHeadAddress,
+		MeshAuthKey:            meshAuthKey,
+		RunAsUser:              runAsUser,
+		RunAsGroup:             runAsGroup,
+		CPUMillicores:          cpuMillicores,
+		MemoryBytes:            memoryBytes,
+		ClusterTag:             defaultClusterTag,
+		RegistryMirrors:        registryMirrors,
+		OtelEndpoint:           otelEndpoint,
+		NodeProblemDetector:    enableNPD,
+		CustomBootstrapScript:  customBootstrapScript,
 		SubnetIDs:              subnetIDs,
 		CandidateInstanceTypes: candidateInstanceTypes,
 	}, nil
