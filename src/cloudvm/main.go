@@ -251,6 +251,7 @@ func run() error {
 		}
 		reconciler.SetLaunchGracePeriod(launchGrace)
 		server.SetReconciler(reconciler)
+		go reconciler.Start(ctx)
 
 		go func() {
 			ticker := time.NewTicker(reconcileInterval)

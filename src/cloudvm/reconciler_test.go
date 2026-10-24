@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -528,5 +530,140 @@ func TestServer_DeletedPodVMWithFailedTerminationIsTerminatedAsZombie(t *testing
 	activeAfter, _ := srv.GetActivePods(context.Background())
 	if _, exists := activeAfter["uid-u1"]; exists {
 		t.Fatalf("expected uid-u1 NOT in active pods after zombie termination, got: %v", activeAfter)
+	}
+}
+
+func TestReconciler_KeepAlivePingsDispatchedToActiveNodes(t *testing.T) {
+	var pingReceived atomic.Int32
+	var lastAuthHeader string
+	var lastPath string
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		lastAuthHeader = r.Header.Get("Authorization")
+		lastPath = r.URL.Path
+		mu.Unlock()
+		pingReceived.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	hostPort := ts.Listener.Addr().String()
+
+	np := NewNodePool(60 * time.Second)
+
+	// Node 1: active, non-cordoned, with IP and token -> should receive ping
+	node1 := NewCloudVMNode("i-active-1", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+	node1.RunnerAuthToken = "secret-token-test-1" //nolint:gosec // test token
+	np.RegisterNode(node1)
+
+	// Node 2: cordoned node -> must NOT receive ping
+	node2 := NewCloudVMNode("i-cordoned-2", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
+	node2.RunnerAuthToken = "secret-token-test-2" //nolint:gosec // test token
+	node2.Cordoned = true
+	np.RegisterNode(node2)
+
+	// Node 3: active node without IP -> must NOT receive ping
+	node3 := NewCloudVMNode("i-no-ip-3", ProviderAWS, "us-east-1", "", ResourceVector{})
+	node3.RunnerAuthToken = "secret-token-test-3" //nolint:gosec // test token
+	np.RegisterNode(node3)
+
+	mock := NewMockProvider()
+	reconciler := NewReconciler(mock, nil, mock, "test-cluster", 10*time.Minute)
+	reconciler.SetNodePool(np)
+
+	reconciler.PingActiveNodes(context.Background())
+
+	if got := pingReceived.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 keep-alive ping, got %d", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if lastPath != "/healthz" {
+		t.Errorf("expected ping path /healthz, got %s", lastPath)
+	}
+	expectedAuth := "Bearer secret-token-test-1"
+	if lastAuthHeader != expectedAuth {
+		t.Errorf("expected auth header %q, got %q", expectedAuth, lastAuthHeader)
+	}
+}
+
+func TestReconciler_KeepAlivePingsUnreachableNodeGraceful(_ *testing.T) {
+	np := NewNodePool(60 * time.Second)
+
+	// Node with unreachable IP
+	node1 := NewCloudVMNode("i-unreachable-1", ProviderAWS, "us-east-1", "127.0.0.1:1", ResourceVector{})
+	node1.RunnerAuthToken = "token-unreachable" //nolint:gosec // test token
+	np.RegisterNode(node1)
+
+	// Node that returns 500 Internal Server Error
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	node2 := NewCloudVMNode("i-err-2", ProviderAWS, "us-east-1", ts.Listener.Addr().String(), ResourceVector{})
+	node2.RunnerAuthToken = "token-500" //nolint:gosec // test token
+	np.RegisterNode(node2)
+
+	mock := NewMockProvider()
+	reconciler := NewReconciler(mock, nil, mock, "test-cluster", 10*time.Minute)
+	reconciler.SetNodePool(np)
+	reconciler.SetHTTPClient(&http.Client{Timeout: 100 * time.Millisecond})
+
+	// Must not crash or panic
+	reconciler.PingActiveNodes(context.Background())
+}
+
+func TestReconciler_KeepAliveStartTickerLoop(t *testing.T) {
+	var pingCount atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		pingCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	np := NewNodePool(60 * time.Second)
+	node := NewCloudVMNode("i-ticker-1", ProviderAWS, "us-east-1", ts.Listener.Addr().String(), ResourceVector{})
+	node.RunnerAuthToken = "test-token" //nolint:gosec // test token
+	np.RegisterNode(node)
+
+	mock := NewMockProvider()
+	reconciler := NewReconciler(mock, nil, mock, "test-cluster", 10*time.Minute)
+	reconciler.SetNodePool(np)
+	reconciler.SetPingInterval(25 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		reconciler.Start(ctx)
+		close(done)
+	}()
+
+	// Wait for at least 2 pings (initial + 1 ticker tick)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if pingCount.Load() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("reconciler.Start did not terminate after context cancellation")
+	}
+
+	if got := pingCount.Load(); got < 2 {
+		t.Fatalf("expected at least 2 pings in ticker loop, got %d", got)
 	}
 }

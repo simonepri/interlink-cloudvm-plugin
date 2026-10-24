@@ -125,6 +125,13 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 			s.nodePool.SetIdleGracePeriod(time.Duration(sec) * time.Second)
 		}
 	}
+	if raw := os.Getenv("MAX_PODS_PER_NODE"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			s.nodePool.SetMaxPodsPerNode(n)
+		} else {
+			s.nodePool.SetMaxPodsPerNode(100)
+		}
+	}
 	if kmsKey := os.Getenv("KMS_KEY_ID"); kmsKey != "" {
 		s.kmsKeyID = kmsKey
 	}
@@ -299,6 +306,21 @@ func (s *Server) SetIdleGracePeriod(d time.Duration) {
 	}
 }
 
+// MaxPodsPerNode returns the configured max active pods per node.
+func (s *Server) MaxPodsPerNode() int {
+	if s.nodePool != nil {
+		return s.nodePool.MaxPodsPerNode()
+	}
+	return 100
+}
+
+// SetMaxPodsPerNode updates the max active pods per node on the node pool.
+func (s *Server) SetMaxPodsPerNode(n int) {
+	if s.nodePool != nil {
+		s.nodePool.SetMaxPodsPerNode(n)
+	}
+}
+
 // SetLaunchTimeout overrides the maximum allowed duration for bare VM creation and bootstrap.
 func (s *Server) SetLaunchTimeout(d time.Duration) {
 	if d > 0 {
@@ -335,6 +357,7 @@ func (s *Server) SetReconciler(r *Reconciler) {
 	defer s.mu.Unlock()
 	s.reconciler = r
 	if r != nil {
+		r.SetNodePool(s.nodePool)
 		r.SetOnTerminated(func(id string) {
 			if s.tokenStore != nil {
 				_ = s.tokenStore.Delete(id)
@@ -933,9 +956,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	remainingPods := 0
 	foundInPool := false
 	var nodeRef *CloudVMNode
+	wasCordoned := false
 	if node, _, found := s.nodePool.FindPodNode(uid); found {
 		foundInPool = true
 		nodeRef = node
+		wasCordoned = node.Cordoned
 		_ = s.runner.StopContainer(r.Context(), node, uid)
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
@@ -955,10 +980,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If the node pool has an active idle grace period and the node is not cordoned,
-	// retain the warm VM so subsequent pods can bin-pack onto it without VM cold-start.
-	if foundInPool && nodeRef != nil && !nodeRef.Cordoned && s.nodePool.IdleGracePeriod() > 0 {
-		log.Printf("[cloudvm] Node %s has 0 active pods; holding warm for %v for potential reuse",
+	// If the node pool has an active idle grace period and the node was not cordoned prior to release,
+	// retain the warm VM during its cooldown window before idle termination.
+	if foundInPool && nodeRef != nil && !wasCordoned && s.nodePool.IdleGracePeriod() > 0 {
+		log.Printf("[cloudvm] Node %s has 0 active pods; holding warm for %v for idle cooldown",
 			nodeRef.InstanceID, s.nodePool.IdleGracePeriod())
 		w.WriteHeader(http.StatusOK)
 		return
