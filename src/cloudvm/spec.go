@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"os"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -138,6 +139,46 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	jobID := pod.Metadata.Annotations["cloudvm.vk.io/job-id"]
 	launchTemplateID := pod.Metadata.Annotations["cloudvm.vk.io/aws-launch-template"]
 	launchTemplateName := pod.Metadata.Annotations["cloudvm.vk.io/aws-launch-template-name"]
+
+	var subnetIDs []string
+	if rawSubnets := pod.Metadata.Annotations["cloudvm.vk.io/subnets"]; rawSubnets != "" {
+		for _, s := range strings.Split(rawSubnets, ",") {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				subnetIDs = append(subnetIDs, trimmed)
+			}
+		}
+	}
+	if len(subnetIDs) == 0 {
+		envSubnets := os.Getenv("AWS_SUBNET_IDS")
+		if envSubnets == "" {
+			envSubnets = os.Getenv("SUBNET_IDS")
+		}
+		if envSubnets != "" {
+			for _, s := range strings.Split(envSubnets, ",") {
+				if trimmed := strings.TrimSpace(s); trimmed != "" {
+				subnetIDs = append(subnetIDs, trimmed)
+				}
+			}
+		}
+	}
+
+	var candidateInstanceTypes []string
+	if cand := pod.Metadata.Annotations["cloudvm.vk.io/candidate-instance-types"]; cand != "" {
+		for _, t := range strings.Split(cand, ",") {
+			if trimmed := strings.TrimSpace(t); trimmed != "" {
+				candidateInstanceTypes = append(candidateInstanceTypes, trimmed)
+			}
+		}
+	}
+	if len(candidateInstanceTypes) == 0 {
+		if envTypes := os.Getenv("AWS_INSTANCE_TYPES"); envTypes != "" {
+			for _, t := range strings.Split(envTypes, ",") {
+				if trimmed := strings.TrimSpace(t); trimmed != "" {
+				candidateInstanceTypes = append(candidateInstanceTypes, trimmed)
+				}
+			}
+		}
+	}
 
 	// KMS token encryption is controlled exclusively by provider configuration
 
@@ -288,6 +329,8 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		OtelEndpoint:          otelEndpoint,
 		NodeProblemDetector:   enableNPD,
 		CustomBootstrapScript: customBootstrapScript,
+		SubnetIDs:              subnetIDs,
+		CandidateInstanceTypes: candidateInstanceTypes,
 	}, nil
 }
 

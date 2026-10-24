@@ -455,8 +455,16 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		return nil, err
 	}
 
-	instanceTypes := []string{spec.InstanceType}
-	if len(instanceTypes) == 0 || instanceTypes[0] == "" {
+	instanceTypes := []string{}
+	if spec.InstanceType != "" {
+		instanceTypes = append(instanceTypes, spec.InstanceType)
+	}
+	for _, cand := range spec.CandidateInstanceTypes {
+		if cand != "" && cand != spec.InstanceType {
+			instanceTypes = append(instanceTypes, cand)
+		}
+	}
+	if len(instanceTypes) == 0 {
 		switch {
 		case spec.NumGPUs >= 8:
 			instanceTypes = []string{"p5.48xlarge", "p4de.24xlarge", "g5.48xlarge"}
@@ -486,7 +494,12 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		MarketType:         spec.MarketType,
 		MaxPrice:           spec.MaxPrice,
 		PricePolicy:        spec.PricePolicy,
-		AllocationStrategy: StrategyPriceCapacityOptimized,
+		AllocationStrategy: func() FleetAllocationStrategy {
+			if spec.PricePolicy == "capacity-optimized" || strings.ToLower(os.Getenv("AWS_FLEET_ALLOCATION_STRATEGY")) == "capacity-optimized" {
+				return StrategyCapacityOptimized
+			}
+			return StrategyPriceCapacityOptimized
+		}(),
 		RunnerAuthToken:    spec.RunnerAuthToken,
 	}
 
@@ -497,7 +510,11 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		return nil, fmt.Errorf("launch fleet failed: %w", err)
 	}
 	if len(resp.Instances) == 0 {
-		return nil, fmt.Errorf("no instances launched by fleet in %s", spec.Region)
+		errMsg := fmt.Sprintf("no instances launched by fleet in %s", spec.Region)
+		if len(resp.Errors) > 0 {
+			errMsg = fmt.Sprintf("%s (fleet errors: %s)", errMsg, strings.Join(resp.Errors, "; "))
+		}
+		return nil, fmt.Errorf("%s", errMsg)
 	}
 
 	inst := resp.Instances[0]

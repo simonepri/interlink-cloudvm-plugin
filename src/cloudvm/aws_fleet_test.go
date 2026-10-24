@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -342,5 +343,66 @@ func TestAWSProvider_RegionPersistenceAcrossReload(t *testing.T) {
 	p3 := NewAWSProvider("us-east-1")
 	if reg := p3.instanceRegions["i-west-persist"]; reg != "" {
 		t.Fatalf("expected empty region after termination reload, got %s", reg)
+	}
+}
+
+func TestAWSFleetCandidateTypesAndSubnets(t *testing.T) {
+	pod := &Pod{
+		Metadata: PodMeta{
+			Name:      "test-burst-pod",
+			Namespace: "team-research-workloads",
+			UID:       "uid-test-123",
+			Annotations: map[string]string{
+				"cloudvm.vk.io/subnets":                  "subnet-1,subnet-2",
+				"cloudvm.vk.io/candidate-instance-types": "g5.xlarge,g6.xlarge",
+				"cloudvm.vk.io/instance-type":            "g5.2xlarge",
+			},
+		},
+	}
+
+	spec, err := PodToInstanceSpec(pod, "cell-aws-usw2", "us-west-2")
+	if err != nil {
+		t.Fatalf("PodToInstanceSpec failed: %v", err)
+	}
+
+	if len(spec.SubnetIDs) != 2 || spec.SubnetIDs[0] != "subnet-1" || spec.SubnetIDs[1] != "subnet-2" {
+		t.Fatalf("unexpected subnetIDs: %v", spec.SubnetIDs)
+	}
+	if len(spec.CandidateInstanceTypes) != 2 || spec.CandidateInstanceTypes[0] != "g5.xlarge" {
+		t.Fatalf("unexpected candidateInstanceTypes: %v", spec.CandidateInstanceTypes)
+	}
+
+	// Verify fleet launch receives candidate types and reports errors on zero instances
+	var capturedOverrides []ec2types.FleetLaunchTemplateOverridesRequest
+	client := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, input *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			if len(input.LaunchTemplateConfigs) > 0 {
+				capturedOverrides = input.LaunchTemplateConfigs[0].Overrides
+			}
+			return &ec2.CreateFleetOutput{
+				Errors: []ec2types.CreateFleetError{
+					{
+						ErrorCode:    aws.String("UnfulfillableCapacity"),
+						ErrorMessage: aws.String("Insufficient capacity in AZ"),
+					},
+				},
+			}, nil
+		},
+	}
+
+	p := NewAWSProvider("us-west-2")
+	p.SetRegionClient("us-west-2", client)
+
+	_, err = p.Launch(context.Background(), spec)
+	if err == nil {
+		t.Fatalf("expected launch error on unfulfillable capacity, got nil")
+	}
+	if !strings.Contains(err.Error(), "Insufficient capacity in AZ") {
+		t.Fatalf("expected error message to contain fleet error details, got: %v", err)
+	}
+
+	// Overrides should contain g5.2xlarge, g5.xlarge, g6.xlarge crossed with subnet-1, subnet-2 (6 total)
+	if len(capturedOverrides) != 6 {
+		t.Fatalf("expected 6 overrides (3 types x 2 subnets), got %d", len(capturedOverrides))
 	}
 }
