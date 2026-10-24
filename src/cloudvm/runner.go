@@ -2,15 +2,24 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/yamux"
 )
 
 // StartContainerRequest contains the parameters required to execute a sliced container on a warm VM.
@@ -323,4 +332,364 @@ func (m *MockContainerRunner) GetHostStats(_ context.Context, _ *CloudVMNode) (*
 		return m.hostStats, nil
 	}
 	return &HostStatsResult{}, nil
+}
+
+// FormatTunnelEndpoint constructs the reverse tunnel gateway address for a given cell.
+func FormatTunnelEndpoint(cell string) string {
+	return fmt.Sprintf("clvm-tunnel.%s.c.corp.boltz.com:443", cell)
+}
+
+// ComputeJitter applies random jitter within [1-fraction, 1+fraction] to the provided duration.
+func ComputeJitter(d time.Duration, fraction float64) time.Duration {
+	if fraction <= 0 {
+		return d
+	}
+	if fraction > 1.0 {
+		fraction = 1.0
+	}
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	r := float64(binary.BigEndian.Uint64(b[:])>>11) / (1 << 53)
+	factor := (1.0 - fraction) + (2.0 * fraction * r)
+	jittered := time.Duration(float64(d) * factor)
+	if jittered < 0 {
+		return 0
+	}
+	return jittered
+}
+
+// ContainerRunnerHandler defines the operations an in-VM runner executes locally.
+type ContainerRunnerHandler interface {
+	StartContainer(ctx context.Context, req *StartContainerRequest) error
+	GetStatus(ctx context.Context, podUID string) (*ContainerStatusResult, error)
+	StopContainer(ctx context.Context, podUID string) error
+	ListContainers(ctx context.Context) ([]*ContainerStatusResult, error)
+	GetHostStats(ctx context.Context) (*HostStatsResult, error)
+}
+
+// RunnerHandlerAdapter adapts a ContainerRunner and CloudVMNode into a ContainerRunnerHandler.
+type RunnerHandlerAdapter struct {
+	Runner ContainerRunner
+	Node   *CloudVMNode
+}
+
+// StartContainer adapts ContainerRunner.StartContainer.
+func (a *RunnerHandlerAdapter) StartContainer(ctx context.Context, req *StartContainerRequest) error {
+	return a.Runner.StartContainer(ctx, a.Node, req)
+}
+
+// GetStatus adapts ContainerRunner.GetStatus.
+func (a *RunnerHandlerAdapter) GetStatus(ctx context.Context, podUID string) (*ContainerStatusResult, error) {
+	return a.Runner.GetStatus(ctx, a.Node, podUID)
+}
+
+// StopContainer adapts ContainerRunner.StopContainer.
+func (a *RunnerHandlerAdapter) StopContainer(ctx context.Context, podUID string) error {
+	return a.Runner.StopContainer(ctx, a.Node, podUID)
+}
+
+// ListContainers adapts ContainerRunner.ListContainers.
+func (a *RunnerHandlerAdapter) ListContainers(ctx context.Context) ([]*ContainerStatusResult, error) {
+	return a.Runner.ListContainers(ctx, a.Node)
+}
+
+// GetHostStats adapts ContainerRunner.GetHostStats.
+func (a *RunnerHandlerAdapter) GetHostStats(ctx context.Context) (*HostStatsResult, error) {
+	return a.Runner.GetHostStats(ctx, a.Node)
+}
+
+// NewRunnerHTTPMux constructs an HTTP mux serving the runner API endpoints.
+func NewRunnerHTTPMux(handler ContainerRunnerHandler, authToken string) *http.ServeMux {
+	mux := http.NewServeMux()
+
+	checkAuth := func(r *http.Request) bool {
+		if authToken == "" {
+			return true
+		}
+		hdr := r.Header.Get("Authorization")
+		return hdr == "Bearer "+authToken
+	}
+
+	mux.HandleFunc("/containers/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAuth(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var req StartContainerRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("invalid request payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := handler.StartContainer(r.Context(), &req); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/containers/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAuth(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		podUID := r.URL.Query().Get("podUID")
+		if podUID == "" {
+			http.Error(w, "missing podUID query parameter", http.StatusBadRequest)
+			return
+		}
+		status, err := handler.GetStatus(r.Context(), podUID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
+	})
+
+	mux.HandleFunc("/containers/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAuth(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		podUID := r.URL.Query().Get("podUID")
+		if podUID == "" {
+			var body struct {
+				PodUID string `json:"podUID"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			podUID = body.PodUID
+		}
+		if podUID == "" {
+			http.Error(w, "missing podUID", http.StatusBadRequest)
+			return
+		}
+		if err := handler.StopContainer(r.Context(), podUID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/containers/list", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAuth(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		containers, err := handler.ListContainers(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(containers)
+	})
+
+	mux.HandleFunc("/host/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAuth(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		stats, err := handler.GetHostStats(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(stats)
+	})
+
+	return mux
+}
+
+// ReverseTunnelDialerConfig configures the reverse dialer connecting to the tunnel gateway.
+type ReverseTunnelDialerConfig struct {
+	Endpoint       string
+	Cell           string
+	InstanceID     string
+	AuthToken      string
+	Platform       string // "aws" or "gcp"
+	Attestation    []byte
+	TLSConfig      *tls.Config
+	DialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
+	BackoffFactor  float64
+	JitterFraction float64
+	YamuxConfig    *yamux.Config
+}
+
+// ReverseTunnelDialer continuously dials the reverse tunnel gateway and serves the runner HTTP mux.
+type ReverseTunnelDialer struct {
+	cfg ReverseTunnelDialerConfig
+}
+
+// NewReverseTunnelDialer creates a new ReverseTunnelDialer.
+func NewReverseTunnelDialer(cfg ReverseTunnelDialerConfig) (*ReverseTunnelDialer, error) {
+	if cfg.Endpoint == "" {
+		if cfg.Cell != "" {
+			cfg.Endpoint = FormatTunnelEndpoint(cfg.Cell)
+		} else {
+			cfg.Endpoint = "clvm-tunnel.default.c.corp.boltz.com:443"
+		}
+	}
+	if cfg.InstanceID == "" {
+		return nil, errors.New("instanceID is required")
+	}
+	if cfg.InitialBackoff <= 0 {
+		cfg.InitialBackoff = 500 * time.Millisecond
+	}
+	if cfg.MaxBackoff <= 0 {
+		cfg.MaxBackoff = 30 * time.Second
+	}
+	if cfg.BackoffFactor <= 1.0 {
+		cfg.BackoffFactor = 2.0
+	}
+	if cfg.JitterFraction <= 0 {
+		cfg.JitterFraction = 0.2
+	}
+	if cfg.YamuxConfig == nil {
+		cfg.YamuxConfig = DefaultYamuxConfig()
+	}
+	return &ReverseTunnelDialer{cfg: cfg}, nil
+}
+
+// Run starts the dialer loop with exponential backoff and jitter upon disconnect.
+func (d *ReverseTunnelDialer) Run(ctx context.Context, handler http.Handler) error {
+	backoff := d.cfg.InitialBackoff
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		err := d.DialAndServeOnce(ctx, handler)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			log.Printf("[cloudvm-runner] Reverse tunnel disconnected: %v. Reconnecting...", err)
+		}
+
+		sleep := ComputeJitter(backoff, d.cfg.JitterFraction)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleep):
+		}
+
+		next := time.Duration(float64(backoff) * d.cfg.BackoffFactor)
+		if next > d.cfg.MaxBackoff {
+			backoff = d.cfg.MaxBackoff
+		} else {
+			backoff = next
+		}
+	}
+}
+
+// DialAndServeOnce performs a single connection, handshake, and serves until disconnected.
+func (d *ReverseTunnelDialer) DialAndServeOnce(ctx context.Context, handler http.Handler) error {
+	var conn net.Conn
+	var err error
+	switch {
+	case d.cfg.DialContext != nil:
+		conn, err = d.cfg.DialContext(ctx, "tcp", d.cfg.Endpoint)
+	case d.cfg.TLSConfig != nil:
+		dialer := &tls.Dialer{
+			Config: d.cfg.TLSConfig,
+		}
+		conn, err = dialer.DialContext(ctx, "tcp", d.cfg.Endpoint)
+	default:
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err = dialer.DialContext(ctx, "tcp", d.cfg.Endpoint)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to dial tunnel gateway at %s: %w", d.cfg.Endpoint, err)
+	}
+	defer conn.Close()
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetReadBuffer(64 * 1024)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// Send handshake request
+	req := TunnelHandshakeRequest{
+		InstanceID:  d.cfg.InstanceID,
+		AuthToken:   d.cfg.AuthToken,
+		Platform:    d.cfg.Platform,
+		Attestation: d.cfg.Attestation,
+	}
+	data, err := json.Marshal(req) //nolint:gosec // AuthToken is required for reverse tunnel authentication handshake
+	if err != nil {
+		return fmt.Errorf("failed to marshal handshake request: %w", err)
+	}
+	data = append(data, '\n')
+	if _, err := conn.Write(data); err != nil {
+		return fmt.Errorf("failed to write handshake request: %w", err)
+	}
+
+	// Read handshake response
+	reader := bufio.NewReader(conn)
+	respLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read handshake response: %w", err)
+	}
+	var resp TunnelHandshakeResponse
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		return fmt.Errorf("invalid handshake response: %w", err)
+	}
+	if resp.Status != "ok" {
+		return fmt.Errorf("handshake rejected by gateway: %s", resp.Error)
+	}
+
+	// Initialize Yamux client session
+	session, err := yamux.Client(conn, d.cfg.YamuxConfig)
+	if err != nil {
+		return fmt.Errorf("failed to initialize yamux client session: %w", err)
+	}
+	defer session.Close()
+
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- server.Serve(session)
+	}()
+
+	select {
+	case <-ctx.Done():
+		_ = server.Close()
+		_ = session.Close()
+		return ctx.Err()
+	case <-session.CloseChan():
+		_ = server.Close()
+		return errors.New("yamux session closed by remote peer")
+	case err := <-errChan:
+		return err
+	}
 }

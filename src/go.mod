@@ -11,8 +11,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/pricing v1.51.0
 	github.com/aws/aws-sdk-go-v2/service/servicequotas v1.43.6
 	github.com/aws/smithy-go v1.28.6
+	github.com/hashicorp/yamux v0.1.2
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.25.0
+	go.mozilla.org/pkcs7 v0.10.0
 	golang.org/x/time v0.16.0
 	google.golang.org/api v0.308.0
 	k8s.io/api v0.32.2
