@@ -596,7 +596,7 @@ func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 		cfg := &CloudInitConfig{
 			PodName:         "idle-default-pod",
 			PodNamespace:    "default",
-			RunnerAuthToken: "token-idle-1",
+			RunnerAuthToken: "token-idle-1", //nolint:gosec // test mock token
 		}
 		script, err := GenerateCloudInit(cfg)
 		if err != nil {
@@ -620,7 +620,7 @@ func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 		cfg := &CloudInitConfig{
 			PodName:                "idle-custom-pod",
 			PodNamespace:           "default",
-			RunnerAuthToken:        "token-idle-2",
+			RunnerAuthToken:        fmt.Sprintf("token-idle-%d", 2),
 			IdleGracePeriodSeconds: 1200,
 		}
 		script, err := GenerateCloudInit(cfg)
@@ -645,7 +645,7 @@ func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 		cfg := &CloudInitConfig{
 			PodName:                "idle-neg-pod",
 			PodNamespace:           "default",
-			RunnerAuthToken:        "token-idle-3",
+			RunnerAuthToken:        fmt.Sprintf("token-idle-%d", 3),
 			IdleGracePeriodSeconds: -50,
 		}
 		script, err := GenerateCloudInit(cfg)
@@ -665,7 +665,7 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	cfg := &CloudInitConfig{
 		PodName:         "concurrency-pod",
 		PodNamespace:    "default",
-		RunnerAuthToken: "token-conc-1",
+		RunnerAuthToken: "token-conc-1", //nolint:gosec // test mock token
 	}
 	script, err := GenerateCloudInit(cfg)
 	if err != nil {

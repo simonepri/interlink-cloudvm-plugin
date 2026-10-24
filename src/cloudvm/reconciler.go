@@ -192,9 +192,9 @@ func (r *Reconciler) pingSingleNode(ctx context.Context, client *http.Client, no
 	}
 
 	url := fmt.Sprintf("http://%s/healthz", hostPort)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // internal mesh endpoint
 	if err != nil {
-		log.Printf("[reconciler] Debug: failed to build keep-alive ping request for node %s: %v", sanitizeLog(node.InstanceID), err)
+		log.Printf("[reconciler] Debug: failed to build keep-alive ping request for node %s: %v", sanitizeLog(node.InstanceID), err) //nolint:gosec // sanitized
 		return
 	}
 
@@ -203,16 +203,16 @@ func (r *Reconciler) pingSingleNode(ctx context.Context, client *http.Client, no
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // internal mesh call
 	if err != nil {
-		log.Printf("[reconciler] Debug: keep-alive ping failed for node %s (%s): %v", sanitizeLog(node.InstanceID), sanitizeLog(ip), err)
+		log.Printf("[reconciler] Debug: keep-alive ping failed for node %s (%s): %v", sanitizeLog(node.InstanceID), sanitizeLog(ip), err) //nolint:gosec // sanitized
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[reconciler] Debug: keep-alive ping returned unexpected status %d for node %s (%s)", resp.StatusCode, sanitizeLog(node.InstanceID), sanitizeLog(ip))
+		log.Printf("[reconciler] Debug: keep-alive ping returned unexpected status %d for node %s (%s)", resp.StatusCode, sanitizeLog(node.InstanceID), sanitizeLog(ip)) //nolint:gosec // sanitized
 		return
 	}
 }

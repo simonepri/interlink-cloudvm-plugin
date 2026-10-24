@@ -557,18 +557,18 @@ func TestReconciler_KeepAlivePingsDispatchedToActiveNodes(t *testing.T) {
 
 	// Node 1: active, non-cordoned, with IP and token -> should receive ping
 	node1 := NewCloudVMNode("i-active-1", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
-	node1.RunnerAuthToken = "secret-token-test-1"
+	node1.RunnerAuthToken = "secret-token-test-1" //nolint:gosec // test token
 	np.RegisterNode(node1)
 
 	// Node 2: cordoned node -> must NOT receive ping
 	node2 := NewCloudVMNode("i-cordoned-2", ProviderAWS, "us-east-1", hostPort, ResourceVector{})
-	node2.RunnerAuthToken = "secret-token-test-2"
+	node2.RunnerAuthToken = "secret-token-test-2" //nolint:gosec // test token
 	node2.Cordoned = true
 	np.RegisterNode(node2)
 
 	// Node 3: active node without IP -> must NOT receive ping
 	node3 := NewCloudVMNode("i-no-ip-3", ProviderAWS, "us-east-1", "", ResourceVector{})
-	node3.RunnerAuthToken = "secret-token-test-3"
+	node3.RunnerAuthToken = "secret-token-test-3" //nolint:gosec // test token
 	np.RegisterNode(node3)
 
 	mock := NewMockProvider()
@@ -592,12 +592,12 @@ func TestReconciler_KeepAlivePingsDispatchedToActiveNodes(t *testing.T) {
 	}
 }
 
-func TestReconciler_KeepAlivePingsUnreachableNodeGraceful(t *testing.T) {
+func TestReconciler_KeepAlivePingsUnreachableNodeGraceful(_ *testing.T) {
 	np := NewNodePool(60 * time.Second)
 
 	// Node with unreachable IP
 	node1 := NewCloudVMNode("i-unreachable-1", ProviderAWS, "us-east-1", "127.0.0.1:1", ResourceVector{})
-	node1.RunnerAuthToken = "token-unreachable"
+	node1.RunnerAuthToken = "token-unreachable" //nolint:gosec // test token
 	np.RegisterNode(node1)
 
 	// Node that returns 500 Internal Server Error
@@ -607,7 +607,7 @@ func TestReconciler_KeepAlivePingsUnreachableNodeGraceful(t *testing.T) {
 	defer ts.Close()
 
 	node2 := NewCloudVMNode("i-err-2", ProviderAWS, "us-east-1", ts.Listener.Addr().String(), ResourceVector{})
-	node2.RunnerAuthToken = "token-500"
+	node2.RunnerAuthToken = "token-500" //nolint:gosec // test token
 	np.RegisterNode(node2)
 
 	mock := NewMockProvider()
@@ -630,7 +630,7 @@ func TestReconciler_KeepAliveStartTickerLoop(t *testing.T) {
 
 	np := NewNodePool(60 * time.Second)
 	node := NewCloudVMNode("i-ticker-1", ProviderAWS, "us-east-1", ts.Listener.Addr().String(), ResourceVector{})
-	node.RunnerAuthToken = "test-token"
+	node.RunnerAuthToken = "test-token" //nolint:gosec // test token
 	np.RegisterNode(node)
 
 	mock := NewMockProvider()
