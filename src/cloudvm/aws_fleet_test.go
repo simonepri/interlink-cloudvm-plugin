@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"io"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -404,5 +408,41 @@ func TestAWSFleetCandidateTypesAndSubnets(t *testing.T) {
 	// Overrides should contain g5.2xlarge, g5.xlarge, g6.xlarge crossed with subnet-1, subnet-2 (6 total)
 	if len(capturedOverrides) != 6 {
 		t.Fatalf("expected 6 overrides (3 types x 2 subnets), got %d", len(capturedOverrides))
+	}
+}
+
+func TestAWSFleetUserDataGzipCompression(t *testing.T) {
+	// Generate large cloud-init content (> 25KB)
+	largeData := strings.Repeat("# comment line with filler data\n", 1000)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, err := gz.Write([]byte(largeData))
+	if err != nil {
+		t.Fatalf("failed to gzip: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("failed to close gzip: %v", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	if len(encoded) >= 25600 {
+		t.Fatalf("compressed user data exceeds 25600 bytes limit: %d", len(encoded))
+	}
+
+	// Verify decompression
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("failed to decode base64: %v", err)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("failed to create gzip reader: %v", err)
+	}
+	decompressed, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read decompressed: %v", err)
+	}
+	if string(decompressed) != largeData {
+		t.Fatalf("decompressed data does not match original")
 	}
 }

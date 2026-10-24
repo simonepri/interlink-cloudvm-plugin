@@ -131,6 +131,9 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	}
 	pricePolicy := pod.Metadata.Annotations["cloudvm.vk.io/price-policy"]
 	if pricePolicy == "" {
+		pricePolicy = pod.Metadata.Annotations["cloudvm.vk.io/fleet-allocation-strategy"]
+	}
+	if pricePolicy == "" {
 		pricePolicy = "fail-fast"
 	}
 

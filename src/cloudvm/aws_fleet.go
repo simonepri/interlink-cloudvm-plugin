@@ -2,6 +2,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -475,7 +477,15 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		}
 	}
 
-	encodedUserData := base64.StdEncoding.EncodeToString([]byte(cloudInit))
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write([]byte(cloudInit)); err != nil {
+		return nil, fmt.Errorf("failed to compress cloud-init with gzip: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return nil, fmt.Errorf("failed to finalize gzip compression: %w", err)
+	}
+	encodedUserData := base64.StdEncoding.EncodeToString(buf.Bytes())
 
 	req := &FleetRequest{
 		Region:             spec.Region,
