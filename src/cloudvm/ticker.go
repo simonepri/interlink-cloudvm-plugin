@@ -431,7 +431,9 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 
 	// 3. AWS Spot Advisor
 	if t.advisor != nil {
-		_ = t.advisor.Poll(ctx)
+		if err := t.advisor.Poll(ctx); err != nil {
+			log.Printf("[cloudvm-ticker] Warning: failed to poll spot advisor: %v", err)
+		}
 		now := time.Now()
 		for _, reg := range t.regions {
 			for _, itype := range t.instanceTypes {
