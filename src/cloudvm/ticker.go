@@ -437,26 +437,14 @@ func (t *SpotPriceTicker) AllScores() map[string]*PlacementScoreEntry {
 	return out
 }
 
-// OnDemandBaselineUSD returns standard AWS on-demand pricing baseline for known shapes.
+// OnDemandBaselineUSD returns standard AWS on-demand pricing baseline from the pricing catalog.
 func OnDemandBaselineUSD(instanceType string) float64 {
-	switch instanceType {
-	case "g5.xlarge":
-		return 1.006
-	case "g5.2xlarge":
-		return 1.212
-	case "g5.12xlarge":
-		return 5.672
-	case "g5.48xlarge":
-		return 16.288
-	case "g6.xlarge":
-		return 0.804
-	case "g6.2xlarge":
-		return 0.977
-	case "p4d.24xlarge":
-		return 32.7726
-	default:
-		return 1.000
+	if GlobalPricingCatalog != nil {
+		if rate, ok := GlobalPricingCatalog.GetAWSRate(instanceType); ok {
+			return rate
+		}
 	}
+	return 1.000
 }
 
 // Start runs the background polling loop until ctx is canceled.

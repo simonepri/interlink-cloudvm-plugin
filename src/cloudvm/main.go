@@ -165,6 +165,20 @@ func run() error {
 		}
 	}
 	server.SetIdleGracePeriod(idleGrace)
+	if raw := os.Getenv("VM_LAUNCH_TIMEOUT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			server.SetLaunchTimeout(d)
+		} else if sec, err := strconv.Atoi(raw); err == nil && sec > 0 {
+			server.SetLaunchTimeout(time.Duration(sec) * time.Second)
+		}
+	}
+	if raw := os.Getenv("POD_SIGHTING_TIMEOUT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			server.SetPodSightingTimeout(d)
+		} else if sec, err := strconv.Atoi(raw); err == nil && sec > 0 {
+			server.SetPodSightingTimeout(time.Duration(sec) * time.Second)
+		}
+	}
 	log.Printf("[cloudvm] Node pool warm idle grace period configured to %v", idleGrace) //nolint:gosec // duration is safe
 	server.RegisterProvider(ProviderAWS, awsProv)
 	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
@@ -217,7 +231,13 @@ func run() error {
 			log.Printf("[cloudvm] Warning: failed to recover active instances: %v", err)
 		}
 
-		reconciler := NewReconciler(inventory, server, terminator, clusterTag, 10*time.Minute)
+		graceTTL := 10 * time.Minute
+		if sec := os.Getenv("RECONCILE_GRACE_TTL_SECONDS"); sec != "" {
+			if s, err := strconv.Atoi(sec); err == nil && s > 0 {
+				graceTTL = time.Duration(s) * time.Second
+			}
+		}
+		reconciler := NewReconciler(inventory, server, terminator, clusterTag, graceTTL)
 		launchGrace := 2 * time.Minute
 		if sec := os.Getenv("RECONCILE_LAUNCH_GRACE_SECONDS"); sec != "" {
 			if s, err := strconv.Atoi(sec); err == nil && s >= 0 {

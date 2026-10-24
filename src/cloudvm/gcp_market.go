@@ -14,47 +14,25 @@ type GCPPriceBaseline struct {
 }
 
 // KnownGCPPrices provides baseline catalog pricing for standard GCE accelerator machine types.
-var KnownGCPPrices = map[string]GCPPriceBaseline{
-	// NVIDIA L4 instances (us-central1, us-east1, etc.)
-	"g2-standard-4":  {OnDemandUSD: 0.7024, SpotUSD: 0.2308},
-	"g2-standard-8":  {OnDemandUSD: 0.8066, SpotUSD: 0.2642},
-	"g2-standard-12": {OnDemandUSD: 0.9109, SpotUSD: 0.2976},
-	"g2-standard-16": {OnDemandUSD: 1.0152, SpotUSD: 0.3311},
-	"g2-standard-24": {OnDemandUSD: 1.7217, SpotUSD: 0.5619},
-	"g2-standard-32": {OnDemandUSD: 2.0304, SpotUSD: 0.6622},
-	"g2-standard-48": {OnDemandUSD: 3.4435, SpotUSD: 1.1238},
-	"g2-standard-96": {OnDemandUSD: 6.8869, SpotUSD: 2.2475},
+// Loaded dynamically from GlobalPricingCatalog, overridable via PRICING_CATALOG_FILE.
+var KnownGCPPrices = func() map[string]GCPPriceBaseline {
+	res := make(map[string]GCPPriceBaseline)
+	if GlobalPricingCatalog != nil {
+		GlobalPricingCatalog.mu.RLock()
+		defer GlobalPricingCatalog.mu.RUnlock()
+		for k, v := range GlobalPricingCatalog.gcpRates {
+			res[k] = v
+		}
+	}
+	return res
+}()
 
-	// NVIDIA A100 40GB instances
-	"a2-highgpu-1g":  {OnDemandUSD: 3.6732, SpotUSD: 1.1020},
-	"a2-highgpu-2g":  {OnDemandUSD: 7.3464, SpotUSD: 2.2040},
-	"a2-highgpu-4g":  {OnDemandUSD: 14.6928, SpotUSD: 4.4080},
-	"a2-highgpu-8g":  {OnDemandUSD: 29.3856, SpotUSD: 8.8160},
-	"a2-megagpu-16g": {OnDemandUSD: 58.7712, SpotUSD: 17.6320},
-
-	// NVIDIA A100 80GB instances
-	"a2-ultragpu-1g": {OnDemandUSD: 5.0361, SpotUSD: 1.5108},
-	"a2-ultragpu-2g": {OnDemandUSD: 10.0722, SpotUSD: 3.0216},
-	"a2-ultragpu-4g": {OnDemandUSD: 20.1444, SpotUSD: 6.0432},
-	"a2-ultragpu-8g": {OnDemandUSD: 40.2888, SpotUSD: 12.0864},
-
-	// NVIDIA H100 80GB instances
-	"a3-highgpu-8g": {OnDemandUSD: 31.2184, SpotUSD: 9.3655},
-	"a3-megagpu-8g": {OnDemandUSD: 31.2184, SpotUSD: 9.3655},
-	"a3-edgegpu-8g": {OnDemandUSD: 31.2184, SpotUSD: 9.3655},
-
-	// NVIDIA T4 instances
-	"n1-standard-4-1t4":  {OnDemandUSD: 0.5400, SpotUSD: 0.1620},
-	"n1-standard-8-1t4":  {OnDemandUSD: 0.7300, SpotUSD: 0.2190},
-	"n1-standard-16-2t4": {OnDemandUSD: 1.4600, SpotUSD: 0.4380},
-	"n1-standard-32-4t4": {OnDemandUSD: 2.9200, SpotUSD: 0.8760},
-}
-
-// GetGCPPrice returns the hourly on-demand and spot rates for a GCE machine type.
+// GetGCPPrice returns the hourly on-demand and spot rates for a GCE machine type from the pricing catalog.
 func GetGCPPrice(mtype string) (onDemand float64, spot float64) {
-	clean := strings.ToLower(strings.TrimSpace(mtype))
-	if p, ok := KnownGCPPrices[clean]; ok {
-		return p.OnDemandUSD, p.SpotUSD
+	if GlobalPricingCatalog != nil {
+		if od, sp, ok := GlobalPricingCatalog.GetGCPRate(mtype); ok {
+			return od, sp
+		}
 	}
 	return 1.0, 0.3
 }

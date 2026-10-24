@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -211,14 +212,53 @@ func parsePricingJSONPrice(raw string) float64 {
 	return 0
 }
 
-// KnownAWSGPUQuotaCodes maps standard EC2 quota codes for GPU families.
-var KnownAWSGPUQuotaCodes = map[string]string{
+// DefaultAWSGPUQuotaCodes maps standard EC2 quota codes for GPU families.
+var DefaultAWSGPUQuotaCodes = map[string]string{
 	"g_vt_spot":         "L-3819A6DF", // All G and VT Spot Instance Requests
 	"p_spot":            "L-7295265B", // All P Spot Instance Requests
 	"standard_spot":     "L-34B43A08", // All Standard (A, C, D, I, M, R, T, Z) Spot
 	"g_vt_ondemand":     "L-DB2E81BA", // Running On-Demand G and VT instances
 	"p_ondemand":        "L-417A185B", // Running On-Demand P instances
 	"standard_ondemand": "L-1216C47A", // Running On-Demand Standard instances
+}
+
+// KnownAWSGPUQuotaCodes contains active EC2 quota codes, overridable via AWS_GPU_QUOTA_CODES.
+var KnownAWSGPUQuotaCodes = DefaultAWSGPUQuotaCodes
+
+// Conversion ratios from EC2 quota vCPUs to approximate GPU instances.
+var (
+	AWSVCPUPerGPUG = 4.0
+	AWSVCPUPerGPUP = 12.0
+)
+
+func init() {
+	if raw := os.Getenv("AWS_VCPU_PER_GPU_G"); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 {
+			AWSVCPUPerGPUG = v
+		}
+	}
+	if raw := os.Getenv("AWS_VCPU_PER_GPU_P"); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v > 0 {
+			AWSVCPUPerGPUP = v
+		}
+	}
+	if raw := os.Getenv("AWS_GPU_QUOTA_CODES"); raw != "" {
+		codes := make(map[string]string)
+		for k, v := range DefaultAWSGPUQuotaCodes {
+			codes[k] = v
+		}
+		for _, pair := range strings.Split(raw, ",") {
+			parts := strings.SplitN(strings.TrimSpace(pair), ":", 2)
+			if len(parts) == 2 {
+				k := strings.TrimSpace(parts[0])
+				v := strings.TrimSpace(parts[1])
+				if k != "" && v != "" {
+					codes[k] = v
+				}
+			}
+		}
+		KnownAWSGPUQuotaCodes = codes
+	}
 }
 
 // QueryAWSQuota retrieves an EC2 Service Quota limit in vCPUs and estimates GPU quota.
@@ -247,10 +287,10 @@ func QueryAWSGPUQuotas(ctx context.Context, client AWSServiceQuotasAPI, region s
 	for name, code := range KnownAWSGPUQuotaCodes {
 		val, err := QueryAWSQuota(ctx, client, code)
 		if err == nil && val >= 0 {
-			// Convert vCPUs to approx GPUs (assuming ~4 vCPUs per GPU for G instances, ~12 for P instances)
-			gpus := val / 4.0
+			// Convert vCPUs to approx GPUs using configurable ratios
+			gpus := val / AWSVCPUPerGPUG
 			if strings.HasPrefix(name, "p_") {
-				gpus = val / 12.0
+				gpus = val / AWSVCPUPerGPUP
 			}
 			metrics.SetQuota("aws", region, name, gpus, 0)
 		}
