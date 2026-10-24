@@ -45,6 +45,8 @@ type ObservabilityMetrics struct {
 	launchDuration       *prometheus.HistogramVec
 	interruptions        *prometheus.CounterVec
 	instanceSeconds      *prometheus.CounterVec
+	networkRxBytes       *prometheus.CounterVec
+	networkTxBytes       *prometheus.CounterVec
 
 	// Legacy compatibility metrics (kept for 1 release)
 	legacySpotPrice      *prometheus.GaugeVec
@@ -62,6 +64,7 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 
 	marketLabels := []string{"provider", "region", "zone", "accelerator", "gpu_model", "gpu_memory_gb", "gpu_count", "capacity_type", "instance_type"}
 	fleetLabels := []string{"provider", "region", "accelerator", "instance_type", "gpu_model", "capacity_type"}
+	networkLabels := []string{"provider", "region", "accelerator", "instance_type"}
 
 	m := &ObservabilityMetrics{
 		Registry: reg,
@@ -182,6 +185,16 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 			Help: "Total cumulative instance runtime in seconds",
 		}, fleetLabels),
 
+		networkRxBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_network_receive_bytes_total",
+			Help: "Total cumulative network bytes received across cloud VM instances",
+		}, networkLabels),
+
+		networkTxBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_network_transmit_bytes_total",
+			Help: "Total cumulative network bytes transmitted across cloud VM instances",
+		}, networkLabels),
+
 		// Legacy metrics
 		legacySpotPrice: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_spot_price_usd_per_hour",
@@ -228,6 +241,8 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.launchDuration,
 		m.interruptions,
 		m.instanceSeconds,
+		m.networkRxBytes,
+		m.networkTxBytes,
 		m.legacySpotPrice,
 		m.legacyOnDemandPrice,
 		m.legacySpotSavings,
@@ -428,4 +443,36 @@ func (m *ObservabilityMetrics) SetLegacyPlacementScore(region, az, itype string,
 		zone = "all"
 	}
 	m.legacyPlacementScore.WithLabelValues(region, zone, itype).Set(score)
+}
+
+// AddNetworkReceiveBytes increments cumulative network receive byte counter.
+func (m *ObservabilityMetrics) AddNetworkReceiveBytes(provider, region, accelerator, instanceType string, bytes float64) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if bytes > 0 {
+		m.networkRxBytes.WithLabelValues(provider, region, accelerator, instanceType).Add(bytes)
+	}
+}
+
+// AddNetworkTransmitBytes increments cumulative network transmit byte counter.
+func (m *ObservabilityMetrics) AddNetworkTransmitBytes(provider, region, accelerator, instanceType string, bytes float64) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if bytes > 0 {
+		m.networkTxBytes.WithLabelValues(provider, region, accelerator, instanceType).Add(bytes)
+	}
+}
+
+// AddNetworkBytes increments cumulative network receive and transmit byte counters.
+func (m *ObservabilityMetrics) AddNetworkBytes(provider, region, accelerator, instanceType string, rxBytes, txBytes float64) {
+	m.AddNetworkReceiveBytes(provider, region, accelerator, instanceType, rxBytes)
+	m.AddNetworkTransmitBytes(provider, region, accelerator, instanceType, txBytes)
 }

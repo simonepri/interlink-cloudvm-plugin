@@ -41,6 +41,7 @@ func (s *Server) buildRecoveredNode(inst *Instance, podUID, ns, marketType strin
 	defaultVec, _ := NewResourceVector("2", "4Gi", 0, 0)
 	capVec := CapacityForInstanceType(inst.InstanceType, defaultVec)
 	recNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, capVec)
+	recNode.InstanceType = inst.InstanceType
 	recNode.Namespace = ns
 	recNode.Spot = (marketType == "spot")
 	recNode.Cordoned = true

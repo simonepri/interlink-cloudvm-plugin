@@ -916,6 +916,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	nodeCapacity := GlobalCatalog.ResolveCapacity(r.Context(), describer, itype, reqVec)
 
 	newNode := NewCloudVMNode(inst.ID, inst.Provider, inst.Region, inst.IP, nodeCapacity)
+	newNode.InstanceType = itype
 	newNode.Namespace = spec.PodNamespace
 	newNode.RunnerAuthToken = spec.RunnerAuthToken
 	newNode.Spot = spec.MarketType != "on-demand"
@@ -1444,6 +1445,25 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 										Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", node.InstanceID, node.GetMeshIP()),
 									}
 								} else if cResult != nil {
+									if cResult.NetworkRxBytes > 0 || cResult.NetworkTxBytes > 0 {
+										prov := string(node.Provider)
+										if prov == "" && tgt.inst != nil {
+											prov = string(tgt.inst.Provider)
+										}
+										reg := node.Region
+										if reg == "" && tgt.inst != nil {
+											reg = tgt.inst.Region
+										}
+										itype := node.InstanceType
+										if itype == "" && tgt.inst != nil {
+											itype = tgt.inst.InstanceType
+										}
+										instID := node.InstanceID
+										if instID == "" && tgt.inst != nil {
+											instID = tgt.inst.ID
+										}
+										GlobalFleetTracker.RecordNetworkTraffic(prov, reg, itype, instID, cResult.NetworkRxBytes, cResult.NetworkTxBytes)
+									}
 									switch {
 									case cResult.Running:
 										status.Ready = true

@@ -29,6 +29,7 @@ type CloudVMNode struct {
 	InstanceID              string         `json:"instanceId"`
 	Provider                ProviderType   `json:"provider"`
 	Region                  string         `json:"region"`
+	InstanceType            string         `json:"instanceType,omitempty"`
 	Namespace               string         `json:"namespace,omitempty"`
 	Spot                    bool           `json:"spot"`
 	Zone                    string         `json:"zone,omitempty"`

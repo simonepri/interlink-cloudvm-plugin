@@ -505,6 +505,15 @@ func (f *failingContainerRunner) ListContainers(_ context.Context, _ *CloudVMNod
 	return f.containers, nil
 }
 
+func (f *failingContainerRunner) GetHostStats(_ context.Context, _ *CloudVMNode) (*HostStatsResult, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.shouldFail {
+		return nil, fmt.Errorf("connection refused: in-VM runner unreachable during mesh initialization")
+	}
+	return &HostStatsResult{}, nil
+}
+
 func TestServer_RecoverActiveInstances_UnknownCoTenantsRetainedAndRetried(t *testing.T) {
 	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
 	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))

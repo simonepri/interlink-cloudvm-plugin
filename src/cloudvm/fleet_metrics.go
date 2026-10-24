@@ -16,6 +16,8 @@ type FleetTracker struct {
 	metrics         *ObservabilityMetrics
 	catalog         *HardwareCatalog
 	instanceAges    map[string]time.Time // instanceID -> lastSampleTime
+	lastNetworkRx   map[string]int64     // instanceID -> lastCumulativeRxBytes
+	lastNetworkTx   map[string]int64     // instanceID -> lastCumulativeTxBytes
 	defaultProvider string
 	defaultRegion   string
 }
@@ -43,6 +45,8 @@ func NewFleetTracker(metrics *ObservabilityMetrics, catalog *HardwareCatalog) *F
 		metrics:         metrics,
 		catalog:         catalog,
 		instanceAges:    make(map[string]time.Time),
+		lastNetworkRx:   make(map[string]int64),
+		lastNetworkTx:   make(map[string]int64),
 		defaultProvider: defProv,
 		defaultRegion:   defReg,
 	}
@@ -51,22 +55,31 @@ func NewFleetTracker(metrics *ObservabilityMetrics, catalog *HardwareCatalog) *F
 func (f *FleetTracker) resolveAccelerator(itype string) (string, string) {
 	accelerator := "none"
 	gpuModel := "none"
+	var resCap ResourceVector
+	var found bool
 	if f.catalog != nil {
-		if resCap, ok := f.catalog.Get(itype); ok {
-			if resCap.TPUs > 0 {
-				accelerator = "tpu"
-				if resCap.GPUModel != "" {
-					gpuModel = resCap.GPUModel
-				} else {
-					gpuModel = itype
-				}
-			} else if resCap.GPUs > 0 {
-				accelerator = "gpu"
-				if resCap.GPUModel != "" {
-					gpuModel = resCap.GPUModel
-				} else {
-					gpuModel = itype
-				}
+		resCap, found = f.catalog.Get(itype)
+	}
+	if !found {
+		resCap = CapacityForInstanceType(itype, ResourceVector{})
+		if resCap.GPUs > 0 || resCap.TPUs > 0 {
+			found = true
+		}
+	}
+	if found {
+		if resCap.TPUs > 0 {
+			accelerator = "tpu"
+			if resCap.GPUModel != "" {
+				gpuModel = resCap.GPUModel
+			} else {
+				gpuModel = itype
+			}
+		} else if resCap.GPUs > 0 {
+			accelerator = "gpu"
+			if resCap.GPUModel != "" {
+				gpuModel = resCap.GPUModel
+			} else {
+				gpuModel = itype
 			}
 		}
 	}
@@ -304,6 +317,8 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 	for id := range f.instanceAges {
 		if !activeSet[id] {
 			delete(f.instanceAges, id)
+			delete(f.lastNetworkRx, id)
+			delete(f.lastNetworkTx, id)
 		}
 	}
 
@@ -324,4 +339,63 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 			f.metrics.SetFleetGauges(k.provider, k.region, k.accelerator, k.instanceType, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k], float64(podCounts[k]), spendBaselineRates[k])
 		}
 	}
+}
+
+// RecordNetworkBytes directly increments network receive and transmit counters by delta bytes.
+func (f *FleetTracker) RecordNetworkBytes(provider, region, itype string, rxDelta, txDelta float64) {
+	if f.metrics == nil {
+		return
+	}
+	accelerator, _ := f.resolveAccelerator(itype)
+	f.metrics.AddNetworkBytes(provider, region, accelerator, itype, rxDelta, txDelta)
+}
+
+// RecordNetworkTraffic records delta network bytes from cumulative readings for an instance.
+func (f *FleetTracker) RecordNetworkTraffic(provider, region, itype, instanceID string, cumulativeRx, cumulativeTx int64) {
+	if f.metrics == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	accelerator, _ := f.resolveAccelerator(itype)
+
+	var deltaRx, deltaTx int64
+	if lastRx, ok := f.lastNetworkRx[instanceID]; ok {
+		if cumulativeRx >= lastRx {
+			deltaRx = cumulativeRx - lastRx
+		} else {
+			deltaRx = cumulativeRx
+		}
+	} else if cumulativeRx > 0 {
+		deltaRx = cumulativeRx
+	}
+
+	if lastTx, ok := f.lastNetworkTx[instanceID]; ok {
+		if cumulativeTx >= lastTx {
+			deltaTx = cumulativeTx - lastTx
+		} else {
+			deltaTx = cumulativeTx
+		}
+	} else if cumulativeTx > 0 {
+		deltaTx = cumulativeTx
+	}
+
+	if instanceID != "" {
+		if cumulativeRx > 0 {
+			f.lastNetworkRx[instanceID] = cumulativeRx
+		}
+		if cumulativeTx > 0 {
+			f.lastNetworkTx[instanceID] = cumulativeTx
+		}
+	}
+
+	if deltaRx > 0 || deltaTx > 0 {
+		f.metrics.AddNetworkBytes(provider, region, accelerator, itype, float64(deltaRx), float64(deltaTx))
+	}
+}
+
+// CollectFleetTelemetry records telemetry such as network bytes for a given instance.
+func (f *FleetTracker) CollectFleetTelemetry(provider, region, itype, instanceID string, rxBytes, txBytes int64) {
+	f.RecordNetworkTraffic(provider, region, itype, instanceID, rxBytes, txBytes)
 }

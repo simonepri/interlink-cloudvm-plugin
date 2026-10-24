@@ -134,3 +134,50 @@ func TestFleetTracker_LiveFleetAndInterruption(t *testing.T) {
 		t.Errorf("expected cloudvm_pods_running in idle metrics: %s", bodyIdle)
 	}
 }
+
+func TestFleetTracker_NetworkMetrics(t *testing.T) {
+	metrics := NewObservabilityMetrics()
+	cat := NewHardwareCatalog()
+	tracker := NewFleetTracker(metrics, cat)
+
+	// 1. Initial cumulative reading: 1000 RX, 2000 TX
+	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", 1000, 2000)
+
+	// 2. Second cumulative reading: 1500 RX (+500), 2800 TX (+800)
+	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", 1500, 2800)
+
+	// 3. Counter reset (e.g. reboot): 300 RX (+300), 400 TX (+400)
+	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", 300, 400)
+
+	// 4. CollectFleetTelemetry delegation
+	tracker.CollectFleetTelemetry("aws", "us-west-2", "g5.xlarge", "i-net-2", 5000, 10000)
+
+	// 5. Direct delta recording
+	tracker.RecordNetworkBytes("gcp", "us-central1", "a2-highgpu-1g", 1024, 2048)
+
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "cloudvm_network_receive_bytes_total") {
+		t.Fatalf("expected cloudvm_network_receive_bytes_total in metrics output")
+	}
+	if !strings.Contains(body, "cloudvm_network_transmit_bytes_total") {
+		t.Fatalf("expected cloudvm_network_transmit_bytes_total in metrics output")
+	}
+	// For i-net-1: initial=1000 + delta=500 + reset=300 = 1800 RX; initial=2000 + delta=800 + reset=400 = 3200 TX
+	// Total for aws us-west-2 g5.xlarge: 1800 + 5000 (i-net-2) = 6800 RX, 3200 + 10000 = 13200 TX
+	if !strings.Contains(body, `cloudvm_network_receive_bytes_total{accelerator="gpu",instance_type="g5.xlarge",provider="aws",region="us-west-2"} 6800`) {
+		t.Errorf("expected 6800 RX bytes for aws g5.xlarge, got metrics:\n%s", body)
+	}
+	if !strings.Contains(body, `cloudvm_network_transmit_bytes_total{accelerator="gpu",instance_type="g5.xlarge",provider="aws",region="us-west-2"} 13200`) {
+		t.Errorf("expected 13200 TX bytes for aws g5.xlarge, got metrics:\n%s", body)
+	}
+	// For GCP: 1024 RX, 2048 TX
+	if !strings.Contains(body, `cloudvm_network_receive_bytes_total{accelerator="gpu",instance_type="a2-highgpu-1g",provider="gcp",region="us-central1"} 1024`) {
+		t.Errorf("expected 1024 RX bytes for gcp a2-highgpu-1g, got metrics:\n%s", body)
+	}
+	if !strings.Contains(body, `cloudvm_network_transmit_bytes_total{accelerator="gpu",instance_type="a2-highgpu-1g",provider="gcp",region="us-central1"} 2048`) {
+		t.Errorf("expected 2048 TX bytes for gcp a2-highgpu-1g, got metrics:\n%s", body)
+	}
+}

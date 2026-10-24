@@ -36,6 +36,9 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 	metrics.RecordLaunchDuration("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", 35.5)
 	metrics.RecordInterruption("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot")
 	metrics.AddInstanceSeconds("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", 3600)
+	metrics.AddNetworkReceiveBytes("aws", "us-west-2", "gpu", "g5.xlarge", 1024000)
+	metrics.AddNetworkTransmitBytes("aws", "us-west-2", "gpu", "g5.xlarge", 2048000)
+	metrics.AddNetworkBytes("aws", "us-west-2", "gpu", "g5.xlarge", 512, 1024)
 
 	// 6. Record legacy metrics
 	metrics.SetLegacySpotMetrics("us-west-2", "us-west-2a", "g5.xlarge", 0.4024, 1.0060, 60.0)
@@ -73,6 +76,8 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 		"cloudvm_launch_duration_seconds",
 		"cloudvm_interruptions_total",
 		"cloudvm_instance_seconds_total",
+		"cloudvm_network_receive_bytes_total",
+		"cloudvm_network_transmit_bytes_total",
 		"cloudvm_spot_price_usd_per_hour",
 		"cloudvm_ondemand_price_usd_per_hour",
 		"cloudvm_spot_savings_percentage",
