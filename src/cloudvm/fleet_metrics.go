@@ -111,7 +111,7 @@ func (f *FleetTracker) RecordInterruption(provider, region, itype, capacityType 
 }
 
 // UpdateLiveFleet is invoked by the reconciler on each pass to update running instances, GPUs, and spend $/h.
-func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
+func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[string]string) {
 	if f.metrics == nil {
 		return
 	}
@@ -131,6 +131,17 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
 	gpuCounts := make(map[fleetKey]int)
 	vramGBCounts := make(map[fleetKey]int)
 	spendRates := make(map[fleetKey]float64)
+	podCounts := make(map[fleetKey]int)
+	spendBaselineRates := make(map[fleetKey]float64)
+
+	podCountsByInstance := make(map[string]int)
+	if len(activePods) > 0 && activePods[0] != nil {
+		for _, instID := range activePods[0] {
+			if instID != "" {
+				podCountsByInstance[instID]++
+			}
+		}
+	}
 
 	now := time.Now()
 	for _, inst := range instances {
@@ -205,12 +216,26 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
 			capacityType: capacityType,
 		}
 
+		ondemandBaseline := 0.0
+		switch provider {
+		case "aws":
+			ondemandBaseline = OnDemandBaselineUSD(itype)
+		case "gcp":
+			onDemand, _ := GetGCPPrice(itype)
+			ondemandBaseline = onDemand
+		}
+		if ondemandBaseline == 0 {
+			ondemandBaseline = hourlyPrice
+		}
+
 		instanceCounts[key]++
 		vcpuCounts[key] += cpuCount
 		memGiBCounts[key] += memGiB
 		gpuCounts[key] += gpuCount
 		vramGBCounts[key] += vramGB
 		spendRates[key] += hourlyPrice
+		podCounts[key] += podCountsByInstance[inst.ID]
+		spendBaselineRates[key] += ondemandBaseline
 
 		// Accumulate instance seconds
 		if start, ok := f.instanceAges[inst.ID]; ok {
@@ -237,6 +262,6 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
 
 	f.metrics.ResetFleetGauges()
 	for k, count := range instanceCounts {
-		f.metrics.SetFleetGauges(k.provider, k.region, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k])
+		f.metrics.SetFleetGauges(k.provider, k.region, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k], float64(podCounts[k]), spendBaselineRates[k])
 	}
 }

@@ -76,9 +76,15 @@ func TestFleetTracker_LiveFleetAndInterruption(t *testing.T) {
 
 	tracker.UpdateLiveFleet(instances)
 
-	// Advance time and update again to accumulate instance seconds
+	activePods := map[string]string{
+		"pod-1": "i-spot-1",
+		"pod-2": "i-spot-1",
+		"pod-3": "i-spot-2",
+	}
+
+	// Advance time and update again with active pods
 	time.Sleep(10 * time.Millisecond)
-	tracker.UpdateLiveFleet(instances)
+	tracker.UpdateLiveFleet(instances, activePods)
 
 	// Record launch attempt & duration
 	tracker.RecordLaunchAttempt("aws", "us-west-2", "g5.xlarge", "spot", "ok")
@@ -102,5 +108,11 @@ func TestFleetTracker_LiveFleetAndInterruption(t *testing.T) {
 	}
 	if !strings.Contains(body, "cloudvm_launch_attempts_total") {
 		t.Errorf("expected launch attempts in metrics: %s", body)
+	}
+	if !strings.Contains(body, "cloudvm_pods_running") {
+		t.Errorf("expected cloudvm_pods_running in metrics: %s", body)
+	}
+	if !strings.Contains(body, "cloudvm_spend_ondemand_baseline_usd_per_hour") {
+		t.Errorf("expected cloudvm_spend_ondemand_baseline_usd_per_hour in metrics: %s", body)
 	}
 }
