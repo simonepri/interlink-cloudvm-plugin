@@ -1329,3 +1329,44 @@ func TestServerPinglinkAndHealthz(t *testing.T) {
 		_ = postRes.Body.Close()
 	}
 }
+
+func TestServer_RetryStartContainerDiscoversIP(t *testing.T) {
+	mockProv := NewMockProvider()
+	srv := NewServer(mockProv, "test-cluster")
+	runner := NewMockContainerRunner()
+	srv.SetContainerRunner(runner)
+
+	node := NewCloudVMNode("i-retry-ip", ProviderMock, "us-west-2", "", ResourceVector{})
+	srv.nodePool.RegisterNode(node)
+
+	mockProv.mu.Lock()
+	mockProv.instances["i-retry-ip"] = &Instance{
+		ID:    "i-retry-ip",
+		IP:    "10.136.5.99",
+		State: StateRunning,
+	}
+	mockProv.mu.Unlock()
+
+	req := &StartContainerRequest{
+		PodUID:    "uid-retry-ip",
+		Namespace: "default",
+		PodName:   "test-retry",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go srv.retryStartContainer(ctx, node, req)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if node.MeshIP == "10.136.5.99" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if node.MeshIP != "10.136.5.99" {
+		t.Fatalf("expected node.MeshIP to be discovered as 10.136.5.99, got %q", node.MeshIP)
+	}
+}

@@ -535,6 +535,18 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	inst.Metadata["namespace"] = spec.PodNamespace
 	inst.Metadata["podUID"] = spec.PodUID
 	inst.Metadata["runnerToken"] = spec.RunnerAuthToken
+
+	// Query DescribeInstances to populate the instance IP assigned by EC2
+	descOut, descErr := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{inst.ID},
+	})
+	if descErr == nil && len(descOut.Reservations) > 0 && len(descOut.Reservations[0].Instances) > 0 {
+		ec2Inst := descOut.Reservations[0].Instances[0]
+		if ec2Inst.PrivateIpAddress != nil && *ec2Inst.PrivateIpAddress != "" {
+			inst.IP = *ec2Inst.PrivateIpAddress
+		}
+	}
+
 	p.AddConfiguredRegions(spec.Region)
 	p.AddConfiguredRegions(spec.CandidateRegions...)
 	p.mu.Lock()

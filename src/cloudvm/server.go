@@ -1173,12 +1173,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					}
 				case StateRunning:
 					if s.runner != nil && tgt.node != nil && tgt.uid != "" {
+						if tgt.node.MeshIP == "" {
+							if prov := s.ProviderForType(tgt.node.Provider); prov != nil {
+								if st, err := prov.Status(r.Context(), tgt.node.InstanceID); err == nil && st != nil && st.IP != "" {
+									tgt.node.MeshIP = st.IP
+									if tgt.inst != nil {
+										tgt.inst.IP = st.IP
+									}
+									s.mu.Lock()
+									if inst, ok := s.instances[tgt.uid]; ok && inst != nil {
+										inst.IP = st.IP
+									}
+									s.mu.Unlock()
+								}
+							}
+						}
 						cResult, err := s.runner.GetStatus(r.Context(), tgt.node, tgt.uid)
 						if err != nil {
 							status.Ready = false
 							status.State.Waiting = &ContainerWaitingState{
-								Reason:  "ContainerStatusUnknown",
-								Message: err.Error(),
+								Reason:  "ContainerCreating",
+								Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", tgt.node.InstanceID, tgt.node.MeshIP),
 							}
 						} else if cResult != nil {
 							switch {
@@ -1338,6 +1353,25 @@ func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req
 			if tombstoned {
 				log.Printf("[cloudvm] Pod %s was tombstoned while waiting to start container; aborting retry", req.PodUID)
 				return
+			}
+
+			if node.MeshIP == "" {
+				if prov := s.ProviderForType(node.Provider); prov != nil {
+					st, err := prov.Status(ctx, node.InstanceID)
+					if err == nil && st != nil && st.IP != "" {
+						node.MeshIP = st.IP
+						log.Printf("[cloudvm] Discovered IP %s for node %s during retryStartContainer", st.IP, node.InstanceID)
+						s.mu.Lock()
+						if inst, ok := s.instances[req.PodUID]; ok && inst != nil {
+							inst.IP = st.IP
+						}
+						key := fmt.Sprintf("%s/%s", req.Namespace, req.PodName)
+						if inst, ok := s.instances[key]; ok && inst != nil {
+							inst.IP = st.IP
+						}
+						s.mu.Unlock()
+					}
+				}
 			}
 
 			err := s.runner.StartContainer(ctx, node, req)

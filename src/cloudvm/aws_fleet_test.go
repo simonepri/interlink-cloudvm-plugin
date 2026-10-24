@@ -446,3 +446,64 @@ func TestAWSFleetUserDataGzipCompression(t *testing.T) {
 		t.Fatalf("decompressed data does not match original")
 	}
 }
+
+func TestAWSProvider_LaunchResolvesPrivateIP(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	p := NewAWSProvider("us-west-2")
+	expectedIP := "10.136.3.116"
+
+	client := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, _ *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			return &ec2.CreateFleetOutput{
+				FleetId: aws.String("fleet-1234"),
+				Instances: []ec2types.CreateFleetInstance{
+					{
+						InstanceIds:  []string{"i-0123456789abcdef0"},
+						InstanceType: ec2types.InstanceTypeC5Xlarge,
+					},
+				},
+			}, nil
+		},
+		describeInstancesFn: func(_ context.Context, params *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			if len(params.InstanceIds) > 0 && params.InstanceIds[0] == "i-0123456789abcdef0" {
+				return &ec2.DescribeInstancesOutput{
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{
+									InstanceId:       aws.String("i-0123456789abcdef0"),
+									InstanceType:     ec2types.InstanceTypeC5Xlarge,
+									PrivateIpAddress: aws.String(expectedIP),
+									State: &ec2types.InstanceState{
+										Name: ec2types.InstanceStateNameRunning,
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			return &ec2.DescribeInstancesOutput{}, nil
+		},
+	}
+
+	p.SetRegionClient("us-west-2", client)
+
+	spec := &InstanceSpec{
+		PodName:                "smoke-test",
+		PodNamespace:           "default",
+		PodUID:                 "uid-1234",
+		Region:                 "us-west-2",
+		CandidateInstanceTypes: []string{"c5.xlarge"},
+		ClusterTag:             "test-cluster",
+		LaunchTemplateID:       "lt-1234",
+	}
+
+	inst, err := p.Launch(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	if inst.IP != expectedIP {
+		t.Fatalf("expected inst.IP %s, got %s", expectedIP, inst.IP)
+	}
+}
