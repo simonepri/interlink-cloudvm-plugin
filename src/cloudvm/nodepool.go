@@ -57,7 +57,7 @@ func (node *CloudVMNode) GetMeshIP() string {
 	if node == nil {
 		return ""
 	}
-	n.mu.RLock()
+	node.mu.RLock()
 	defer node.mu.RUnlock()
 	return node.MeshIP
 }
@@ -67,9 +67,9 @@ func (node *CloudVMNode) SetMeshIP(ip string) {
 	if node == nil {
 		return
 	}
-	n.mu.Lock()
+	node.mu.Lock()
 	defer node.mu.Unlock()
-	n.MeshIP = ip
+	node.MeshIP = ip
 }
 
 func NewCloudVMNode(instanceID string, provider ProviderType, region, meshIP string, capacity ResourceVector) *CloudVMNode {
