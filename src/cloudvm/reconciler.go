@@ -122,6 +122,9 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		return nil, fmt.Errorf("failed to query active pods: %w", err)
 	}
 
+	// Update live fleet metrics from cloud inventory
+	GlobalFleetTracker.UpdateLiveFleet(activeInstances)
+
 	cloudInstances := make(map[string]*Instance, len(activeInstances))
 	for _, inst := range activeInstances {
 		if inst != nil {
@@ -178,6 +181,18 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 				}
 			}
 			log.Printf("[reconciler] Detected vanished/interrupted cloud VM %s for pod %s (reason: %s). Marking pod failed...", cleanID, cleanKey, reason) //nolint:gosec // sanitized
+			if reason == "SpotInterruption" || strings.Contains(reason, "Preempt") || strings.Contains(reason, "Spot") {
+				prov := "aws"
+				reg := ""
+				itype := ""
+				capType := "spot"
+				if inst != nil {
+					prov = string(inst.Provider)
+					reg = inst.Region
+					itype = inst.InstanceType
+				}
+				GlobalFleetTracker.RecordInterruption(prov, reg, itype, capType)
+			}
 			if err := r.tracker.MarkPodFailed(ctx, podKey, reason); err != nil {
 				log.Printf("[reconciler] Error marking pod %s failed: %v", cleanKey, err)
 			} else {

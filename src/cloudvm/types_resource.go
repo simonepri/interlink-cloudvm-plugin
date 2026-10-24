@@ -12,10 +12,12 @@ import (
 
 // ResourceVector wraps standard Kubernetes resource quantities for exact arithmetic and comparisons.
 type ResourceVector struct {
-	CPU    resource.Quantity `json:"cpu"`
-	Memory resource.Quantity `json:"memory"`
-	GPUs   int               `json:"gpus"`
-	TPUs   int               `json:"tpus"`
+	CPU         resource.Quantity `json:"cpu"`
+	Memory      resource.Quantity `json:"memory"`
+	GPUs        int               `json:"gpus"`
+	TPUs        int               `json:"tpus"`
+	GPUModel    string            `json:"gpuModel,omitempty"`
+	GPUMemoryGB int               `json:"gpuMemoryGB,omitempty"`
 }
 
 // NewResourceVector parses human-readable quantities (e.g., "4", "16Gi") into exact Kubernetes quantities.
@@ -110,11 +112,21 @@ func (r ResourceVector) Add(other ResourceVector) ResourceVector {
 	cpu.Add(other.CPU)
 	mem := r.Memory.DeepCopy()
 	mem.Add(other.Memory)
+	gpuModel := r.GPUModel
+	if gpuModel == "" {
+		gpuModel = other.GPUModel
+	}
+	gpuMem := r.GPUMemoryGB
+	if gpuMem == 0 {
+		gpuMem = other.GPUMemoryGB
+	}
 	return ResourceVector{
-		CPU:    cpu,
-		Memory: mem,
-		GPUs:   r.GPUs + other.GPUs,
-		TPUs:   r.TPUs + other.TPUs,
+		CPU:         cpu,
+		Memory:      mem,
+		GPUs:        r.GPUs + other.GPUs,
+		TPUs:        r.TPUs + other.TPUs,
+		GPUModel:    gpuModel,
+		GPUMemoryGB: gpuMem,
 	}
 }
 
@@ -133,10 +145,12 @@ func (r ResourceVector) Sub(other ResourceVector) ResourceVector {
 		tpus = 0
 	}
 	return ResourceVector{
-		CPU:    cpu,
-		Memory: mem,
-		GPUs:   gpus,
-		TPUs:   tpus,
+		CPU:         cpu,
+		Memory:      mem,
+		GPUs:        gpus,
+		TPUs:        tpus,
+		GPUModel:    r.GPUModel,
+		GPUMemoryGB: r.GPUMemoryGB,
 	}
 }
 
@@ -158,6 +172,9 @@ func (r ResourceVector) Fits(capacity ResourceVector) bool {
 }
 
 func (r ResourceVector) String() string {
+	if r.GPUModel != "" {
+		return fmt.Sprintf("CPU=%s, Mem=%s, GPUs=%d (%s), TPUs=%d", r.CPU.String(), r.Memory.String(), r.GPUs, r.GPUModel, r.TPUs)
+	}
 	return fmt.Sprintf("CPU=%s, Mem=%s, GPUs=%d, TPUs=%d", r.CPU.String(), r.Memory.String(), r.GPUs, r.TPUs)
 }
 
@@ -192,11 +209,15 @@ func CapacityForInstanceType(itype string, fallback ResourceVector) ResourceVect
 		if gpus < fallback.GPUs {
 			gpus = fallback.GPUs
 		}
+		gpuModel := fallback.GPUModel
+		gpuMem := fallback.GPUMemoryGB
 		return ResourceVector{
-			CPU:    cpu,
-			Memory: mem,
-			GPUs:   gpus,
-			TPUs:   fallback.TPUs,
+			CPU:         cpu,
+			Memory:      mem,
+			GPUs:        gpus,
+			TPUs:        fallback.TPUs,
+			GPUModel:    gpuModel,
+			GPUMemoryGB: gpuMem,
 		}
 	}
 
@@ -212,10 +233,56 @@ func CapacityForInstanceType(itype string, fallback ResourceVector) ResourceVect
 		gpus = fallback.GPUs
 	}
 
+	var gpuModel string
+	var gpuMemGB int
+	switch {
+	case strings.HasPrefix(itype, "g5."):
+		gpuModel = "A10G 24GB"
+		gpuMemGB = 24
+	case strings.HasPrefix(itype, "g6."):
+		gpuModel = "L4 24GB"
+		gpuMemGB = 24
+	case strings.HasPrefix(itype, "g6e."):
+		gpuModel = "L40S 48GB"
+		gpuMemGB = 48
+	case strings.HasPrefix(itype, "gr6."):
+		gpuModel = "Radeon PRO V620 32GB"
+		gpuMemGB = 32
+	case strings.HasPrefix(itype, "p4d."):
+		gpuModel = "A100 40GB"
+		gpuMemGB = 40
+	case strings.HasPrefix(itype, "p4de."):
+		gpuModel = "A100 80GB"
+		gpuMemGB = 80
+	case strings.HasPrefix(itype, "p5."):
+		gpuModel = "H100 80GB"
+		gpuMemGB = 80
+	case strings.HasPrefix(itype, "p5e."):
+		gpuModel = "H200 141GB"
+		gpuMemGB = 141
+	case strings.HasPrefix(itype, "p3.") || strings.HasPrefix(itype, "p3dn."):
+		if strings.HasPrefix(itype, "p3dn.") {
+			gpuModel = "V100 32GB"
+			gpuMemGB = 32
+		} else {
+			gpuModel = "V100 16GB"
+			gpuMemGB = 16
+		}
+	case strings.HasPrefix(itype, "g4dn."):
+		gpuModel = "T4 16GB"
+		gpuMemGB = 16
+	}
+	if gpuModel == "" && fallback.GPUModel != "" {
+		gpuModel = fallback.GPUModel
+		gpuMemGB = fallback.GPUMemoryGB
+	}
+
 	return ResourceVector{
-		CPU:    cpu,
-		Memory: mem,
-		GPUs:   gpus,
-		TPUs:   fallback.TPUs,
+		CPU:         cpu,
+		Memory:      mem,
+		GPUs:        gpus,
+		TPUs:        fallback.TPUs,
+		GPUModel:    gpuModel,
+		GPUMemoryGB: gpuMemGB,
 	}
 }
