@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestMain(m *testing.M) {
@@ -1368,5 +1369,78 @@ func TestServer_RetryStartContainerDiscoversIP(t *testing.T) {
 
 	if node.GetMeshIP() != "10.136.5.99" {
 		t.Fatalf("expected node.MeshIP to be discovered as 10.136.5.99, got %q", node.GetMeshIP())
+	}
+}
+
+type failOnceRunner struct {
+	*MockContainerRunner
+	failedOnce sync.Map
+}
+
+func (f *failOnceRunner) StartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) error {
+	if _, loaded := f.failedOnce.LoadOrStore(req.PodUID, true); !loaded {
+		return fmt.Errorf("runner not ready yet")
+	}
+	return f.MockContainerRunner.StartContainer(ctx, node, req)
+}
+
+func TestServer_BinPackHitRetriesStartContainerWhenBooting(t *testing.T) {
+	mockProv := NewMockProvider()
+	srv := NewServer(mockProv, "test-cluster")
+	runner := &failOnceRunner{MockContainerRunner: NewMockContainerRunner()}
+	srv.SetContainerRunner(runner)
+
+	nodeCap := ResourceVector{
+		CPU:    resource.MustParse("8"),
+		Memory: resource.MustParse("16Gi"),
+	}
+	warmNode := NewCloudVMNode("i-warm-slice", ProviderMock, "us-west-2", "10.136.1.10", nodeCap)
+	warmNode.Spot = true
+	srv.nodePool.RegisterNode(warmNode)
+
+	podJSON := `{
+		"metadata": {
+			"name": "test-slice-pod",
+			"namespace": "default",
+			"uid": "uid-slice-retry",
+			"annotations": {
+				"cloudvm.vk.io/region": "us-west-2",
+				"cloudvm.vk.io/instance-type": "c6i.xlarge",
+				"cloudvm.vk.io/capacity-type": "spot",
+				"cloudvm.vk.io/cpu": "1",
+				"cloudvm.vk.io/memory": "2Gi"
+			}
+		},
+		"spec": {
+			"containers": [
+				{
+					"name": "worker",
+					"image": "alpine:latest"
+				}
+			]
+		}
+	}`
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/create", strings.NewReader(podJSON))
+	r.Header.Set("Content-Type", "application/json")
+
+	srv.handleCreate(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from handleCreate, got %d: %s", w.Code, w.Body.String())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var succeeded bool
+	for time.Now().Before(deadline) {
+		if req := runner.GetStartRequest("uid-slice-retry"); req != nil {
+			succeeded = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if !succeeded {
+		t.Fatalf("expected background retry worker to start container for sliced pod, but request was not found")
 	}
 }
