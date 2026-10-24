@@ -12,17 +12,17 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 	metrics := NewObservabilityMetrics()
 
 	// 1. Record market prices
-	metrics.SetGPUPrice("aws", "us-west-2", "us-west-2a", "A10G 24GB", 24, 1, "spot", "g5.xlarge", 0.4024)
-	metrics.SetGPUPrice("aws", "us-west-2", "us-west-2a", "A10G 24GB", 24, 1, "on-demand", "g5.xlarge", 1.0060)
+	metrics.SetGPUPrice("aws", "us-west-2", "us-west-2a", "gpu", "A10G 24GB", 24, 1, "spot", "g5.xlarge", 0.4024)
+	metrics.SetGPUPrice("aws", "us-west-2", "us-west-2a", "gpu", "A10G 24GB", 24, 1, "on-demand", "g5.xlarge", 1.0060)
 	metrics.SetVCPUPrice("aws", "us-west-2", "us-west-2a", "spot", "c6i.xlarge", 0.0520)
 
 	// 2. Record availability and signals
-	metrics.SetAvailabilityScore("aws", "us-west-2", "us-west-2a", "A10G 24GB", "g5.xlarge", "aws_placement_score", 1, 0.9)
-	metrics.SetExpectedUptime("aws", "us-west-2", "g5.xlarge", "A10G 24GB", "aws_spot_advisor", 50400)
+	metrics.SetAvailabilityScore("aws", "us-west-2", "us-west-2a", "gpu", "A10G 24GB", "g5.xlarge", "aws_placement_score", 1, 0.9)
+	metrics.SetExpectedUptime("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "aws_spot_advisor", 50400)
 	metrics.SetSignalAge("aws", "us-west-2", "aws_spot_advisor", 3600)
 
 	// 3. Record quotas
-	metrics.SetQuota("aws", "us-west-2", "g_vt_spot", 64, 8)
+	metrics.SetQuota("aws", "us-west-2", "gpu", "g_vt_spot", 64, 8)
 
 	// 4. Record fill quotes
 	metrics.SetFillQuote(24, 64, "1", "spot", 0.4500, nil, "")
@@ -30,12 +30,12 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 	metrics.SetFillQuote(80, 1000, "1", "spot", 0.0, nil, "capacity")
 
 	// 5. Record fleet metrics
-	metrics.SetFleetGauges("aws", "us-west-2", "A10G 24GB", "spot", 4, 16, 64, 4, 96, 1.6096)
-	metrics.RecordLaunchAttempt("aws", "us-west-2", "A10G 24GB", "spot", "ok")
-	metrics.RecordLaunchAttempt("aws", "us-west-2", "A10G 24GB", "spot", "no_capacity")
-	metrics.RecordLaunchDuration("aws", "us-west-2", "A10G 24GB", "spot", 35.5)
-	metrics.RecordInterruption("aws", "us-west-2", "A10G 24GB", "spot")
-	metrics.AddInstanceSeconds("aws", "us-west-2", "A10G 24GB", "spot", 3600)
+	metrics.SetFleetGauges("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", 4, 16, 64, 4, 96, 1.6096)
+	metrics.RecordLaunchAttempt("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", "ok")
+	metrics.RecordLaunchAttempt("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", "no_capacity")
+	metrics.RecordLaunchDuration("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", 35.5)
+	metrics.RecordInterruption("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot")
+	metrics.AddInstanceSeconds("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", 3600)
 
 	// 6. Record legacy metrics
 	metrics.SetLegacySpotMetrics("us-west-2", "us-west-2a", "g5.xlarge", 0.4024, 1.0060, 60.0)

@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,10 +12,12 @@ import (
 
 // FleetTracker maintains runtime fleet metrics and instance lifetimes.
 type FleetTracker struct {
-	mu           sync.RWMutex
-	metrics      *ObservabilityMetrics
-	catalog      *HardwareCatalog
-	instanceAges map[string]time.Time // instanceID -> lastSampleTime
+	mu              sync.RWMutex
+	metrics         *ObservabilityMetrics
+	catalog         *HardwareCatalog
+	instanceAges    map[string]time.Time // instanceID -> lastSampleTime
+	defaultProvider string
+	defaultRegion   string
 }
 
 // GlobalFleetTracker is the singleton instance of the fleet tracker.
@@ -28,11 +31,46 @@ func NewFleetTracker(metrics *ObservabilityMetrics, catalog *HardwareCatalog) *F
 	if catalog == nil {
 		catalog = GlobalCatalog
 	}
-	return &FleetTracker{
-		metrics:      metrics,
-		catalog:      catalog,
-		instanceAges: make(map[string]time.Time),
+	defReg := os.Getenv("AWS_REGION")
+	if defReg == "" {
+		defReg = "us-west-2"
 	}
+	defProv := os.Getenv("CLOUD_PROVIDER")
+	if defProv == "" {
+		defProv = "aws"
+	}
+	return &FleetTracker{
+		metrics:         metrics,
+		catalog:         catalog,
+		instanceAges:    make(map[string]time.Time),
+		defaultProvider: defProv,
+		defaultRegion:   defReg,
+	}
+}
+
+func (f *FleetTracker) resolveAccelerator(itype string) (string, string) {
+	accelerator := "none"
+	gpuModel := "none"
+	if f.catalog != nil {
+		if resCap, ok := f.catalog.Get(itype); ok {
+			if resCap.TPUs > 0 {
+				accelerator = "tpu"
+				if resCap.GPUModel != "" {
+					gpuModel = resCap.GPUModel
+				} else {
+					gpuModel = itype
+				}
+			} else if resCap.GPUs > 0 {
+				accelerator = "gpu"
+				if resCap.GPUModel != "" {
+					gpuModel = resCap.GPUModel
+				} else {
+					gpuModel = itype
+				}
+			}
+		}
+	}
+	return accelerator, gpuModel
 }
 
 // ClassifyAWSError maps AWS EC2 Fleet error strings or error objects to result categories:
@@ -73,13 +111,8 @@ func (f *FleetTracker) RecordLaunchAttempt(provider, region, itype, capacityType
 	if f.metrics == nil {
 		return
 	}
-	gpuModel := itype
-	if f.catalog != nil {
-		if resCap, ok := f.catalog.Get(itype); ok && resCap.GPUModel != "" {
-			gpuModel = resCap.GPUModel
-		}
-	}
-	f.metrics.RecordLaunchAttempt(provider, region, gpuModel, capacityType, result)
+	accelerator, gpuModel := f.resolveAccelerator(itype)
+	f.metrics.RecordLaunchAttempt(provider, region, accelerator, itype, gpuModel, capacityType, result)
 }
 
 // RecordLaunchDuration records the latency from request to instance readiness.
@@ -87,13 +120,8 @@ func (f *FleetTracker) RecordLaunchDuration(provider, region, itype, capacityTyp
 	if f.metrics == nil {
 		return
 	}
-	gpuModel := itype
-	if f.catalog != nil {
-		if resCap, ok := f.catalog.Get(itype); ok && resCap.GPUModel != "" {
-			gpuModel = resCap.GPUModel
-		}
-	}
-	f.metrics.RecordLaunchDuration(provider, region, gpuModel, capacityType, duration.Seconds())
+	accelerator, gpuModel := f.resolveAccelerator(itype)
+	f.metrics.RecordLaunchDuration(provider, region, accelerator, itype, gpuModel, capacityType, duration.Seconds())
 }
 
 // RecordInterruption records an unexpected spot interruption or node lost.
@@ -101,13 +129,8 @@ func (f *FleetTracker) RecordInterruption(provider, region, itype, capacityType 
 	if f.metrics == nil {
 		return
 	}
-	gpuModel := itype
-	if f.catalog != nil {
-		if resCap, ok := f.catalog.Get(itype); ok && resCap.GPUModel != "" {
-			gpuModel = resCap.GPUModel
-		}
-	}
-	f.metrics.RecordInterruption(provider, region, gpuModel, capacityType)
+	accelerator, gpuModel := f.resolveAccelerator(itype)
+	f.metrics.RecordInterruption(provider, region, accelerator, itype, gpuModel, capacityType)
 }
 
 // UpdateLiveFleet is invoked by the reconciler on each pass to update running instances, GPUs, and spend $/h.
@@ -121,6 +144,8 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 	type fleetKey struct {
 		provider     string
 		region       string
+		accelerator  string
+		instanceType string
 		gpuModel     string
 		capacityType string
 	}
@@ -177,9 +202,22 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 			}
 		}
 
-		gpuModel := itype
-		if resCap.GPUModel != "" {
-			gpuModel = resCap.GPUModel
+		accelerator := "none"
+		gpuModel := "none"
+		if resCap.TPUs > 0 {
+			accelerator = "tpu"
+			if resCap.GPUModel != "" {
+				gpuModel = resCap.GPUModel
+			} else {
+				gpuModel = itype
+			}
+		} else if resCap.GPUs > 0 {
+			accelerator = "gpu"
+			if resCap.GPUModel != "" {
+				gpuModel = resCap.GPUModel
+			} else {
+				gpuModel = itype
+			}
 		}
 		gpuCount := resCap.GPUs
 		vramGB := resCap.GPUMemoryGB * resCap.GPUs
@@ -209,9 +247,18 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 			}
 		}
 
+		if provider != "" {
+			f.defaultProvider = provider
+		}
+		if region != "" {
+			f.defaultRegion = region
+		}
+
 		key := fleetKey{
 			provider:     provider,
 			region:       region,
+			accelerator:  accelerator,
+			instanceType: itype,
 			gpuModel:     gpuModel,
 			capacityType: capacityType,
 		}
@@ -241,7 +288,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 		if start, ok := f.instanceAges[inst.ID]; ok {
 			elapsed := now.Sub(start).Seconds()
 			if elapsed > 0 {
-				f.metrics.AddInstanceSeconds(provider, region, gpuModel, capacityType, elapsed)
+				f.metrics.AddInstanceSeconds(provider, region, accelerator, itype, gpuModel, capacityType, elapsed)
 			}
 		}
 		f.instanceAges[inst.ID] = now
@@ -261,7 +308,20 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 	}
 
 	f.metrics.ResetFleetGauges()
-	for k, count := range instanceCounts {
-		f.metrics.SetFleetGauges(k.provider, k.region, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k], float64(podCounts[k]), spendBaselineRates[k])
+	if len(instanceCounts) == 0 {
+		defProv := f.defaultProvider
+		if defProv == "" {
+			defProv = "aws"
+		}
+		defReg := f.defaultRegion
+		if defReg == "" {
+			defReg = "us-west-2"
+		}
+		f.metrics.SetFleetGauges(defProv, defReg, "none", "none", "none", "spot", 0, 0, 0, 0, 0, 0, 0, 0)
+		f.metrics.SetFleetGauges(defProv, defReg, "none", "none", "none", "on-demand", 0, 0, 0, 0, 0, 0, 0, 0)
+	} else {
+		for k, count := range instanceCounts {
+			f.metrics.SetFleetGauges(k.provider, k.region, k.accelerator, k.instanceType, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k], float64(podCounts[k]), spendBaselineRates[k])
+		}
 	}
 }
