@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -51,11 +52,12 @@ func (c *PricingCatalog) LoadDefault() error {
 	}
 
 	if path := os.Getenv("PRICING_CATALOG_FILE"); path != "" {
-		if err := c.LoadFile(path); err != nil {
-			log.Printf("[cloudvm-pricing] Failed to load PRICING_CATALOG_FILE (%s): %v", path, err)
+		cleanPath := filepath.Clean(path)
+		if err := c.LoadFile(cleanPath); err != nil {
+			log.Printf("[cloudvm-pricing] Failed to load PRICING_CATALOG_FILE (%s): %v", sanitizeLog(cleanPath), err) //nolint:gosec // sanitized
 			return err
 		}
-		log.Printf("[cloudvm-pricing] Loaded pricing catalog from file: %s", path)
+		log.Printf("[cloudvm-pricing] Loaded pricing catalog from file: %s", sanitizeLog(cleanPath)) //nolint:gosec // sanitized
 	} else if rawJSON := os.Getenv("PRICING_CATALOG_JSON"); rawJSON != "" {
 		if err := c.LoadJSON([]byte(rawJSON)); err != nil {
 			log.Printf("[cloudvm-pricing] Failed to parse PRICING_CATALOG_JSON: %v", err)
@@ -69,9 +71,10 @@ func (c *PricingCatalog) LoadDefault() error {
 
 // LoadFile parses a JSON file into the pricing catalog.
 func (c *PricingCatalog) LoadFile(path string) error {
-	data, err := os.ReadFile(path)
+	cleanPath := filepath.Clean(path)
+	data, err := os.ReadFile(cleanPath) //nolint:gosec // operator-configured pricing file path
 	if err != nil {
-		return fmt.Errorf("failed to read pricing file %s: %w", path, err)
+		return fmt.Errorf("failed to read pricing file %s: %w", cleanPath, err)
 	}
 	return c.LoadJSON(data)
 }
