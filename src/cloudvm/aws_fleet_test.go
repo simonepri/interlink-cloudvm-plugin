@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
+	"golang.org/x/time/rate"
 )
 
 func TestFleetOverridesWeightedCapacity(t *testing.T) {
@@ -505,5 +508,448 @@ func TestAWSProvider_LaunchResolvesPrivateIP(t *testing.T) {
 	}
 	if inst.IP != expectedIP {
 		t.Fatalf("expected inst.IP %s, got %s", expectedIP, inst.IP)
+	}
+}
+
+func TestDescribeAllInstances_Pagination(t *testing.T) {
+	var requestedTokens []string
+	callCount := 0
+
+	mockClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, params *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			callCount++
+			token := ""
+			if params != nil && params.NextToken != nil {
+				token = *params.NextToken
+			}
+			requestedTokens = append(requestedTokens, token)
+
+			switch callCount {
+			case 1:
+				return &ec2.DescribeInstancesOutput{
+					NextToken: aws.String("token-page-2"),
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{InstanceId: aws.String("i-page1-inst1")},
+								{InstanceId: aws.String("i-page1-inst2")},
+							},
+						},
+					},
+				}, nil
+			case 2:
+				return &ec2.DescribeInstancesOutput{
+					NextToken: aws.String("token-page-3"),
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{InstanceId: aws.String("i-page2-inst1")},
+							},
+						},
+					},
+				}, nil
+			case 3:
+				return &ec2.DescribeInstancesOutput{
+					NextToken: nil,
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{InstanceId: aws.String("i-page3-inst1")},
+								{InstanceId: aws.String("i-page3-inst2")},
+							},
+						},
+					},
+				}, nil
+			default:
+				t.Fatalf("unexpected call %d to DescribeInstances", callCount)
+				return nil, nil
+			}
+		},
+	}
+
+	out, err := DescribeAllInstances(context.Background(), mockClient, &ec2.DescribeInstancesInput{
+		Filters: []ec2types.Filter{
+			{Name: aws.String("instance-state-name"), Values: []string{"running"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("DescribeAllInstances failed: %v", err)
+	}
+
+	if callCount != 3 {
+		t.Fatalf("expected 3 calls, got %d", callCount)
+	}
+
+	expectedTokens := []string{"", "token-page-2", "token-page-3"}
+	for i, exp := range expectedTokens {
+		if requestedTokens[i] != exp {
+			t.Errorf("call %d token = %q, expected %q", i+1, requestedTokens[i], exp)
+		}
+	}
+
+	if len(out.Reservations) != 3 {
+		t.Fatalf("expected 3 reservations, got %d", len(out.Reservations))
+	}
+	var totalInsts int
+	for _, res := range out.Reservations {
+		totalInsts += len(res.Instances)
+	}
+	if totalInsts != 5 {
+		t.Fatalf("expected 5 total instances, got %d", totalInsts)
+	}
+}
+
+func TestDescribeAllInstances_Error(t *testing.T) {
+	callCount := 0
+	mockClient := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			callCount++
+			if callCount == 1 {
+				return &ec2.DescribeInstancesOutput{
+					NextToken: aws.String("token-page-2"),
+					Reservations: []ec2types.Reservation{
+						{Instances: []ec2types.Instance{{InstanceId: aws.String("i-1")}}},
+					},
+				}, nil
+			}
+			return nil, fmt.Errorf("network connection error")
+		},
+	}
+
+	out, err := DescribeAllInstances(context.Background(), mockClient, nil)
+	if err == nil {
+		t.Fatalf("expected error from page 2, got output: %v", out)
+	}
+	if !strings.Contains(err.Error(), "network connection error") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 calls, got %d", callCount)
+	}
+}
+
+func TestAWSProvider_ListActiveInstances_Paginated(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	p := NewAWSProvider("us-east-1")
+
+	callCount := 0
+	client := &mockEC2FleetClient{
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			callCount++
+			if callCount == 1 {
+				return &ec2.DescribeInstancesOutput{
+					NextToken: aws.String("page-2"),
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{
+									InstanceId:       aws.String("i-paginated-1"),
+									InstanceType:     ec2types.InstanceTypeG5Xlarge,
+									PrivateIpAddress: aws.String("10.0.1.10"),
+									State:            &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning},
+									LaunchTime:       aws.Time(time.Now()),
+									Tags: []ec2types.Tag{
+										{Key: aws.String("ClusterTag"), Value: aws.String("paginated-cluster")},
+										{Key: aws.String("PodUID"), Value: aws.String("uid-p1")},
+										{Key: aws.String("PodName"), Value: aws.String("pod-p1")},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			return &ec2.DescribeInstancesOutput{
+				NextToken: nil,
+				Reservations: []ec2types.Reservation{
+					{
+						Instances: []ec2types.Instance{
+							{
+								InstanceId:       aws.String("i-paginated-2"),
+								InstanceType:     ec2types.InstanceTypeG52xlarge,
+								PrivateIpAddress: aws.String("10.0.1.20"),
+								State:            &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning},
+								LaunchTime:       aws.Time(time.Now()),
+								Tags: []ec2types.Tag{
+									{Key: aws.String("ClusterTag"), Value: aws.String("paginated-cluster")},
+									{Key: aws.String("PodUID"), Value: aws.String("uid-p2")},
+									{Key: aws.String("PodName"), Value: aws.String("pod-p2")},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	p.SetRegionClient("us-east-1", client)
+
+	instances, err := p.ListActiveInstances(context.Background(), "paginated-cluster")
+	if err != nil {
+		t.Fatalf("ListActiveInstances failed: %v", err)
+	}
+
+	if callCount != 2 {
+		t.Fatalf("expected 2 DescribeInstances calls, got %d", callCount)
+	}
+	if len(instances) != 2 {
+		t.Fatalf("expected 2 instances across 2 pages, got %d", len(instances))
+	}
+	if instances[0].ID != "i-paginated-1" || instances[1].ID != "i-paginated-2" {
+		t.Fatalf("unexpected instances returned: %v, %v", instances[0].ID, instances[1].ID)
+	}
+}
+
+func TestCreateFleet_RateLimiting(t *testing.T) {
+	ResetFleetRateLimiters()
+	defer ResetFleetRateLimiters()
+
+	// Configure a tight rate limiter: 5 calls/second, burst 1
+	testLimiter := rate.NewLimiter(rate.Limit(5), 1)
+	SetFleetRateLimiter("us-east-rate", testLimiter)
+
+	var callTimes []time.Time
+	client := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, _ *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			callTimes = append(callTimes, time.Now())
+			return &ec2.CreateFleetOutput{
+				FleetId: aws.String("fleet-rate-test"),
+				Instances: []ec2types.CreateFleetInstance{
+					{
+						InstanceIds:  []string{"i-rate-1"},
+						InstanceType: ec2types.InstanceTypeG5Xlarge,
+					},
+				},
+			}, nil
+		},
+	}
+
+	req := &FleetRequest{
+		Region:        "us-east-rate",
+		PodUID:        "uid-rate-1",
+		PodName:       "pod-rate-1",
+		PodNamespace:  "default",
+		InstanceTypes: []string{"g5.xlarge"},
+	}
+
+	start := time.Now()
+	// First call consumes the burst token immediately
+	_, err := LaunchFleetWithClient(context.Background(), client, req, nil)
+	if err != nil {
+		t.Fatalf("first launch failed: %v", err)
+	}
+
+	// Second call must wait ~200ms for next token (5 calls/s = 200ms interval)
+	req.PodUID = "uid-rate-2"
+	_, err = LaunchFleetWithClient(context.Background(), client, req, nil)
+	if err != nil {
+		t.Fatalf("second launch failed: %v", err)
+	}
+
+	elapsed := time.Since(start)
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("expected rate limiting delay >= 150ms, elapsed was: %v", elapsed)
+	}
+	if len(callTimes) != 2 {
+		t.Fatalf("expected 2 calls, got %d", len(callTimes))
+	}
+}
+
+func TestCreateFleet_RateLimiting_ContextCanceled(t *testing.T) {
+	ResetFleetRateLimiters()
+	defer ResetFleetRateLimiters()
+
+	// Drain the limiter completely
+	testLimiter := rate.NewLimiter(rate.Limit(1), 1)
+	if !testLimiter.Allow() {
+		t.Fatalf("expected first token allowed")
+	}
+	SetFleetRateLimiter("us-east-rate-cancel", testLimiter)
+
+	client := &mockEC2FleetClient{}
+	req := &FleetRequest{
+		Region:        "us-east-rate-cancel",
+		PodUID:        "uid-rate-cancel",
+		PodName:       "pod-rate-cancel",
+		PodNamespace:  "default",
+		InstanceTypes: []string{"g5.xlarge"},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel before call
+
+	_, err := LaunchFleetWithClient(ctx, client, req, nil)
+	if err == nil {
+		t.Fatalf("expected error on canceled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+}
+
+func TestCreateFleet_BackoffRetry_SuccessOnRetry(t *testing.T) {
+	ResetFleetRateLimiters()
+	defer ResetFleetRateLimiters()
+	SetFleetRetryParams(5*time.Millisecond, 20*time.Millisecond, 5)
+	defer ResetFleetRetryParams()
+
+	calls := 0
+	client := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, _ *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			calls++
+			if calls < 3 {
+				return nil, &smithy.GenericAPIError{
+					Code:    "RequestLimitExceeded",
+					Message: "Request limit exceeded.",
+				}
+			}
+			return &ec2.CreateFleetOutput{
+				FleetId: aws.String("fleet-retry-ok"),
+				Instances: []ec2types.CreateFleetInstance{
+					{
+						InstanceIds:  []string{"i-retry-success"},
+						InstanceType: ec2types.InstanceTypeG5Xlarge,
+					},
+				},
+			}, nil
+		},
+	}
+
+	req := &FleetRequest{
+		Region:        "us-west-2",
+		PodUID:        "uid-retry-ok",
+		PodName:       "pod-retry-ok",
+		PodNamespace:  "default",
+		InstanceTypes: []string{"g5.xlarge"},
+	}
+
+	resp, err := LaunchFleetWithClient(context.Background(), client, req, nil)
+	if err != nil {
+		t.Fatalf("LaunchFleetWithClient failed: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls (2 throttles + 1 success), got %d", calls)
+	}
+	if resp.FleetID != "fleet-retry-ok" {
+		t.Fatalf("expected fleetId fleet-retry-ok, got %s", resp.FleetID)
+	}
+	if len(resp.Instances) != 1 || resp.Instances[0].ID != "i-retry-success" {
+		t.Fatalf("expected instance i-retry-success, got %v", resp.Instances)
+	}
+}
+
+func TestCreateFleet_BackoffRetry_ExceedsMaxRetries(t *testing.T) {
+	ResetFleetRateLimiters()
+	defer ResetFleetRateLimiters()
+	maxRetries := 3
+	SetFleetRetryParams(5*time.Millisecond, 20*time.Millisecond, maxRetries)
+	defer ResetFleetRetryParams()
+
+	calls := 0
+	client := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, _ *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			calls++
+			return nil, &smithy.GenericAPIError{
+				Code:    "RequestLimitExceeded",
+				Message: "Request limit exceeded.",
+			}
+		},
+	}
+
+	req := &FleetRequest{
+		Region:        "us-west-2",
+		PodUID:        "uid-retry-fail",
+		PodName:       "pod-retry-fail",
+		PodNamespace:  "default",
+		InstanceTypes: []string{"g5.xlarge"},
+	}
+
+	_, err := LaunchFleetWithClient(context.Background(), client, req, nil)
+	if err == nil {
+		t.Fatalf("expected failure after exceeding max retries, got nil")
+	}
+	// Initial call + 3 retries = 4 calls total
+	if calls != maxRetries+1 {
+		t.Fatalf("expected %d calls, got %d", maxRetries+1, calls)
+	}
+	if !strings.Contains(err.Error(), "RequestLimitExceeded") {
+		t.Fatalf("expected error mentioning RequestLimitExceeded, got: %v", err)
+	}
+}
+
+func TestCreateFleet_BackoffRetry_NonRetryableError(t *testing.T) {
+	ResetFleetRateLimiters()
+	defer ResetFleetRateLimiters()
+	SetFleetRetryParams(5*time.Millisecond, 20*time.Millisecond, 5)
+	defer ResetFleetRetryParams()
+
+	calls := 0
+	client := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, _ *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			calls++
+			return nil, fmt.Errorf("InvalidParameterValue: Value (ami-nonexistent) is invalid")
+		},
+	}
+
+	req := &FleetRequest{
+		Region:        "us-west-2",
+		PodUID:        "uid-non-retryable",
+		PodName:       "pod-non-retryable",
+		PodNamespace:  "default",
+		InstanceTypes: []string{"g5.xlarge"},
+	}
+
+	_, err := LaunchFleetWithClient(context.Background(), client, req, nil)
+	if err == nil {
+		t.Fatalf("expected non-retryable error, got nil")
+	}
+	// Must fail immediately without retry!
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 call for non-retryable error, got %d", calls)
+	}
+	if !strings.Contains(err.Error(), "InvalidParameterValue") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCreateFleet_BackoffRetry_ContextCanceledDuringBackoff(t *testing.T) {
+	ResetFleetRateLimiters()
+	defer ResetFleetRateLimiters()
+	// Set longer backoff so context timeout fires during sleep
+	SetFleetRetryParams(2*time.Second, 5*time.Second, 5)
+	defer ResetFleetRetryParams()
+
+	calls := 0
+	client := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, _ *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			calls++
+			return nil, &smithy.GenericAPIError{
+				Code:    "RequestLimitExceeded",
+				Message: "Request limit exceeded.",
+			}
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	req := &FleetRequest{
+		Region:        "us-west-2",
+		PodUID:        "uid-ctx-cancel",
+		PodName:       "pod-ctx-cancel",
+		PodNamespace:  "default",
+		InstanceTypes: []string{"g5.xlarge"},
+	}
+
+	_, err := LaunchFleetWithClient(ctx, client, req, nil)
+	if err == nil {
+		t.Fatalf("expected context error, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("expected deadline exceeded, got: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call before context cancellation during sleep, got %d", calls)
 	}
 }

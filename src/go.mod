@@ -10,8 +10,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kms v1.61.6
 	github.com/aws/aws-sdk-go-v2/service/pricing v1.51.0
 	github.com/aws/aws-sdk-go-v2/service/servicequotas v1.43.6
+	github.com/aws/smithy-go v1.28.6
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.25.0
+	golang.org/x/time v0.16.0
 	google.golang.org/api v0.308.0
 	k8s.io/api v0.32.2
 	k8s.io/apimachinery v0.32.2
@@ -33,7 +35,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.38.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.43.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.4 // indirect
-	github.com/aws/smithy-go v1.28.6 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -81,7 +82,6 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
 	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +21,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
+	"golang.org/x/time/rate"
 )
 
 // FleetAllocationStrategy specifies the spot allocation behavior.
@@ -118,6 +123,139 @@ type EC2FleetClient interface {
 	DescribeInstances(ctx context.Context, params *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
 	TerminateInstances(ctx context.Context, params *ec2.TerminateInstancesInput, optFns ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error)
 	DescribeInstanceTypes(ctx context.Context, params *ec2.DescribeInstanceTypesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error)
+}
+
+var (
+	fleetRateLimitMu  sync.RWMutex
+	fleetRateLimiters = make(map[string]*rate.Limiter)
+	fleetRateLimit    = rate.Limit(15) // ~15 calls/second
+	fleetBurstSize    = 15
+
+	fleetRetryMu        sync.RWMutex
+	fleetInitialBackoff = 100 * time.Millisecond
+	fleetMaxBackoff     = 3 * time.Second
+	fleetMaxRetries     = 5
+)
+
+// getFleetRateLimiter returns the rate.Limiter for a given region (or global if region is empty).
+func getFleetRateLimiter(region string) *rate.Limiter {
+	fleetRateLimitMu.RLock()
+	limiter, exists := fleetRateLimiters[region]
+	fleetRateLimitMu.RUnlock()
+	if exists && limiter != nil {
+		return limiter
+	}
+
+	fleetRateLimitMu.Lock()
+	defer fleetRateLimitMu.Unlock()
+	if limiter, exists := fleetRateLimiters[region]; exists && limiter != nil {
+		return limiter
+	}
+
+	limiter = rate.NewLimiter(fleetRateLimit, fleetBurstSize)
+	fleetRateLimiters[region] = limiter
+	return limiter
+}
+
+// SetFleetRateLimiter configures the rate limiter for a specific region (or empty string for global).
+func SetFleetRateLimiter(region string, limiter *rate.Limiter) {
+	fleetRateLimitMu.Lock()
+	defer fleetRateLimitMu.Unlock()
+	fleetRateLimiters[region] = limiter
+}
+
+// ResetFleetRateLimiters resets the regional rate limiters map.
+func ResetFleetRateLimiters() {
+	fleetRateLimitMu.Lock()
+	defer fleetRateLimitMu.Unlock()
+	fleetRateLimiters = make(map[string]*rate.Limiter)
+}
+
+func getFleetRetryParams() (time.Duration, time.Duration, int) {
+	fleetRetryMu.RLock()
+	defer fleetRetryMu.RUnlock()
+	return fleetInitialBackoff, fleetMaxBackoff, fleetMaxRetries
+}
+
+// SetFleetRetryParams allows overriding backoff and max retries for testing.
+func SetFleetRetryParams(initialBackoff, maxBackoff time.Duration, maxRetries int) {
+	fleetRetryMu.Lock()
+	defer fleetRetryMu.Unlock()
+	fleetInitialBackoff = initialBackoff
+	fleetMaxBackoff = maxBackoff
+	fleetMaxRetries = maxRetries
+}
+
+// ResetFleetRetryParams resets retry parameters to default values.
+func ResetFleetRetryParams() {
+	fleetRetryMu.Lock()
+	defer fleetRetryMu.Unlock()
+	fleetInitialBackoff = 100 * time.Millisecond
+	fleetMaxBackoff = 3 * time.Second
+	fleetMaxRetries = 5
+}
+
+func jitterDuration(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	// Add up to 25% jitter: [base, base + base/4]
+	extraMax := int64(base / 4)
+	if extraMax <= 0 {
+		return base
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(extraMax))
+	if err != nil {
+		return base
+	}
+	return base + time.Duration(n.Int64())
+}
+
+func isRequestLimitExceeded(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode() == "RequestLimitExceeded" {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "RequestLimitExceeded")
+}
+
+// DescribeAllInstances paginates through all pages of ec2.DescribeInstances using NextToken,
+// aggregating all reservations across pages into a single DescribeInstancesOutput.
+func DescribeAllInstances(ctx context.Context, client EC2FleetClient, input *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+	if client == nil {
+		return nil, fmt.Errorf("ec2 fleet client is nil")
+	}
+
+	var req ec2.DescribeInstancesInput
+	if input != nil {
+		req = *input
+	}
+
+	var allReservations []ec2types.Reservation
+	for {
+		out, err := client.DescribeInstances(ctx, &req)
+		if err != nil {
+			return nil, err
+		}
+		if out != nil {
+			allReservations = append(allReservations, out.Reservations...)
+			if out.NextToken == nil || *out.NextToken == "" {
+				break
+			}
+			req.NextToken = out.NextToken
+		} else {
+			break
+		}
+	}
+
+	return &ec2.DescribeInstancesOutput{
+		Reservations: allReservations,
+	}, nil
 }
 
 // BuildFleetOverrides constructs the launch template overrides for EC2 Fleet.
@@ -242,9 +380,52 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		},
 	}
 
-	out, err := client.CreateFleet(ctx, input)
-	if err != nil {
-		return nil, fmt.Errorf("ec2:CreateFleet call failed: %w", err)
+	limiter := getFleetRateLimiter(req.Region)
+	initBackoff, maxBackoff, maxRetries := getFleetRetryParams()
+	backoff := initBackoff
+
+	var out *ec2.CreateFleetOutput
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			sleepDur := jitterDuration(backoff)
+			cleanRegion := sanitizeLog(req.Region)
+			log.Printf("[aws] CreateFleet throttled (RequestLimitExceeded) for region %s, attempt %d/%d; retrying after %v",
+				cleanRegion, attempt, maxRetries, sleepDur) //nolint:gosec // sanitized
+			timer := time.NewTimer(sleepDur)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+
+		if err := limiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("rate limiter wait failed: %w", err)
+		}
+
+		out, lastErr = client.CreateFleet(ctx, input)
+		if lastErr == nil {
+			break
+		}
+
+		if !isRequestLimitExceeded(lastErr) {
+			return nil, fmt.Errorf("ec2:CreateFleet call failed: %w", lastErr)
+		}
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("ec2:CreateFleet call failed after %d retries: %w", maxRetries, lastErr)
+	}
+
+	if out == nil {
+		return nil, fmt.Errorf("ec2:CreateFleet returned nil output")
 	}
 
 	resp := &FleetResponse{
@@ -696,7 +877,7 @@ func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTa
 			errorsByRegion[reg] = fmt.Errorf("failed to get AWS client for region %s: %w", reg, err)
 			continue
 		}
-		out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		out, err := DescribeAllInstances(ctx, client, &ec2.DescribeInstancesInput{
 			Filters: []ec2types.Filter{
 				{
 					Name:   aws.String("tag:ClusterTag"),
@@ -842,4 +1023,16 @@ func (p *AWSProvider) ListActiveInstances(ctx context.Context, clusterTag string
 	}
 
 	return instances, nil
+}
+
+// DescribeAllInstances retrieves all instances for the given region using DescribeAllInstances pagination.
+func (p *AWSProvider) DescribeAllInstances(ctx context.Context, region string, input *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+	if region == "" {
+		region = p.Region
+	}
+	client, err := p.getClient(ctx, region)
+	if err != nil {
+		return nil, err
+	}
+	return DescribeAllInstances(ctx, client, input)
 }
