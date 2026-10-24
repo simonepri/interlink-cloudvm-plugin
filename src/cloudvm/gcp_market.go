@@ -139,12 +139,12 @@ func (c *GCPMarketCollector) Collect(ctx context.Context, metrics *Observability
 			onDemand, spot := GetGCPPrice(mtype)
 
 			// Spot prices in GCP are regional; each zone in region gets the same spot value
-			metrics.SetGPUPrice("gcp", region, "", profile.GPUModel, profile.GPUMemoryGB, profile.GPUs, "spot", mtype, spot)
-			metrics.SetGPUPrice("gcp", region, "", profile.GPUModel, profile.GPUMemoryGB, profile.GPUs, "on-demand", mtype, onDemand)
+			metrics.SetGPUPrice("gcp", region, "regional", profile.GPUModel, profile.GPUMemoryGB, profile.GPUs, "spot", mtype, spot)
+			metrics.SetGPUPrice("gcp", region, "regional", profile.GPUModel, profile.GPUMemoryGB, profile.GPUs, "on-demand", mtype, onDemand)
 
 			// 3. Advice signals
 			if resp, err := c.adviceClient.QueryAdviceCapacity(ctx, region, mtype, profile.GPUs); err == nil && resp != nil {
-				metrics.SetAvailabilityScore("gcp", region, "", profile.GPUModel, mtype, "gcp_advice_capacity", profile.GPUs, resp.ObtainabilityScore)
+				metrics.SetAvailabilityScore("gcp", region, "regional", profile.GPUModel, mtype, "gcp_advice_capacity", profile.GPUs, resp.ObtainabilityScore)
 				metrics.SetExpectedUptime("gcp", region, mtype, profile.GPUModel, "gcp_advice_capacity", resp.EstimatedUptimeSec)
 				metrics.SetSignalAge("gcp", region, "gcp_advice_capacity", time.Since(now).Seconds())
 			}

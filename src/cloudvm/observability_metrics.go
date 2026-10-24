@@ -33,16 +33,18 @@ type ObservabilityMetrics struct {
 	fillLimited *prometheus.GaugeVec
 
 	// Fleet Metrics
-	instancesRunning *prometheus.GaugeVec
-	vcpusRunning     *prometheus.GaugeVec
-	memoryGiBRunning *prometheus.GaugeVec
-	gpusRunning      *prometheus.GaugeVec
-	vramGBRunning    *prometheus.GaugeVec
-	spendPerHour     *prometheus.GaugeVec
-	launchAttempts   *prometheus.CounterVec
-	launchDuration   *prometheus.HistogramVec
-	interruptions    *prometheus.CounterVec
-	instanceSeconds  *prometheus.CounterVec
+	instancesRunning     *prometheus.GaugeVec
+	vcpusRunning         *prometheus.GaugeVec
+	memoryGiBRunning     *prometheus.GaugeVec
+	gpusRunning          *prometheus.GaugeVec
+	vramGBRunning        *prometheus.GaugeVec
+	spendPerHour         *prometheus.GaugeVec
+	podsRunning          *prometheus.GaugeVec
+	spendBaselinePerHour *prometheus.GaugeVec
+	launchAttempts       *prometheus.CounterVec
+	launchDuration       *prometheus.HistogramVec
+	interruptions        *prometheus.CounterVec
+	instanceSeconds      *prometheus.CounterVec
 
 	// Legacy compatibility metrics (kept for 1 release)
 	legacySpotPrice      *prometheus.GaugeVec
@@ -149,6 +151,16 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 			Help: "Current run-rate spend in USD per hour computed from fulfilled instance prices",
 		}, fleetLabels),
 
+		podsRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_pods_running",
+			Help: "Current number of running pods across cloud VM instances",
+		}, fleetLabels),
+
+		spendBaselinePerHour: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_spend_ondemand_baseline_usd_per_hour",
+			Help: "Current run-rate on-demand baseline spend in USD per hour for running instances",
+		}, fleetLabels),
+
 		launchAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cloudvm_launch_attempts_total",
 			Help: "Total number of instance launch attempts classified by outcome result",
@@ -210,6 +222,8 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.gpusRunning,
 		m.vramGBRunning,
 		m.spendPerHour,
+		m.podsRunning,
+		m.spendBaselinePerHour,
 		m.launchAttempts,
 		m.launchDuration,
 		m.interruptions,
@@ -299,16 +313,24 @@ func (m *ObservabilityMetrics) ResetFleetGauges() {
 	m.gpusRunning.Reset()
 	m.vramGBRunning.Reset()
 	m.spendPerHour.Reset()
+	m.podsRunning.Reset()
+	m.spendBaselinePerHour.Reset()
 }
 
-// SetFleetGauges sets live instance, vCPU, memory, GPU, VRAM count, and run-rate spend.
-func (m *ObservabilityMetrics) SetFleetGauges(provider, region, gpuModel, capacityType string, instances, vcpus, memGiB, gpus, vramGB, spendPerHour float64) {
+// SetFleetGauges sets live instance, vCPU, memory, GPU, VRAM count, run-rate spend, pods, and baseline spend.
+func (m *ObservabilityMetrics) SetFleetGauges(provider, region, gpuModel, capacityType string, instances, vcpus, memGiB, gpus, vramGB, spendPerHour float64, extras ...float64) {
 	m.instancesRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(instances)
 	m.vcpusRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(vcpus)
 	m.memoryGiBRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(memGiB)
 	m.gpusRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(gpus)
 	m.vramGBRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(vramGB)
 	m.spendPerHour.WithLabelValues(provider, region, gpuModel, capacityType).Set(spendPerHour)
+	if len(extras) > 0 {
+		m.podsRunning.WithLabelValues(provider, region, gpuModel, capacityType).Set(extras[0])
+	}
+	if len(extras) > 1 {
+		m.spendBaselinePerHour.WithLabelValues(provider, region, gpuModel, capacityType).Set(extras[1])
+	}
 }
 
 // RecordLaunchAttempt increments launch attempt counters classified by outcome result.

@@ -279,7 +279,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	}
 
 	// Update live fleet metrics from cloud inventory
-	GlobalFleetTracker.UpdateLiveFleet(activeInstances)
+	GlobalFleetTracker.UpdateLiveFleet(activeInstances, activePods)
 
 	cloudInstances := make(map[string]*Instance, len(activeInstances))
 	for _, inst := range activeInstances {
