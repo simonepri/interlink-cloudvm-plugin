@@ -53,22 +53,22 @@ type CloudVMNode struct {
 
 // NewCloudVMNode creates an initialized CloudVMNode.
 // GetMeshIP thread-safely returns the mesh IP of the node.
-func (n *CloudVMNode) GetMeshIP() string {
-	if n == nil {
+func (node *CloudVMNode) GetMeshIP() string {
+	if node == nil {
 		return ""
 	}
 	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.MeshIP
+	defer node.mu.RUnlock()
+	return node.MeshIP
 }
 
 // SetMeshIP thread-safely updates the mesh IP of the node.
-func (n *CloudVMNode) SetMeshIP(ip string) {
-	if n == nil {
+func (node *CloudVMNode) SetMeshIP(ip string) {
+	if node == nil {
 		return
 	}
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	defer node.mu.Unlock()
 	n.MeshIP = ip
 }
 
