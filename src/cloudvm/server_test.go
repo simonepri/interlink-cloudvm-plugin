@@ -1191,6 +1191,7 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 	srv.SetOtelEndpoint("otel-collector:4317")
 	srv.SetEnableNPD(true)
 	srv.SetCustomBootstrapScript("echo global-bootstrap")
+	srv.SetRunnerConcurrency(16)
 
 	ts := httptest.NewServer(srv.Routes())
 	defer ts.Close()
@@ -1219,6 +1220,9 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 	if spec1.CustomBootstrapScript != "echo global-bootstrap" {
 		t.Errorf("expected inherited CustomBootstrapScript, got: %s", spec1.CustomBootstrapScript)
 	}
+	if spec1.RunnerConcurrency != 16 {
+		t.Errorf("expected inherited RunnerConcurrency 16, got: %d", spec1.RunnerConcurrency)
+	}
 
 	// 2. Pod with custom annotations should override server generic daemon options
 	mockProv2 := NewMockProvider()
@@ -1227,6 +1231,7 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 	srv2.SetOtelEndpoint("otel-collector:4317")
 	srv2.SetEnableNPD(false)
 	srv2.SetCustomBootstrapScript("echo global-bootstrap")
+	srv2.SetRunnerConcurrency(16)
 
 	ts2 := httptest.NewServer(srv2.Routes())
 	defer ts2.Close()
@@ -1241,7 +1246,8 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 					"cloudvm.vk.io/registry-mirrors": "override.mirror.io,backup.mirror.io",
 					"cloudvm.vk.io/otel-endpoint": "custom-otel:4317",
 					"cloudvm.vk.io/enable-npd": "true",
-					"cloudvm.vk.io/custom-bootstrap-script": "echo pod-bootstrap"
+					"cloudvm.vk.io/custom-bootstrap-script": "echo pod-bootstrap",
+					"cloudvm.vk.io/runner-concurrency": "32"
 				}
 			}
 		}
@@ -1264,6 +1270,131 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 	}
 	if spec2.CustomBootstrapScript != "echo pod-bootstrap" {
 		t.Errorf("expected overridden CustomBootstrapScript, got: %s", spec2.CustomBootstrapScript)
+	}
+	if spec2.RunnerConcurrency != 32 {
+		t.Errorf("expected overridden RunnerConcurrency 32, got: %d", spec2.RunnerConcurrency)
+	}
+}
+
+func TestServer_RunnerConcurrency_EnvAndAnnotation(t *testing.T) {
+	// 1. Set MAX_RUNNER_CONCURRENCY in environment and verify server reads and propagates to pod
+	t.Setenv("MAX_RUNNER_CONCURRENCY", "8")
+	mockProv := NewMockProvider()
+	srv := NewServer(mockProv, "test-cluster")
+	if srv.RunnerConcurrency() != 8 {
+		t.Fatalf("expected runner concurrency 8 from env, got: %d", srv.RunnerConcurrency())
+	}
+
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	// Pod without annotation inherits MAX_RUNNER_CONCURRENCY
+	payload1 := `{"pod": {"metadata": {"name": "pod-default-concurrency", "namespace": "default", "uid": "uid-rc-1"}}}`
+	resp1, err := http.Post(ts.URL+"/create", "application/json", strings.NewReader(payload1))
+	if err != nil {
+		t.Fatalf("POST /create failed: %v", err)
+	}
+	_ = resp1.Body.Close()
+
+	spec1 := mockProv.LastSpec()
+	if spec1 == nil {
+		t.Fatalf("expected LastSpec to be populated")
+	}
+	if spec1.RunnerConcurrency != 8 {
+		t.Errorf("expected spec.RunnerConcurrency to be 8, got: %d", spec1.RunnerConcurrency)
+	}
+
+	cfg1 := srv.BuildCloudInitConfig(spec1)
+	script1, err := GenerateCloudInit(cfg1)
+	if err != nil {
+		t.Fatalf("failed to generate cloud-init: %v", err)
+	}
+	if !strings.Contains(script1, "RUNNER_CONCURRENCY = 8") {
+		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = 8")
+	}
+	if !strings.Contains(script1, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("expected cloud-init to contain DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
+	}
+
+	// 2. Pod with annotation "cloudvm.vk.io/runner-concurrency" overrides environment default
+	mockProv2 := NewMockProvider()
+	srv2 := NewServer(mockProv2, "test-cluster")
+	ts2 := httptest.NewServer(srv2.Routes())
+	defer ts2.Close()
+
+	payload2 := `{
+		"pod": {
+			"metadata": {
+				"name": "pod-annotated-concurrency",
+				"namespace": "default",
+				"uid": "uid-rc-2",
+				"annotations": {
+					"cloudvm.vk.io/runner-concurrency": "24"
+				}
+			}
+		}
+	}`
+	resp2, err := http.Post(ts2.URL+"/create", "application/json", strings.NewReader(payload2))
+	if err != nil {
+		t.Fatalf("POST /create failed: %v", err)
+	}
+	_ = resp2.Body.Close()
+
+	spec2 := mockProv2.LastSpec()
+	if spec2 == nil {
+		t.Fatalf("expected LastSpec to be populated")
+	}
+	if spec2.RunnerConcurrency != 24 {
+		t.Errorf("expected spec.RunnerConcurrency to be 24, got: %d", spec2.RunnerConcurrency)
+	}
+
+	cfg2 := srv2.BuildCloudInitConfig(spec2)
+	script2, err := GenerateCloudInit(cfg2)
+	if err != nil {
+		t.Fatalf("failed to generate cloud-init: %v", err)
+	}
+	if !strings.Contains(script2, "RUNNER_CONCURRENCY = 24") {
+		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = 24")
+	}
+	if !strings.Contains(script2, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("expected cloud-init to contain DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
+	}
+
+	// 3. When neither env var nor annotation is set, defaults to auto/cpu_count
+	t.Setenv("MAX_RUNNER_CONCURRENCY", "")
+	mockProv3 := NewMockProvider()
+	srv3 := NewServer(mockProv3, "test-cluster")
+	ts3 := httptest.NewServer(srv3.Routes())
+	defer ts3.Close()
+
+	payload3 := `{"pod": {"metadata": {"name": "pod-auto-concurrency", "namespace": "default", "uid": "uid-rc-3"}}}`
+	resp3, err := http.Post(ts3.URL+"/create", "application/json", strings.NewReader(payload3))
+	if err != nil {
+		t.Fatalf("POST /create failed: %v", err)
+	}
+	_ = resp3.Body.Close()
+
+	spec3 := mockProv3.LastSpec()
+	if spec3 == nil {
+		t.Fatalf("expected LastSpec to be populated")
+	}
+	if spec3.RunnerConcurrency != 0 {
+		t.Errorf("expected spec.RunnerConcurrency to be 0 (auto), got: %d", spec3.RunnerConcurrency)
+	}
+
+	cfg3 := srv3.BuildCloudInitConfig(spec3)
+	script3, err := GenerateCloudInit(cfg3)
+	if err != nil {
+		t.Fatalf("failed to generate cloud-init: %v", err)
+	}
+	if !strings.Contains(script3, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") {
+		t.Errorf("expected cloud-init to contain DEFAULT_RUNNER_CONCURRENCY definition")
+	}
+	if !strings.Contains(script3, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") {
+		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY")
+	}
+	if !strings.Contains(script3, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("expected cloud-init to contain DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
 	}
 }
 

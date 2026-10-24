@@ -42,6 +42,7 @@ type CloudInitConfig struct {
 	NodeProblemDetector    bool
 	CustomBootstrapScript  string
 	IdleGracePeriodSeconds int `json:"idleGracePeriodSeconds,omitempty"`
+	RunnerConcurrency      int `json:"runnerConcurrency,omitempty"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -54,6 +55,9 @@ func (c *CloudInitConfig) Ciphertext() string {
 func (c *CloudInitConfig) Validate() error {
 	if c.IdleGracePeriodSeconds <= 0 {
 		c.IdleGracePeriodSeconds = 600
+	}
+	if c.RunnerConcurrency < 0 {
+		c.RunnerConcurrency = 0
 	}
 	if c.IsKMSEncrypted() && c.KMSCiphertext == "" {
 		return fmt.Errorf("KMS token encryption is enabled but KMSCiphertext is empty")
@@ -534,7 +538,9 @@ pod_locks = {}
 pod_locks_guard = threading.Lock()
 starting_pods = set()
 start_failures = {}
-DOCKER_SEMAPHORE = threading.Semaphore(8)
+DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)
+RUNNER_CONCURRENCY = {{if .RunnerConcurrency}}{{.RunnerConcurrency}}{{else}}DEFAULT_RUNNER_CONCURRENCY{{end}}
+DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)
 
 def get_pod_lock(uid):
     with pod_locks_guard:
@@ -1001,6 +1007,9 @@ func RenderCloudInit(cfg *CloudInitConfig) (string, error) {
 	}
 	if cfg.IdleGracePeriodSeconds <= 0 {
 		cfg.IdleGracePeriodSeconds = 600
+	}
+	if cfg.RunnerConcurrency < 0 {
+		cfg.RunnerConcurrency = 0
 	}
 	if err := cfg.Validate(); err != nil {
 		return "", err

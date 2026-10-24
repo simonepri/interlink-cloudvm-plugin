@@ -238,7 +238,9 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	}
 
 	// Verify runner concurrency throttle and shutdown check
-	if !strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(8)") {
+	if !strings.Contains(script, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") ||
+		!strings.Contains(script, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") ||
+		!strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
 		t.Fatalf("cloud-init runner missing DOCKER_SEMAPHORE definition")
 	}
 	if !strings.Contains(script, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
@@ -662,6 +664,7 @@ func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 }
 
 func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
+	// 1. Default behavior (RunnerConcurrency = 0) renders DEFAULT_RUNNER_CONCURRENCY and threading.Semaphore(RUNNER_CONCURRENCY)
 	cfg := &CloudInitConfig{
 		PodName:         "concurrency-pod",
 		PodNamespace:    "default",
@@ -672,12 +675,51 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 		t.Fatalf("GenerateCloudInit failed: %v", err)
 	}
 
-	// Verify semaphore definition and usage
-	if !strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(8)") {
-		t.Errorf("cloud-init runner missing DOCKER_SEMAPHORE definition")
+	if !strings.Contains(script, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") {
+		t.Errorf("cloud-init runner missing DEFAULT_RUNNER_CONCURRENCY definition")
+	}
+	if !strings.Contains(script, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") {
+		t.Errorf("cloud-init runner missing default RUNNER_CONCURRENCY assignment")
+	}
+	if !strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("cloud-init runner missing DOCKER_SEMAPHORE definition with RUNNER_CONCURRENCY")
 	}
 	if !strings.Contains(script, "with DOCKER_SEMAPHORE:") {
 		t.Errorf("cloud-init runner missing with DOCKER_SEMAPHORE acquisition around container launch")
+	}
+
+	// 2. Explicit positive RunnerConcurrency renders the exact integer in RUNNER_CONCURRENCY = <val>
+	cfgExplicit := &CloudInitConfig{
+		PodName:           "concurrency-pod-explicit",
+		PodNamespace:      "default",
+		RunnerConcurrency: 16,
+	}
+	scriptExplicit, err := GenerateCloudInit(cfgExplicit)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit explicit concurrency failed: %v", err)
+	}
+	if !strings.Contains(scriptExplicit, "RUNNER_CONCURRENCY = 16") {
+		t.Errorf("cloud-init runner missing explicit RUNNER_CONCURRENCY = 16")
+	}
+	if !strings.Contains(scriptExplicit, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("cloud-init runner missing DOCKER_SEMAPHORE definition with RUNNER_CONCURRENCY")
+	}
+
+	// 3. Negative RunnerConcurrency resets to 0 in Validate() and renders default
+	cfgNegative := &CloudInitConfig{
+		PodName:           "concurrency-pod-neg",
+		PodNamespace:      "default",
+		RunnerConcurrency: -5,
+	}
+	scriptNegative, err := GenerateCloudInit(cfgNegative)
+	if err != nil {
+		t.Fatalf("GenerateCloudInit negative concurrency failed: %v", err)
+	}
+	if cfgNegative.RunnerConcurrency != 0 {
+		t.Errorf("expected negative RunnerConcurrency to be reset to 0, got %d", cfgNegative.RunnerConcurrency)
+	}
+	if !strings.Contains(scriptNegative, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") {
+		t.Errorf("cloud-init runner missing default RUNNER_CONCURRENCY assignment for negative value")
 	}
 
 	// Verify shutdown fail-fast check

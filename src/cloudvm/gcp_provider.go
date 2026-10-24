@@ -360,6 +360,7 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		OtelEndpoint:          spec.OtelEndpoint,
 		NodeProblemDetector:   spec.NodeProblemDetector,
 		CustomBootstrapScript: spec.CustomBootstrapScript,
+		RunnerConcurrency:     spec.RunnerConcurrency,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate gcp startup script: %w", err)

@@ -58,6 +58,7 @@ type Server struct {
 	otelEndpoint          string
 	enableNPD             bool
 	customBootstrapScript string
+	runnerConcurrency     int
 	launchTimeout         time.Duration
 	podSightingTimeout    time.Duration
 	tombstones            map[string]time.Time                 // podUID or instanceID -> deletion timestamp
@@ -150,6 +151,11 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	s.otelEndpoint = os.Getenv("OTEL_ENDPOINT")
 	s.enableNPD = os.Getenv("ENABLE_NPD") == "true" || os.Getenv("ENABLE_NPD") == "1"
 	s.customBootstrapScript = os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT")
+	if raw := os.Getenv("MAX_RUNNER_CONCURRENCY"); raw != "" {
+		if c, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && c > 0 {
+			s.runnerConcurrency = c
+		}
+	}
 	return s
 }
 
@@ -179,6 +185,98 @@ func (s *Server) SetCustomBootstrapScript(script string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.customBootstrapScript = script
+}
+
+// SetRunnerConcurrency configures default runner concurrency for provisioned VMs.
+func (s *Server) SetRunnerConcurrency(c int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c < 0 {
+		c = 0
+	}
+	s.runnerConcurrency = c
+}
+
+// RunnerConcurrency returns the configured default runner concurrency.
+func (s *Server) RunnerConcurrency() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.runnerConcurrency
+}
+
+// BuildCloudInitConfig constructs a CloudInitConfig from an InstanceSpec, populating
+// server-level defaults including RunnerConcurrency if not explicitly set.
+func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
+	if spec == nil {
+		return nil
+	}
+	rc := spec.RunnerConcurrency
+	if rc <= 0 && s != nil {
+		s.mu.RLock()
+		rc = s.runnerConcurrency
+		s.mu.RUnlock()
+	}
+	runnerToken := spec.RunnerAuthToken
+	if spec.KMSEncryptedToken || spec.KMSCiphertext != "" {
+		runnerToken = ""
+	}
+	mirrors := spec.RegistryMirrors
+	if len(mirrors) == 0 && s != nil {
+		s.mu.RLock()
+		mirrors = s.registryMirrors
+		s.mu.RUnlock()
+	}
+	otel := spec.OtelEndpoint
+	if otel == "" && s != nil {
+		s.mu.RLock()
+		otel = s.otelEndpoint
+		s.mu.RUnlock()
+	}
+	npd := spec.NodeProblemDetector
+	if !npd && s != nil {
+		s.mu.RLock()
+		npd = s.enableNPD
+		s.mu.RUnlock()
+	}
+	script := spec.CustomBootstrapScript
+	if script == "" && s != nil {
+		s.mu.RLock()
+		script = s.customBootstrapScript
+		s.mu.RUnlock()
+	}
+	return &CloudInitConfig{
+		PodName:               spec.PodName,
+		PodNamespace:          spec.PodNamespace,
+		PodUID:                spec.PodUID,
+		RayHeadAddress:        spec.RayHeadAddress,
+		RayVersion:            spec.RayVersion,
+		TargetContainerImage:  spec.TargetContainerImage,
+		Command:               spec.Command,
+		Args:                  spec.Args,
+		Env:                   spec.Env,
+		UseNativeDLAMI:        spec.AMIMode == "dlami",
+		NumGPUs:               spec.NumGPUs,
+		AssignedGPUs:          spec.AssignedGPUs,
+		CPUMillicores:         spec.CPUMillicores,
+		MemoryBytes:           spec.MemoryBytes,
+		RunnerAuthToken:       runnerToken,
+		KMSEncryptedToken:     spec.KMSEncryptedToken,
+		KMSKeyID:              spec.KMSKeyID,
+		KMSCiphertext:         spec.KMSCiphertext,
+		MeshAuthKey:           spec.MeshAuthKey,
+		Region:                spec.Region,
+		InstanceType:          spec.InstanceType,
+		EgressBandwidth:       spec.EgressBandwidth,
+		EgressBurst:           spec.EgressBurst,
+		RunAsUser:             spec.RunAsUser,
+		RunAsGroup:            spec.RunAsGroup,
+		DockerConfigJSON:      spec.DockerConfigJSON,
+		RegistryMirrors:       mirrors,
+		OtelEndpoint:          otel,
+		NodeProblemDetector:   npd,
+		CustomBootstrapScript: script,
+		RunnerConcurrency:     rc,
+	}
 }
 
 // SetRegionStore overrides the region store for instance-to-region mapping persistence.
@@ -515,6 +613,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
 		spec.CustomBootstrapScript = s.customBootstrapScript
+	}
+	if spec.RunnerConcurrency <= 0 && s.runnerConcurrency > 0 {
+		spec.RunnerConcurrency = s.runnerConcurrency
 	}
 
 	// Single-flight in-flight create check and idempotency under lock

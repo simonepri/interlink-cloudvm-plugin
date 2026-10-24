@@ -197,6 +197,17 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	enableNPD := pod.Metadata.Annotations["cloudvm.vk.io/enable-npd"] == "true" || pod.Metadata.Annotations["cloudvm.vk.io/node-problem-detector"] == "true"
 	customBootstrapScript := pod.Metadata.Annotations["cloudvm.vk.io/custom-bootstrap-script"]
 
+	runnerConcurrency := 0
+	rawConcurrency := pod.Metadata.Annotations["cloudvm.vk.io/runner-concurrency"]
+	if rawConcurrency == "" && pod.Spec.NodeSelector != nil {
+		rawConcurrency = pod.Spec.NodeSelector["cloudvm.vk.io/runner-concurrency"]
+	}
+	if rawConcurrency != "" {
+		if rc, err := strconv.Atoi(strings.TrimSpace(rawConcurrency)); err == nil && rc > 0 {
+			runnerConcurrency = rc
+		}
+	}
+
 	// 6. Network Egress Rate Limiting (Token Bucket Filter via rate or dollar/hr spend)
 	maxEgressRate := pod.Metadata.Annotations["cloudvm.vk.io/max-egress-rate"]
 	egressBandwidth := pod.Metadata.Annotations["cloudvm.vk.io/egress-bandwidth"]
@@ -332,6 +343,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		OtelEndpoint:           otelEndpoint,
 		NodeProblemDetector:    enableNPD,
 		CustomBootstrapScript:  customBootstrapScript,
+		RunnerConcurrency:      runnerConcurrency,
 		SubnetIDs:              subnetIDs,
 		CandidateInstanceTypes: candidateInstanceTypes,
 	}, nil

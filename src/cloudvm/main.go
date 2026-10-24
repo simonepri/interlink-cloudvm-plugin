@@ -155,6 +155,11 @@ func run() error {
 	if script := os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT"); script != "" {
 		server.SetCustomBootstrapScript(script)
 	}
+	if raw := os.Getenv("MAX_RUNNER_CONCURRENCY"); raw != "" {
+		if c, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && c > 0 {
+			server.SetRunnerConcurrency(c)
+		}
+	}
 
 	idleGrace := 60 * time.Second
 	if raw := os.Getenv("IDLE_GRACE_PERIOD"); raw != "" {
