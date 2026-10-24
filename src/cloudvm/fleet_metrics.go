@@ -126,7 +126,10 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
 	}
 
 	instanceCounts := make(map[fleetKey]int)
+	vcpuCounts := make(map[fleetKey]int)
+	memGiBCounts := make(map[fleetKey]int)
 	gpuCounts := make(map[fleetKey]int)
+	vramGBCounts := make(map[fleetKey]int)
 	spendRates := make(map[fleetKey]float64)
 
 	now := time.Now()
@@ -143,14 +146,39 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
 			capacityType = "spot"
 		}
 
-		gpuModel := itype
-		gpuCount := 0
+		resCap := CapacityForInstanceType(itype, ResourceVector{})
 		if f.catalog != nil {
-			resCap := f.catalog.ResolveCapacity(context.Background(), nil, itype, ResourceVector{})
-			if resCap.GPUModel != "" {
-				gpuModel = resCap.GPUModel
+			resolved := f.catalog.ResolveCapacity(context.Background(), nil, itype, resCap)
+			if resolved.GPUModel != "" {
+				resCap.GPUModel = resolved.GPUModel
 			}
-			gpuCount = resCap.GPUs
+			if resolved.GPUs > 0 {
+				resCap.GPUs = resolved.GPUs
+			}
+			if resolved.GPUMemoryGB > 0 {
+				resCap.GPUMemoryGB = resolved.GPUMemoryGB
+			}
+			if !resolved.CPU.IsZero() {
+				resCap.CPU = resolved.CPU
+			}
+			if !resolved.Memory.IsZero() {
+				resCap.Memory = resolved.Memory
+			}
+		}
+
+		gpuModel := itype
+		if resCap.GPUModel != "" {
+			gpuModel = resCap.GPUModel
+		}
+		gpuCount := resCap.GPUs
+		vramGB := resCap.GPUMemoryGB * resCap.GPUs
+		cpuCount := 0
+		if c, err := strconv.Atoi(resCap.CPU.String()); err == nil && c > 0 {
+			cpuCount = c
+		}
+		memGiB := 0
+		if memBytes, _ := resCap.Memory.AsInt64(); memBytes > 0 {
+			memGiB = int(memBytes / (1024 * 1024 * 1024))
 		}
 
 		// Calculate fulfilled price
@@ -178,7 +206,10 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
 		}
 
 		instanceCounts[key]++
+		vcpuCounts[key] += cpuCount
+		memGiBCounts[key] += memGiB
 		gpuCounts[key] += gpuCount
+		vramGBCounts[key] += vramGB
 		spendRates[key] += hourlyPrice
 
 		// Accumulate instance seconds
@@ -206,6 +237,6 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance) {
 
 	f.metrics.ResetFleetGauges()
 	for k, count := range instanceCounts {
-		f.metrics.SetFleetGauges(k.provider, k.region, k.gpuModel, k.capacityType, float64(count), float64(gpuCounts[k]), spendRates[k])
+		f.metrics.SetFleetGauges(k.provider, k.region, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k])
 	}
 }

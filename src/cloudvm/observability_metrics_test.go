@@ -30,7 +30,7 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 	metrics.SetFillQuote(80, 1000, "1", "spot", 0.0, nil, "capacity")
 
 	// 5. Record fleet metrics
-	metrics.SetFleetGauges("aws", "us-west-2", "A10G 24GB", "spot", 4, 4, 1.6096)
+	metrics.SetFleetGauges("aws", "us-west-2", "A10G 24GB", "spot", 4, 16, 64, 4, 96, 1.6096)
 	metrics.RecordLaunchAttempt("aws", "us-west-2", "A10G 24GB", "spot", "ok")
 	metrics.RecordLaunchAttempt("aws", "us-west-2", "A10G 24GB", "spot", "no_capacity")
 	metrics.RecordLaunchDuration("aws", "us-west-2", "A10G 24GB", "spot", 35.5)
@@ -64,7 +64,10 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 		"cloudvm_fill_gpus",
 		"cloudvm_fill_limited",
 		"cloudvm_instances_running",
+		"cloudvm_vcpus_running",
+		"cloudvm_memory_gib_running",
 		"cloudvm_gpus_running",
+		"cloudvm_vram_gb_running",
 		"cloudvm_spend_usd_per_hour",
 		"cloudvm_launch_attempts_total",
 		"cloudvm_launch_duration_seconds",

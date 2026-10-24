@@ -44,6 +44,19 @@ func (m *mockEC2TickerFetcher) GetSpotPlacementScores(_ context.Context, _ *ec2.
 	}, nil
 }
 
+func (m *mockEC2TickerFetcher) DescribeRegions(_ context.Context, _ *ec2.DescribeRegionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeRegionsOutput, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &ec2.DescribeRegionsOutput{
+		Regions: []ec2types.Region{
+			{RegionName: aws.String("us-east-1")},
+			{RegionName: aws.String("us-west-2")},
+			{RegionName: aws.String("eu-west-1")},
+		},
+	}, nil
+}
+
 func TestSpotPriceTicker_PlacementScoresAndSavings(t *testing.T) {
 	now := time.Now()
 	scoreVal := int32(9)
@@ -96,5 +109,35 @@ func TestSpotPriceTicker_PlacementScoresAndSavings(t *testing.T) {
 	}
 	if !strings.Contains(body, "cloudvm_ondemand_price_usd_per_hour") {
 		t.Errorf("metrics missing cloudvm_ondemand_price_usd_per_hour")
+	}
+}
+
+func TestSpotPriceTicker_DynamicRegionDiscovery(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-west-2")
+
+	// Empty regions slice enables auto-discovery
+	ticker := NewSpotPriceTicker(nil, []string{"g5.xlarge"}, 10*time.Minute)
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) {
+		return &mockEC2TickerFetcher{}, nil
+	})
+
+	if !ticker.autoDiscoverRegions {
+		t.Fatalf("expected autoDiscoverRegions to be true")
+	}
+
+	ticker.PollOnce(context.Background())
+
+	ticker.mu.RLock()
+	regions := ticker.regions
+	ticker.mu.RUnlock()
+
+	expected := []string{"eu-west-1", "us-east-1", "us-west-2"}
+	if len(regions) != len(expected) {
+		t.Fatalf("expected %d discovered regions, got %d: %v", len(expected), len(regions), regions)
+	}
+	for i, r := range expected {
+		if regions[i] != r {
+			t.Errorf("expected region %s at %d, got %s", r, i, regions[i])
+		}
 	}
 }

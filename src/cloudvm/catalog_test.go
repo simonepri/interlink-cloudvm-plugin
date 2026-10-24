@@ -122,6 +122,12 @@ func (m *mockSpotPriceFetcher) DescribeSpotPriceHistory(_ context.Context, _ *ec
 	}, nil
 }
 
+func (m *mockSpotPriceFetcher) DescribeRegions(_ context.Context, _ *ec2.DescribeRegionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeRegionsOutput, error) {
+	return &ec2.DescribeRegionsOutput{
+		Regions: []ec2types.Region{{RegionName: aws.String("us-east-1")}},
+	}, nil
+}
+
 func TestSpotPriceTicker_PollAndMetrics(t *testing.T) {
 	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"g5.xlarge"}, 10*time.Minute)
 	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) {
@@ -172,6 +178,12 @@ func (m *mockMultiAZSpotFetcher) DescribeSpotPriceHistory(_ context.Context, _ *
 				Timestamp:        aws.Time(t3),
 			},
 		},
+	}, nil
+}
+
+func (m *mockMultiAZSpotFetcher) DescribeRegions(_ context.Context, _ *ec2.DescribeRegionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeRegionsOutput, error) {
+	return &ec2.DescribeRegionsOutput{
+		Regions: []ec2types.Region{{RegionName: aws.String("us-east-1")}},
 	}, nil
 }
 

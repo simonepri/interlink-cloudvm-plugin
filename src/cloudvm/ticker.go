@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -21,6 +23,7 @@ import (
 type SpotPriceFetcher interface {
 	DescribeSpotPriceHistory(ctx context.Context, params *ec2.DescribeSpotPriceHistoryInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error)
 	GetSpotPlacementScores(ctx context.Context, params *ec2.GetSpotPlacementScoresInput, optFns ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error)
+	DescribeRegions(ctx context.Context, params *ec2.DescribeRegionsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeRegionsOutput, error)
 }
 
 // PlacementScoreEntry represents a placement score record.
@@ -47,13 +50,16 @@ func tickerKey(region, az, instanceType string) string {
 
 // SpotPriceTicker maintains a live cache of spot prices and exports Prometheus metrics.
 type SpotPriceTicker struct {
-	mu             sync.RWMutex
-	prices         map[string]*SpotPriceEntry
-	scores         map[string]*PlacementScoreEntry
-	regions        []string
-	instanceTypes  []string
-	scrapeInterval time.Duration
-	fetcherFactory func(ctx context.Context, region string) (SpotPriceFetcher, error)
+	mu                  sync.RWMutex
+	prices              map[string]*SpotPriceEntry
+	scores              map[string]*PlacementScoreEntry
+	regions             []string
+	instanceTypes       []string
+	scrapeInterval      time.Duration
+	autoDiscoverRegions bool
+	lastRegionDiscovery time.Time
+	defaultRegion       string
+	fetcherFactory      func(ctx context.Context, region string) (SpotPriceFetcher, error)
 
 	metrics    *ObservabilityMetrics
 	advisor    *SpotAdvisorCollector
@@ -69,8 +75,16 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 	if scrapeInterval <= 0 {
 		scrapeInterval = 10 * time.Minute
 	}
-	if len(regions) == 0 {
-		regions = []string{"us-east-1", "us-west-2", "eu-west-1"}
+	autoDiscover := false
+	defaultReg := "us-west-2"
+	if raw := os.Getenv("AWS_REGION"); raw != "" {
+		defaultReg = raw
+	}
+	if len(regions) == 0 || (len(regions) == 1 && (regions[0] == "" || regions[0] == "auto")) {
+		autoDiscover = true
+		regions = []string{defaultReg}
+	} else if len(regions) > 0 && regions[0] != "" {
+		defaultReg = regions[0]
 	}
 	if len(instanceTypes) == 0 {
 		instanceTypes = DiscoverTrackedShapes(nil)
@@ -83,16 +97,18 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 	solver := NewFillSolver()
 
 	return &SpotPriceTicker{
-		prices:         make(map[string]*SpotPriceEntry),
-		scores:         make(map[string]*PlacementScoreEntry),
-		regions:        regions,
-		instanceTypes:  instanceTypes,
-		scrapeInterval: scrapeInterval,
-		metrics:        metrics,
-		advisor:        advisor,
-		gcpMarket:      gcpMarket,
-		solver:         solver,
-		catalog:        catalog,
+		prices:              make(map[string]*SpotPriceEntry),
+		scores:              make(map[string]*PlacementScoreEntry),
+		regions:             regions,
+		instanceTypes:       instanceTypes,
+		scrapeInterval:      scrapeInterval,
+		autoDiscoverRegions: autoDiscover,
+		defaultRegion:       defaultReg,
+		metrics:             metrics,
+		advisor:             advisor,
+		gcpMarket:           gcpMarket,
+		solver:              solver,
+		catalog:             catalog,
 		fetcherFactory: func(ctx context.Context, region string) (SpotPriceFetcher, error) {
 			cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 			if err != nil {
@@ -159,9 +175,56 @@ func (t *SpotPriceTicker) Solver() *FillSolver {
 	return t.solver
 }
 
+// DiscoverRegions queries EC2 DescribeRegions to find all accessible regions for the account.
+func (t *SpotPriceTicker) DiscoverRegions(ctx context.Context) []string {
+	fetcher, err := t.fetcherFactory(ctx, t.defaultRegion)
+	if err != nil {
+		return t.regions
+	}
+	out, err := fetcher.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("opt-in-status"),
+				Values: []string{"opt-in-not-required", "opted-in"},
+			},
+		},
+	})
+	if err != nil || out == nil || len(out.Regions) == 0 {
+		return t.regions
+	}
+	var res []string
+	for _, r := range out.Regions {
+		if r.RegionName != nil && *r.RegionName != "" {
+			res = append(res, *r.RegionName)
+		}
+	}
+	if len(res) == 0 {
+		return t.regions
+	}
+	sort.Strings(res)
+	return res
+}
+
 // PollOnce queries DescribeSpotPriceHistory across configured regions and instance types.
 func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
-	for _, reg := range t.regions {
+	if t.autoDiscoverRegions && (t.lastRegionDiscovery.IsZero() || time.Since(t.lastRegionDiscovery) > 1*time.Hour) {
+		discovered := t.DiscoverRegions(ctx)
+		if len(discovered) > 0 {
+			t.mu.Lock()
+			t.regions = discovered
+			t.lastRegionDiscovery = time.Now()
+			if t.gcpMarket != nil {
+				t.gcpMarket.SetRegions(discovered)
+			}
+			t.mu.Unlock()
+		}
+	}
+	t.mu.RLock()
+	regionsToPoll := make([]string, len(t.regions))
+	copy(regionsToPoll, t.regions)
+	t.mu.RUnlock()
+
+	for _, reg := range regionsToPoll {
 		fetcher, err := t.fetcherFactory(ctx, reg)
 		if err != nil {
 			cleanReg := sanitizeLog(reg)
@@ -182,9 +245,11 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 			StartTime:           aws.Time(startTime),
 			EndTime:             aws.Time(now),
 		})
-		if err != nil {
-			cleanReg := sanitizeLog(reg)
-			log.Printf("[cloudvm-ticker] Error querying spot prices in %s: %v", cleanReg, err) //nolint:gosec // region sanitized
+		if err != nil || out == nil {
+			if err != nil {
+				cleanReg := sanitizeLog(reg)
+				log.Printf("[cloudvm-ticker] Error querying spot prices in %s: %v", cleanReg, err) //nolint:gosec // region sanitized
+			}
 			continue
 		}
 
