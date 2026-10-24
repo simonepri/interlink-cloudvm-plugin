@@ -36,6 +36,8 @@ type CloudVMNode struct {
 	IP                      string         `json:"ip,omitempty"`
 	Capacity                ResourceVector `json:"capacity"`
 	Allocated               ResourceVector `json:"allocated"`
+	AllocatedPods           int            `json:"allocatedPods,omitempty"`
+	Pods                    []string       `json:"pods,omitempty"`
 	CreatedAt               time.Time      `json:"createdAt"`
 	IdleSince               *time.Time     `json:"idleSince,omitempty"`
 	Cordoned                bool           `json:"cordoned,omitempty"`
@@ -191,6 +193,7 @@ func (node *CloudVMNode) FitsAndScores(req ResourceVector) (bool, []int, []int, 
 // AssignPod commits resource and discrete device reservations for a pod.
 func (node *CloudVMNode) AssignPod(alloc *PodAllocation) {
 	node.ActivePods[alloc.PodUID] = alloc
+	node.AllocatedPods = node.ActivePodCount()
 	node.Allocated = node.Allocated.Add(alloc.Allocated)
 	for _, gpu := range alloc.AssignedGPUs {
 		node.GPUSlots[gpu] = alloc.PodUID
@@ -231,6 +234,7 @@ func (node *CloudVMNode) MarkPodCompleted(podUID string, exitCode int32, reason,
 	alloc.FinishedAt = &finishedAt
 
 	node.Allocated = node.Allocated.Sub(alloc.Allocated)
+	node.AllocatedPods = node.ActivePodCount()
 	for _, gpu := range alloc.AssignedGPUs {
 		if node.GPUSlots[gpu] == podUID {
 			node.GPUSlots[gpu] = ""
@@ -258,6 +262,7 @@ func (node *CloudVMNode) ReleasePod(podUID string) bool {
 	}
 
 	delete(node.ActivePods, podUID)
+	node.AllocatedPods = node.ActivePodCount()
 	if !alloc.Completed {
 		node.Allocated = node.Allocated.Sub(alloc.Allocated)
 		for _, gpu := range alloc.AssignedGPUs {
