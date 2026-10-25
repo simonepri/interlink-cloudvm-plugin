@@ -353,7 +353,7 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 6. **Same-Namespace Host Network Sharing**: Bin-packed multi-tenant containers on a shared VM run with `--net=host` to provide native throughput for Ray workers and distributed training. Co-tenants on the same VM share localhost networking within the same Kubernetes namespace (bin-packing across different namespaces is disallowed).
 7. **AWS KMS Runner Token Encryption**: When `KMS_KEY_ID` is configured, runner authentication tokens are encrypted using AWS KMS before rendering instance user-data. The VM decrypts the token at boot using its instance profile (`kms:Decrypt`), ensuring zero plaintext tokens are present in user-data or cloud instance metadata.
 8. **Private Registry Auth & Ephemeral Credentials**: Kubernetes `imagePullSecrets` are resolved directly by the provider daemon via `get` permissions on Kubernetes Secrets and transferred exclusively over the authenticated runner channel. The in-VM runner creates an ephemeral, permission-restricted (`0700`) temporary directory for `docker --config` during image pull and deletes it immediately in a `finally:` block, preventing co-tenant credential leakage.
-9. **Runner Channel Transport Security**: The runner exposes an HTTP daemon on port 9090. To protect runner Bearer tokens and image pull credentials from network inspection, traffic should flow across the WireGuard / Tailscale encrypted mesh network. When operating directly over VPC private IPs without an encrypted overlay mesh, intra-VPC network encryption must be enabled.
+9. **Reverse Tunnel Runner Channel**: Workers accept no inbound traffic. At boot each worker joins the tailnet with the plugin's ephemeral, pre-tagged `TAILSCALE_AUTHKEY` (advertising `tag:clvm-worker`, read from a `0600` file and deleted after join, KMS-enveloped when `KMS_KEY_ID` is set), then a small agent dials `clvm-tunnel.<cell>.c.corp.boltz.com:443` over TLS verified against the public CA. The plugin's gateway (plain TCP on `TUNNEL_GATEWAY_LISTEN`, TLS terminated in front of it) accepts a session only from a tracked instance presenting the runner token issued at its launch, and every container call travels over that Yamux session to the runner, which listens on loopback only. A worker that has not connected within `TUNNEL_CONNECT_TIMEOUT` is failed and terminated. `RUNNER_DIRECT_FALLBACK=true` restores direct private-IP calls for same-VPC workers.
 
 ---
 
@@ -508,6 +508,22 @@ Runner authorization tokens are generated securely per instance and passed throu
 4. Co-tenant Discovery Timeout:
 When the provider restarts while an in-VM runner is unreachable, the node is flagged with unverified co-tenants and protected from idle collection and zombie cleanup. Background reconciliation retries container discovery on each reconcile pass for up to 30 minutes before releasing the node for garbage collection.
 
+
+### Reverse Tunnel Configuration
+
+With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers can reach it through the tunnel:
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `TUNNEL_CELL` | (required unless `TUNNEL_ENDPOINT` is set) | Cell name; workers dial `clvm-tunnel.<cell>.c.corp.boltz.com:443` |
+| `TUNNEL_ENDPOINT` | | Overrides the `host:port` workers dial |
+| `TUNNEL_GATEWAY_LISTEN` | `:7443` | Plain TCP listener for worker sessions behind the TLS-terminating gateway |
+| `TAILSCALE_AUTHKEY` | (required) | Reusable, ephemeral, pre-tagged tailnet auth key workers join with |
+| `TAILSCALE_TAGS` | `tag:clvm-worker` | Tags workers advertise |
+| `TUNNEL_CONNECT_TIMEOUT` | `10m` | Deadline for a new worker's first tunnel session |
+| `RUNNER_DIRECT_FALLBACK` | `false` | Also call the runner on the worker's private IP |
+
+`/metrics` exports `cloudvm_tunnel_sessions{region}` and `cloudvm_tunnel_handshake_rejections_total{reason}`. Sessions live in one plugin process, so run a single replica while the tunnel is enabled.
 
 ### AWS KMS Runner Token Encryption
 

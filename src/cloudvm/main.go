@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -203,12 +204,16 @@ func run() error {
 	server.RegisterProvider(ProviderAWS, awsProv)
 	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
 	server.RegisterProvider(ProviderMock, mockProv)
-	if providerType == "aws" || providerType == "gcp" {
-		server.SetContainerRunner(NewHTTPContainerRunner(9090))
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	if providerType == "aws" || providerType == "gcp" {
+		gateway, err := startTunnelGateway(ctx, server)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = gateway.Close() }()
+	}
 
 	// Embedded spot price ticker
 	if os.Getenv("ENABLE_TICKER") == "true" {
@@ -350,4 +355,59 @@ func run() error {
 	case err := <-httpErrChan:
 		return fmt.Errorf("http server failed: %w", err)
 	}
+}
+
+// startTunnelGateway listens for worker reverse tunnels and routes every runner call through them.
+func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, error) {
+	endpoint := strings.TrimSpace(os.Getenv("TUNNEL_ENDPOINT"))
+	if endpoint == "" {
+		cell := strings.TrimSpace(os.Getenv("TUNNEL_CELL"))
+		if cell == "" {
+			return nil, fmt.Errorf("TUNNEL_CELL or TUNNEL_ENDPOINT is required so workers can dial the tunnel gateway")
+		}
+		endpoint = FormatTunnelEndpoint(cell)
+	}
+	meshKey := os.Getenv("TAILSCALE_AUTHKEY")
+	if meshKey == "" {
+		return nil, fmt.Errorf("TAILSCALE_AUTHKEY is required so workers can join the tailnet")
+	}
+	connectTimeout := DefaultTunnelConnectTimeout
+	if raw := os.Getenv("TUNNEL_CONNECT_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("invalid TUNNEL_CONNECT_TIMEOUT %q", raw)
+		}
+		connectTimeout = d
+	}
+	listenAddr := os.Getenv("TUNNEL_GATEWAY_LISTEN")
+	if listenAddr == "" {
+		listenAddr = ":7443"
+	}
+
+	registry := NewSessionRegistry()
+	metrics := server.EnableTunnel(TunnelSettings{
+		Registry:       registry,
+		Endpoint:       endpoint,
+		MeshAuthKey:    meshKey,
+		MeshTags:       os.Getenv("TAILSCALE_TAGS"),
+		ConnectTimeout: connectTimeout,
+		DirectFallback: os.Getenv("RUNNER_DIRECT_FALLBACK") == "true",
+	})
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen for reverse tunnels on %s: %w", listenAddr, err)
+	}
+	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
+		Listener:       listener,
+		Registry:       registry,
+		TokenValidator: server.ValidateTunnelToken,
+		OnReject:       metrics.RecordRejection,
+	})
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	gateway.Start(ctx)
+	log.Printf("[cloudvm-tunnel] Gateway listening on %s; workers dial %s (connect timeout %v)", listenAddr, endpoint, connectTimeout) //nolint:gosec // configuration values
+	return gateway, nil
 }

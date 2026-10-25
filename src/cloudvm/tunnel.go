@@ -30,6 +30,9 @@ func DefaultYamuxConfig() *yamux.Config {
 	return cfg
 }
 
+// maxHandshakeBytes bounds the handshake line a worker may send before authentication.
+const maxHandshakeBytes = 64 * 1024
+
 // TunnelHandshakeRequest carries worker identification and optional attestation on connection initiation.
 type TunnelHandshakeRequest struct {
 	InstanceID  string `json:"instanceId"`
@@ -154,6 +157,7 @@ type TunnelGateway struct {
 	tokenValidator      func(ctx context.Context, instanceID, token string) error
 	yamuxConfig         *yamux.Config
 	handshakeTimeout    time.Duration
+	onReject            func(reason string)
 	closeOnce           sync.Once
 	closed              chan struct{}
 }
@@ -166,12 +170,17 @@ type TunnelGatewayConfig struct {
 	TokenValidator      func(ctx context.Context, instanceID, token string) error
 	YamuxConfig         *yamux.Config
 	HandshakeTimeout    time.Duration
+	// OnReject is called with a short machine-readable reason for every refused handshake.
+	OnReject func(reason string)
 }
 
 // NewTunnelGateway creates a new TunnelGateway.
 func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 	if cfg.Listener == nil {
 		return nil, errors.New("gateway listener is required")
+	}
+	if cfg.TokenValidator == nil {
+		return nil, errors.New("gateway token validator is required")
 	}
 	if cfg.Registry == nil {
 		cfg.Registry = NewSessionRegistry()
@@ -190,6 +199,7 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		tokenValidator:      cfg.TokenValidator,
 		yamuxConfig:         cfg.YamuxConfig,
 		handshakeTimeout:    cfg.HandshakeTimeout,
+		onReject:            cfg.OnReject,
 		closed:              make(chan struct{}),
 	}
 	return gw, nil
@@ -224,16 +234,12 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
-	defer func() {
-		// Clean up conn if handshake fails before yamux wraps it
-	}()
-
 	if err := conn.SetDeadline(time.Now().Add(g.handshakeTimeout)); err != nil {
 		_ = conn.Close()
 		return
 	}
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReader(io.LimitReader(conn, maxHandshakeBytes))
 	reqLine, err := reader.ReadBytes('\n')
 	if err != nil {
 		_ = conn.Close()
@@ -242,54 +248,20 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 
 	var req TunnelHandshakeRequest
 	if err := json.Unmarshal(reqLine, &req); err != nil {
-		_ = g.sendHandshakeResponse(conn, "error", fmt.Sprintf("invalid handshake payload: %v", err))
-		_ = conn.Close()
+		g.reject(conn, "", "invalid_payload", fmt.Sprintf("invalid handshake payload: %v", err))
 		return
 	}
-
 	if req.InstanceID == "" {
-		_ = g.sendHandshakeResponse(conn, "error", "instanceId is required")
-		_ = conn.Close()
+		g.reject(conn, "", "missing_instance", "instanceId is required")
 		return
 	}
-
-	// Verify attestation if configured and attestation data is present
-	if g.attestationVerifier != nil && len(req.Attestation) > 0 {
-		switch strings.ToLower(req.Platform) {
-		case "aws":
-			identity, err := g.attestationVerifier.VerifyAWS(ctx, req.Attestation)
-			if err != nil {
-				_ = g.sendHandshakeResponse(conn, "error", fmt.Sprintf("AWS attestation verification failed: %v", err))
-				_ = conn.Close()
-				return
-			}
-			if identity.InstanceID != req.InstanceID {
-				_ = g.sendHandshakeResponse(conn, "error", fmt.Sprintf("attestation instance ID mismatch: %s != %s", identity.InstanceID, req.InstanceID))
-				_ = conn.Close()
-				return
-			}
-		case "gcp":
-			identity, err := g.attestationVerifier.VerifyGCP(ctx, string(req.Attestation), "")
-			if err != nil {
-				_ = g.sendHandshakeResponse(conn, "error", fmt.Sprintf("GCP attestation verification failed: %v", err))
-				_ = conn.Close()
-				return
-			}
-			if identity.InstanceID != req.InstanceID {
-				_ = g.sendHandshakeResponse(conn, "error", fmt.Sprintf("attestation instance ID mismatch: %s != %s", identity.InstanceID, req.InstanceID))
-				_ = conn.Close()
-				return
-			}
-		}
+	if err := g.verifyAttestation(ctx, &req); err != nil {
+		g.reject(conn, req.InstanceID, "attestation", err.Error())
+		return
 	}
-
-	// Validate runner auth token if validator is provided
-	if g.tokenValidator != nil {
-		if err := g.tokenValidator(ctx, req.InstanceID, req.AuthToken); err != nil {
-			_ = g.sendHandshakeResponse(conn, "error", fmt.Sprintf("unauthorized runner token: %v", err))
-			_ = conn.Close()
-			return
-		}
+	if err := g.tokenValidator(ctx, req.InstanceID, req.AuthToken); err != nil {
+		g.reject(conn, req.InstanceID, "unauthorized", fmt.Sprintf("unauthorized runner token: %v", err))
+		return
 	}
 
 	// Acknowledge handshake success
@@ -312,6 +284,7 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	g.registry.Register(req.InstanceID, session)
+	log.Printf("[cloudvm-tunnel] Registered reverse tunnel session for instance %s from %s", sanitizeLog(req.InstanceID), conn.RemoteAddr()) //nolint:gosec // sanitized
 
 	// Wait for session termination to unregister
 	go func(id string, s *yamux.Session) {
@@ -320,6 +293,44 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 			g.registry.Unregister(id)
 		}
 	}(req.InstanceID, session)
+}
+
+// verifyAttestation checks the platform identity document when a verifier is configured and the worker sent one.
+func (g *TunnelGateway) verifyAttestation(ctx context.Context, req *TunnelHandshakeRequest) error {
+	if g.attestationVerifier == nil || len(req.Attestation) == 0 {
+		return nil
+	}
+	var instanceID string
+	switch strings.ToLower(req.Platform) {
+	case "aws":
+		identity, err := g.attestationVerifier.VerifyAWS(ctx, req.Attestation)
+		if err != nil {
+			return fmt.Errorf("AWS attestation verification failed: %w", err)
+		}
+		instanceID = identity.InstanceID
+	case "gcp":
+		identity, err := g.attestationVerifier.VerifyGCP(ctx, string(req.Attestation), "")
+		if err != nil {
+			return fmt.Errorf("GCP attestation verification failed: %w", err)
+		}
+		instanceID = identity.InstanceID
+	default:
+		return nil
+	}
+	if instanceID != req.InstanceID {
+		return fmt.Errorf("attestation instance ID mismatch: %s != %s", instanceID, req.InstanceID)
+	}
+	return nil
+}
+
+// reject answers a refused handshake, records why, and closes the connection; it never logs the presented token.
+func (g *TunnelGateway) reject(conn net.Conn, instanceID, reason, message string) {
+	log.Printf("[cloudvm-tunnel] Rejected handshake from %s (instance %q): %s", conn.RemoteAddr(), sanitizeLog(instanceID), reason) //nolint:gosec // sanitized
+	if g.onReject != nil {
+		g.onReject(reason)
+	}
+	_ = g.sendHandshakeResponse(conn, "error", message)
+	_ = conn.Close()
 }
 
 func (g *TunnelGateway) sendHandshakeResponse(w io.Writer, status, errMsg string) error {

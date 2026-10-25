@@ -499,6 +499,14 @@ func (np *NodePool) HasNode(instanceID string) bool {
 	return found
 }
 
+// Node returns the tracked node for instanceID.
+func (np *NodePool) Node(instanceID string) (*CloudVMNode, bool) {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	node, found := np.nodes[instanceID]
+	return node, found && node != nil
+}
+
 // FindPodNode returns the node and a thread-safe copy of the allocation for a given podUID.
 func (np *NodePool) FindPodNode(podUID string) (*CloudVMNode, PodAllocation, bool) {
 	np.mu.RLock()

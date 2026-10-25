@@ -98,6 +98,14 @@ type InstanceSpec struct {
 	RayVersion string `json:"rayVersion,omitempty"`
 	// MeshAuthKey is the Tailscale/WireGuard ephemeral join key.
 	MeshAuthKey string `json:"meshAuthKey,omitempty"`
+	// MeshAuthKeyCiphertext holds the base64 KMS ciphertext of MeshAuthKey when KMS envelope encryption is configured.
+	MeshAuthKeyCiphertext string `json:"meshAuthKeyCiphertext,omitempty"`
+	// MeshTags is the comma-separated list of tailnet tags the worker advertises.
+	MeshTags string `json:"meshTags,omitempty"`
+	// TunnelEndpoint is the reverse tunnel gateway host:port the worker dials.
+	TunnelEndpoint string `json:"tunnelEndpoint,omitempty"`
+	// RunnerDirectHTTP keeps the in-VM runner listening on all interfaces for same-VPC direct HTTP access.
+	RunnerDirectHTTP bool `json:"runnerDirectHTTP,omitempty"`
 	// RegionalAMI maps cloud regions to pre-baked golden AMI / image IDs.
 	RegionalAMI map[string]string `json:"regionalAMI,omitempty"`
 	// IAMInstanceProfileArn is the AWS IAM role attached to the EC2 instance.

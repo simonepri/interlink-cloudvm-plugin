@@ -53,6 +53,8 @@ type Server struct {
 	kmsKeyID              string
 	secretResolver        SecretResolver
 	runner                ContainerRunner
+	tunnel                *tunnelState
+	startRetryInterval    time.Duration
 	spotTicker            *SpotPriceTicker
 	tokenStore            *TokenStore
 	completedStore        *CompletedStore
@@ -106,6 +108,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		clusterTag:         clusterTag,
 		defaultRegion:      "us-east-1",
 		launchTimeout:      5 * time.Minute,
+		startRetryInterval: 2 * time.Second,
 		podSightingTimeout: 10 * time.Minute,
 		nodePool:           NewNodePool(0),
 		runner:             NewMockContainerRunner(),
@@ -268,6 +271,10 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		KMSKeyID:              spec.KMSKeyID,
 		KMSCiphertext:         spec.KMSCiphertext,
 		MeshAuthKey:           spec.MeshAuthKey,
+		MeshAuthKeyCiphertext: spec.MeshAuthKeyCiphertext,
+		MeshTags:              spec.MeshTags,
+		TunnelEndpoint:        spec.TunnelEndpoint,
+		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                spec.Region,
 		InstanceType:          spec.InstanceType,
 		EgressBandwidth:       spec.EgressBandwidth,
@@ -536,16 +543,7 @@ func (s *Server) Routes() http.Handler {
 		}
 		ticker.Routes().ServeHTTP(w, r)
 	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		s.mu.RLock()
-		ticker := s.spotTicker
-		s.mu.RUnlock()
-		if ticker == nil {
-			http.Error(w, "spot ticker not enabled", http.StatusNotFound)
-			return
-		}
-		ticker.Routes().ServeHTTP(w, r)
-	})
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	return mux
 }
@@ -838,6 +836,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	spec.RunnerAuthToken = tok
+	s.applyTunnelSpec(spec)
 
 	// Resolve KMS token encryption (AWS EC2 instances only, key taken strictly from provider configuration)
 	_, isAWS := prov.(*AWSProvider)
@@ -869,6 +868,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		spec.KMSEncryptedToken = true
 		spec.KMSKeyID = kmsKeyID
 		spec.KMSCiphertext = ciphertext
+		if err := encryptMeshAuthKey(r.Context(), kmsClient, kmsKeyID, spec); err != nil {
+			finalErr = err
+			http.Error(w, finalErr.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	var preAssignedGPUs []int
@@ -1583,10 +1587,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	launchedAt := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, s.startRetryTimeout())
 	defer cancel()
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(s.startRetryInterval)
 	defer ticker.Stop()
 
 	for {
@@ -1622,6 +1627,10 @@ func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req
 			s.mu.RUnlock()
 			if tombstoned {
 				log.Printf("[cloudvm] Pod %s was tombstoned while waiting to start container; aborting retry", req.PodUID)
+				return
+			}
+			if s.tunnelDeadlineExceeded(node, launchedAt) {
+				s.failTunnelDeadline(ctx, node, req)
 				return
 			}
 
