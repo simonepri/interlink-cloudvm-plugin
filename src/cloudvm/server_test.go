@@ -1766,3 +1766,58 @@ func TestServer_HandleStatus_NetworkMetrics(t *testing.T) {
 		t.Errorf("expected cloudvm_network_transmit_bytes_total in metrics")
 	}
 }
+
+func TestServer_HandleStatus_RunnerStartFailureIsTerminal(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	server := NewServer(NewMockProvider(), "test-cluster")
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	const startErr = `could not select device driver "" with capabilities: [[gpu]]`
+	runner := NewMockContainerRunner()
+	// A failed docker run leaves the container in "created"; the start failure must still end the pod.
+	runner.SetStatus("uid-gpu-pod", &ContainerStatusResult{
+		Status:  "created",
+		Reason:  "StartError",
+		Message: startErr,
+	})
+	server.SetContainerRunner(runner)
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode("i-gpu-node", ProviderAWS, "us-west-2", "100.64.0.51", capVec)
+	reqVec, _ := NewResourceVector("1", "4Gi", 1, 0)
+	server.NodePool().RegisterAndAllocate(node, reqVec, "uid-gpu-pod", "default", "gpu-pod")
+
+	server.mu.Lock()
+	server.instances["uid-gpu-pod"] = &Instance{
+		ID:        "i-gpu-node",
+		Provider:  ProviderAWS,
+		Region:    "us-west-2",
+		State:     StateRunning,
+		CreatedAt: time.Now(),
+	}
+	server.mu.Unlock()
+
+	queryPayload := `[{"pod": {"metadata": {"name": "gpu-pod", "namespace": "default", "uid": "uid-gpu-pod"}}}]`
+	resp, err := http.Post(ts.URL+"/status", "application/json", strings.NewReader(queryPayload))
+	if err != nil {
+		t.Fatalf("POST /status failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var statuses []PodStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&statuses); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if len(statuses) != 1 || len(statuses[0].Containers) != 1 {
+		t.Fatalf("unexpected status payload: %+v", statuses)
+	}
+	term := statuses[0].Containers[0].State.Terminated
+	if term == nil {
+		t.Fatalf("expected terminated state for start failure, got %+v", statuses[0].Containers[0].State)
+	}
+	if term.Reason != "StartError" || term.Message != startErr || term.ExitCode == 0 {
+		t.Fatalf("unexpected terminated state: %+v", term)
+	}
+}

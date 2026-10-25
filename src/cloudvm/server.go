@@ -1474,6 +1474,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 										status.State.Running = &ContainerRunningState{
 											StartedAt: cResult.StartedAt,
 										}
+									case cResult.Reason == "StartError" || cResult.Reason == "ErrImagePull":
+										s.recordRunnerTermination(tgt.uid, tgt.jid, cResult, &status)
 									case cResult.Status == "created" || cResult.Status == "starting":
 										status.Ready = false
 										status.State.Waiting = &ContainerWaitingState{
@@ -1486,35 +1488,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 											Reason:  cResult.Reason,
 											Message: fmt.Sprintf("Container is %s", cResult.Status),
 										}
-									case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || cResult.Reason == "ErrImagePull" || cResult.Reason == "StartError" || (cResult.ExitCode != 0 && !cResult.Running):
-										status.Ready = false
-										finAt := cResult.FinishedAt
-										if finAt.IsZero() {
-											finAt = time.Now()
-										}
-										term := &ContainerTerminatedState{
-											ExitCode:   cResult.ExitCode,
-											Reason:     cResult.Reason,
-											Message:    cResult.Message,
-											FinishedAt: finAt,
-										}
-										status.State.Terminated = term
-										s.nodePool.MarkPodCompleted(tgt.uid, cResult.ExitCode, cResult.Reason, cResult.Message, finAt)
-										s.mu.Lock()
-										if tgt.uid != "" {
-											s.completedPods[tgt.uid] = term
-										}
-										s.mu.Unlock()
-										if tgt.uid != "" && s.completedStore != nil {
-											_ = s.completedStore.Set(tgt.uid, &CompletedPodRecord{
-												PodUID:     tgt.uid,
-												PodJID:     tgt.jid,
-												ExitCode:   cResult.ExitCode,
-												Reason:     cResult.Reason,
-												Message:    cResult.Message,
-												FinishedAt: finAt,
-											})
-										}
+									case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || (cResult.ExitCode != 0 && !cResult.Running):
+										s.recordRunnerTermination(tgt.uid, tgt.jid, cResult, &status)
 									default:
 										status.Ready = false
 										status.State.Waiting = &ContainerWaitingState{
@@ -1573,6 +1548,42 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(responses)
+}
+
+// recordRunnerTermination marks a pod terminated with the runner's exit code, reason, and message and persists it.
+func (s *Server) recordRunnerTermination(uid, jid string, cResult *ContainerStatusResult, status *ContainerStatus) {
+	status.Ready = false
+	finAt := cResult.FinishedAt
+	if finAt.IsZero() || finAt.Year() <= 1 {
+		finAt = time.Now()
+	}
+	exitCode := cResult.ExitCode
+	if exitCode == 0 && (cResult.Reason == "StartError" || cResult.Reason == "ErrImagePull") {
+		exitCode = 1
+	}
+	term := &ContainerTerminatedState{
+		ExitCode:   exitCode,
+		Reason:     cResult.Reason,
+		Message:    cResult.Message,
+		FinishedAt: finAt,
+	}
+	status.State.Terminated = term
+	s.nodePool.MarkPodCompleted(uid, exitCode, cResult.Reason, cResult.Message, finAt)
+	s.mu.Lock()
+	if uid != "" {
+		s.completedPods[uid] = term
+	}
+	s.mu.Unlock()
+	if uid != "" && s.completedStore != nil {
+		_ = s.completedStore.Set(uid, &CompletedPodRecord{
+			PodUID:     uid,
+			PodJID:     jid,
+			ExitCode:   exitCode,
+			Reason:     cResult.Reason,
+			Message:    cResult.Message,
+			FinishedAt: finAt,
+		})
+	}
 }
 
 // AdoptInstance re-adopts an active cloud VM into the server tracked state if it has valid pod tags
