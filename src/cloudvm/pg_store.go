@@ -39,12 +39,27 @@ type DBStore interface {
 	DeleteTombstone(ctx context.Context, id string) error
 	GetAllTombstones(ctx context.Context) (map[string]time.Time, error)
 
+	// Nodes
+	GetNode(ctx context.Context, instanceID string) (*NodeRecord, error)
+	SetNode(ctx context.Context, instanceID string, rec *NodeRecord) error
+	DeleteNode(ctx context.Context, instanceID string) error
+	GetAllNodes(ctx context.Context) (map[string]*NodeRecord, error)
 	// Lifecycle
 	Ping(ctx context.Context) error
 	Close() error
 }
 
 var schemaStatements = []string{
+	`CREATE TABLE IF NOT EXISTS cloudvm_nodes (
+		instance_id TEXT PRIMARY KEY,
+		region TEXT,
+		provider TEXT,
+		ip TEXT,
+		instance_type TEXT,
+		status TEXT,
+		created_at TIMESTAMPTZ,
+		updated_at TIMESTAMPTZ
+	)`,
 	`CREATE TABLE IF NOT EXISTS cloudvm_tokens (
 		instance_id TEXT PRIMARY KEY,
 		token TEXT,
@@ -69,6 +84,12 @@ var schemaStatements = []string{
 	)`,
 }
 
+var migrationStatements = []string{
+	`ALTER TABLE cloudvm_nodes ADD COLUMN IF NOT EXISTS region TEXT`,
+	`ALTER TABLE cloudvm_tokens ADD COLUMN IF NOT EXISTS region TEXT`,
+	`ALTER TABLE cloudvm_instance_regions ADD COLUMN IF NOT EXISTS region TEXT`,
+}
+
 // PGStore implements DBStore using PostgreSQL via database/sql and pgx.
 type PGStore struct {
 	db *sql.DB
@@ -77,6 +98,7 @@ type PGStore struct {
 	Completed  *PGCompletedStore
 	Regions    *PGRegionStore
 	Tombstones *PGTombstoneStore
+	Nodes      *PGNodeStore
 }
 
 // NewPGStore connects to PostgreSQL using the provided connection string,
@@ -124,14 +146,20 @@ func NewPGStoreWithDB(db *sql.DB) *PGStore {
 	store.Completed = &PGCompletedStore{pg: store}
 	store.Regions = &PGRegionStore{pg: store}
 	store.Tombstones = &PGTombstoneStore{pg: store}
+	store.Nodes = &PGNodeStore{pg: store}
 	return store
 }
 
-// InitSchema creates tables if they do not exist.
+// InitSchema creates tables and applies migrations if they do not exist.
 func (s *PGStore) InitSchema(ctx context.Context) error {
 	for _, stmt := range schemaStatements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("failed to execute schema initialization statement: %w", err)
+		}
+	}
+	for _, stmt := range migrationStatements {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("failed to execute schema migration statement: %w", err)
 		}
 	}
 	return nil
@@ -170,6 +198,11 @@ func (s *PGStore) RegionStore() *RegionStore {
 // TombstoneStore returns a TombstoneStore adapter backed by this PGStore.
 func (s *PGStore) TombstoneStore() *TombstoneStore {
 	return NewTombstoneStoreFromDB(s)
+}
+
+// NodeStore returns a NodeStore adapter backed by this PGStore.
+func (s *PGStore) NodeStore() *NodeStore {
+	return NewNodeStoreFromDB(s)
 }
 
 // ----------------------------------------------------------------------------
@@ -677,4 +710,169 @@ func (ts *PGTombstoneStore) GetAll() map[string]time.Time {
 		return make(map[string]time.Time)
 	}
 	return tombstones
+}
+
+// ----------------------------------------------------------------------------
+// Nodes: GetNode, SetNode, DeleteNode, GetAllNodes
+// ----------------------------------------------------------------------------
+
+// GetNode retrieves the node tracking record for the given instance ID.
+func (s *PGStore) GetNode(ctx context.Context, instanceID string) (*NodeRecord, error) {
+	if instanceID == "" {
+		return nil, nil
+	}
+	query := `
+		SELECT instance_id, COALESCE(region, ''), COALESCE(provider, ''), COALESCE(ip, ''), COALESCE(instance_type, ''), COALESCE(status, ''), created_at, updated_at
+		FROM cloudvm_nodes
+		WHERE instance_id = $1
+	`
+	var rec NodeRecord
+	var region, provider, ip, instanceType, status string
+	var createdAt, updatedAt time.Time
+	err := s.db.QueryRowContext(ctx, query, instanceID).Scan(
+		&rec.InstanceID,
+		&region,
+		&provider,
+		&ip,
+		&instanceType,
+		&status,
+		&createdAt,
+		&updatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get node for instance %s: %w", instanceID, err)
+	}
+	rec.Region = region
+	rec.Provider = provider
+	rec.IP = ip
+	rec.InstanceType = instanceType
+	rec.Status = status
+	rec.CreatedAt = createdAt
+	rec.UpdatedAt = updatedAt
+	return &rec, nil
+}
+
+// SetNode creates or updates a node tracking record with regional placement.
+func (s *PGStore) SetNode(ctx context.Context, instanceID string, rec *NodeRecord) error {
+	if instanceID == "" || rec == nil {
+		return nil
+	}
+	createdAt := rec.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := rec.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	query := `
+		INSERT INTO cloudvm_nodes (instance_id, region, provider, ip, instance_type, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (instance_id) DO UPDATE SET
+			region = EXCLUDED.region,
+			provider = EXCLUDED.provider,
+			ip = EXCLUDED.ip,
+			instance_type = EXCLUDED.instance_type,
+			status = EXCLUDED.status,
+			updated_at = EXCLUDED.updated_at
+	`
+	_, err := s.db.ExecContext(ctx, query, instanceID, rec.Region, rec.Provider, rec.IP, rec.InstanceType, rec.Status, createdAt, updatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to set node for instance %s: %w", instanceID, err)
+	}
+	return nil
+}
+
+// DeleteNode removes a node tracking record for the given instance ID.
+func (s *PGStore) DeleteNode(ctx context.Context, instanceID string) error {
+	if instanceID == "" {
+		return nil
+	}
+	query := "DELETE FROM cloudvm_nodes WHERE instance_id = $1"
+	_, err := s.db.ExecContext(ctx, query, instanceID)
+	if err != nil {
+		return fmt.Errorf("failed to delete node for instance %s: %w", instanceID, err)
+	}
+	return nil
+}
+
+// GetAllNodes returns all tracked node records mapped by instance ID.
+func (s *PGStore) GetAllNodes(ctx context.Context) (map[string]*NodeRecord, error) {
+	query := `
+		SELECT instance_id, COALESCE(region, ''), COALESCE(provider, ''), COALESCE(ip, ''), COALESCE(instance_type, ''), COALESCE(status, ''), created_at, updated_at
+		FROM cloudvm_nodes
+	`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query all nodes: %w", err)
+	}
+	defer rows.Close()
+
+	nodes := make(map[string]*NodeRecord)
+	for rows.Next() {
+		var rec NodeRecord
+		var region, provider, ip, instanceType, status string
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(
+			&rec.InstanceID,
+			&region,
+			&provider,
+			&ip,
+			&instanceType,
+			&status,
+			&createdAt,
+			&updatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan node row: %w", err)
+		}
+		rec.Region = region
+		rec.Provider = provider
+		rec.IP = ip
+		rec.InstanceType = instanceType
+		rec.Status = status
+		rec.CreatedAt = createdAt
+		rec.UpdatedAt = updatedAt
+		nodes[rec.InstanceID] = &rec
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error during nodes iteration: %w", err)
+	}
+	return nodes, nil
+}
+
+// PGNodeStore provides node tracking store operations backed by PGStore.
+type PGNodeStore struct {
+	pg *PGStore
+}
+
+// Get returns the node tracking record for the given instance ID.
+func (ns *PGNodeStore) Get(instanceID string) *NodeRecord {
+	rec, err := ns.pg.GetNode(context.Background(), instanceID)
+	if err != nil {
+		log.Printf("[pg_store] GetNode failed for %s: %v", instanceID, err)
+	}
+	return rec
+}
+
+// Set commits or updates a node tracking record.
+func (ns *PGNodeStore) Set(instanceID string, rec *NodeRecord) error {
+	return ns.pg.SetNode(context.Background(), instanceID, rec)
+}
+
+// Delete removes a node tracking record.
+func (ns *PGNodeStore) Delete(instanceID string) error {
+	return ns.pg.DeleteNode(context.Background(), instanceID)
+}
+
+// GetAll returns all node tracking records.
+func (ns *PGNodeStore) GetAll() map[string]*NodeRecord {
+	nodes, err := ns.pg.GetAllNodes(context.Background())
+	if err != nil {
+		log.Printf("[pg_store] GetAllNodes failed: %v", err)
+		return make(map[string]*NodeRecord)
+	}
+	return nodes
 }

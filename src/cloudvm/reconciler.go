@@ -52,6 +52,11 @@ type NodePoolProvider interface {
 	NodePool() *NodePool
 }
 
+// RegionalInstanceScanner queries EC2 instances for a specific region.
+type RegionalInstanceScanner interface {
+	DescribeInstancesInRegion(ctx context.Context, region, clusterTag string) ([]*Instance, error)
+}
+
 // Reconciler handles background garbage collection for opportunistic VMs.
 const defaultMaxPingConcurrency = 20
 
@@ -68,6 +73,8 @@ type Reconciler struct {
 	pingInterval      time.Duration
 	pingConcurrency   int
 	pingJitter        time.Duration
+	configuredRegions []string
+	regionsMu         sync.RWMutex
 }
 
 // SetOnTerminated registers a callback invoked when a zombie instance is terminated.
@@ -303,6 +310,120 @@ func (r *Reconciler) Start(ctx context.Context) {
 	}
 }
 
+// SetConfiguredRegions sets the regions monitored by the reconciler and syncs with inventory.
+func (r *Reconciler) SetConfiguredRegions(regions ...string) {
+	r.regionsMu.Lock()
+	defer r.regionsMu.Unlock()
+	r.configuredRegions = make([]string, 0, len(regions))
+	seen := make(map[string]bool)
+	for _, reg := range regions {
+		trimmed := strings.TrimSpace(reg)
+		if trimmed != "" && !seen[trimmed] {
+			r.configuredRegions = append(r.configuredRegions, trimmed)
+			seen[trimmed] = true
+		}
+	}
+	if adder, ok := r.inventory.(interface{ AddConfiguredRegions(...string) }); ok {
+		adder.AddConfiguredRegions(r.configuredRegions...)
+	}
+}
+
+// AddConfiguredRegions registers additional regions to scan concurrently during watchdog passes.
+func (r *Reconciler) AddConfiguredRegions(regions ...string) {
+	r.regionsMu.Lock()
+	defer r.regionsMu.Unlock()
+	seen := make(map[string]bool, len(r.configuredRegions))
+	for _, reg := range r.configuredRegions {
+		seen[reg] = true
+	}
+	for _, reg := range regions {
+		trimmed := strings.TrimSpace(reg)
+		if trimmed != "" && !seen[trimmed] {
+			r.configuredRegions = append(r.configuredRegions, trimmed)
+			seen[trimmed] = true
+		}
+	}
+	if adder, ok := r.inventory.(interface{ AddConfiguredRegions(...string) }); ok {
+		adder.AddConfiguredRegions(r.configuredRegions...)
+	}
+}
+
+// ConfiguredRegions returns a copy of configured regions scanned by the reconciler.
+func (r *Reconciler) ConfiguredRegions() []string {
+	r.regionsMu.RLock()
+	defer r.regionsMu.RUnlock()
+	res := make([]string, len(r.configuredRegions))
+	copy(res, r.configuredRegions)
+	return res
+}
+
+// ScanRegionsConcurrently scans all given regions in parallel using DescribeInstances filtered by ClusterTag.
+func (r *Reconciler) ScanRegionsConcurrently(ctx context.Context, regions []string) (map[string][]*Instance, map[string]error) {
+	if len(regions) == 0 {
+		regions = r.ConfiguredRegions()
+	}
+	if len(regions) > 0 {
+		if adder, ok := r.inventory.(interface{ AddConfiguredRegions(...string) }); ok {
+			adder.AddConfiguredRegions(regions...)
+		}
+	}
+	if regInv, ok := r.inventory.(RegionInventory); ok {
+		return regInv.ListActiveInstancesByRegion(ctx, r.clusterTag)
+	}
+	if scanner, ok := r.inventory.(RegionalInstanceScanner); ok {
+		type regRes struct {
+			region string
+			insts  []*Instance
+			err    error
+		}
+		ch := make(chan regRes, len(regions))
+		var wg sync.WaitGroup
+		for _, reg := range regions {
+			wg.Add(1)
+			go func(rg string) {
+				defer wg.Done()
+				insts, err := scanner.DescribeInstancesInRegion(ctx, rg, r.clusterTag)
+				ch <- regRes{region: rg, insts: insts, err: err}
+			}(reg)
+		}
+		wg.Wait()
+		close(ch)
+
+		byRegion := make(map[string][]*Instance)
+		errs := make(map[string]error)
+		for res := range ch {
+			if res.err != nil {
+				errs[res.region] = res.err
+			} else {
+				byRegion[res.region] = res.insts
+			}
+		}
+		return byRegion, errs
+	}
+
+	insts, err := r.inventory.ListActiveInstances(ctx, r.clusterTag)
+	byRegion := make(map[string][]*Instance)
+	errs := make(map[string]error)
+	if err != nil {
+		errs["default"] = err
+	} else {
+		for _, inst := range insts {
+			reg := inst.Region
+			if reg == "" {
+				reg = "default"
+			}
+			byRegion[reg] = append(byRegion[reg], inst)
+		}
+	}
+	return byRegion, errs
+}
+
+// ReapIdleWatchdog executes an idle watchdog pass, scanning all configured regions concurrently
+// and terminating orphaned or idle instances.
+func (r *Reconciler) ReapIdleWatchdog(ctx context.Context) (*ReconcileResult, error) {
+	return r.ReconcileOnce(ctx)
+}
+
 // ReconcileOnce performs a single pass of bidirectional synchronization.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error) {
 	result := &ReconcileResult{}
@@ -315,25 +436,17 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	var activeInstances []*Instance
 	var errorsByRegion map[string]error
 
-	if regInv, ok := r.inventory.(RegionInventory); ok {
-		byRegion, errs := regInv.ListActiveInstancesByRegion(ctx, r.clusterTag)
-		errorsByRegion = errs
-		for _, insts := range byRegion {
-			activeInstances = append(activeInstances, insts...)
+	byRegion, errs := r.ScanRegionsConcurrently(ctx, r.ConfiguredRegions())
+	errorsByRegion = errs
+	for _, insts := range byRegion {
+		activeInstances = append(activeInstances, insts...)
+	}
+	if len(byRegion) == 0 && len(errs) > 0 {
+		var errMsgs []string
+		for reg, err := range errs {
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", reg, err))
 		}
-		if len(byRegion) == 0 && len(errs) > 0 {
-			var errMsgs []string
-			for reg, err := range errs {
-				errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", reg, err))
-			}
-			return nil, fmt.Errorf("failed to query all cloud inventory regions: %s", strings.Join(errMsgs, "; "))
-		}
-	} else {
-		insts, err := r.inventory.ListActiveInstances(ctx, r.clusterTag)
-		if err != nil {
-			return nil, fmt.Errorf("failed to query cloud inventory: %w", err)
-		}
-		activeInstances = insts
+		return nil, fmt.Errorf("failed to query all cloud inventory regions: %s", strings.Join(errMsgs, "; "))
 	}
 
 	activePods, err := r.tracker.GetActivePods(ctx)
