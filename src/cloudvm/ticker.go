@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,7 @@ type SpotPriceTicker struct {
 	prices              map[string]*SpotPriceEntry
 	scores              map[string]*PlacementScoreEntry
 	regions             []string
+	fallbackRegions     []string
 	instanceTypes       []string
 	scrapeInterval      time.Duration
 	autoDiscoverRegions bool
@@ -71,21 +73,67 @@ type SpotPriceTicker struct {
 }
 
 // NewSpotPriceTicker initializes a spot price ticker with full market observability.
-func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Duration) *SpotPriceTicker {
+func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Duration, fallbackRegions ...string) *SpotPriceTicker {
 	if scrapeInterval <= 0 {
 		scrapeInterval = 10 * time.Minute
 	}
+
 	autoDiscover := false
+	if len(regions) == 0 {
+		autoDiscover = true
+	} else {
+		for _, r := range regions {
+			trimmed := strings.TrimSpace(r)
+			if trimmed == "" || strings.EqualFold(trimmed, "auto") {
+				autoDiscover = true
+				break
+			}
+		}
+	}
+
 	defaultReg := "us-west-2"
 	if raw := os.Getenv("AWS_REGION"); raw != "" {
 		defaultReg = raw
 	}
-	if len(regions) == 0 || (len(regions) == 1 && (regions[0] == "" || regions[0] == "auto")) {
-		autoDiscover = true
-		regions = []string{defaultReg}
-	} else if len(regions) > 0 && regions[0] != "" {
-		defaultReg = regions[0]
+
+	var cleanFallbacks []string
+	seenFallbacks := make(map[string]bool)
+	for _, r := range fallbackRegions {
+		r = strings.TrimSpace(r)
+		if r != "" && !strings.EqualFold(r, "auto") && !seenFallbacks[r] {
+			cleanFallbacks = append(cleanFallbacks, r)
+			seenFallbacks[r] = true
+		}
 	}
+
+	var explicitRegions []string
+	for _, r := range regions {
+		r = strings.TrimSpace(r)
+		if r != "" && !strings.EqualFold(r, "auto") {
+			explicitRegions = append(explicitRegions, r)
+			if !seenFallbacks[r] {
+				cleanFallbacks = append(cleanFallbacks, r)
+				seenFallbacks[r] = true
+			}
+		}
+	}
+
+	if len(cleanFallbacks) == 0 {
+		cleanFallbacks = []string{defaultReg}
+	}
+
+	if len(explicitRegions) > 0 {
+		defaultReg = explicitRegions[0]
+	} else if len(cleanFallbacks) > 0 {
+		defaultReg = cleanFallbacks[0]
+	}
+
+	initialRegions := explicitRegions
+	if autoDiscover || len(initialRegions) == 0 {
+		initialRegions = make([]string, len(cleanFallbacks))
+		copy(initialRegions, cleanFallbacks)
+	}
+
 	if len(instanceTypes) == 0 {
 		instanceTypes = DiscoverTrackedShapes(nil)
 	}
@@ -93,13 +141,14 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 	metrics := GlobalMetrics
 	catalog := GlobalCatalog
 	advisor := NewSpotAdvisorCollector("", nil)
-	gcpMarket := NewGCPMarketCollector(regions, nil)
+	gcpMarket := NewGCPMarketCollector(initialRegions, nil)
 	solver := NewFillSolver()
 
 	return &SpotPriceTicker{
 		prices:              make(map[string]*SpotPriceEntry),
 		scores:              make(map[string]*PlacementScoreEntry),
-		regions:             regions,
+		regions:             initialRegions,
+		fallbackRegions:     cleanFallbacks,
 		instanceTypes:       instanceTypes,
 		scrapeInterval:      scrapeInterval,
 		autoDiscoverRegions: autoDiscover,
@@ -138,6 +187,9 @@ func (t *SpotPriceTicker) SetAdvisorCollector(a *SpotAdvisorCollector) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.advisor = a
+	if a != nil && len(t.regions) > 0 {
+		a.SetRegions(t.regions)
+	}
 }
 
 // SetGCPMarketCollector overrides the GCP market collector.
@@ -145,6 +197,57 @@ func (t *SpotPriceTicker) SetGCPMarketCollector(g *GCPMarketCollector) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.gcpMarket = g
+	if g != nil && len(t.regions) > 0 {
+		g.SetRegions(t.regions)
+	}
+}
+
+// Regions returns a copy of current monitored regions.
+func (t *SpotPriceTicker) Regions() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]string, len(t.regions))
+	copy(out, t.regions)
+	return out
+}
+
+// FallbackRegions returns a copy of fallback regions.
+func (t *SpotPriceTicker) FallbackRegions() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]string, len(t.fallbackRegions))
+	copy(out, t.fallbackRegions)
+	return out
+}
+
+// SetFallbackRegions updates the fallback regions for the ticker.
+func (t *SpotPriceTicker) SetFallbackRegions(regions ...string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var clean []string
+	seen := make(map[string]bool)
+	for _, r := range regions {
+		r = strings.TrimSpace(r)
+		if r != "" && !strings.EqualFold(r, "auto") && !seen[r] {
+			clean = append(clean, r)
+			seen[r] = true
+		}
+	}
+	t.fallbackRegions = clean
+}
+
+// Advisor returns the spot advisor collector.
+func (t *SpotPriceTicker) Advisor() *SpotAdvisorCollector {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.advisor
+}
+
+// GCPMarket returns the GCP market collector.
+func (t *SpotPriceTicker) GCPMarket() *GCPMarketCollector {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.gcpMarket
 }
 
 // SetPricingAPI overrides the AWS pricing API client.
@@ -175,12 +278,38 @@ func (t *SpotPriceTicker) Solver() *FillSolver {
 	return t.solver
 }
 
+func (t *SpotPriceTicker) fallbackOrCurrentRegions() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if len(t.fallbackRegions) > 0 {
+		out := make([]string, len(t.fallbackRegions))
+		copy(out, t.fallbackRegions)
+		return out
+	}
+	out := make([]string, len(t.regions))
+	copy(out, t.regions)
+	return out
+}
+
 // DiscoverRegions queries EC2 DescribeRegions to find all accessible regions for the account.
 func (t *SpotPriceTicker) DiscoverRegions(ctx context.Context) []string {
-	fetcher, err := t.fetcherFactory(ctx, t.defaultRegion)
-	if err != nil {
-		return t.regions
+	t.mu.RLock()
+	defReg := t.defaultRegion
+	factory := t.fetcherFactory
+	t.mu.RUnlock()
+
+	if factory == nil {
+		log.Printf("[cloudvm-ticker] Warning: no fetcher factory configured, falling back to configured regions")
+		return t.fallbackOrCurrentRegions()
 	}
+
+	fetcher, err := factory(ctx, defReg)
+	if err != nil {
+		cleanReg := sanitizeLog(defReg)
+		log.Printf("[cloudvm-ticker] Warning: failed to initialize EC2 client for region discovery in %s: %v, falling back to configured regions", cleanReg, err) //nolint:gosec // region sanitized
+		return t.fallbackOrCurrentRegions()
+	}
+
 	out, err := fetcher.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
 		Filters: []ec2types.Filter{
 			{
@@ -189,9 +318,15 @@ func (t *SpotPriceTicker) DiscoverRegions(ctx context.Context) []string {
 			},
 		},
 	})
-	if err != nil || out == nil || len(out.Regions) == 0 {
-		return t.regions
+	if err != nil {
+		log.Printf("[cloudvm-ticker] Warning: DescribeRegions failed: %v, falling back to configured regions", err)
+		return t.fallbackOrCurrentRegions()
 	}
+	if out == nil || len(out.Regions) == 0 {
+		log.Printf("[cloudvm-ticker] Warning: DescribeRegions returned empty region list, falling back to configured regions")
+		return t.fallbackOrCurrentRegions()
+	}
+
 	var res []string
 	for _, r := range out.Regions {
 		if r.RegionName != nil && *r.RegionName != "" {
@@ -199,24 +334,38 @@ func (t *SpotPriceTicker) DiscoverRegions(ctx context.Context) []string {
 		}
 	}
 	if len(res) == 0 {
-		return t.regions
+		log.Printf("[cloudvm-ticker] Warning: DescribeRegions returned no valid region names, falling back to configured regions")
+		return t.fallbackOrCurrentRegions()
 	}
 	sort.Strings(res)
+	log.Printf("[cloudvm-ticker] Discovered %d allowed regions: %v", len(res), res)
 	return res
+}
+
+func (t *SpotPriceTicker) refreshDiscoveredRegions(ctx context.Context) {
+	discovered := t.DiscoverRegions(ctx)
+	if len(discovered) > 0 {
+		t.mu.Lock()
+		t.regions = discovered
+		t.lastRegionDiscovery = time.Now()
+		if t.gcpMarket != nil {
+			t.gcpMarket.SetRegions(discovered)
+		}
+		if t.advisor != nil {
+			t.advisor.SetRegions(discovered)
+		}
+		t.mu.Unlock()
+	}
 }
 
 // PollOnce queries DescribeSpotPriceHistory across configured regions and instance types.
 func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
-	if t.autoDiscoverRegions && (t.lastRegionDiscovery.IsZero() || time.Since(t.lastRegionDiscovery) > 1*time.Hour) {
-		discovered := t.DiscoverRegions(ctx)
-		if len(discovered) > 0 {
-			t.mu.Lock()
-			t.regions = discovered
-			t.lastRegionDiscovery = time.Now()
-			if t.gcpMarket != nil {
-				t.gcpMarket.SetRegions(discovered)
-			}
-			t.mu.Unlock()
+	if t.autoDiscoverRegions {
+		t.mu.RLock()
+		needsDiscovery := t.lastRegionDiscovery.IsZero() || time.Since(t.lastRegionDiscovery) > 1*time.Hour
+		t.mu.RUnlock()
+		if needsDiscovery {
+			t.refreshDiscoveredRegions(ctx)
 		}
 	}
 	t.mu.RLock()
@@ -282,7 +431,12 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 
 // PollPlacementScores queries AWS GetSpotPlacementScores for configured instance types.
 func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
-	for _, reg := range t.regions {
+	t.mu.RLock()
+	regionsToPoll := make([]string, len(t.regions))
+	copy(regionsToPoll, t.regions)
+	t.mu.RUnlock()
+
+	for _, reg := range regionsToPoll {
 		fetcher, err := t.fetcherFactory(ctx, reg)
 		if err != nil {
 			continue
@@ -535,6 +689,9 @@ func OnDemandBaselineUSD(instanceType string) float64 {
 
 // Start runs the background polling loop until ctx is canceled.
 func (t *SpotPriceTicker) Start(ctx context.Context) {
+	if t.autoDiscoverRegions {
+		t.refreshDiscoveredRegions(ctx)
+	}
 	t.PollOnce(ctx)
 	t.PollPlacementScores(ctx)
 	ticker := time.NewTicker(t.scrapeInterval)
