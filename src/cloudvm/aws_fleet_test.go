@@ -1001,7 +1001,7 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 	}
 
 	// Dynamic resolution
-	ltID, ltName := p.ResolveRegionalLaunchTemplate("us-west-2")
+	ltID, ltName := p.ResolveRegionalLaunchTemplate("us-west-2", false)
 	if ltID != "lt-west-001" || ltName != "" {
 		t.Errorf("expected lt-west-001, got id=%s name=%s", ltID, ltName)
 	}
@@ -1013,7 +1013,7 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 	// Update regional facts dynamically
 	p.SetRegionalLaunchTemplate("eu-west-1", "lt-eu-999")
 	p.SetRegionalSubnets("eu-west-1", []string{"subnet-eu-1"})
-	euLTID, _ := p.ResolveRegionalLaunchTemplate("eu-west-1")
+	euLTID, _ := p.ResolveRegionalLaunchTemplate("eu-west-1", false)
 	if euLTID != "lt-eu-999" {
 		t.Errorf("expected lt-eu-999 for eu-west-1, got %s", euLTID)
 	}
@@ -1115,5 +1115,91 @@ func TestAWSProvider_UnreachableRegionDoesNotStallInventory(t *testing.T) {
 	}
 	if errs["me-central-1"] == nil {
 		t.Errorf("expected me-central-1 timeout error, got %v", errs)
+	}
+}
+
+func TestAWSProvider_ResolveRegionalLaunchTemplatePrefersGPUTemplate(t *testing.T) {
+	p := NewAWSProvider("us-west-2")
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
+		"us-west-2": {LaunchTemplateID: "lt-cpu", GPULaunchTemplateID: "lt-gpu"},
+		"eu-west-1": {LaunchTemplateID: "lt-cpu-eu"},
+	}})
+
+	cases := []struct {
+		region string
+		gpu    bool
+		want   string
+	}{
+		{"us-west-2", true, "lt-gpu"},
+		{"us-west-2", false, "lt-cpu"},
+		{"eu-west-1", true, "lt-cpu-eu"},
+		{"eu-west-1", false, "lt-cpu-eu"},
+	}
+	for _, tc := range cases {
+		if got, _ := p.ResolveRegionalLaunchTemplate(tc.region, tc.gpu); got != tc.want {
+			t.Errorf("ResolveRegionalLaunchTemplate(%q, %v) = %q, want %q", tc.region, tc.gpu, got, tc.want)
+		}
+	}
+}
+
+func TestAWSProvider_ClusterFactsWithoutGPUTemplateParse(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":{"launchTemplateId":"lt-cpu","subnetIds":["subnet-a"]}}}`)
+	p := NewAWSProvider("us-west-2")
+	if got, _ := p.ResolveRegionalLaunchTemplate("us-west-2", true); got != "lt-cpu" {
+		t.Fatalf("expected fallback to lt-cpu when gpuLaunchTemplateId is absent, got %q", got)
+	}
+
+	t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":{"launchTemplateId":"lt-cpu","gpuLaunchTemplateId":"lt-gpu"}}}`)
+	p = NewAWSProvider("us-west-2")
+	if got, _ := p.ResolveRegionalLaunchTemplate("us-west-2", true); got != "lt-gpu" {
+		t.Fatalf("expected lt-gpu from gpuLaunchTemplateId, got %q", got)
+	}
+}
+
+func TestAWSProvider_LaunchUsesGPUTemplateForGPUPods(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	p := NewAWSProvider("us-west-2")
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
+		"us-west-2": {LaunchTemplateID: "lt-cpu", GPULaunchTemplateID: "lt-gpu", SubnetIDs: []string{"subnet-a"}},
+	}})
+
+	var capturedLT string
+	p.SetRegionClient("us-west-2", &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, input *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			capturedLT = aws.ToString(input.LaunchTemplateConfigs[0].LaunchTemplateSpecification.LaunchTemplateId)
+			return &ec2.CreateFleetOutput{
+				FleetId:   aws.String("fleet-gpu"),
+				Instances: []ec2types.CreateFleetInstance{{InstanceIds: []string{"i-gpu"}, InstanceType: ec2types.InstanceTypeG4dnXlarge}},
+			}, nil
+		},
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return &ec2.DescribeInstancesOutput{Reservations: []ec2types.Reservation{{Instances: []ec2types.Instance{{
+				InstanceId:       aws.String("i-gpu"),
+				InstanceType:     ec2types.InstanceTypeG4dnXlarge,
+				PrivateIpAddress: aws.String("10.0.0.5"),
+			}}}}}, nil
+		},
+	})
+
+	for _, tc := range []struct {
+		gpus int
+		want string
+	}{{1, "lt-gpu"}, {0, "lt-cpu"}} {
+		capturedLT = ""
+		spec := &InstanceSpec{
+			PodName:      "gpu-pod",
+			PodNamespace: "default",
+			PodUID:       "uid-gpu",
+			Region:       "us-west-2",
+			InstanceType: "g4dn.xlarge",
+			NumGPUs:      tc.gpus,
+		}
+		if _, err := p.Launch(context.Background(), spec); err != nil {
+			t.Fatalf("Launch(gpus=%d) failed: %v", tc.gpus, err)
+		}
+		if capturedLT != tc.want {
+			t.Errorf("Launch(gpus=%d) used launch template %q, want %q", tc.gpus, capturedLT, tc.want)
+		}
 	}
 }

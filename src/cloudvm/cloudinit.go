@@ -730,6 +730,27 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             pod_uid = params.get('podUID', [''])[0]
             container_name = f"cloudvm-{pod_uid}"
             rx_bytes, tx_bytes = get_network_bytes()
+            # A recorded start failure wins over docker inspect: a failed docker run can leave the container in "created".
+            with get_pod_lock(pod_uid):
+                failure = start_failures.get(pod_uid)
+            if failure is not None:
+                reason_val, err_val = failure
+                resp = {
+                    "podUID": pod_uid,
+                    "running": False,
+                    "status": "dead",
+                    "exitCode": 1,
+                    "reason": reason_val,
+                    "message": err_val,
+                    "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "networkRxBytes": rx_bytes,
+                    "networkTxBytes": tx_bytes,
+                }
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(resp).encode('utf-8'))
+                return
             try:
                 res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
                 if res.returncode == 0:
@@ -740,17 +761,27 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     exit_code = state.get('ExitCode', 0)
                     started_at = state.get('StartedAt', '')
                     finished_at = state.get('FinishedAt', '')
-                    reason = "Running" if running else (
-                        "ContainerCreating" if status_str in ("created", "starting") else (
-                            ("Completed" if exit_code == 0 else "Error") if status_str in ("exited", "dead") else status_str.capitalize()
+                    start_error = state.get('Error', '')
+                    message = ''
+                    if not running and start_error:
+                        # Docker records why it could not start the container, such as a missing GPU device driver.
+                        status_str = 'dead'
+                        exit_code = exit_code or 1
+                        reason = "StartError"
+                        message = start_error
+                    else:
+                        reason = "Running" if running else (
+                            "ContainerCreating" if status_str in ("created", "starting") else (
+                                ("Completed" if exit_code == 0 else "Error") if status_str in ("exited", "dead") else status_str.capitalize()
+                            )
                         )
-                    )
                     resp = {
                         "podUID": pod_uid,
                         "running": running,
                         "status": status_str,
                         "exitCode": exit_code,
                         "reason": reason,
+                        "message": message,
                         "startedAt": started_at,
                         "finishedAt": finished_at,
                         "networkRxBytes": rx_bytes,
@@ -766,24 +797,6 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
             plock = get_pod_lock(pod_uid)
             with plock:
-                if pod_uid in start_failures:
-                    reason_val, err_val = start_failures[pod_uid]
-                    resp = {
-                        "podUID": pod_uid,
-                        "running": False,
-                        "status": "dead",
-                        "exitCode": 1,
-                        "reason": reason_val,
-                        "message": err_val,
-                        "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        "networkRxBytes": rx_bytes,
-                        "networkTxBytes": tx_bytes,
-                    }
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(resp).encode('utf-8'))
-                    return
                 if pod_uid in starting_pods:
                     resp = {
                         "podUID": pod_uid,

@@ -120,10 +120,12 @@ type FleetResponse struct {
 
 // RegionalClusterFact stores dynamic Launch Template and subnet configuration for a specific AWS region.
 type RegionalClusterFact struct {
-	LaunchTemplateID   string   `json:"launchTemplateId,omitempty"`
-	LaunchTemplateName string   `json:"launchTemplateName,omitempty"`
-	SubnetIDs          []string `json:"subnetIds,omitempty"`
-	SecurityGroupIDs   []string `json:"securityGroupIds,omitempty"`
+	LaunchTemplateID string `json:"launchTemplateId,omitempty"`
+	// GPULaunchTemplateID names the template whose image ships the NVIDIA driver and container toolkit; pods requesting GPUs use it.
+	GPULaunchTemplateID string   `json:"gpuLaunchTemplateId,omitempty"`
+	LaunchTemplateName  string   `json:"launchTemplateName,omitempty"`
+	SubnetIDs           []string `json:"subnetIds,omitempty"`
+	SecurityGroupIDs    []string `json:"securityGroupIds,omitempty"`
 }
 
 // ClusterFacts holds the regional deployment facts for dynamic Launch Template and subnet selection.
@@ -606,7 +608,8 @@ func (p *AWSProvider) SetRegionalSubnets(region string, subnets []string) {
 }
 
 // ResolveRegionalLaunchTemplate resolves launch template ID and Name for a region from cluster facts.
-func (p *AWSProvider) ResolveRegionalLaunchTemplate(region string) (string, string) {
+// A GPU request prefers the region's GPU template and falls back to the default template when none is published.
+func (p *AWSProvider) ResolveRegionalLaunchTemplate(region string, gpu bool) (string, string) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.clusterFacts == nil || p.clusterFacts.Regions == nil {
@@ -615,6 +618,9 @@ func (p *AWSProvider) ResolveRegionalLaunchTemplate(region string) (string, stri
 	fact, ok := p.clusterFacts.Regions[region]
 	if !ok {
 		return "", ""
+	}
+	if gpu && fact.GPULaunchTemplateID != "" {
+		return fact.GPULaunchTemplateID, ""
 	}
 	return fact.LaunchTemplateID, fact.LaunchTemplateName
 }
@@ -866,7 +872,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	ltID := spec.LaunchTemplateID
 	ltName := spec.LaunchTemplateName
 	if ltID == "" && ltName == "" {
-		regLTID, regLTName := p.ResolveRegionalLaunchTemplate(spec.Region)
+		regLTID, regLTName := p.ResolveRegionalLaunchTemplate(spec.Region, spec.NumGPUs > 0)
 		if regLTID != "" {
 			ltID = regLTID
 		} else if regLTName != "" {
