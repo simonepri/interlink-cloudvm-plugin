@@ -79,6 +79,29 @@ spec:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.secretKey | default "DATABASE_URL" }}
             {{- end }}
+            - name: TUNNEL_GATEWAY_LISTEN
+              value: ":{{ .Values.tunnel.port }}"
+            {{- if .Values.tunnel.cell }}
+            - name: TUNNEL_CELL
+              value: {{ .Values.tunnel.cell | quote }}
+            {{- end }}
+            {{- if .Values.tunnel.endpoint }}
+            - name: TUNNEL_ENDPOINT
+              value: {{ .Values.tunnel.endpoint | quote }}
+            {{- end }}
+            - name: TUNNEL_CONNECT_TIMEOUT
+              value: {{ .Values.tunnel.connectTimeout | quote }}
+            - name: RUNNER_DIRECT_FALLBACK
+              value: "{{ .Values.tunnel.directFallback }}"
+            - name: TAILSCALE_TAGS
+              value: {{ .Values.tunnel.tailscaleTags | quote }}
+            {{- if .Values.tunnel.authKeySecret.name }}
+            - name: TAILSCALE_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tunnel.authKeySecret.name }}
+                  key: {{ .Values.tunnel.authKeySecret.key }}
+            {{- end }}
             {{- if .Values.registryMirrors }}
             - name: REGISTRY_MIRRORS
               value: {{ join "," .Values.registryMirrors | quote }}
@@ -98,6 +121,9 @@ spec:
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            - name: tunnel
+              containerPort: {{ .Values.tunnel.port }}
               protocol: TCP
           livenessProbe:
             httpGet:

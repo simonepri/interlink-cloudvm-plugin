@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -761,4 +763,101 @@ func TestCloudInit_NetworkMetricsScript(t *testing.T) {
 	if !strings.Contains(script, "/host/stats") {
 		t.Errorf("cloud-init runner missing /host/stats endpoint")
 	}
+}
+
+func TestRenderCloudInit_TunnelWorker(t *testing.T) {
+	base := CloudInitConfig{
+		PodName:              "tunnel-pod",
+		Region:               "eu-west-1",
+		RunnerAuthToken:      "runner-secret",
+		TunnelEndpoint:       FormatTunnelEndpoint("cell-aws-usw2"),
+		MeshTags:             DefaultMeshTags,
+		MeshAuthKey:          "tskey-auth-plaintext",
+		TargetContainerImage: "alpine",
+	}
+
+	t.Run("plaintext mesh key", func(t *testing.T) {
+		cfg := base
+		script, err := RenderCloudInit(&cfg)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		for _, want := range []string{
+			"tailscale up --auth-key=file:/etc/cloudvm/mesh-authkey",
+			`--advertise-tags="tag:clvm-worker"`,
+			"ExecStop=/usr/bin/tailscale logout",
+			`CLOUDVM_TUNNEL_ENDPOINT="clvm-tunnel.cell-aws-usw2.c.corp.boltz.com:443"`,
+			"instance-identity/pkcs7",
+			"ThreadingHTTPServer(('127.0.0.1', PORT)",
+			"class Session(object):",
+		} {
+			if !strings.Contains(script, want) {
+				t.Errorf("rendered script missing %q", want)
+			}
+		}
+		if strings.Contains(script, "--authkey=") || strings.Contains(script, `--auth-key="tskey`) {
+			t.Error("mesh key must never be passed as a command-line argument")
+		}
+		assertBashSyntax(t, script)
+		assertUserDataFits(t, script)
+	})
+
+	t.Run("kms envelope", func(t *testing.T) {
+		cfg := base
+		cfg.MeshAuthKey = ""
+		cfg.MeshAuthKeyCiphertext = "mesh-ciphertext"
+		cfg.RunnerAuthToken = ""
+		cfg.KMSEncryptedToken = true
+		cfg.KMSCiphertext = "runner-ciphertext"
+		cfg.KMSKeyID = "arn:aws:kms:us-west-2:111122223333:key/abc"
+		script, err := RenderCloudInit(&cfg)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		if strings.Contains(script, "tskey-auth-plaintext") {
+			t.Error("plaintext mesh key leaked into a KMS-enveloped script")
+		}
+		if got := strings.Count(script, `--region "us-west-2"`); got != 2 {
+			t.Errorf("expected both KMS decrypts to target the key's region, found %d", got)
+		}
+		assertBashSyntax(t, script)
+	})
+
+	t.Run("direct fallback keeps runner on all interfaces", func(t *testing.T) {
+		cfg := base
+		cfg.RunnerDirectHTTP = true
+		script, err := RenderCloudInit(&cfg)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		if !strings.Contains(script, "ThreadingHTTPServer(('0.0.0.0', PORT)") {
+			t.Error("direct fallback must keep the runner reachable on the VPC address")
+		}
+	})
+}
+
+func assertBashSyntax(t *testing.T, script string) {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	cmd := exec.Command(bash, "-n") //nolint:gosec // fixed interpreter
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rendered script is not valid bash: %v\n%s", err, out)
+	}
+}
+
+// assertUserDataFits checks the gzip-compressed script stays under the 16 KiB EC2 user-data limit.
+func assertUserDataFits(t *testing.T, script string) {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, _ = gz.Write([]byte(script))
+	_ = gz.Close()
+	if buf.Len() > 16*1024 {
+		t.Fatalf("compressed user data is %d bytes, above the 16 KiB EC2 limit", buf.Len())
+	}
+	t.Logf("compressed user data: %d bytes", buf.Len())
 }

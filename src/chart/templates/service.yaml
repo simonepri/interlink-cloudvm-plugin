@@ -12,6 +12,10 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    - port: {{ .Values.tunnel.port }}
+      targetPort: tunnel
+      protocol: TCP
+      name: tunnel
   selector:
     app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
