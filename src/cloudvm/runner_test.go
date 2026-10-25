@@ -7,7 +7,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -125,5 +129,193 @@ func TestMockContainerRunner_HostStats(t *testing.T) {
 	}
 	if stats.NetworkRxBytes != 4096 || stats.NetworkTxBytes != 8192 {
 		t.Errorf("expected configured stats, got rx=%d, tx=%d", stats.NetworkRxBytes, stats.NetworkTxBytes)
+	}
+}
+
+func TestSpotInterruptionWatcher_IMDSPolling(t *testing.T) {
+	var imdsHit atomic.Bool
+	var imdsInterrupted atomic.Bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest/api/token":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("mock-imds-token"))
+		case "/latest/meta-data/spot/instance-action":
+			imdsHit.Store(true)
+			if imdsInterrupted.Load() {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"action": "terminate", "time": "2026-10-25T02:00:00Z"}`))
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	var pushedFrames []*StatusFrame
+	var framesMu sync.Mutex
+
+	pusher := StatusFramePusherFunc(func(_ context.Context, frame *StatusFrame) error {
+		framesMu.Lock()
+		defer framesMu.Unlock()
+		pushedFrames = append(pushedFrames, frame)
+		return nil
+	})
+
+	watcher := NewSpotInterruptionWatcher(SpotInterruptionWatcherConfig{
+		IMDSEndpoint:      server.URL + "/latest/meta-data/spot/instance-action",
+		IMDSTokenEndpoint: server.URL + "/latest/api/token",
+		PollInterval:      10 * time.Millisecond,
+		Pusher:            pusher,
+	})
+	watcher.TrackPod("pod-spot-1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watcher.Start(ctx)
+
+	// Initially not interrupted
+	time.Sleep(30 * time.Millisecond)
+	if watcher.IsInterrupted() {
+		t.Fatalf("expected watcher not interrupted initially")
+	}
+
+	// Trigger interruption on IMDS
+	imdsInterrupted.Store(true)
+
+	// Wait for watcher to detect interruption
+	for i := 0; i < 50; i++ {
+		if watcher.IsInterrupted() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !watcher.IsInterrupted() {
+		t.Fatalf("expected watcher to detect spot interruption")
+	}
+
+	watcher.Stop()
+
+	framesMu.Lock()
+	defer framesMu.Unlock()
+
+	if len(pushedFrames) == 0 {
+		t.Fatalf("expected PodInterrupted frame pushed down tunnel, got 0 frames")
+	}
+
+	foundGeneral := false
+	foundPod := false
+	for _, f := range pushedFrames {
+		if f.Type == FrameTypePodInterrupted && f.Status == "PodInterrupted" && f.Reason == "SpotInterruption" {
+			switch f.PodUID {
+			case "":
+				foundGeneral = true
+			case "pod-spot-1":
+				foundPod = true
+			}
+		}
+	}
+
+	if !foundGeneral || !foundPod {
+		t.Fatalf("expected both general and pod-scoped PodInterrupted frames: general=%v, pod=%v", foundGeneral, foundPod)
+	}
+}
+
+func TestSpotInterruptionWatcher_ACPIEvent(t *testing.T) {
+	tmpDir := t.TempDir()
+	acpiFile := tmpDir + "/acpi_events"
+
+	// Initially benign event
+	if err := os.WriteFile(acpiFile, []byte(`ac_adapter AC 00000080 00000001
+`), 0600); err != nil {
+		t.Fatalf("failed to write acpi file: %v", err)
+	}
+
+	var pushedFrames []*StatusFrame
+	var framesMu sync.Mutex
+
+	pusher := StatusFramePusherFunc(func(_ context.Context, frame *StatusFrame) error {
+		framesMu.Lock()
+		defer framesMu.Unlock()
+		pushedFrames = append(pushedFrames, frame)
+		return nil
+	})
+
+	watcher := NewSpotInterruptionWatcher(SpotInterruptionWatcherConfig{
+		ACPIEventPath: acpiFile,
+		PollInterval:  10 * time.Millisecond,
+		Pusher:        pusher,
+	})
+	watcher.TrackPod("pod-acpi-1")
+
+	detected, _, err := watcher.CheckACPIOnce(context.Background())
+	if err != nil || detected {
+		t.Fatalf("expected no detection on ac adapter event, got detected=%v, err=%v", detected, err)
+	}
+
+	// Write ACPI power button event
+	if err := os.WriteFile(acpiFile, []byte(`button/power PBTN 00000080 00000000
+`), 0600); err != nil {
+		t.Fatalf("failed to write power event: %v", err)
+	}
+
+	detected, msg, err := watcher.CheckACPIOnce(context.Background())
+	if err != nil || !detected {
+		t.Fatalf("expected ACPI detection, got detected=%v, err=%v", detected, err)
+	}
+	if !strings.Contains(msg, "button/power") {
+		t.Errorf("unexpected ACPI message: %s", msg)
+	}
+
+	// Trigger via watcher
+	if err := watcher.TriggerInterruption(context.Background(), "SpotInterruption", "ACPI shutdown event: "+msg); err != nil {
+		t.Fatalf("TriggerInterruption failed: %v", err)
+	}
+
+	framesMu.Lock()
+	defer framesMu.Unlock()
+	if len(pushedFrames) == 0 {
+		t.Fatalf("expected frames pushed on ACPI event")
+	}
+	if pushedFrames[0].Type != FrameTypePodInterrupted || pushedFrames[0].Reason != "SpotInterruption" {
+		t.Errorf("unexpected frame: %+v", pushedFrames[0])
+	}
+}
+
+func TestHTTPFramePusher(t *testing.T) {
+	var receivedAuth string
+	var receivedFrame StatusFrame
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&receivedFrame); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	pusher := NewHTTPFramePusher(server.URL, "secret-token", server.Client())
+	frame := &StatusFrame{
+		Type:      FrameTypePodInterrupted,
+		Status:    "PodInterrupted",
+		Reason:    "SpotInterruption",
+		PodUID:    "uid-push-1",
+		Timestamp: time.Now().UTC(),
+	}
+
+	if err := pusher.PushStatusFrame(context.Background(), frame); err != nil {
+		t.Fatalf("PushStatusFrame failed: %v", err)
+	}
+
+	if receivedAuth != "Bearer secret-token" {
+		t.Errorf("expected Bearer secret-token, got %s", receivedAuth)
+	}
+	if receivedFrame.Type != FrameTypePodInterrupted || receivedFrame.PodUID != "uid-push-1" {
+		t.Errorf("unexpected received frame: %+v", receivedFrame)
 	}
 }

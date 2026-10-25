@@ -36,9 +36,31 @@ func TestPGStore_InitSchema_Success(t *testing.T) {
 	for _, stmt := range schemaStatements {
 		mock.ExpectExec(regexp.QuoteMeta(stmt)).WillReturnResult(sqlmock.NewResult(0, 0))
 	}
+	for _, stmt := range migrationStatements {
+		mock.ExpectExec(regexp.QuoteMeta(stmt)).WillReturnResult(sqlmock.NewResult(0, 0))
+	}
 
 	if err := store.InitSchema(ctx); err != nil {
 		t.Fatalf("expected InitSchema to succeed, got: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet mock expectations: %v", err)
+	}
+}
+
+func TestPGStore_InitSchema_MigrationError(t *testing.T) {
+	store, mock := setupMockPGStore(t)
+	ctx := context.Background()
+
+	for _, stmt := range schemaStatements {
+		mock.ExpectExec(regexp.QuoteMeta(stmt)).WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+	mock.ExpectExec(regexp.QuoteMeta(migrationStatements[0])).
+		WillReturnError(errors.New("migration column failure"))
+
+	if err := store.InitSchema(ctx); err == nil {
+		t.Fatal("expected InitSchema to fail on migration error, got nil")
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -976,4 +998,169 @@ func TestStore_DiskMapFallbackWhenEmptyConn(t *testing.T) {
 
 	// ResetGlobalPGStores
 	ResetGlobalPGStores()
+}
+
+// ----------------------------------------------------------------------------
+// Nodes Tests
+// ----------------------------------------------------------------------------
+
+func TestPGStore_NodeOperations(t *testing.T) {
+	store, mock := setupMockPGStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	rec := &NodeRecord{
+		InstanceID:   "i-node-1",
+		Region:       "us-west-2",
+		Provider:     "aws",
+		IP:           "10.0.0.5",
+		InstanceType: "g5.xlarge",
+		Status:       "Running",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	// 1. SetNode
+	setQuery := `
+		INSERT INTO cloudvm_nodes (instance_id, region, provider, ip, instance_type, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (instance_id) DO UPDATE SET
+			region = EXCLUDED.region,
+			provider = EXCLUDED.provider,
+			ip = EXCLUDED.ip,
+			instance_type = EXCLUDED.instance_type,
+			status = EXCLUDED.status,
+			updated_at = EXCLUDED.updated_at
+	`
+	mock.ExpectExec(regexp.QuoteMeta(setQuery)).
+		WithArgs("i-node-1", "us-west-2", "aws", "10.0.0.5", "g5.xlarge", "Running", now, now).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := store.SetNode(ctx, "i-node-1", rec); err != nil {
+		t.Fatalf("SetNode failed: %v", err)
+	}
+
+	// 2. GetNode
+	getQuery := `
+		SELECT instance_id, COALESCE(region, ''), COALESCE(provider, ''), COALESCE(ip, ''), COALESCE(instance_type, ''), COALESCE(status, ''), created_at, updated_at
+		FROM cloudvm_nodes
+		WHERE instance_id = $1
+	`
+	mock.ExpectQuery(regexp.QuoteMeta(getQuery)).
+		WithArgs("i-node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"instance_id", "region", "provider", "ip", "instance_type", "status", "created_at", "updated_at"}).
+			AddRow("i-node-1", "us-west-2", "aws", "10.0.0.5", "g5.xlarge", "Running", now, now))
+
+	fetched, err := store.GetNode(ctx, "i-node-1")
+	if err != nil {
+		t.Fatalf("GetNode failed: %v", err)
+	}
+	if fetched == nil || fetched.Region != "us-west-2" || fetched.InstanceID != "i-node-1" {
+		t.Fatalf("unexpected fetched node: %+v", fetched)
+	}
+
+	// 3. GetAllNodes
+	getAllQuery := `
+		SELECT instance_id, COALESCE(region, ''), COALESCE(provider, ''), COALESCE(ip, ''), COALESCE(instance_type, ''), COALESCE(status, ''), created_at, updated_at
+		FROM cloudvm_nodes
+	`
+	mock.ExpectQuery(regexp.QuoteMeta(getAllQuery)).
+		WillReturnRows(sqlmock.NewRows([]string{"instance_id", "region", "provider", "ip", "instance_type", "status", "created_at", "updated_at"}).
+			AddRow("i-node-1", "us-west-2", "aws", "10.0.0.5", "g5.xlarge", "Running", now, now))
+
+	all, err := store.GetAllNodes(ctx)
+	if err != nil {
+		t.Fatalf("GetAllNodes failed: %v", err)
+	}
+	if len(all) != 1 || all["i-node-1"].Region != "us-west-2" {
+		t.Fatalf("unexpected GetAllNodes output: %+v", all)
+	}
+
+	// 4. DeleteNode
+	delQuery := "DELETE FROM cloudvm_nodes WHERE instance_id = $1"
+	mock.ExpectExec(regexp.QuoteMeta(delQuery)).
+		WithArgs("i-node-1").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := store.DeleteNode(ctx, "i-node-1"); err != nil {
+		t.Fatalf("DeleteNode failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGNodeStore_Adapter(t *testing.T) {
+	store, mock := setupMockPGStore(t)
+	nodeStore := store.NodeStore()
+
+	now := time.Now().UTC()
+	rec := &NodeRecord{
+		InstanceID: "i-adapt-1",
+		Region:     "eu-west-1",
+	}
+
+	// Set
+	setQuery := `
+		INSERT INTO cloudvm_nodes (instance_id, region, provider, ip, instance_type, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (instance_id) DO UPDATE SET
+			region = EXCLUDED.region,
+			provider = EXCLUDED.provider,
+			ip = EXCLUDED.ip,
+			instance_type = EXCLUDED.instance_type,
+			status = EXCLUDED.status,
+			updated_at = EXCLUDED.updated_at
+	`
+	mock.ExpectExec(regexp.QuoteMeta(setQuery)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := nodeStore.Set("i-adapt-1", rec); err != nil {
+		t.Fatalf("adapter Set failed: %v", err)
+	}
+
+	// Get
+	getQuery := `
+		SELECT instance_id, COALESCE(region, ''), COALESCE(provider, ''), COALESCE(ip, ''), COALESCE(instance_type, ''), COALESCE(status, ''), created_at, updated_at
+		FROM cloudvm_nodes
+		WHERE instance_id = $1
+	`
+	mock.ExpectQuery(regexp.QuoteMeta(getQuery)).
+		WithArgs("i-adapt-1").
+		WillReturnRows(sqlmock.NewRows([]string{"instance_id", "region", "provider", "ip", "instance_type", "status", "created_at", "updated_at"}).
+			AddRow("i-adapt-1", "eu-west-1", "aws", "", "", "", now, now))
+
+	res := nodeStore.Get("i-adapt-1")
+	if res == nil || res.Region != "eu-west-1" {
+		t.Fatalf("unexpected adapter Get: %+v", res)
+	}
+
+	// GetAll
+	getAllQuery := `
+		SELECT instance_id, COALESCE(region, ''), COALESCE(provider, ''), COALESCE(ip, ''), COALESCE(instance_type, ''), COALESCE(status, ''), created_at, updated_at
+		FROM cloudvm_nodes
+	`
+	mock.ExpectQuery(regexp.QuoteMeta(getAllQuery)).
+		WillReturnRows(sqlmock.NewRows([]string{"instance_id", "region", "provider", "ip", "instance_type", "status", "created_at", "updated_at"}).
+			AddRow("i-adapt-1", "eu-west-1", "aws", "", "", "", now, now))
+
+	all := nodeStore.GetAll()
+	if len(all) != 1 || all["i-adapt-1"].Region != "eu-west-1" {
+		t.Fatalf("unexpected adapter GetAll: %+v", all)
+	}
+
+	// Delete
+	delQuery := "DELETE FROM cloudvm_nodes WHERE instance_id = $1"
+	mock.ExpectExec(regexp.QuoteMeta(delQuery)).
+		WithArgs("i-adapt-1").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := nodeStore.Delete("i-adapt-1"); err != nil {
+		t.Fatalf("adapter Delete failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }

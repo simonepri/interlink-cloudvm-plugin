@@ -828,3 +828,91 @@ func TestReconciler_KeepAlivePingsConcurrencyClamped(t *testing.T) {
 		}
 	})
 }
+
+func TestReconciler_ConcurrentWatchdogReaper(t *testing.T) {
+	var concurrentScans atomic.Int32
+	var peakScans atomic.Int32
+
+	createMockClient := func(reg string, instID string) *mockEC2FleetClient {
+		return &mockEC2FleetClient{
+			describeInstancesFn: func(_ context.Context, input *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+				curr := concurrentScans.Add(1)
+				defer concurrentScans.Add(-1)
+				for {
+					p := peakScans.Load()
+					if curr <= p || peakScans.CompareAndSwap(p, curr) {
+						break
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+
+				// Verify input filter by ClusterTag
+				hasClusterTag := false
+				for _, filter := range input.Filters {
+					if *filter.Name == "tag:ClusterTag" && len(filter.Values) > 0 && filter.Values[0] == "multi-cluster" {
+						hasClusterTag = true
+						break
+					}
+				}
+				if !hasClusterTag {
+					return &ec2.DescribeInstancesOutput{}, nil
+				}
+
+				return &ec2.DescribeInstancesOutput{
+					Reservations: []ec2types.Reservation{
+						{
+							Instances: []ec2types.Instance{
+								{
+									InstanceId:   aws.String(instID),
+									InstanceType: ec2types.InstanceTypeG5Xlarge,
+									State: &ec2types.InstanceState{
+										Name: ec2types.InstanceStateNameRunning,
+									},
+									PrivateIpAddress: aws.String("10.0.1.5"),
+									LaunchTime:       aws.Time(time.Now().Add(-15 * time.Minute)), // expired zombie
+									Tags: []ec2types.Tag{
+										{Key: aws.String("ClusterTag"), Value: aws.String("multi-cluster")},
+										{Key: aws.String("PodName"), Value: aws.String("zombie-pod-" + reg)},
+										{Key: aws.String("Namespace"), Value: aws.String("default")},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			},
+		}
+	}
+
+	awsProv := NewAWSProvider("us-east-1", "us-west-2", "eu-central-1")
+	awsProv.SetRegionClient("us-east-1", createMockClient("us-east-1", "i-east"))
+	awsProv.SetRegionClient("us-west-2", createMockClient("us-west-2", "i-west"))
+	awsProv.SetRegionClient("eu-central-1", createMockClient("eu-central-1", "i-eu"))
+
+	mockTracker := &mockTrackerWrapper{
+		activePods: map[string]string{}, // All pods vanished, VMs are zombies
+	}
+
+	terminated := make(map[string]bool)
+	var termMu sync.Mutex
+	reconciler := NewReconciler(awsProv, mockTracker, nil, "multi-cluster", 5*time.Minute)
+	reconciler.SetConfiguredRegions("us-east-1", "us-west-2", "eu-central-1")
+	reconciler.SetOnTerminated(func(id string) {
+		termMu.Lock()
+		defer termMu.Unlock()
+		terminated[id] = true
+	})
+
+	res, err := reconciler.ReapIdleWatchdog(context.Background())
+	if err != nil {
+		t.Fatalf("ReapIdleWatchdog failed: %v", err)
+	}
+
+	if len(res.TerminatedZombies) != 3 {
+		t.Fatalf("expected 3 terminated zombies across 3 regions, got %d: %v", len(res.TerminatedZombies), res.TerminatedZombies)
+	}
+
+	if peak := peakScans.Load(); peak < 2 {
+		t.Fatalf("expected concurrent region scans, got peak concurrency %d", peak)
+	}
+}

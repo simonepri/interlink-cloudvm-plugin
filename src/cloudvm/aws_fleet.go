@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -115,6 +116,20 @@ type FleetResponse struct {
 	ActiveWorkers int         `json:"activeWorkers"`
 	Instances     []*Instance `json:"instances"`
 	Errors        []string    `json:"errors,omitempty"`
+}
+
+// RegionalClusterFact stores dynamic Launch Template and subnet configuration for a specific AWS region.
+type RegionalClusterFact struct {
+	LaunchTemplateID   string   `json:"launchTemplateId,omitempty"`
+	LaunchTemplateName string   `json:"launchTemplateName,omitempty"`
+	SubnetIDs          []string `json:"subnetIds,omitempty"`
+	SecurityGroupIDs   []string `json:"securityGroupIds,omitempty"`
+}
+
+// ClusterFacts holds the regional deployment facts for dynamic Launch Template and subnet selection.
+type ClusterFacts struct {
+	ClusterTag string                         `json:"clusterTag,omitempty"`
+	Regions    map[string]RegionalClusterFact `json:"regions,omitempty"`
 }
 
 // EC2FleetClient abstracts the AWS EC2 client for unit testing.
@@ -469,6 +484,8 @@ type AWSProvider struct {
 	Region            string
 	configuredRegions []string
 	clients           map[string]EC2FleetClient
+	ec2Clients        map[string]*ec2.Client
+	clusterFacts      *ClusterFacts
 	regionStore       *RegionStore
 	instanceRegions   map[string]string
 	missingCount      map[string]int
@@ -509,13 +526,162 @@ func NewAWSProvider(region string, additionalRegions ...string) *AWSProvider {
 		}
 	}
 
+	facts := &ClusterFacts{
+		Regions: make(map[string]RegionalClusterFact),
+	}
+	if rawFacts := os.Getenv("CLUSTER_FACTS"); rawFacts != "" {
+		_ = json.Unmarshal([]byte(rawFacts), facts)
+	}
+	if facts.Regions == nil {
+		facts.Regions = make(map[string]RegionalClusterFact)
+	}
+
 	return &AWSProvider{
 		Region:            region,
 		configuredRegions: confRegions,
 		clients:           make(map[string]EC2FleetClient),
+		ec2Clients:        make(map[string]*ec2.Client),
+		clusterFacts:      facts,
 		regionStore:       regStore,
 		instanceRegions:   initialRegions,
 	}
+}
+
+// SetClusterFacts updates the regional cluster facts.
+func (p *AWSProvider) SetClusterFacts(facts *ClusterFacts) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clusterFacts = facts
+}
+
+// ClusterFacts returns a copy of the current regional cluster facts.
+func (p *AWSProvider) ClusterFacts() *ClusterFacts {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.clusterFacts == nil {
+		return nil
+	}
+	cp := &ClusterFacts{
+		ClusterTag: p.clusterFacts.ClusterTag,
+		Regions:    make(map[string]RegionalClusterFact, len(p.clusterFacts.Regions)),
+	}
+	for k, v := range p.clusterFacts.Regions {
+		cp.Regions[k] = v
+	}
+	return cp
+}
+
+// SetRegionalLaunchTemplate configures the regional launch template (ID or Name) for a region.
+func (p *AWSProvider) SetRegionalLaunchTemplate(region, lt string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.clusterFacts == nil {
+		p.clusterFacts = &ClusterFacts{Regions: make(map[string]RegionalClusterFact)}
+	}
+	if p.clusterFacts.Regions == nil {
+		p.clusterFacts.Regions = make(map[string]RegionalClusterFact)
+	}
+	fact := p.clusterFacts.Regions[region]
+	if strings.HasPrefix(lt, "lt-") {
+		fact.LaunchTemplateID = lt
+	} else {
+		fact.LaunchTemplateName = lt
+	}
+	p.clusterFacts.Regions[region] = fact
+}
+
+// SetRegionalSubnets configures the regional subnets for a region.
+func (p *AWSProvider) SetRegionalSubnets(region string, subnets []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.clusterFacts == nil {
+		p.clusterFacts = &ClusterFacts{Regions: make(map[string]RegionalClusterFact)}
+	}
+	if p.clusterFacts.Regions == nil {
+		p.clusterFacts.Regions = make(map[string]RegionalClusterFact)
+	}
+	fact := p.clusterFacts.Regions[region]
+	fact.SubnetIDs = subnets
+	p.clusterFacts.Regions[region] = fact
+}
+
+// ResolveRegionalLaunchTemplate resolves launch template ID and Name for a region from cluster facts.
+func (p *AWSProvider) ResolveRegionalLaunchTemplate(region string) (string, string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.clusterFacts == nil || p.clusterFacts.Regions == nil {
+		return "", ""
+	}
+	fact, ok := p.clusterFacts.Regions[region]
+	if !ok {
+		return "", ""
+	}
+	return fact.LaunchTemplateID, fact.LaunchTemplateName
+}
+
+// ResolveRegionalSubnets resolves subnet IDs for a region from cluster facts.
+func (p *AWSProvider) ResolveRegionalSubnets(region string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.clusterFacts == nil || p.clusterFacts.Regions == nil {
+		return nil
+	}
+	fact, ok := p.clusterFacts.Regions[region]
+	if !ok || len(fact.SubnetIDs) == 0 {
+		return nil
+	}
+	res := make([]string, len(fact.SubnetIDs))
+	copy(res, fact.SubnetIDs)
+	return res
+}
+
+// SetEC2Client registers a concrete *ec2.Client into the multi-region client pool.
+func (p *AWSProvider) SetEC2Client(region string, c *ec2.Client) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ec2Clients == nil {
+		p.ec2Clients = make(map[string]*ec2.Client)
+	}
+	p.ec2Clients[region] = c
+	if p.clients == nil {
+		p.clients = make(map[string]EC2FleetClient)
+	}
+	p.clients[region] = c
+}
+
+// GetEC2Client returns the concrete *ec2.Client for the given region from the pool.
+func (p *AWSProvider) GetEC2Client(ctx context.Context, region string) (*ec2.Client, error) {
+	if region == "" {
+		region = p.Region
+	}
+	p.mu.RLock()
+	if c, ok := p.ec2Clients[region]; ok && c != nil {
+		p.mu.RUnlock()
+		return c, nil
+	}
+	p.mu.RUnlock()
+
+	client, err := p.getClient(ctx, region)
+	if err != nil {
+		return nil, err
+	}
+	if concrete, ok := client.(*ec2.Client); ok {
+		return concrete, nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.ec2Clients[region], nil
+}
+
+// EC2Clients returns a thread-safe copy of the multi-region concrete ec2.Client pool.
+func (p *AWSProvider) EC2Clients() map[string]*ec2.Client {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	pool := make(map[string]*ec2.Client, len(p.ec2Clients))
+	for k, v := range p.ec2Clients {
+		pool[k] = v
+	}
+	return pool
 }
 
 // SetRegionStore overrides the region store for instance-to-region mapping persistence.
@@ -558,6 +724,12 @@ func (p *AWSProvider) SetRegionClient(region string, c EC2FleetClient) {
 		p.clients = make(map[string]EC2FleetClient)
 	}
 	p.clients[region] = c
+	if concrete, ok := c.(*ec2.Client); ok {
+		if p.ec2Clients == nil {
+			p.ec2Clients = make(map[string]*ec2.Client)
+		}
+		p.ec2Clients[region] = concrete
+	}
 }
 
 func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetClient, error) {
@@ -589,6 +761,10 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 		p.clients = make(map[string]EC2FleetClient)
 	}
 	p.clients[region] = cl
+	if p.ec2Clients == nil {
+		p.ec2Clients = make(map[string]*ec2.Client)
+	}
+	p.ec2Clients[region] = cl
 	return cl, nil
 }
 
@@ -674,11 +850,29 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}
 	encodedUserData := base64.StdEncoding.EncodeToString(buf.Bytes())
 
+	ltID := spec.LaunchTemplateID
+	ltName := spec.LaunchTemplateName
+	if ltID == "" && ltName == "" {
+		regLTID, regLTName := p.ResolveRegionalLaunchTemplate(spec.Region)
+		if regLTID != "" {
+			ltID = regLTID
+		} else if regLTName != "" {
+			ltName = regLTName
+		}
+	}
+
+	subnetIDs := spec.SubnetIDs
+	if len(subnetIDs) == 0 {
+		if regSubnets := p.ResolveRegionalSubnets(spec.Region); len(regSubnets) > 0 {
+			subnetIDs = regSubnets
+		}
+	}
+
 	req := &FleetRequest{
 		Region:             spec.Region,
 		TargetCapacity:     1,
 		InstanceTypes:      instanceTypes,
-		SubnetIDs:          spec.SubnetIDs,
+		SubnetIDs:          subnetIDs,
 		ClusterTag:         spec.ClusterTag,
 		PodName:            spec.PodName,
 		PodNamespace:       spec.PodNamespace,
@@ -686,8 +880,8 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		CostCenter:         spec.CostCenter,
 		JobID:              spec.JobID,
 		UserData:           encodedUserData,
-		LaunchTemplateID:   spec.LaunchTemplateID,
-		LaunchTemplateName: spec.LaunchTemplateName,
+		LaunchTemplateID:   ltID,
+		LaunchTemplateName: ltName,
 		MarketType:         spec.MarketType,
 		MaxPrice:           spec.MaxPrice,
 		PricePolicy:        spec.PricePolicy,
@@ -871,129 +1065,157 @@ func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTa
 	instancesByRegion := make(map[string][]*Instance)
 	errorsByRegion := make(map[string]error)
 
+	type regResult struct {
+		region    string
+		instances []*Instance
+		seenIDs   map[string]bool
+		err       error
+	}
+
+	resultsChan := make(chan regResult, len(regionsMap))
+	var wg sync.WaitGroup
+
 	for reg := range regionsMap {
-		client, err := p.getClient(ctx, reg)
-		if err != nil {
-			errorsByRegion[reg] = fmt.Errorf("failed to get AWS client for region %s: %w", reg, err)
-			continue
-		}
-		out, err := DescribeAllInstances(ctx, client, &ec2.DescribeInstancesInput{
-			Filters: []ec2types.Filter{
-				{
-					Name:   aws.String("tag:ClusterTag"),
-					Values: []string{clusterTag},
-				},
-				{
-					Name:   aws.String("instance-state-name"),
-					Values: []string{"pending", "running"},
-				},
-			},
-		})
-		if err != nil {
-			errorsByRegion[reg] = fmt.Errorf("failed to describe instances in region %s: %w", reg, err)
-			continue
-		}
-
-		var regionInstances []*Instance
-		seenInReg := make(map[string]bool)
-		for _, res := range out.Reservations {
-			for _, inst := range res.Instances {
-				podName := ""
-				podNamespace := "default"
-				podUID := ""
-				runnerToken := ""
-				for _, tag := range inst.Tags {
-					k := aws.ToString(tag.Key)
-					v := aws.ToString(tag.Value)
-					switch k {
-					case "PodName":
-						podName = v
-					case "Namespace":
-						podNamespace = v
-					case "PodUID":
-						podUID = v
-					case "RunnerToken":
-						runnerToken = v
-					}
-				}
-				instID := aws.ToString(inst.InstanceId)
-				seenInReg[instID] = true
-
-				stateReasonCode := ""
-				stateReasonMsg := ""
-				if inst.StateReason != nil {
-					stateReasonCode = aws.ToString(inst.StateReason.Code)
-					stateReasonMsg = aws.ToString(inst.StateReason.Message)
-				}
-				marketType := "on-demand"
-				if inst.InstanceLifecycle == ec2types.InstanceLifecycleTypeSpot {
-					marketType = "spot"
-				}
-
-				p.mu.Lock()
-				regChanged := false
-				if p.instanceRegions == nil {
-					p.instanceRegions = make(map[string]string)
-				}
-				if p.instanceRegions[instID] != reg {
-					p.instanceRegions[instID] = reg
-					regChanged = true
-				}
-				p.mu.Unlock()
-				if regChanged && p.regionStore != nil {
-					_ = p.regionStore.Set(instID, reg)
-				}
-
-				regionInstances = append(regionInstances, &Instance{
-					ID:           instID,
-					Provider:     ProviderAWS,
-					Region:       reg,
-					InstanceType: string(inst.InstanceType),
-					IP:           aws.ToString(inst.PrivateIpAddress),
-					State:        StateRunning,
-					CreatedAt:    aws.ToTime(inst.LaunchTime),
-					Metadata: map[string]string{
-						"podName":            podName,
-						"namespace":          podNamespace,
-						"podUID":             podUID,
-						"marketType":         marketType,
-						"clusterTag":         clusterTag,
-						"runnerToken":        runnerToken,
-						"stateReasonCode":    stateReasonCode,
-						"stateReasonMessage": stateReasonMsg,
+		wg.Add(1)
+		go func(targetRegion string) {
+			defer wg.Done()
+			client, err := p.getClient(ctx, targetRegion)
+			if err != nil {
+				resultsChan <- regResult{region: targetRegion, err: fmt.Errorf("failed to get AWS client for region %s: %w", targetRegion, err)}
+				return
+			}
+			out, err := DescribeAllInstances(ctx, client, &ec2.DescribeInstancesInput{
+				Filters: []ec2types.Filter{
+					{
+						Name:   aws.String("tag:ClusterTag"),
+						Values: []string{clusterTag},
 					},
-				})
+					{
+						Name:   aws.String("instance-state-name"),
+						Values: []string{"pending", "running"},
+					},
+				},
+			})
+			if err != nil {
+				resultsChan <- regResult{region: targetRegion, err: fmt.Errorf("failed to describe instances in region %s: %w", targetRegion, err)}
+				return
+			}
+
+			var regionInstances []*Instance
+			seenInReg := make(map[string]bool)
+			for _, res := range out.Reservations {
+				for _, inst := range res.Instances {
+					podName := ""
+					podNamespace := "default"
+					podUID := ""
+					runnerToken := ""
+					for _, tag := range inst.Tags {
+						k := aws.ToString(tag.Key)
+						v := aws.ToString(tag.Value)
+						switch k {
+						case "PodName":
+							podName = v
+						case "Namespace":
+							podNamespace = v
+						case "PodUID":
+							podUID = v
+						case "RunnerToken":
+							runnerToken = v
+						}
+					}
+					instID := aws.ToString(inst.InstanceId)
+					seenInReg[instID] = true
+
+					stateReasonCode := ""
+					stateReasonMsg := ""
+					if inst.StateReason != nil {
+						stateReasonCode = aws.ToString(inst.StateReason.Code)
+						stateReasonMsg = aws.ToString(inst.StateReason.Message)
+					}
+					marketType := "on-demand"
+					if inst.InstanceLifecycle == ec2types.InstanceLifecycleTypeSpot {
+						marketType = "spot"
+					}
+
+					regionInstances = append(regionInstances, &Instance{
+						ID:           instID,
+						Provider:     ProviderAWS,
+						Region:       targetRegion,
+						InstanceType: string(inst.InstanceType),
+						IP:           aws.ToString(inst.PrivateIpAddress),
+						State:        StateRunning,
+						CreatedAt:    aws.ToTime(inst.LaunchTime),
+						Metadata: map[string]string{
+							"podName":            podName,
+							"namespace":          podNamespace,
+							"podUID":             podUID,
+							"marketType":         marketType,
+							"clusterTag":         clusterTag,
+							"runnerToken":        runnerToken,
+							"stateReasonCode":    stateReasonCode,
+							"stateReasonMessage": stateReasonMsg,
+						},
+					})
+				}
+			}
+			resultsChan <- regResult{region: targetRegion, instances: regionInstances, seenIDs: seenInReg}
+		}(reg)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	var allChangedIDs []string
+	var allChangedRegs []string
+	var allStaleIDs []string
+
+	for res := range resultsChan {
+		if res.err != nil {
+			errorsByRegion[res.region] = res.err
+			continue
+		}
+		instancesByRegion[res.region] = res.instances
+
+		p.mu.Lock()
+		if p.instanceRegions == nil {
+			p.instanceRegions = make(map[string]string)
+		}
+		for _, inst := range res.instances {
+			if p.instanceRegions[inst.ID] != res.region {
+				p.instanceRegions[inst.ID] = res.region
+				allChangedIDs = append(allChangedIDs, inst.ID)
+				allChangedRegs = append(allChangedRegs, res.region)
 			}
 		}
-		instancesByRegion[reg] = regionInstances
 
-		// Prune stale instance mappings that belonged to this region only after >= 3 consecutive misses
-		p.mu.Lock()
 		if p.missingCount == nil {
 			p.missingCount = make(map[string]int)
 		}
-		var staleIDs []string
 		for id, mappedReg := range p.instanceRegions {
-			if mappedReg == reg {
-				if seenInReg[id] {
+			if mappedReg == res.region {
+				if res.seenIDs[id] {
 					delete(p.missingCount, id)
 				} else {
 					p.missingCount[id]++
 					if p.missingCount[id] >= 3 {
-						staleIDs = append(staleIDs, id)
+						allStaleIDs = append(allStaleIDs, id)
 					}
 				}
 			}
 		}
-		for _, id := range staleIDs {
+		for _, id := range allStaleIDs {
 			delete(p.instanceRegions, id)
 			delete(p.missingCount, id)
 		}
 		p.mu.Unlock()
-		if p.regionStore != nil {
-			for _, id := range staleIDs {
-				_ = p.regionStore.Delete(id)
-			}
+	}
+
+	if p.regionStore != nil {
+		for i, id := range allChangedIDs {
+			_ = p.regionStore.Set(id, allChangedRegs[i])
+		}
+		for _, id := range allStaleIDs {
+			_ = p.regionStore.Delete(id)
 		}
 	}
 

@@ -496,3 +496,60 @@ func TestCompletedStore_NullFileDoesNotPanic(t *testing.T) {
 		t.Fatalf("expected record to be retrievable from previously null store")
 	}
 }
+
+func TestNodeStore_SetGetDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "nodes.json")
+
+	ns, err := NewNodeStore(storePath)
+	if err != nil {
+		t.Fatalf("failed to create NodeStore: %v", err)
+	}
+
+	if node := ns.Get("i-999"); node != nil {
+		t.Fatalf("expected nil for non-existent node, got %+v", node)
+	}
+
+	now := time.Now().UTC()
+	rec := &NodeRecord{
+		InstanceID:   "i-999",
+		Region:       "us-east-1",
+		Provider:     "aws",
+		IP:           "10.0.0.99",
+		InstanceType: "g5.2xlarge",
+		Status:       "Running",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	if err := ns.Set("i-999", rec); err != nil {
+		t.Fatalf("failed to set node record: %v", err)
+	}
+
+	got := ns.Get("i-999")
+	if got == nil || got.Region != "us-east-1" || got.InstanceID != "i-999" {
+		t.Fatalf("unexpected node retrieved: %+v", got)
+	}
+
+	all := ns.GetAll()
+	if len(all) != 1 || all["i-999"].Region != "us-east-1" {
+		t.Fatalf("unexpected GetAll result: %+v", all)
+	}
+
+	// Reload from disk
+	ns2, err := NewNodeStore(storePath)
+	if err != nil {
+		t.Fatalf("failed to reload NodeStore: %v", err)
+	}
+	if got2 := ns2.Get("i-999"); got2 == nil || got2.Region != "us-east-1" {
+		t.Fatalf("expected node to persist across reload: %+v", got2)
+	}
+
+	// Delete
+	if err := ns2.Delete("i-999"); err != nil {
+		t.Fatalf("failed to delete node: %v", err)
+	}
+	if got3 := ns2.Get("i-999"); got3 != nil {
+		t.Fatalf("expected node to be deleted, got %+v", got3)
+	}
+}

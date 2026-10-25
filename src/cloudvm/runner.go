@@ -15,6 +15,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -692,4 +694,298 @@ func (d *ReverseTunnelDialer) DialAndServeOnce(ctx context.Context, handler http
 	case err := <-errChan:
 		return err
 	}
+}
+
+// StatusFrameType identifies the event type of an asynchronous status frame.
+type StatusFrameType string
+
+const (
+	FrameTypePodInterrupted StatusFrameType = "PodInterrupted"
+	FrameTypeStatusUpdate   StatusFrameType = "StatusUpdate"
+)
+
+// StatusFrame represents an asynchronous status frame pushed down the tunnel.
+type StatusFrame struct {
+	Type      StatusFrameType        `json:"type"`
+	Status    string                 `json:"status,omitempty"`
+	Reason    string                 `json:"reason,omitempty"`
+	Message   string                 `json:"message,omitempty"`
+	PodUID    string                 `json:"podUID,omitempty"`
+	Timestamp time.Time              `json:"timestamp"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// StatusFramePusher abstracts pushing a status frame down the reverse tunnel.
+type StatusFramePusher interface {
+	PushStatusFrame(ctx context.Context, frame *StatusFrame) error
+}
+
+// StatusFramePusherFunc allows using a plain function as a StatusFramePusher.
+type StatusFramePusherFunc func(ctx context.Context, frame *StatusFrame) error
+
+func (f StatusFramePusherFunc) PushStatusFrame(ctx context.Context, frame *StatusFrame) error {
+	return f(ctx, frame)
+}
+
+// HTTPFramePusher pushes StatusFrames to an HTTP endpoint (such as a reverse tunnel gateway).
+type HTTPFramePusher struct {
+	endpoint   string
+	authToken  string
+	httpClient *http.Client
+}
+
+// NewHTTPFramePusher initializes an HTTPFramePusher.
+func NewHTTPFramePusher(endpoint, authToken string, client *http.Client) *HTTPFramePusher {
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+	return &HTTPFramePusher{
+		endpoint:   endpoint,
+		authToken:  authToken,
+		httpClient: client,
+	}
+}
+
+// PushStatusFrame posts a serialized StatusFrame to the endpoint.
+func (p *HTTPFramePusher) PushStatusFrame(ctx context.Context, frame *StatusFrame) error {
+	payload, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+p.authToken)
+	}
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status code %d from frame endpoint", resp.StatusCode)
+	}
+	return nil
+}
+
+// SpotInterruptionWatcherConfig configures the spot interruption watcher.
+type SpotInterruptionWatcherConfig struct {
+	IMDSEndpoint      string
+	IMDSTokenEndpoint string
+	ACPIEventPath     string
+	PollInterval      time.Duration
+	HTTPClient        *http.Client
+	Pusher            StatusFramePusher
+	OnInterruption    func(frame *StatusFrame)
+}
+
+// SpotInterruptionWatcher monitors AWS IMDS and ACPI events for spot interruptions,
+// pushing a PodInterrupted frame down the tunnel immediately upon warning.
+type SpotInterruptionWatcher struct {
+	cfg         SpotInterruptionWatcherConfig
+	mu          sync.RWMutex
+	interrupted bool
+	activePods  map[string]bool
+	stopCh      chan struct{}
+	doneCh      chan struct{}
+}
+
+// NewSpotInterruptionWatcher initializes a SpotInterruptionWatcher.
+func NewSpotInterruptionWatcher(cfg SpotInterruptionWatcherConfig) *SpotInterruptionWatcher {
+	if cfg.IMDSEndpoint == "" {
+		cfg.IMDSEndpoint = "http://169.254.169.254/latest/meta-data/spot/instance-action"
+	}
+	if cfg.IMDSTokenEndpoint == "" {
+		cfg.IMDSTokenEndpoint = "http://169.254.169.254/latest/api/token"
+	}
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 2 * time.Second
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: 1 * time.Second}
+	}
+	return &SpotInterruptionWatcher{
+		cfg:        cfg,
+		activePods: make(map[string]bool),
+		stopCh:     make(chan struct{}),
+		doneCh:     make(chan struct{}),
+	}
+}
+
+// TrackPod registers an active podUID with the watcher.
+func (w *SpotInterruptionWatcher) TrackPod(podUID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.activePods[podUID] = true
+}
+
+// UntrackPod unregisters a completed or evicted podUID from the watcher.
+func (w *SpotInterruptionWatcher) UntrackPod(podUID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.activePods, podUID)
+}
+
+// PollIMDSOnce checks AWS IMDS for an active spot instance action.
+func (w *SpotInterruptionWatcher) PollIMDSOnce(ctx context.Context) (bool, string, error) {
+	token := ""
+	tokenReq, err := http.NewRequestWithContext(ctx, http.MethodPut, w.cfg.IMDSTokenEndpoint, nil)
+	if err == nil {
+		tokenReq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+		if tokenResp, err := w.cfg.HTTPClient.Do(tokenReq); err == nil {
+			defer tokenResp.Body.Close()
+			if tokenResp.StatusCode == http.StatusOK {
+				body, _ := io.ReadAll(tokenResp.Body)
+				token = strings.TrimSpace(string(body))
+			}
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, w.cfg.IMDSEndpoint, nil)
+	if err != nil {
+		return false, "", err
+	}
+	if token != "" {
+		req.Header.Set("X-aws-ec2-metadata-token", token)
+	}
+
+	resp, err := w.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return false, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return true, strings.TrimSpace(string(body)), nil
+	}
+	return false, "", nil
+}
+
+// CheckACPIOnce checks whether the ACPI event source indicates a power/sleep event.
+func (w *SpotInterruptionWatcher) CheckACPIOnce(_ context.Context) (bool, string, error) {
+	if w.cfg.ACPIEventPath == "" {
+		return false, "", nil
+	}
+	cleanPath := filepath.Clean(w.cfg.ACPIEventPath)
+	data, err := os.ReadFile(cleanPath)
+	if err != nil {
+		return false, "", err
+	}
+	content := string(data)
+	if strings.Contains(content, "button/power") || strings.Contains(content, "button/sleep") ||
+		strings.Contains(content, "PBTN") || strings.Contains(content, "PWRB") {
+		return true, content, nil
+	}
+	return false, "", nil
+}
+
+// TriggerInterruption constructs and immediately pushes a PodInterrupted status frame down the tunnel.
+func (w *SpotInterruptionWatcher) TriggerInterruption(ctx context.Context, reason, message string) error {
+	w.mu.Lock()
+	if w.interrupted {
+		w.mu.Unlock()
+		return nil
+	}
+	w.interrupted = true
+	podUIDs := make([]string, 0, len(w.activePods))
+	for uid := range w.activePods {
+		podUIDs = append(podUIDs, uid)
+	}
+	w.mu.Unlock()
+
+	if reason == "" {
+		reason = "SpotInterruption"
+	}
+	if message == "" {
+		message = "AWS Spot interruption notice received (2-minute warning)"
+	}
+
+	frame := &StatusFrame{
+		Type:      FrameTypePodInterrupted,
+		Status:    "PodInterrupted",
+		Reason:    reason,
+		Message:   message,
+		Timestamp: time.Now().UTC(),
+		Metadata: map[string]interface{}{
+			"source": "imds/acpi",
+		},
+	}
+
+	if w.cfg.OnInterruption != nil {
+		w.cfg.OnInterruption(frame)
+	}
+
+	var lastErr error
+	if w.cfg.Pusher != nil {
+		if err := w.cfg.Pusher.PushStatusFrame(ctx, frame); err != nil {
+			log.Printf("[runner] Warning: failed to push PodInterrupted frame: %v", err)
+			lastErr = err
+		}
+		for _, uid := range podUIDs {
+			podFrame := &StatusFrame{
+				Type:      FrameTypePodInterrupted,
+				Status:    "PodInterrupted",
+				Reason:    reason,
+				Message:   message,
+				PodUID:    uid,
+				Timestamp: time.Now().UTC(),
+			}
+			if err := w.cfg.Pusher.PushStatusFrame(ctx, podFrame); err != nil {
+				lastErr = err
+			}
+		}
+	}
+
+	return lastErr
+}
+
+// IsInterrupted reports whether a spot interruption signal has been observed.
+func (w *SpotInterruptionWatcher) IsInterrupted() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.interrupted
+}
+
+// Start launches the background polling and event listener loops.
+func (w *SpotInterruptionWatcher) Start(ctx context.Context) {
+	go func() {
+		defer close(w.doneCh)
+		ticker := time.NewTicker(w.cfg.PollInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-w.stopCh:
+				return
+			case <-ticker.C:
+				if w.IsInterrupted() {
+					return
+				}
+				if detected, msg, _ := w.PollIMDSOnce(ctx); detected {
+					_ = w.TriggerInterruption(ctx, "SpotInterruption", msg)
+					return
+				}
+				if detected, msg, _ := w.CheckACPIOnce(ctx); detected {
+					_ = w.TriggerInterruption(ctx, "SpotInterruption", "ACPI event: "+msg)
+					return
+				}
+			}
+		}
+	}()
+}
+
+// Stop terminates the background watcher loop.
+func (w *SpotInterruptionWatcher) Stop() {
+	select {
+	case <-w.stopCh:
+	default:
+		close(w.stopCh)
+	}
+	<-w.doneCh
 }

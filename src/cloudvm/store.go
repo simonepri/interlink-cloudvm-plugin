@@ -26,6 +26,18 @@ type CompletedPodRecord struct {
 	FinishedAt time.Time `json:"finishedAt"`
 }
 
+// NodeRecord represents a tracked cloud VM node entry with regional metadata.
+type NodeRecord struct {
+	InstanceID   string    `json:"instanceId"`
+	Region       string    `json:"region"`
+	Provider     string    `json:"provider,omitempty"`
+	IP           string    `json:"ip,omitempty"`
+	InstanceType string    `json:"instanceType,omitempty"`
+	Status       string    `json:"status,omitempty"`
+	CreatedAt    time.Time `json:"createdAt,omitempty"`
+	UpdatedAt    time.Time `json:"updatedAt,omitempty"`
+}
+
 // diskMap is a generic, thread-safe, fsync-backed persistent key-value map.
 type diskMap[V any] struct {
 	mu       sync.RWMutex
@@ -193,6 +205,14 @@ func atomicSaveWithFsync(path string, data []byte) error {
 // ----------------------------------------------------------------------------
 
 // CompletedStoreBackend defines the storage operations for completed pod records.
+
+// NodeStoreBackend defines the storage operations for node tracking records.
+type NodeStoreBackend interface {
+	Get(instanceID string) *NodeRecord
+	Set(instanceID string, rec *NodeRecord) error
+	Delete(instanceID string) error
+	GetAll() map[string]*NodeRecord
+}
 type CompletedStoreBackend interface {
 	Get(podUID string) *CompletedPodRecord
 	Set(podUID string, rec *CompletedPodRecord) error
@@ -270,6 +290,30 @@ func ResetGlobalPGStores() {
 // ----------------------------------------------------------------------------
 // diskMap Backend Implementations
 // ----------------------------------------------------------------------------
+
+type diskMapNodeBackend struct {
+	dm *diskMap[*NodeRecord]
+}
+
+func (b *diskMapNodeBackend) Get(instanceID string) *NodeRecord {
+	rec, _ := b.dm.get(instanceID)
+	return rec
+}
+
+func (b *diskMapNodeBackend) Set(instanceID string, rec *NodeRecord) error {
+	if rec == nil {
+		return nil
+	}
+	return b.dm.set(instanceID, rec, false)
+}
+
+func (b *diskMapNodeBackend) Delete(instanceID string) error {
+	return b.dm.delete(instanceID, false)
+}
+
+func (b *diskMapNodeBackend) GetAll() map[string]*NodeRecord {
+	return b.dm.getAll()
+}
 
 type diskMapCompletedBackend struct {
 	dm *diskMap[*CompletedPodRecord]
@@ -371,6 +415,35 @@ func (b *diskMapTombstoneBackend) GetAll() map[string]time.Time {
 // ----------------------------------------------------------------------------
 // DBStore Generic Backend Implementations
 // ----------------------------------------------------------------------------
+
+type dbStoreNodeBackend struct {
+	db DBStore
+}
+
+func (b *dbStoreNodeBackend) Get(instanceID string) *NodeRecord {
+	rec, err := b.db.GetNode(context.Background(), instanceID)
+	if err != nil {
+		log.Printf("[store] GetNode failed for %s: %v", instanceID, err)
+	}
+	return rec
+}
+
+func (b *dbStoreNodeBackend) Set(instanceID string, rec *NodeRecord) error {
+	return b.db.SetNode(context.Background(), instanceID, rec)
+}
+
+func (b *dbStoreNodeBackend) Delete(instanceID string) error {
+	return b.db.DeleteNode(context.Background(), instanceID)
+}
+
+func (b *dbStoreNodeBackend) GetAll() map[string]*NodeRecord {
+	all, err := b.db.GetAllNodes(context.Background())
+	if err != nil {
+		log.Printf("[store] GetAllNodes failed: %v", err)
+		return make(map[string]*NodeRecord)
+	}
+	return all
+}
 
 type dbStoreCompletedBackend struct {
 	db DBStore
@@ -807,4 +880,73 @@ func (ts *TombstoneStore) GetAll() map[string]time.Time {
 		return nil
 	}
 	return ts.backend.GetAll()
+}
+
+// ----------------------------------------------------------------------------
+// NodeStore
+// ----------------------------------------------------------------------------
+
+// NodeStore safely persists node tracking records locally on PVC storage or remotely in PostgreSQL.
+type NodeStore struct {
+	*diskMap[*NodeRecord]
+	backend NodeStoreBackend
+}
+
+// NewNodeStore initializes a NodeStore with the given file path or connection string.
+// If connStr is provided and non-empty (or DATABASE_URL is set), it uses PostgreSQL;
+// otherwise it falls back to diskMap persistence.
+func NewNodeStore(filePath string, connStr ...string) (*NodeStore, error) {
+	targetConn := resolveConnStr(connStr...)
+	if targetConn != "" {
+		pg, err := getOrCreatePGStore(targetConn)
+		if err != nil {
+			return nil, err
+		}
+		return NewNodeStoreFromDB(pg), nil
+	}
+	dm, err := newDiskMap[*NodeRecord]("node store", filePath, "cloudvm-nodes.json", false, nil)
+	return &NodeStore{
+		backend: &diskMapNodeBackend{dm: dm},
+		diskMap: dm,
+	}, err
+}
+
+// NewNodeStoreFromDB initializes a NodeStore backed by a DBStore.
+func NewNodeStoreFromDB(db DBStore) *NodeStore {
+	if pg, ok := db.(*PGStore); ok && pg != nil {
+		return &NodeStore{backend: pg.Nodes}
+	}
+	return &NodeStore{backend: &dbStoreNodeBackend{db: db}}
+}
+
+// Get returns the NodeRecord for the specified instance ID.
+func (ns *NodeStore) Get(instanceID string) *NodeRecord {
+	if ns == nil || ns.backend == nil {
+		return nil
+	}
+	return ns.backend.Get(instanceID)
+}
+
+// Set stores and persists the node tracking record for the specified instance ID.
+func (ns *NodeStore) Set(instanceID string, rec *NodeRecord) error {
+	if ns == nil || ns.backend == nil || rec == nil {
+		return nil
+	}
+	return ns.backend.Set(instanceID, rec)
+}
+
+// Delete removes and persists the deletion of the specified instance ID.
+func (ns *NodeStore) Delete(instanceID string) error {
+	if ns == nil || ns.backend == nil {
+		return nil
+	}
+	return ns.backend.Delete(instanceID)
+}
+
+// GetAll returns a thread-safe copy of all tracked node records.
+func (ns *NodeStore) GetAll() map[string]*NodeRecord {
+	if ns == nil || ns.backend == nil {
+		return nil
+	}
+	return ns.backend.GetAll()
 }

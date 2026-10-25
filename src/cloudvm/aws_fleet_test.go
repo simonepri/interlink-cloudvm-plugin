@@ -953,3 +953,131 @@ func TestCreateFleet_BackoffRetry_ContextCanceledDuringBackoff(t *testing.T) {
 		t.Fatalf("expected 1 call before context cancellation during sleep, got %d", calls)
 	}
 }
+
+func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
+	p := NewAWSProvider("us-east-1", "us-west-2")
+
+	// 1. EC2 client pool
+	pool := p.EC2Clients()
+	if len(pool) != 0 {
+		t.Fatalf("expected empty initial ec2 client pool, got %d", len(pool))
+	}
+
+	concreteClient := &ec2.Client{}
+	p.SetEC2Client("us-west-2", concreteClient)
+
+	gotClient, err := p.GetEC2Client(context.Background(), "us-west-2")
+	if err != nil {
+		t.Fatalf("GetEC2Client failed: %v", err)
+	}
+	if gotClient != concreteClient {
+		t.Fatalf("expected retrieved client to match registered client")
+	}
+
+	pool = p.EC2Clients()
+	if len(pool) != 1 || pool["us-west-2"] != concreteClient {
+		t.Fatalf("expected us-west-2 in client pool")
+	}
+
+	// 2. ClusterFacts configuration
+	facts := &ClusterFacts{
+		ClusterTag: "prod-cluster",
+		Regions: map[string]RegionalClusterFact{
+			"us-west-2": {
+				LaunchTemplateID: "lt-west-001",
+				SubnetIDs:        []string{"subnet-west-a", "subnet-west-b"},
+			},
+			"us-east-1": {
+				LaunchTemplateName: "interlink-east-template",
+				SubnetIDs:          []string{"subnet-east-a"},
+			},
+		},
+	}
+	p.SetClusterFacts(facts)
+
+	retrievedFacts := p.ClusterFacts()
+	if retrievedFacts == nil || retrievedFacts.ClusterTag != "prod-cluster" {
+		t.Fatalf("unexpected retrieved facts: %+v", retrievedFacts)
+	}
+
+	// Dynamic resolution
+	ltID, ltName := p.ResolveRegionalLaunchTemplate("us-west-2")
+	if ltID != "lt-west-001" || ltName != "" {
+		t.Errorf("expected lt-west-001, got id=%s name=%s", ltID, ltName)
+	}
+	subnets := p.ResolveRegionalSubnets("us-west-2")
+	if len(subnets) != 2 || subnets[0] != "subnet-west-a" || subnets[1] != "subnet-west-b" {
+		t.Errorf("unexpected subnets: %v", subnets)
+	}
+
+	// Update regional facts dynamically
+	p.SetRegionalLaunchTemplate("eu-west-1", "lt-eu-999")
+	p.SetRegionalSubnets("eu-west-1", []string{"subnet-eu-1"})
+	euLTID, _ := p.ResolveRegionalLaunchTemplate("eu-west-1")
+	if euLTID != "lt-eu-999" {
+		t.Errorf("expected lt-eu-999 for eu-west-1, got %s", euLTID)
+	}
+
+	// 3. Launch with regional fact resolution
+	var capturedOverrides []ec2types.FleetLaunchTemplateOverridesRequest
+	var capturedLT *ec2types.FleetLaunchTemplateSpecificationRequest
+	mockClient := &mockEC2FleetClient{
+		createFleetFn: func(_ context.Context, input *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+			if len(input.LaunchTemplateConfigs) > 0 {
+				capturedOverrides = input.LaunchTemplateConfigs[0].Overrides
+				capturedLT = input.LaunchTemplateConfigs[0].LaunchTemplateSpecification
+			}
+			return &ec2.CreateFleetOutput{
+				FleetId: aws.String("fleet-facts-123"),
+				Instances: []ec2types.CreateFleetInstance{
+					{
+						InstanceIds:  []string{"i-facts-node"},
+						InstanceType: ec2types.InstanceTypeG5Xlarge,
+					},
+				},
+			}, nil
+		},
+		describeInstancesFn: func(_ context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			return &ec2.DescribeInstancesOutput{
+				Reservations: []ec2types.Reservation{
+					{
+						Instances: []ec2types.Instance{
+							{
+								InstanceId:       aws.String("i-facts-node"),
+								InstanceType:     ec2types.InstanceTypeG5Xlarge,
+								PrivateIpAddress: aws.String("10.2.1.20"),
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+	p.SetRegionClient("us-west-2", mockClient)
+
+	// Launch with NO LaunchTemplate and NO SubnetIDs specified in spec
+	spec := &InstanceSpec{
+		PodName:      "test-fact-pod",
+		PodNamespace: "default",
+		PodUID:       "uid-fact-1",
+		Region:       "us-west-2",
+		InstanceType: "g5.xlarge",
+		ClusterTag:   "prod-cluster",
+	}
+
+	inst, err := p.Launch(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	if inst.ID != "i-facts-node" {
+		t.Fatalf("expected instance i-facts-node, got %s", inst.ID)
+	}
+
+	if capturedLT == nil || aws.ToString(capturedLT.LaunchTemplateId) != "lt-west-001" {
+		t.Fatalf("expected launch template lt-west-001 from facts, got: %+v", capturedLT)
+	}
+
+	if len(capturedOverrides) != 2 {
+		t.Fatalf("expected 2 overrides (1 shape x 2 subnets from facts), got %d", len(capturedOverrides))
+	}
+}
