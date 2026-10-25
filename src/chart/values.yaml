@@ -16,6 +16,8 @@ provider:
   clusterTag: "interlink-cloudvm"
   awsRegion: "us-east-1"
   awsRegions: []
+  # Region each virtual node's pods launch in, keyed by node name; a cloudvm.vk.io/region annotation overrides it.
+  nodeRegions: {}
   awsLaunchTemplateId: ""
   awsLaunchTemplateName: ""
   awsSubnetId: ""

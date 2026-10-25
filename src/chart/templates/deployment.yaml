@@ -39,6 +39,10 @@ spec:
               value: "{{ .Values.provider.awsRegion }}"
             - name: AWS_REGIONS
               value: "{{ join "," .Values.provider.awsRegions | default .Values.provider.awsRegion }}"
+            {{- with .Values.provider.nodeRegions }}
+            - name: NODE_REGIONS
+              value: {{ toJson . | quote }}
+            {{- end }}
             - name: RECONCILE_LAUNCH_GRACE_SECONDS
               value: "{{ .Values.provider.reconcileLaunchGraceSeconds | default 120 }}"
             - name: REGION_STORE_PATH

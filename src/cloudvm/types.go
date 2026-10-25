@@ -234,6 +234,7 @@ type ContainerSpec struct {
 }
 
 type PodSpecWrapper struct {
+	NodeName         string                        `json:"nodeName,omitempty"`
 	NodeSelector     map[string]string             `json:"nodeSelector,omitempty"`
 	Containers       []ContainerSpec               `json:"containers"`
 	SecurityContext  *PodSecurityContext           `json:"securityContext,omitempty"`
