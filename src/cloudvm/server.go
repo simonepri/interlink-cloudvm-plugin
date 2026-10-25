@@ -47,6 +47,7 @@ type Server struct {
 	instances             map[string]*Instance // key: UID and namespace/podName -> *Instance
 	clusterTag            string
 	defaultRegion         string
+	nodeRegions           map[string]string // virtual node name -> region its pods launch in
 	reconciler            *Reconciler
 	nodePool              *NodePool
 	kmsClient             KMSClient
@@ -163,7 +164,22 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 			s.runnerConcurrency = c
 		}
 	}
+	if raw := os.Getenv("NODE_REGIONS"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &s.nodeRegions); err != nil {
+			log.Printf("[cloudvm] ERROR parsing NODE_REGIONS: %v", err)
+		}
+	}
 	return s
+}
+
+// regionForNode returns the region of the virtual node a pod is bound to, falling back to the default region.
+func (s *Server) regionForNode(nodeName string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if region := s.nodeRegions[nodeName]; region != "" {
+		return region
+	}
+	return s.defaultRegion
 }
 
 // SetRegistryMirrors configures default container registry mirror endpoints.
@@ -583,7 +599,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var finalResp *CreateStruct
 	var finalErr error
 
-	spec, err := PodToInstanceSpec(pod, s.clusterTag, s.defaultRegion)
+	spec, err := PodToInstanceSpec(pod, s.clusterTag, s.regionForNode(pod.Spec.NodeName))
 	if err != nil {
 		finalErr = err
 		http.Error(w, err.Error(), http.StatusBadRequest)

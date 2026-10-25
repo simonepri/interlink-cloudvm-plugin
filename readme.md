@@ -509,6 +509,10 @@ Runner authorization tokens are generated securely per instance and passed throu
 When the provider restarts while an in-VM runner is unreachable, the node is flagged with unverified co-tenants and protected from idle collection and zombie cleanup. Background reconciliation retries container discovery on each reconcile pass for up to 30 minutes before releasing the node for garbage collection.
 
 
+### Regional Virtual Nodes
+
+Run one Virtual Kubelet per region and map each node name to its region with `NODE_REGIONS` (`provider.nodeRegions` in Helm), a JSON object such as `{"virtual-node-clvm-aws-euw1":"eu-west-1"}`. A pod bound to a mapped node launches in that node's region. The region is chosen in this order: the `cloudvm.vk.io/region` annotation, the bound node's region, the pod's `topology.kubernetes.io/region` node selector, then `AWS_REGION`.
+
 ### Reverse Tunnel Configuration
 
 With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers can reach it through the tunnel:
