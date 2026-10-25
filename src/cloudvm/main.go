@@ -24,6 +24,23 @@ func parseCommaList(val string) []string {
 	return out
 }
 
+func parseTickerRegions(val string) []string {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" || strings.EqualFold(trimmed, "auto") {
+		return []string{"auto"}
+	}
+	regions := parseCommaList(trimmed)
+	if len(regions) == 0 {
+		return []string{"auto"}
+	}
+	for _, r := range regions {
+		if strings.EqualFold(r, "auto") {
+			return []string{"auto"}
+		}
+	}
+	return regions
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("[cloudvm] %v", err)
@@ -70,10 +87,7 @@ func run() error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		tickerRegions := strings.Split(os.Getenv("TICKER_REGIONS"), ",")
-		if len(tickerRegions) == 1 && tickerRegions[0] == "" {
-			tickerRegions = []string{awsRegion}
-		}
+		tickerRegions := parseTickerRegions(os.Getenv("TICKER_REGIONS"))
 		interval := 10 * time.Minute
 		if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
 			if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
@@ -81,9 +95,10 @@ func run() error {
 			}
 		}
 		tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
-		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval)
+		fallbackRegions := awsProv.ConfiguredRegions()
+		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval, fallbackRegions...)
 		go spotTicker.Start(ctx)
-		log.Printf("[cloudvm-ticker] Running standalone spot ticker on port %s for %d regions", port, len(tickerRegions)) //nolint:gosec // length safe
+		log.Printf("[cloudvm-ticker] Running standalone spot ticker on port %s for %d regions", port, len(spotTicker.Regions())) //nolint:gosec // length safe
 
 		tickerServer := &http.Server{
 			Addr:         ":" + port,
@@ -197,10 +212,7 @@ func run() error {
 
 	// Embedded spot price ticker
 	if os.Getenv("ENABLE_TICKER") == "true" {
-		tickerRegions := strings.Split(os.Getenv("TICKER_REGIONS"), ",")
-		if len(tickerRegions) == 1 && tickerRegions[0] == "" {
-			tickerRegions = []string{awsRegion}
-		}
+		tickerRegions := parseTickerRegions(os.Getenv("TICKER_REGIONS"))
 		interval := 10 * time.Minute
 		if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
 			if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
@@ -208,10 +220,11 @@ func run() error {
 			}
 		}
 		tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
-		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval)
+		fallbackRegions := awsProv.ConfiguredRegions()
+		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval, fallbackRegions...)
 		go spotTicker.Start(ctx)
 		server.SetSpotTicker(spotTicker)
-		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(tickerRegions)) //nolint:gosec // log length is safe
+		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(spotTicker.Regions())) //nolint:gosec // log length is safe
 	}
 
 	// Background reconciler

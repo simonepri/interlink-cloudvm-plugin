@@ -49,6 +49,7 @@ type SpotAdvisorData struct {
 // SpotAdvisorCollector fetches and caches the AWS Spot Advisor interruption frequency feed.
 type SpotAdvisorCollector struct {
 	mu           sync.RWMutex
+	regions      []string
 	lastData     map[string]map[string]SpotAdvisorEntry // region -> instanceType -> entry
 	lastModified time.Time
 	feedURL      string
@@ -170,6 +171,23 @@ func (c *SpotAdvisorCollector) LastModified() time.Time {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastModified
+}
+
+// SetRegions updates the target regions for the advisor collector.
+func (c *SpotAdvisorCollector) SetRegions(regions []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.regions = make([]string, len(regions))
+	copy(c.regions, regions)
+}
+
+// Regions returns a copy of configured advisor regions.
+func (c *SpotAdvisorCollector) Regions() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, len(c.regions))
+	copy(out, c.regions)
+	return out
 }
 
 // GetAWSOnDemandPrice queries the AWS Price List API for the current Linux shared on-demand price.

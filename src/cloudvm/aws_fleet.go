@@ -711,6 +711,15 @@ func (p *AWSProvider) AddConfiguredRegions(regions ...string) {
 	}
 }
 
+// ConfiguredRegions returns a copy of configured regions monitored by the AWS provider.
+func (p *AWSProvider) ConfiguredRegions() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]string, len(p.configuredRegions))
+	copy(out, p.configuredRegions)
+	return out
+}
+
 // SetClient overrides the internal EC2 client (used for testing).
 func (p *AWSProvider) SetClient(c EC2FleetClient) {
 	p.client = c

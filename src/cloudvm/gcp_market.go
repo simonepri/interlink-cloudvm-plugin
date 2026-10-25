@@ -104,8 +104,16 @@ func NewGCPMarketCollector(regions []string, adviceClient GCPAdviceCapacityClien
 // SetRegions updates the target GCP regions.
 func (c *GCPMarketCollector) SetRegions(regions []string) {
 	if len(regions) > 0 {
-		c.regions = regions
+		c.regions = make([]string, len(regions))
+		copy(c.regions, regions)
 	}
+}
+
+// Regions returns a copy of configured target GCP regions.
+func (c *GCPMarketCollector) Regions() []string {
+	out := make([]string, len(c.regions))
+	copy(out, c.regions)
+	return out
 }
 
 // KnownGCPGPUQuotas maps standard GCP GPU quota names.
