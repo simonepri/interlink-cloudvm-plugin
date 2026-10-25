@@ -318,3 +318,85 @@ func TestSpotPriceTicker_RediscoveryAfterExpiration(t *testing.T) {
 		t.Fatalf("expected updated regions %v after expiration, got %v", expectedUpdated, ticker.Regions())
 	}
 }
+
+// blockingTickerFetcher blocks every call until its context ends, emulating an unreachable regional endpoint.
+type blockingTickerFetcher struct{}
+
+func (blockingTickerFetcher) DescribeSpotPriceHistory(ctx context.Context, _ *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockingTickerFetcher) GetSpotPlacementScores(ctx context.Context, _ *ec2.GetSpotPlacementScoresInput, _ ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockingTickerFetcher) DescribeRegions(ctx context.Context, _ *ec2.DescribeRegionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeRegionsOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestSpotPriceTicker_UnreachableRegionDoesNotStallOthers(t *testing.T) {
+	now := time.Now()
+	score := int32(7)
+	healthy := &mockEC2TickerFetcher{
+		historyOutput: &ec2.DescribeSpotPriceHistoryOutput{
+			SpotPriceHistory: []ec2types.SpotPrice{
+				{
+					InstanceType:     ec2types.InstanceType("g5.xlarge"),
+					AvailabilityZone: aws.String("us-west-2a"),
+					SpotPrice:        aws.String("0.5"),
+					Timestamp:        aws.Time(now),
+				},
+			},
+		},
+		scoresOutput: &ec2.GetSpotPlacementScoresOutput{
+			SpotPlacementScores: []ec2types.SpotPlacementScore{
+				{Region: aws.String("us-west-2"), AvailabilityZoneId: aws.String("usw2-az1"), Score: &score},
+			},
+		},
+	}
+
+	ticker := NewSpotPriceTicker([]string{"me-central-1", "us-west-2"}, []string{"g5.xlarge"}, time.Minute)
+	ticker.SetMetrics(nil)
+	ticker.SetRegionCallTimeout(50 * time.Millisecond)
+	ticker.SetFetcherFactory(func(_ context.Context, region string) (SpotPriceFetcher, error) {
+		if region == "me-central-1" {
+			return blockingTickerFetcher{}, nil
+		}
+		return healthy, nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		ticker.PollOnce(context.Background())
+		ticker.PollPlacementScores(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("polling stalled on an unreachable region")
+	}
+
+	if _, ok := ticker.GetPrice("us-west-2", "g5.xlarge"); !ok {
+		t.Errorf("expected us-west-2 price despite me-central-1 being unreachable")
+	}
+	if _, ok := ticker.AllScores()[tickerKey("us-west-2", "usw2-az1", "g5.xlarge")]; !ok {
+		t.Errorf("expected us-west-2 placement score despite me-central-1 being unreachable")
+	}
+}
+
+func TestSpotPriceTicker_DiscoverRegionsTimesOut(t *testing.T) {
+	ticker := NewSpotPriceTicker(nil, []string{"g5.xlarge"}, time.Minute, "us-west-2")
+	ticker.SetRegionCallTimeout(50 * time.Millisecond)
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) {
+		return blockingTickerFetcher{}, nil
+	})
+
+	got := ticker.DiscoverRegions(context.Background())
+	if !reflect.DeepEqual(got, []string{"us-west-2"}) {
+		t.Fatalf("expected fallback regions after discovery timeout, got %v", got)
+	}
+}

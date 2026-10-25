@@ -45,6 +45,10 @@ type SpotPriceEntry struct {
 	Timestamp        time.Time `json:"timestamp"`
 }
 
+// DefaultRegionCallTimeout bounds each per-region AWS call so one unreachable regional endpoint
+// cannot stall polling for every other region.
+const DefaultRegionCallTimeout = 30 * time.Second
+
 func tickerKey(region, az, instanceType string) string {
 	return fmt.Sprintf("%s/%s/%s", region, az, instanceType)
 }
@@ -61,6 +65,7 @@ type SpotPriceTicker struct {
 	autoDiscoverRegions bool
 	lastRegionDiscovery time.Time
 	defaultRegion       string
+	regionCallTimeout   time.Duration
 	fetcherFactory      func(ctx context.Context, region string) (SpotPriceFetcher, error)
 
 	metrics    *ObservabilityMetrics
@@ -153,6 +158,7 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		scrapeInterval:      scrapeInterval,
 		autoDiscoverRegions: autoDiscover,
 		defaultRegion:       defaultReg,
+		regionCallTimeout:   DefaultRegionCallTimeout,
 		metrics:             metrics,
 		advisor:             advisor,
 		gcpMarket:           gcpMarket,
@@ -173,6 +179,31 @@ func (t *SpotPriceTicker) SetFetcherFactory(fn func(ctx context.Context, region 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.fetcherFactory = fn
+}
+
+// SetRegionCallTimeout overrides the per-region AWS call timeout (for unit testing).
+func (t *SpotPriceTicker) SetRegionCallTimeout(d time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.regionCallTimeout = d
+}
+
+// forEachRegion runs fn concurrently for every region, each under its own timeout, and waits for all.
+func (t *SpotPriceTicker) forEachRegion(ctx context.Context, regions []string, fn func(ctx context.Context, region string)) {
+	t.mu.RLock()
+	timeout := t.regionCallTimeout
+	t.mu.RUnlock()
+	var wg sync.WaitGroup
+	for _, reg := range regions {
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
+			regionCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			fn(regionCtx, region)
+		}(reg)
+	}
+	wg.Wait()
 }
 
 // SetMetrics overrides the metrics registry.
@@ -296,7 +327,11 @@ func (t *SpotPriceTicker) DiscoverRegions(ctx context.Context) []string {
 	t.mu.RLock()
 	defReg := t.defaultRegion
 	factory := t.fetcherFactory
+	timeout := t.regionCallTimeout
 	t.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	if factory == nil {
 		log.Printf("[cloudvm-ticker] Warning: no fetcher factory configured, falling back to configured regions")
@@ -373,12 +408,12 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 	copy(regionsToPoll, t.regions)
 	t.mu.RUnlock()
 
-	for _, reg := range regionsToPoll {
+	t.forEachRegion(ctx, regionsToPoll, func(ctx context.Context, reg string) {
 		fetcher, err := t.fetcherFactory(ctx, reg)
 		if err != nil {
 			cleanReg := sanitizeLog(reg)
 			log.Printf("[cloudvm-ticker] Error initializing EC2 client for %s: %v", cleanReg, err) //nolint:gosec // region sanitized
-			continue
+			return
 		}
 
 		var ec2Types []ec2types.InstanceType
@@ -399,7 +434,7 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 				cleanReg := sanitizeLog(reg)
 				log.Printf("[cloudvm-ticker] Error querying spot prices in %s: %v", cleanReg, err) //nolint:gosec // region sanitized
 			}
-			continue
+			return
 		}
 
 		t.mu.Lock()
@@ -423,7 +458,7 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 			}
 		}
 		t.mu.Unlock()
-	}
+	})
 
 	// Update Prometheus metrics & market offers
 	t.syncMarketMetrics(ctx)
@@ -436,10 +471,10 @@ func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 	copy(regionsToPoll, t.regions)
 	t.mu.RUnlock()
 
-	for _, reg := range regionsToPoll {
+	t.forEachRegion(ctx, regionsToPoll, func(ctx context.Context, reg string) {
 		fetcher, err := t.fetcherFactory(ctx, reg)
 		if err != nil {
-			continue
+			return
 		}
 
 		targetCapacity := int32(1)
@@ -452,7 +487,7 @@ func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 		if err != nil {
 			cleanReg := sanitizeLog(reg)
 			log.Printf("[cloudvm-ticker] Error querying spot placement scores in %s: %v", cleanReg, err) //nolint:gosec // region sanitized
-			continue
+			return
 		}
 
 		now := time.Now()
@@ -473,7 +508,7 @@ func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 			}
 		}
 		t.mu.Unlock()
-	}
+	})
 
 	t.syncMarketMetrics(ctx)
 }
@@ -613,9 +648,9 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 
 	// 4. AWS Quotas
 	if t.quotasAPI != nil {
-		for _, reg := range t.regions {
+		t.forEachRegion(ctx, t.Regions(), func(ctx context.Context, reg string) {
 			QueryAWSGPUQuotas(ctx, t.quotasAPI, reg, t.metrics)
-		}
+		})
 	}
 
 	// 5. GCP Market Collection
