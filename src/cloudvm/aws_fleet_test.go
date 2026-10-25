@@ -1081,3 +1081,39 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 		t.Fatalf("expected 2 overrides (1 shape x 2 subnets from facts), got %d", len(capturedOverrides))
 	}
 }
+
+func TestAWSProvider_UnreachableRegionDoesNotStallInventory(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	prev := regionScanTimeout
+	regionScanTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { regionScanTimeout = prev })
+
+	awsProv := NewAWSProvider("us-west-2", "me-central-1")
+	awsProv.SetRegionClient("me-central-1", &mockEC2FleetClient{
+		describeInstancesFn: func(ctx context.Context, _ *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	awsProv.SetRegionClient("us-west-2", &mockEC2FleetClient{})
+
+	done := make(chan struct{})
+	var byReg map[string][]*Instance
+	var errs map[string]error
+	go func() {
+		byReg, errs = awsProv.ListActiveInstancesByRegion(context.Background(), "test-cluster")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("inventory scan stalled on an unreachable region")
+	}
+
+	if _, ok := byReg["us-west-2"]; !ok {
+		t.Errorf("expected us-west-2 scanned, got %v", byReg)
+	}
+	if errs["me-central-1"] == nil {
+		t.Errorf("expected me-central-1 timeout error, got %v", errs)
+	}
+}

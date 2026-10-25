@@ -1051,6 +1051,10 @@ func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance,
 	return nil, fmt.Errorf("instance %s not found", instanceID)
 }
 
+// regionScanTimeout bounds each region's inventory scan so one unreachable regional endpoint
+// cannot stall reconciliation for every other region.
+var regionScanTimeout = 60 * time.Second
+
 // ListActiveInstancesByRegion queries EC2 across all tracked and configured regions,
 // returning instances grouped by region and recording individual region query errors.
 func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTag string) (map[string][]*Instance, map[string]error) {
@@ -1088,12 +1092,14 @@ func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTa
 		wg.Add(1)
 		go func(targetRegion string) {
 			defer wg.Done()
-			client, err := p.getClient(ctx, targetRegion)
+			regionCtx, cancel := context.WithTimeout(ctx, regionScanTimeout)
+			defer cancel()
+			client, err := p.getClient(regionCtx, targetRegion)
 			if err != nil {
 				resultsChan <- regResult{region: targetRegion, err: fmt.Errorf("failed to get AWS client for region %s: %w", targetRegion, err)}
 				return
 			}
-			out, err := DescribeAllInstances(ctx, client, &ec2.DescribeInstancesInput{
+			out, err := DescribeAllInstances(regionCtx, client, &ec2.DescribeInstancesInput{
 				Filters: []ec2types.Filter{
 					{
 						Name:   aws.String("tag:ClusterTag"),
