@@ -27,12 +27,16 @@ var fakeCatalog = map[string]fakeType{
 	"g5.xlarge":    {4, 16384, 1, 24576, "A10G", "NVIDIA"},
 	"g5.2xlarge":   {8, 32768, 1, 24576, "A10G", "NVIDIA"},
 	"g6.xlarge":    {4, 16384, 1, 23034, "L4", "NVIDIA"},
+	"g5g.xlarge":   {4, 8192, 1, 16384, "T4g", "NVIDIA"},
 	"g5.12xlarge":  {48, 196608, 4, 24576, "A10G", "NVIDIA"},
 	"p4d.24xlarge": {96, 1179648, 8, 40960, "A100", "NVIDIA"},
 	"m7i.large":    {2, 8192, 0, 0, "", ""},
 	"c7i.xlarge":   {4, 8192, 0, 0, "", ""},
 	"r7i.xlarge":   {4, 32768, 0, 0, "", ""},
 }
+
+// fakeArmTypes are the fakeCatalog types with Arm processors.
+var fakeArmTypes = map[string]bool{"g5g.xlarge": true}
 
 // catalogClient serves DescribeInstanceTypes from fakeCatalog, ignoring names it does not know like EC2 filters do.
 func catalogClient(calls *int) *mockEC2FleetClient {
@@ -44,11 +48,15 @@ func catalogClient(calls *int) *mockEC2FleetClient {
 			if !ok {
 				continue
 			}
+			arch := ec2types.ArchitectureTypeX8664
+			if fakeArmTypes[name] {
+				arch = ec2types.ArchitectureTypeArm64
+			}
 			info := ec2types.InstanceTypeInfo{
 				InstanceType:  ec2types.InstanceType(name),
 				VCpuInfo:      &ec2types.VCpuInfo{DefaultVCpus: aws.Int32(ft.vcpus)},
 				MemoryInfo:    &ec2types.MemoryInfo{SizeInMiB: aws.Int64(ft.memMiB)},
-				ProcessorInfo: &ec2types.ProcessorInfo{SupportedArchitectures: []ec2types.ArchitectureType{ec2types.ArchitectureTypeX8664}, Manufacturer: aws.String("Intel")},
+				ProcessorInfo: &ec2types.ProcessorInfo{SupportedArchitectures: []ec2types.ArchitectureType{arch}, Manufacturer: aws.String("Intel")},
 			}
 			if ft.gpus > 0 {
 				info.GpuInfo = &ec2types.GpuInfo{Gpus: []ec2types.GpuDeviceInfo{{
@@ -94,7 +102,7 @@ func derivationProvider(t *testing.T) (*AWSProvider, *int) {
 	p := newTestProvider(t)
 	calls := 0
 	p.SetRegionClient("us-west-1", catalogClient(&calls))
-	p.SetRegionScorer(fakeMarket{"g4dn.xlarge": 0.20, "g6.xlarge": 0.30, "g5.xlarge": 0.40, "g5.2xlarge": 0.50, "g5.12xlarge": 2.0, "p4d.24xlarge": 9.0})
+	p.SetRegionScorer(fakeMarket{"g5g.xlarge": 0.10, "g4dn.xlarge": 0.20, "g6.xlarge": 0.30, "g5.xlarge": 0.40, "g5.2xlarge": 0.50, "g5.12xlarge": 2.0, "p4d.24xlarge": 9.0})
 	return p, &calls
 }
 
@@ -256,5 +264,23 @@ func TestPodInstanceRequirements_KeepsOnlyInstanceLabels(t *testing.T) {
 	}
 	if reqs := podInstanceRequirements(map[string]string{"node.kubernetes.io/instance-type": "g5.xlarge"}, nil); len(reqs) != 1 {
 		t.Fatalf("a real EC2 instance type must stay a requirement, got %+v", reqs)
+	}
+}
+
+func TestDeriveInstanceTypes_LaunchesOnlyArchitecturesWithAnAMI(t *testing.T) {
+	p, _ := derivationProvider(t)
+	// The Arm g5g.xlarge is the cheapest 1-GPU type, but the worker AMI is x86_64 only.
+	got, err := p.launchInstanceTypes(context.Background(), derivationSpec(t, gpuPod(1, "2", "8Gi")))
+	if err != nil {
+		t.Fatalf("launchInstanceTypes: %v", err)
+	}
+	if strings.Contains(strings.Join(got, ","), "g5g") {
+		t.Fatalf("types = %v, want no Arm types for a pod that names no architecture", got)
+	}
+
+	pod := gpuPod(1, "2", "8Gi")
+	pod.Spec.NodeSelector["kubernetes.io/arch"] = "arm64"
+	if _, err := p.Launch(context.Background(), derivationSpec(t, pod)); err == nil || !strings.Contains(err.Error(), errNoInstanceTypeFits.Error()) {
+		t.Fatalf("Launch error = %v, want errNoInstanceTypeFits for an arm64 pod", err)
 	}
 }

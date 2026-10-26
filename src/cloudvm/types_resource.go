@@ -246,8 +246,8 @@ func CapacityForInstanceType(itype string, fallback ResourceVector) ResourceVect
 		gpuModel = "L40S 48GB"
 		gpuMemGB = 48
 	case strings.HasPrefix(itype, "gr6."):
-		gpuModel = "Radeon PRO V620 32GB"
-		gpuMemGB = 32
+		gpuModel = "L4 24GB"
+		gpuMemGB = 24
 	case strings.HasPrefix(itype, "p4d."):
 		gpuModel = "A100 40GB"
 		gpuMemGB = 40

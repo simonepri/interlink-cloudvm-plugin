@@ -20,8 +20,9 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
-// SpotPriceFetcher abstracts AWS DescribeSpotPriceHistory and GetSpotPlacementScores for testing.
+// SpotPriceFetcher abstracts the EC2 reads the ticker makes: spot prices, placement scores, regions, and instance types.
 type SpotPriceFetcher interface {
+	DescribeInstanceTypes(ctx context.Context, params *ec2.DescribeInstanceTypesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error)
 	DescribeSpotPriceHistory(ctx context.Context, params *ec2.DescribeSpotPriceHistoryInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error)
 	GetSpotPlacementScores(ctx context.Context, params *ec2.GetSpotPlacementScoresInput, optFns ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error)
 	DescribeRegions(ctx context.Context, params *ec2.DescribeRegionsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeRegionsOutput, error)
@@ -61,6 +62,9 @@ type SpotPriceTicker struct {
 	regions             []string
 	fallbackRegions     []string
 	instanceTypes       []string
+	instanceArch        map[string]string // instance type -> Kubernetes architecture, for types discovery has seen
+	discoverTypes       bool              // track every GPU type AWS offers instead of an explicit list
+	lastTypeDiscovery   time.Time
 	scrapeInterval      time.Duration
 	autoDiscoverRegions bool
 	lastRegionDiscovery time.Time
@@ -143,7 +147,9 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		copy(initialRegions, cleanFallbacks)
 	}
 
-	if len(instanceTypes) == 0 {
+	// Without an explicit list, the ticker starts from the built-in list and replaces it with every GPU type AWS offers.
+	discoverTypes := len(instanceTypes) == 0
+	if discoverTypes {
 		instanceTypes = DiscoverTrackedShapes(nil)
 	}
 
@@ -159,6 +165,7 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		regions:             initialRegions,
 		fallbackRegions:     cleanFallbacks,
 		instanceTypes:       instanceTypes,
+		discoverTypes:       discoverTypes,
 		scrapeInterval:      scrapeInterval,
 		autoDiscoverRegions: autoDiscover,
 		defaultRegion:       defaultReg,
@@ -445,7 +452,12 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 	t.mu.RLock()
 	regionsToPoll := make([]string, len(t.regions))
 	copy(regionsToPoll, t.regions)
+	typesDue := t.discoverTypes && time.Since(t.lastTypeDiscovery) > gpuTypeDiscoveryInterval
 	t.mu.RUnlock()
+	if typesDue {
+		t.discoverGPUTypes(ctx)
+	}
+	tracked := t.TrackedInstanceTypes()
 
 	t.forEachRegion(ctx, regionsToPoll, func(ctx context.Context, reg string) {
 		fetcher, err := t.fetcherFactory(ctx, reg)
@@ -456,28 +468,39 @@ func (t *SpotPriceTicker) PollOnce(ctx context.Context) {
 		}
 
 		var ec2Types []ec2types.InstanceType
-		for _, itype := range t.instanceTypes {
+		for _, itype := range tracked {
 			ec2Types = append(ec2Types, ec2types.InstanceType(itype))
 		}
 
 		now := time.Now()
 		startTime := now.Add(-30 * time.Minute)
-		out, err := fetcher.DescribeSpotPriceHistory(ctx, &ec2.DescribeSpotPriceHistoryInput{
+		// Read every page: with many tracked types, one page can hold only part of the window.
+		var history []ec2types.SpotPrice
+		input := &ec2.DescribeSpotPriceHistoryInput{
 			InstanceTypes:       ec2Types,
 			ProductDescriptions: []string{"Linux/UNIX", "Linux/UNIX (Amazon VPC)"},
 			StartTime:           aws.Time(startTime),
 			EndTime:             aws.Time(now),
-		})
-		if err != nil || out == nil {
+		}
+		for {
+			page, err := fetcher.DescribeSpotPriceHistory(ctx, input)
 			if err != nil {
 				cleanReg := sanitizeLog(reg)
 				log.Printf("[cloudvm-ticker] Error querying spot prices in %s: %v", cleanReg, err) //nolint:gosec // region sanitized
+				return
 			}
-			return
+			if page == nil {
+				break
+			}
+			history = append(history, page.SpotPriceHistory...)
+			if aws.ToString(page.NextToken) == "" {
+				break
+			}
+			input.NextToken = page.NextToken
 		}
 
 		t.mu.Lock()
-		for _, ph := range out.SpotPriceHistory {
+		for _, ph := range history {
 			itype := string(ph.InstanceType)
 			az := aws.ToString(ph.AvailabilityZone)
 			ts := aws.ToTime(ph.Timestamp)
@@ -518,7 +541,7 @@ func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 
 		targetCapacity := int32(1)
 		out, err := fetcher.GetSpotPlacementScores(ctx, &ec2.GetSpotPlacementScoresInput{
-			InstanceTypes:          t.instanceTypes,
+			InstanceTypes:          t.TrackedInstanceTypes(),
 			RegionNames:            []string{reg},
 			TargetCapacity:         &targetCapacity,
 			SingleAvailabilityZone: aws.Bool(false),
@@ -614,7 +637,10 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			}
 		}
 
-		// Add to solver offers
+		// Add to solver offers; fill plans use only types the worker launch templates can boot.
+		if !t.launchable(p.InstanceType) {
+			continue
+		}
 		pricePerGPU := p.SpotPriceUSD
 		if resCap.GPUs > 0 {
 			pricePerGPU = p.SpotPriceUSD / float64(resCap.GPUs)
@@ -678,8 +704,8 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			log.Printf("[cloudvm-ticker] Warning: failed to poll spot advisor: %v", err)
 		}
 		now := time.Now()
-		for _, reg := range t.regions {
-			for _, itype := range t.instanceTypes {
+		for _, reg := range t.Regions() {
+			for _, itype := range t.TrackedInstanceTypes() {
 				if entry, ok := t.advisor.GetEntry(reg, itype); ok {
 					uptime := UptimeSecondsForAdvisorRange(entry.RangeIndex)
 					resCap := t.catalog.ResolveCapacity(ctx, nil, itype, ResourceVector{})

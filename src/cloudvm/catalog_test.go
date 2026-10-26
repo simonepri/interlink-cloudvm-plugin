@@ -110,6 +110,10 @@ func TestHardwareCatalog_TransientErrorDoesNotPoisonCache(t *testing.T) {
 
 type mockSpotPriceFetcher struct{}
 
+func (m *mockSpotPriceFetcher) DescribeInstanceTypes(_ context.Context, _ *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	return &ec2.DescribeInstanceTypesOutput{}, nil
+}
+
 func (m *mockSpotPriceFetcher) DescribeSpotPriceHistory(_ context.Context, _ *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
 	return &ec2.DescribeSpotPriceHistoryOutput{
 		SpotPriceHistory: []ec2types.SpotPrice{
@@ -152,6 +156,10 @@ func TestSpotPriceTicker_PollAndMetrics(t *testing.T) {
 }
 
 type mockMultiAZSpotFetcher struct{}
+
+func (m *mockMultiAZSpotFetcher) DescribeInstanceTypes(_ context.Context, _ *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	return &ec2.DescribeInstanceTypesOutput{}, nil
+}
 
 func (m *mockMultiAZSpotFetcher) DescribeSpotPriceHistory(_ context.Context, _ *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
 	t1 := time.Now().Add(-10 * time.Minute)
