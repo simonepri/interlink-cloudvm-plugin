@@ -20,6 +20,7 @@ type FleetTracker struct {
 	lastNetworkTx   map[string]int64     // instanceID -> lastCumulativeTxBytes
 	defaultProvider string
 	defaultRegion   string
+	spotPrices      func(region, zone, instanceType string) (float64, bool)
 }
 
 // GlobalFleetTracker is the singleton instance of the fleet tracker.
@@ -146,6 +147,13 @@ func (f *FleetTracker) RecordInterruption(provider, region, itype, capacityType 
 	f.metrics.RecordInterruption(provider, region, accelerator, itype, gpuModel, capacityType)
 }
 
+// SetSpotPrices sets where the tracker reads the current spot price of a spot instance's zone and type.
+func (f *FleetTracker) SetSpotPrices(lookup func(region, zone, instanceType string) (float64, bool)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.spotPrices = lookup
+}
+
 // UpdateLiveFleet is invoked by the reconciler on each pass to update running instances, GPUs, and spend $/h.
 func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[string]string) {
 	if f.metrics == nil {
@@ -243,10 +251,11 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 			memGiB = int(memBytes / (1024 * 1024 * 1024))
 		}
 
-		// Calculate fulfilled price
+		// Spot instances pay the current spot price of their zone; on-demand instances, and spot types the ticker
+		// does not track, are counted at the on-demand list price.
 		hourlyPrice := 0.0
-		if inst.Metadata != nil && inst.Metadata["fulfilledPrice"] != "" {
-			if p, err := strconv.ParseFloat(inst.Metadata["fulfilledPrice"], 64); err == nil && p > 0 {
+		if capacityType == "spot" && f.spotPrices != nil {
+			if p, ok := f.spotPrices(region, inst.Metadata["availabilityZone"], itype); ok && p > 0 {
 				hourlyPrice = p
 			}
 		}

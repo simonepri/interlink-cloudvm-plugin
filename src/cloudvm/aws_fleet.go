@@ -1103,6 +1103,7 @@ func (p *AWSProvider) Status(ctx context.Context, instanceID string) (*Instance,
 				CreatedAt:    aws.ToTime(inst.LaunchTime),
 				Metadata: map[string]string{
 					"marketType":         marketType,
+					"availabilityZone":   instanceZone(inst),
 					"stateReasonCode":    stateReasonCode,
 					"stateReasonMessage": stateReasonMsg,
 				},
@@ -1226,6 +1227,7 @@ func (p *AWSProvider) ListActiveInstancesByRegion(ctx context.Context, clusterTa
 							"namespace":          podNamespace,
 							"podUID":             podUID,
 							"marketType":         marketType,
+							"availabilityZone":   instanceZone(inst),
 							"clusterTag":         clusterTag,
 							"runnerToken":        runnerToken,
 							"stateReasonCode":    stateReasonCode,
@@ -1333,4 +1335,12 @@ func (p *AWSProvider) DescribeAllInstances(ctx context.Context, region string, i
 		return nil, err
 	}
 	return DescribeAllInstances(ctx, client, input)
+}
+
+// instanceZone returns the availability zone an EC2 instance runs in, or "" when EC2 did not report it.
+func instanceZone(inst ec2types.Instance) string {
+	if inst.Placement == nil {
+		return ""
+	}
+	return aws.ToString(inst.Placement.AvailabilityZone)
 }

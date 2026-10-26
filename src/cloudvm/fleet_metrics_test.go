@@ -56,8 +56,8 @@ func TestFleetTracker_LiveFleetAndInterruption(t *testing.T) {
 			State:        StateRunning,
 			CreatedAt:    now,
 			Metadata: map[string]string{
-				"marketType":     "spot",
-				"fulfilledPrice": "0.4024",
+				"marketType":       "spot",
+				"availabilityZone": "us-west-2a",
 			},
 		},
 		{
@@ -68,8 +68,8 @@ func TestFleetTracker_LiveFleetAndInterruption(t *testing.T) {
 			State:        StateRunning,
 			CreatedAt:    now,
 			Metadata: map[string]string{
-				"marketType":     "spot",
-				"fulfilledPrice": "0.4024",
+				"marketType":       "spot",
+				"availabilityZone": "us-west-2a",
 			},
 		},
 	}
@@ -179,5 +179,33 @@ func TestFleetTracker_NetworkMetrics(t *testing.T) {
 	}
 	if !strings.Contains(body, `cloudvm_network_transmit_bytes_total{accelerator="gpu",instance_type="a2-highgpu-1g",provider="gcp",region="us-central1"} 2048`) {
 		t.Errorf("expected 2048 TX bytes for gcp a2-highgpu-1g, got metrics:\n%s", body)
+	}
+}
+
+func TestFleetTracker_SpotSpendUsesSpotPrice(t *testing.T) {
+	metrics := NewObservabilityMetrics()
+	tracker := NewFleetTracker(metrics, NewHardwareCatalog())
+	tracker.SetSpotPrices(func(region, zone, instanceType string) (float64, bool) {
+		if region == "us-west-2" && zone == "us-west-2a" && instanceType == "g5.xlarge" {
+			return 0.4024, true
+		}
+		return 0, false
+	})
+
+	tracker.UpdateLiveFleet([]*Instance{{
+		ID: "i-spot", Provider: ProviderAWS, Region: "us-west-2", InstanceType: "g5.xlarge", State: StateRunning, CreatedAt: time.Now(),
+		Metadata: map[string]string{"marketType": "spot", "availabilityZone": "us-west-2a"},
+	}})
+
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	labels := `{accelerator="gpu",capacity_type="spot",gpu_model="A10G 24GB",instance_type="g5.xlarge",provider="aws",region="us-west-2"}`
+	if !strings.Contains(body, "cloudvm_spend_usd_per_hour"+labels+" 0.4024") {
+		t.Errorf("spot spend is not the zone's spot price:\n%s", body)
+	}
+	// The baseline stays at the g5.xlarge on-demand catalog rate.
+	if !strings.Contains(body, "cloudvm_spend_ondemand_baseline_usd_per_hour"+labels+" 1.006") {
+		t.Errorf("on-demand baseline is not the on-demand price:\n%s", body)
 	}
 }

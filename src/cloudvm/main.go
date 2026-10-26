@@ -249,6 +249,7 @@ func run() error {
 		spotTicker := newConfiguredTicker(ctx, awsProv)
 		go spotTicker.Start(ctx)
 		server.SetSpotTicker(spotTicker)
+		GlobalFleetTracker.SetSpotPrices(spotTicker.SpotPrice)
 		awsProv.SetRegionScorer(spotTicker)
 		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(spotTicker.Regions())) //nolint:gosec // log length is safe
 	} else if providerType == "aws" {
