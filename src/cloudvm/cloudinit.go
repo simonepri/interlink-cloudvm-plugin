@@ -172,7 +172,10 @@ func (c *CloudInitConfig) RenderContainerCommand() string {
 }
 
 const cloudInitTemplate = `#!/usr/bin/env bash
-exec > /var/log/cloudvm-bootstrap.log 2>&1
+# Mirror the bootstrap log to the serial console so EC2 get-console-output shows bootstrap errors.
+CLOUDVM_SERIAL=/dev/console
+[ -w /dev/ttyS0 ] && CLOUDVM_SERIAL=/dev/ttyS0
+exec > >(tee -a /var/log/cloudvm-bootstrap.log > "$CLOUDVM_SERIAL" 2>/dev/null) 2>&1
 echo "=== INTERLINK CLOUDVM BOOTSTRAP: $(date) ==="
 echo "CLOUDVM_STATUS: {\"status\": \"BOOTING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\", \"type\": \"{{.InstanceType}}\"}" > /dev/console 2>/dev/null || true
 

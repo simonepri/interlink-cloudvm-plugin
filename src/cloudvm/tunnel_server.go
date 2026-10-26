@@ -147,6 +147,7 @@ func (s *Server) startRetryTimeout() time.Duration {
 func (s *Server) failTunnelDeadline(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) {
 	msg := fmt.Sprintf("worker %s did not open its reverse tunnel within %v", node.InstanceID, s.tunnelConfig().ConnectTimeout)
 	log.Printf("[cloudvm] %s; terminating it", sanitizeLog(msg)) //nolint:gosec // sanitized
+	msg = s.withConsoleTail(ctx, node, msg)
 	term := &ContainerTerminatedState{ExitCode: 1, Reason: "TunnelConnectTimeout", Message: msg, FinishedAt: time.Now()}
 	s.mu.Lock()
 	s.completedPods[req.PodUID] = term

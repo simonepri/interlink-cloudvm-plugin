@@ -1672,11 +1672,12 @@ func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req
 		select {
 		case <-ctx.Done():
 			log.Printf("[cloudvm] Timed out waiting to start container for pod %s/%s on node %s: %v", req.Namespace, req.PodName, node.InstanceID, ctx.Err())
+			startMsg := s.withConsoleTail(ctx, node, fmt.Sprintf("timed out waiting for in-VM runner on node %s: %v", node.InstanceID, ctx.Err()))
 			s.mu.Lock()
 			term := &ContainerTerminatedState{
 				ExitCode:   1,
 				Reason:     "StartError",
-				Message:    fmt.Sprintf("timed out waiting for in-VM runner on node %s: %v", node.InstanceID, ctx.Err()),
+				Message:    startMsg,
 				FinishedAt: time.Now(),
 			}
 			s.completedPods[req.PodUID] = term
