@@ -295,7 +295,7 @@ cloudvm_spot_placement_score"]:::central
     end
 ```
 
-- **Tracked Instance Types**: Unless `TICKER_INSTANCE_TYPES` lists them, the ticker tracks every EC2 instance type with whole GPUs that `DescribeInstanceTypes` returns in the tracked regions, re-read daily, and labels each GPU with the name and memory AWS reports. Types that share one GPU between instances, such as `g6f`, report no whole GPU and are not tracked. Arm types are tracked for prices but left out of fill plans and launches.
+- **Tracked Instance Types**: Unless `TICKER_INSTANCE_TYPES` lists them, the ticker tracks every EC2 instance type with whole GPUs that `DescribeInstanceTypes` returns in the tracked regions, re-read daily, and labels each GPU with the name and memory AWS reports. A GPU slice, part of one GPU that instances such as `g6f` share, counts as one GPU named like a MIG profile, such as `L4 1/8 3GB`. Pods launch on a slice only by naming its instance type, since a pod's GPU request matches only whole GPUs. Arm types are tracked for prices but left out of fill plans and launches.
 - **Embedded Mode (Default)**: The provider polls spot prices and placement scores directly every `10m ± 2m`.
 - **Central Ticker Mode**: Deploy the `cloudvm-ticker` Helm chart once and point providers at `--ticker-url=http://cloudvm-ticker.monitoring.svc:8080`.
 - **Exposed Prometheus Metrics**:
