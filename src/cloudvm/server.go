@@ -885,7 +885,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		kmsKeyID := s.kmsKeyID
 		kmsClient := s.kmsClient
 		if kmsClient == nil {
-			region := spec.Region
+			region := kmsKeyRegion(kmsKeyID, spec.Region)
 			if region == "" {
 				region = s.defaultRegion
 			}
