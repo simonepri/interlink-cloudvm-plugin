@@ -62,7 +62,7 @@ type SpotPriceTicker struct {
 	regions             []string
 	fallbackRegions     []string
 	instanceTypes       []string
-	instanceArch        map[string]string // instance type -> Kubernetes architecture, for types discovery has seen
+	instanceArch        map[string]string // tracked instance type -> Kubernetes architecture, for types discovery has seen
 	discoverTypes       bool              // track every GPU type AWS offers instead of an explicit list
 	lastTypeDiscovery   time.Time
 	scrapeInterval      time.Duration
@@ -637,10 +637,7 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			}
 		}
 
-		// Add to solver offers; fill plans use only types the worker launch templates can boot.
-		if !t.launchable(p.InstanceType) {
-			continue
-		}
+		// Add to solver offers
 		pricePerGPU := p.SpotPriceUSD
 		if resCap.GPUs > 0 {
 			pricePerGPU = p.SpotPriceUSD / float64(resCap.GPUs)

@@ -76,6 +76,28 @@ type mockEC2FleetClient struct {
 	describeInstanceTypesFn func(ctx context.Context, params *ec2.DescribeInstanceTypesInput) (*ec2.DescribeInstanceTypesOutput, error)
 	describeOfferingsFn     func(ctx context.Context, params *ec2.DescribeInstanceTypeOfferingsInput) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
 	describeSubnetsFn       func(ctx context.Context, params *ec2.DescribeSubnetsInput) (*ec2.DescribeSubnetsOutput, error)
+	// templateImages maps a launch template ID or name to its image's architecture, x86_64 or arm64.
+	templateImages map[string]ec2types.ArchitectureValues
+}
+
+func (m *mockEC2FleetClient) DescribeLaunchTemplateVersions(_ context.Context, params *ec2.DescribeLaunchTemplateVersionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplateVersionsOutput, error) {
+	key := aws.ToString(params.LaunchTemplateId) + aws.ToString(params.LaunchTemplateName)
+	if _, ok := m.templateImages[key]; !ok {
+		return &ec2.DescribeLaunchTemplateVersionsOutput{}, nil
+	}
+	return &ec2.DescribeLaunchTemplateVersionsOutput{LaunchTemplateVersions: []ec2types.LaunchTemplateVersion{{
+		LaunchTemplateData: &ec2types.ResponseLaunchTemplateData{ImageId: aws.String("ami-" + key)},
+	}}}, nil
+}
+
+func (m *mockEC2FleetClient) DescribeImages(_ context.Context, params *ec2.DescribeImagesInput, _ ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	out := &ec2.DescribeImagesOutput{}
+	for _, id := range params.ImageIds {
+		if arch, ok := m.templateImages[strings.TrimPrefix(id, "ami-")]; ok {
+			out.Images = append(out.Images, ec2types.Image{ImageId: aws.String(id), Architecture: arch})
+		}
+	}
+	return out, nil
 }
 
 func (m *mockEC2FleetClient) CreateFleet(ctx context.Context, params *ec2.CreateFleetInput, _ ...func(*ec2.Options)) (*ec2.CreateFleetOutput, error) {
@@ -1018,9 +1040,8 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 	}
 
 	// Dynamic resolution
-	ltID, ltName := p.ResolveRegionalLaunchTemplate("us-west-2", false)
-	if ltID != "lt-west-001" || ltName != "" {
-		t.Errorf("expected lt-west-001, got id=%s name=%s", ltID, ltName)
+	if got := p.configuredTemplates("us-west-2"); len(got) != 1 || got[0].ID != "lt-west-001" || got[0].Name != "" {
+		t.Errorf("expected lt-west-001, got %+v", got)
 	}
 	subnets := p.ResolveRegionalSubnets("us-west-2")
 	if len(subnets) != 2 || subnets[0] != "subnet-west-a" || subnets[1] != "subnet-west-b" {
@@ -1030,9 +1051,8 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 	// Update regional facts dynamically
 	p.SetRegionalLaunchTemplate("eu-west-1", "lt-eu-999")
 	p.SetRegionalSubnets("eu-west-1", []string{"subnet-eu-1"})
-	euLTID, _ := p.ResolveRegionalLaunchTemplate("eu-west-1", false)
-	if euLTID != "lt-eu-999" {
-		t.Errorf("expected lt-eu-999 for eu-west-1, got %s", euLTID)
+	if got := p.configuredTemplates("eu-west-1"); len(got) != 1 || got[0].ID != "lt-eu-999" {
+		t.Errorf("expected lt-eu-999 for eu-west-1, got %+v", got)
 	}
 
 	// 3. Launch with regional fact resolution
@@ -1135,42 +1155,31 @@ func TestAWSProvider_UnreachableRegionDoesNotStallInventory(t *testing.T) {
 	}
 }
 
-func TestAWSProvider_ResolveRegionalLaunchTemplatePrefersGPUTemplate(t *testing.T) {
-	p := NewAWSProvider("us-west-2")
-	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
-		"us-west-2": {LaunchTemplateID: "lt-cpu", GPULaunchTemplateID: "lt-gpu"},
-		"eu-west-1": {LaunchTemplateID: "lt-cpu-eu"},
-	}})
-
-	cases := []struct {
-		region string
-		gpu    bool
-		want   string
-	}{
-		{"us-west-2", true, "lt-gpu"},
-		{"us-west-2", false, "lt-cpu"},
-		{"eu-west-1", true, "lt-cpu-eu"},
-		{"eu-west-1", false, "lt-cpu-eu"},
+func TestAWSProvider_ClusterFactsTemplates(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	ids := func(templates []LaunchTemplateFact) string {
+		var out []string
+		for _, lt := range templates {
+			out = append(out, lt.ID+lt.Name)
+		}
+		return strings.Join(out, ",")
 	}
-	for _, tc := range cases {
-		if got, _ := p.ResolveRegionalLaunchTemplate(tc.region, tc.gpu); got != tc.want {
-			t.Errorf("ResolveRegionalLaunchTemplate(%q, %v) = %q, want %q", tc.region, tc.gpu, got, tc.want)
+	for _, tc := range []struct {
+		facts, want string
+	}{
+		{`{"launchTemplateId":"lt-cpu","subnetIds":["subnet-a"]}`, "lt-cpu"},
+		{`{"launchTemplateId":"lt-cpu","gpuLaunchTemplateId":"lt-gpu"}`, "lt-gpu,lt-cpu"},
+		{`{"launchTemplateId":"lt-cpu","launchTemplates":[{"id":"lt-arm","requirements":[{"key":"kubernetes.io/arch","operator":"In","values":["arm64"]}]},{"name":"x86"}]}`, "lt-arm,x86"},
+	} {
+		t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":`+tc.facts+`}}`)
+		p := NewAWSProvider("us-west-2")
+		if got := ids(p.configuredTemplates("us-west-2")); got != tc.want {
+			t.Errorf("templates for %s = %s, want %s", tc.facts, got, tc.want)
 		}
 	}
-}
-
-func TestAWSProvider_ClusterFactsWithoutGPUTemplateParse(t *testing.T) {
-	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
-	t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":{"launchTemplateId":"lt-cpu","subnetIds":["subnet-a"]}}}`)
-	p := NewAWSProvider("us-west-2")
-	if got, _ := p.ResolveRegionalLaunchTemplate("us-west-2", true); got != "lt-cpu" {
-		t.Fatalf("expected fallback to lt-cpu when gpuLaunchTemplateId is absent, got %q", got)
-	}
-
-	t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":{"launchTemplateId":"lt-cpu","gpuLaunchTemplateId":"lt-gpu"}}}`)
-	p = NewAWSProvider("us-west-2")
-	if got, _ := p.ResolveRegionalLaunchTemplate("us-west-2", true); got != "lt-gpu" {
-		t.Fatalf("expected lt-gpu from gpuLaunchTemplateId, got %q", got)
+	t.Setenv("CLUSTER_FACTS", "")
+	if got := ids(NewAWSProvider("us-west-2").regionTemplates("us-west-2")); got != defaultLaunchTemplateName {
+		t.Errorf("templates without cluster facts = %s, want the default %s", got, defaultLaunchTemplateName)
 	}
 }
 
@@ -1199,24 +1208,26 @@ func TestAWSProvider_LaunchUsesGPUTemplateForGPUPods(t *testing.T) {
 		},
 	})
 
+	// The instance type picks the template: a GPU type boots the GPU image even for a pod without a GPU request.
 	for _, tc := range []struct {
-		gpus int
-		want string
-	}{{1, "lt-gpu"}, {0, "lt-cpu"}} {
+		gpus  int
+		itype string
+		want  string
+	}{{1, "g4dn.xlarge", "lt-gpu"}, {0, "g4dn.xlarge", "lt-gpu"}, {0, "m7i.large", "lt-cpu"}} {
 		capturedLT = ""
 		spec := &InstanceSpec{
 			PodName:      "gpu-pod",
 			PodNamespace: "default",
 			PodUID:       "uid-gpu",
 			Region:       "us-west-2",
-			InstanceType: "g4dn.xlarge",
+			InstanceType: tc.itype,
 			NumGPUs:      tc.gpus,
 		}
 		if _, err := p.Launch(context.Background(), spec); err != nil {
 			t.Fatalf("Launch(gpus=%d) failed: %v", tc.gpus, err)
 		}
 		if capturedLT != tc.want {
-			t.Errorf("Launch(gpus=%d) used launch template %q, want %q", tc.gpus, capturedLT, tc.want)
+			t.Errorf("Launch(gpus=%d, %s) used launch template %q, want %q", tc.gpus, tc.itype, capturedLT, tc.want)
 		}
 	}
 }

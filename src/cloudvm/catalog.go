@@ -144,6 +144,10 @@ func (c *HardwareCatalog) ResolveCapacity(ctx context.Context, client InstanceTy
 						gpus += int(*g.Count)
 					}
 				}
+				// AWS reports a GPU slice, part of one GPU shared between instances, as zero GPUs; it serves one GPU device.
+				if gpus == 0 && len(info.GpuInfo.Gpus) > 0 && info.GpuInfo.Gpus[0].MemoryInfo != nil && aws.ToInt32(info.GpuInfo.Gpus[0].MemoryInfo.SizeInMiB) > 0 {
+					gpus = 1
+				}
 				if len(info.GpuInfo.Gpus) > 0 {
 					g := info.GpuInfo.Gpus[0]
 					name := aws.ToString(g.Name)

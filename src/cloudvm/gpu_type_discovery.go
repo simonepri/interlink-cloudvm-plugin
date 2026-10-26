@@ -24,10 +24,6 @@ const gpuTypeDiscoveryInterval = 24 * time.Hour
 // gpuTypeDiscoveryRetry is how soon the ticker reads again after some regions failed to list their types.
 const gpuTypeDiscoveryRetry = time.Hour
 
-// launchableArchitectures are the CPU architectures the worker launch templates have an AMI for.
-// NOTE(simonepri): the worker AMI is x86_64 only, so Arm GPU types are tracked for prices but never launched or planned.
-var launchableArchitectures = []string{"amd64"}
-
 // discoveredGPUType is one EC2 instance type with named GPUs, as DescribeInstanceTypes reports it.
 // A GPU slice, part of one GPU shared between instances, counts as one GPU.
 type discoveredGPUType struct {
@@ -204,25 +200,4 @@ func labelGPUSlices(types map[string]discoveredGPUType) {
 		gt.capacity.GPUModel = fmt.Sprintf("%s 1/%d %dGB", gt.gpuName, share, gt.capacity.GPUMemoryGB)
 		types[name] = gt
 	}
-}
-
-// launchable reports whether the worker launch templates can boot an instance type; types discovery has not seen count as x86_64.
-func (t *SpotPriceTicker) launchable(instanceType string) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.launchableLocked(instanceType)
-}
-
-// launchableLocked is launchable for callers that hold t.mu.
-func (t *SpotPriceTicker) launchableLocked(instanceType string) bool {
-	arch := t.instanceArch[instanceType]
-	if arch == "" {
-		arch = "amd64"
-	}
-	for _, a := range launchableArchitectures {
-		if a == arch {
-			return true
-		}
-	}
-	return false
 }

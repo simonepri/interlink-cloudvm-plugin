@@ -100,10 +100,12 @@ type FleetRequest struct {
 	UserData           string                  `json:"userData,omitempty"`
 	LaunchTemplateID   string                  `json:"launchTemplateId,omitempty"`
 	LaunchTemplateName string                  `json:"launchTemplateName,omitempty"`
-	MarketType         string                  `json:"marketType,omitempty"`
-	MaxPrice           string                  `json:"maxPrice,omitempty"`
-	PricePolicy        string                  `json:"pricePolicy,omitempty"`
-	RunnerAuthToken    string                  `json:"runnerAuthToken,omitempty"`
+	// LaunchTemplates, when set, replaces LaunchTemplateID and LaunchTemplateName with one fleet config per template.
+	LaunchTemplates []fleetTemplateGroup `json:"-"`
+	MarketType      string               `json:"marketType,omitempty"`
+	MaxPrice        string               `json:"maxPrice,omitempty"`
+	PricePolicy     string               `json:"pricePolicy,omitempty"`
+	RunnerAuthToken string               `json:"runnerAuthToken,omitempty"`
 }
 
 // FleetResponse represents the result of a fleet launch.
@@ -117,14 +119,51 @@ type FleetResponse struct {
 	Errors        []string    `json:"errors,omitempty"`
 }
 
+// fleetTemplateConfigs returns the fleet's launch template configs: one per template group, each with the overrides of
+// its instance types, or the single ltSpec with every override when the request names no groups.
+func fleetTemplateConfigs(req *FleetRequest, ltSpec *ec2types.FleetLaunchTemplateSpecificationRequest, overrides []ec2types.FleetLaunchTemplateOverridesRequest) []ec2types.FleetLaunchTemplateConfigRequest {
+	if len(req.LaunchTemplates) == 0 {
+		return []ec2types.FleetLaunchTemplateConfigRequest{{LaunchTemplateSpecification: ltSpec, Overrides: overrides}}
+	}
+	var configs []ec2types.FleetLaunchTemplateConfigRequest
+	for _, g := range req.LaunchTemplates {
+		spec := &ec2types.FleetLaunchTemplateSpecificationRequest{
+			Version:                             ltSpec.Version,
+			LaunchTemplateSpecificationUserData: ltSpec.LaunchTemplateSpecificationUserData,
+		}
+		if g.ID != "" {
+			spec.LaunchTemplateId = aws.String(g.ID)
+		} else {
+			spec.LaunchTemplateName = aws.String(g.Name)
+		}
+		types := make(map[string]bool, len(g.InstanceTypes))
+		for _, t := range g.InstanceTypes {
+			types[t] = true
+		}
+		var own []ec2types.FleetLaunchTemplateOverridesRequest
+		for _, o := range overrides {
+			if types[string(o.InstanceType)] {
+				own = append(own, o)
+			}
+		}
+		if len(own) > 0 {
+			configs = append(configs, ec2types.FleetLaunchTemplateConfigRequest{LaunchTemplateSpecification: spec, Overrides: own})
+		}
+	}
+	return configs
+}
+
 // RegionalClusterFact stores dynamic Launch Template and subnet configuration for a specific AWS region.
 type RegionalClusterFact struct {
 	LaunchTemplateID string `json:"launchTemplateId,omitempty"`
 	// GPULaunchTemplateID names the template whose image ships the NVIDIA driver and container toolkit; pods requesting GPUs use it.
-	GPULaunchTemplateID string   `json:"gpuLaunchTemplateId,omitempty"`
-	LaunchTemplateName  string   `json:"launchTemplateName,omitempty"`
-	SubnetIDs           []string `json:"subnetIds,omitempty"`
-	SecurityGroupIDs    []string `json:"securityGroupIds,omitempty"`
+	GPULaunchTemplateID string `json:"gpuLaunchTemplateId,omitempty"`
+	// LaunchTemplates lists the region's templates in the order launches try them, each with the instance requirements
+	// a type must satisfy to boot from it; when set, it replaces launchTemplateId, launchTemplateName, and gpuLaunchTemplateId.
+	LaunchTemplates    []LaunchTemplateFact `json:"launchTemplates,omitempty"`
+	LaunchTemplateName string               `json:"launchTemplateName,omitempty"`
+	SubnetIDs          []string             `json:"subnetIds,omitempty"`
+	SecurityGroupIDs   []string             `json:"securityGroupIds,omitempty"`
 	// TunnelTransport is the path the region's workers take to the tunnel gateway; empty means tailnet.
 	TunnelTransport string `json:"tunnelTransport,omitempty"`
 }
@@ -143,6 +182,8 @@ type EC2FleetClient interface {
 	DescribeInstanceTypes(ctx context.Context, params *ec2.DescribeInstanceTypesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error)
 	DescribeInstanceTypeOfferings(ctx context.Context, params *ec2.DescribeInstanceTypeOfferingsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
 	DescribeSubnets(ctx context.Context, params *ec2.DescribeSubnetsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error)
+	DescribeLaunchTemplateVersions(ctx context.Context, params *ec2.DescribeLaunchTemplateVersionsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplateVersionsOutput, error)
+	DescribeImages(ctx context.Context, params *ec2.DescribeImagesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error)
 }
 
 var (
@@ -314,7 +355,7 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 	case req.LaunchTemplateName != "":
 		ltSpec.LaunchTemplateName = aws.String(req.LaunchTemplateName)
 	default:
-		ltSpec.LaunchTemplateName = aws.String("interlink-cloudvm-worker")
+		ltSpec.LaunchTemplateName = aws.String(defaultLaunchTemplateName)
 	}
 	if req.UserData != "" {
 		ltSpec.LaunchTemplateSpecificationUserData = aws.String(req.UserData)
@@ -341,14 +382,9 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 			TotalTargetCapacity:       aws.Int32(targetCapacity),
 			DefaultTargetCapacityType: targetCapType,
 		},
-		SpotOptions:     spotOpts,
-		OnDemandOptions: onDemandOpts,
-		LaunchTemplateConfigs: []ec2types.FleetLaunchTemplateConfigRequest{
-			{
-				LaunchTemplateSpecification: ltSpec,
-				Overrides:                   overrides,
-			},
-		},
+		SpotOptions:           spotOpts,
+		OnDemandOptions:       onDemandOpts,
+		LaunchTemplateConfigs: fleetTemplateConfigs(req, ltSpec, overrides),
 		TagSpecifications: []ec2types.TagSpecification{
 			{
 				ResourceType: ec2types.ResourceTypeInstance,
@@ -574,22 +610,27 @@ func (p *AWSProvider) SetRegionalSubnets(region string, subnets []string) {
 	p.clusterFacts.Regions[region] = fact
 }
 
-// ResolveRegionalLaunchTemplate resolves launch template ID and Name for a region from cluster facts.
-// A GPU request prefers the region's GPU template and falls back to the default template when none is published.
-func (p *AWSProvider) ResolveRegionalLaunchTemplate(region string, gpu bool) (string, string) {
+// configuredTemplates returns the launch templates cluster facts name for a region, in the order launches try them.
+func (p *AWSProvider) configuredTemplates(region string) []LaunchTemplateFact {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.clusterFacts == nil || p.clusterFacts.Regions == nil {
-		return "", ""
+		return nil
 	}
-	fact, ok := p.clusterFacts.Regions[region]
-	if !ok {
-		return "", ""
+	return regionTemplates(p.clusterFacts.Regions[region])
+}
+
+// defaultLaunchTemplateName is the template launches use in a region whose cluster facts name none.
+const defaultLaunchTemplateName = "interlink-cloudvm-worker"
+
+// regionTemplates returns the region's launch templates from cluster facts, in the order launches try them, or the
+// default template when the facts name none.
+func (p *AWSProvider) regionTemplates(region string) []LaunchTemplateFact {
+	templates := p.configuredTemplates(region)
+	if len(templates) == 0 {
+		templates = []LaunchTemplateFact{{Name: defaultLaunchTemplateName}}
 	}
-	if gpu && fact.GPULaunchTemplateID != "" {
-		return fact.GPULaunchTemplateID, ""
-	}
-	return fact.LaunchTemplateID, fact.LaunchTemplateName
+	return templates
 }
 
 // ResolveRegionalSubnets resolves subnet IDs for a region from cluster facts.
@@ -803,9 +844,6 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 		ltID, ltName = spec.LaunchTemplateID, spec.LaunchTemplateName
 		subnetIDs = spec.SubnetIDs
 	}
-	if ltID == "" && ltName == "" {
-		ltID, ltName = p.ResolveRegionalLaunchTemplate(region, spec.NumGPUs > 0)
-	}
 	if len(subnetIDs) == 0 {
 		subnetIDs = p.ResolveRegionalSubnets(region)
 	}
@@ -818,6 +856,21 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 	client, err := p.getClient(ctx, region)
 	if err != nil {
 		return nil, err
+	}
+
+	// A template the pod names boots every candidate; otherwise each candidate boots from the first regional
+	// template it satisfies, and candidates no template accepts are left out.
+	var groups []fleetTemplateGroup
+	if ltID == "" && ltName == "" {
+		resolved := resolveTemplates(ctx, client, region, p.regionTemplates(region))
+		groups = groupByTemplate(resolved, instanceTypes, globalInstanceFacts.resolve(ctx, client, instanceTypes))
+		if len(groups) == 0 {
+			return nil, fmt.Errorf("%w in %s: %s", errNoLaunchTemplateFits, region, strings.Join(instanceTypes, ","))
+		}
+		instanceTypes = nil
+		for _, g := range groups {
+			instanceTypes = append(instanceTypes, g.InstanceTypes...)
+		}
 	}
 
 	overrides, err := p.offeredFleetOverrides(ctx, client, region, instanceTypes, subnetIDs)
@@ -840,6 +893,7 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 		UserData:           encodedUserData,
 		LaunchTemplateID:   ltID,
 		LaunchTemplateName: ltName,
+		LaunchTemplates:    groups,
 		MarketType:         spec.MarketType,
 		MaxPrice:           spec.MaxPrice,
 		PricePolicy:        spec.PricePolicy,

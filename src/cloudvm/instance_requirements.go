@@ -23,6 +23,9 @@ const (
 	labelInstanceGPUManufacturer = "karpenter.k8s.aws/instance-gpu-manufacturer"
 	labelInstanceGPUCount        = "karpenter.k8s.aws/instance-gpu-count"
 	labelInstanceGPUMemory       = "karpenter.k8s.aws/instance-gpu-memory"
+	// labelGPUSlice is "true" for a type whose GPU is a slice of one GPU shared between instances, and "false" otherwise;
+	// launch template requirements use it, since Karpenter has no such label.
+	labelGPUSlice = "cloudvm.vk.io/gpu-slice"
 )
 
 // instanceTypeLabels are the labels every catalog instance type defines; requirements on other labels describe the

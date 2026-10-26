@@ -57,6 +57,8 @@ type InstanceTypeFacts struct {
 	GPUName         string
 	GPUManufacturer string
 	GPUMemoryMiB    int64
+	// GPUSlice marks a type whose GPU is part of one GPU shared between instances, such as g6f.
+	GPUSlice bool
 }
 
 // instanceTypeMarket is the part of the spot ticker that knows the tracked instance types and their spot prices.
@@ -150,6 +152,11 @@ func instanceFactsFromInfo(info ec2types.InstanceTypeInfo) InstanceTypeFacts {
 		for _, gpu := range info.GpuInfo.Gpus {
 			f.GPUs += int(aws.ToInt32(gpu.Count))
 		}
+		// AWS reports a GPU slice, part of one GPU shared between instances, as zero GPUs; it serves one GPU device.
+		if f.GPUs == 0 && g.MemoryInfo != nil && aws.ToInt32(g.MemoryInfo.SizeInMiB) > 0 {
+			f.GPUs = 1
+			f.GPUSlice = true
+		}
 		f.GPUName = labelValue(aws.ToString(g.Name))
 		f.GPUManufacturer = labelValue(aws.ToString(g.Manufacturer))
 		if g.MemoryInfo != nil {
@@ -207,6 +214,7 @@ func (f InstanceTypeFacts) requirements() scheduling.Requirements {
 		in(labelInstanceGPUManufacturer, f.GPUManufacturer),
 		in(labelInstanceGPUCount, gpuCount),
 		in(labelInstanceGPUMemory, gpuMemory),
+		in(labelGPUSlice, strconv.FormatBool(f.GPUSlice)),
 	)
 }
 
@@ -262,9 +270,6 @@ func (p *AWSProvider) launchInstanceTypes(ctx context.Context, spec *InstanceSpe
 func (p *AWSProvider) deriveInstanceTypes(ctx context.Context, spec *InstanceSpec) ([]string, error) {
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(spec.InstanceRequirements...)
 	gpus := spec.Requests.GPUs
-	// Workers boot only the architectures their launch templates have an AMI for, so a pod that names no
-	// architecture gets those and a pod that names another one gets no type.
-	reqs.Add(scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, launchableArchitectures...))
 	if !reqs.Has(labelInstanceGPUCount) {
 		if gpus > 0 {
 			reqs.Add(scheduling.NewRequirement(labelInstanceGPUCount, corev1.NodeSelectorOpIn, strconv.Itoa(gpus)))
@@ -284,6 +289,14 @@ func (p *AWSProvider) deriveInstanceTypes(ctx context.Context, spec *InstanceSpe
 	}
 	pool := p.instanceTypePool(gpus, reqs)
 	facts := globalInstanceFacts.resolve(ctx, client, pool)
+	var templates []resolvedTemplate
+	if spec.LaunchTemplateID == "" && spec.LaunchTemplateName == "" {
+		var tc launchTemplateClient
+		if c, ok := client.(launchTemplateClient); ok {
+			tc = c
+		}
+		templates = resolveTemplates(ctx, tc, spec.Region, p.regionTemplates(spec.Region))
+	}
 
 	requests := spec.Requests.resourceList()
 	var fits cloudprovider.InstanceTypes
@@ -300,6 +313,12 @@ func (p *AWSProvider) deriveInstanceTypes(ctx context.Context, spec *InstanceSpe
 		}
 		if it.Requirements.Compatible(reqs, scheduling.AllowUndefinedWellKnownLabels) != nil || !resources.Fits(requests, it.Allocatable()) {
 			continue
+		}
+		// A type the pinned region has no launch template for cannot boot there, such as an Arm type without an Arm image.
+		if templates != nil {
+			if _, ok := templateFor(templates, f); !ok {
+				continue
+			}
 		}
 		fits = append(fits, it)
 	}

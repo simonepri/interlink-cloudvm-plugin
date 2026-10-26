@@ -134,7 +134,7 @@ Assign GPU Slots [k..m]"]:::pool
 
 - **Idempotency**: Every AWS `CreateFleet` call sets a deterministic `ClientToken` (`cvm-<uid>-<namespace>-<pod>`) with the Pod UID first so network retries never launch duplicate VMs.
 - **Hardware Pinning**: To require a specific instance shape, set `cloudvm.vk.io/instance-type: "p4d.24xlarge"` on the pod; `cloudvm.vk.io/candidate-instance-types` adds comma-separated alternatives. Either annotation makes the list authoritative.
-- **Derived Instance Types**: A pod that sets neither annotation launches on every catalog type that fits its total CPU, memory and `nvidia.com/gpu` request and satisfies its [Karpenter well-known label](https://karpenter.sh/docs/concepts/scheduling/#well-known-labels) requirements, cheapest first. The provider reads them with Karpenter's own scheduling package from the node selector and the first required node affinity term, with the operators Karpenter supports (`In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`, `Gte`, `Lte`, `minValues`). It understands `node.kubernetes.io/instance-type` (only values shaped like an EC2 type, so a virtual node label such as `clvm` is ignored), `kubernetes.io/arch`, `karpenter.sh/capacity-type`, and `karpenter.k8s.aws/instance-{category,family,generation,size,cpu,cpu-manufacturer,memory,gpu-name,gpu-manufacturer,gpu-count,gpu-memory}`, with the values `DescribeInstanceTypes` reports (memory in MiB). Without an `instance-gpu-count` requirement a GPU pod takes only types with exactly its GPU count, and a CPU-only pod only types without GPUs. Every pod gets only `amd64` types, because the worker AMI is x86_64; a pod that requires `kubernetes.io/arch: arm64` gets no type. The catalog is `AWS_INSTANCE_TYPES` when set, otherwise the ticker's tracked GPU types for GPU pods and the `m7i`, `c7i`, `r7i`, `m6i`, `c6i` and `r6i` families for CPU pods, plus any EC2 type an `instance-type` requirement names. Types are ordered by the ticker's spot price in the pinned region (or the on-demand list price), and the list is cut so types times subnets stay within 300 fleet overrides. `karpenter.sh/capacity-type: on-demand` selects on-demand capacity when `cloudvm.vk.io/capacity-type` is unset.
+- **Derived Instance Types**: A pod that sets neither annotation launches on every catalog type that fits its total CPU, memory and `nvidia.com/gpu` request and satisfies its [Karpenter well-known label](https://karpenter.sh/docs/concepts/scheduling/#well-known-labels) requirements, cheapest first. The provider reads them with Karpenter's own scheduling package from the node selector and the first required node affinity term, with the operators Karpenter supports (`In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`, `Gte`, `Lte`, `minValues`). It understands `node.kubernetes.io/instance-type` (only values shaped like an EC2 type, so a virtual node label such as `clvm` is ignored), `kubernetes.io/arch`, `karpenter.sh/capacity-type`, and `karpenter.k8s.aws/instance-{category,family,generation,size,cpu,cpu-manufacturer,memory,gpu-name,gpu-manufacturer,gpu-count,gpu-memory}`, with the values `DescribeInstanceTypes` reports (memory in MiB). Without an `instance-gpu-count` requirement a GPU pod takes only types with exactly its GPU count, and a CPU-only pod only types without GPUs. A type is a candidate only if one of the pinned region's launch templates can boot it (see [Launch Templates](#launch-templates)), so a pod that requires `kubernetes.io/arch: arm64` gets Arm types only where an Arm template exists. The catalog is `AWS_INSTANCE_TYPES` when set, otherwise the ticker's tracked GPU types for GPU pods and the `m7i`, `c7i`, `r7i`, `m6i`, `c6i` and `r6i` families for CPU pods, plus any EC2 type an `instance-type` requirement names. Types are ordered by the ticker's spot price in the pinned region (or the on-demand list price), and the list is cut so types times subnets stay within 300 fleet overrides. `karpenter.sh/capacity-type: on-demand` selects on-demand capacity when `cloudvm.vk.io/capacity-type` is unset.
 
 ---
 
@@ -295,7 +295,7 @@ cloudvm_spot_placement_score"]:::central
     end
 ```
 
-- **Tracked Instance Types**: Unless `TICKER_INSTANCE_TYPES` lists them, the ticker tracks every EC2 instance type with whole GPUs that `DescribeInstanceTypes` returns in the tracked regions, re-read daily, and labels each GPU with the name and memory AWS reports. A GPU slice, part of one GPU that instances such as `g6f` share, counts as one GPU named like a MIG profile, such as `L4 1/8 3GB`. Pods launch on a slice only by naming its instance type, since a pod's GPU request matches only whole GPUs. Arm types are tracked for prices but left out of fill plans and launches.
+- **Tracked Instance Types**: Unless `TICKER_INSTANCE_TYPES` lists them, the ticker tracks every EC2 GPU instance type that `DescribeInstanceTypes` returns in the tracked regions, re-read daily, and labels each GPU with the name and memory AWS reports. A GPU slice, part of one GPU that instances such as `g6f` share, counts as one GPU named like a MIG profile, such as `L4 1/8 3GB`. A slice is one GPU at launch too, so a pod that needs more GPU memory states it with `karpenter.k8s.aws/instance-gpu-memory`.
 - **Embedded Mode (Default)**: The provider polls spot prices and placement scores directly every `10m ± 2m`.
 - **Central Ticker Mode**: Deploy the `cloudvm-ticker` Helm chart once and point providers at `--ticker-url=http://cloudvm-ticker.monitoring.svc:8080`.
 - **Exposed Prometheus Metrics**:
@@ -534,6 +534,20 @@ Set `cloudvm.vk.io/region-selection: scored` next to `cloudvm.vk.io/candidate-re
 
 Every launch posts a `CloudVMRegionSelected` event on the pod naming the region used and, after a fallback, the error that each earlier region returned. The chart's RBAC grants `create` on `events` for this.
 
+### Launch Templates
+
+Each region boots workers from launch templates that `CLUSTER_FACTS` names. `regions.<region>.launchTemplates` lists them in the order launches try them, each with an `id` or `name` and optional `requirements` in the [Karpenter well-known label](https://karpenter.sh/docs/concepts/scheduling/#well-known-labels) format. Every candidate instance type boots from the first template whose requirements it satisfies, so one fleet request can mix templates, and a type no template accepts is not launched in that region. The plugin adds each template's image architecture to its requirements by reading its `$Latest` version and image (`ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeImages`); when EC2 cannot tell, as for an image resolved from an SSM parameter, the template counts as `amd64` unless its requirements name `kubernetes.io/arch`. Besides the Karpenter labels, requirements can use `cloudvm.vk.io/gpu-slice`, which is `true` for a GPU slice and `false` for every other type. For example, GPU slices need NVIDIA's GRID driver:
+
+```json
+{"launchTemplates": [
+  {"id": "lt-grid", "requirements": [{"key": "cloudvm.vk.io/gpu-slice", "operator": "In", "values": ["true"]}]},
+  {"id": "lt-gpu", "requirements": [{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "Exists"}]},
+  {"id": "lt-cpu", "requirements": [{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "DoesNotExist"}]}
+]}
+```
+
+Without `launchTemplates`, `gpuLaunchTemplateId` boots types with whole GPUs and `launchTemplateId` or `launchTemplateName` boots the rest, and no template boots a GPU slice; without either, the `interlink-cloudvm-worker` template boots every type except GPU slices. A template a pod names through its annotation boots every candidate.
+
 ### AWS IAM Permissions
 
 The provider's AWS role needs these actions:
@@ -544,6 +558,7 @@ The provider's AWS role needs these actions:
 | `iam:PassRole` | Passing the worker instance profile named in the launch template |
 | `ec2:DescribeInstances`, `ec2:TerminateInstances` | Instance status, inventory, and cleanup |
 | `ec2:DescribeInstanceTypes` | Hardware catalog discovery |
+| `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeImages` | Launch template image architecture |
 | `ec2:DescribeInstanceTypeOfferings`, `ec2:DescribeSubnets` | Dropping overrides an AZ does not offer |
 | `ec2:DescribeRegions`, `ec2:DescribeSpotPriceHistory`, `ec2:GetSpotPlacementScores` | Spot price ticker and placement scores |
 | `pricing:GetProducts`, `servicequotas:GetServiceQuota`, `cloudwatch:GetMetricData` | On-demand baselines, quota limits, and quota usage |
