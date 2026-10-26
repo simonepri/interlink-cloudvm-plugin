@@ -514,6 +514,29 @@ When the provider restarts while an in-VM runner is unreachable, the node is fla
 
 Run one Virtual Kubelet per region and map each node name to its region with `NODE_REGIONS` (`provider.nodeRegions` in Helm), a JSON object such as `{"virtual-node-clvm-aws-euw1":"eu-west-1"}`. A pod bound to a mapped node launches in that node's region. The region is chosen in this order: the `cloudvm.vk.io/region` annotation, the bound node's region, the pod's `topology.kubernetes.io/region` node selector, then `AWS_REGION`.
 
+### Availability Zone Filtering and Region Fallback
+
+Before each `CreateFleet`, the provider resolves each subnet's Availability Zone with `DescribeSubnets` and drops every (instance type, subnet) override whose AZ does not offer that instance type according to `DescribeInstanceTypeOfferings` (location type `availability-zone`). Offerings stay cached for one hour per region and subnet AZs for the process lifetime. When no override remains, the launch fails in that region with `no requested instance type is offered in the availability zones of the configured subnets`. A failed lookup sends the unfiltered overrides instead of blocking the launch.
+
+A pod launches only in its pinned region (see [Regional Virtual Nodes](#regional-virtual-nodes)) unless it sets `cloudvm.vk.io/candidate-regions`, a comma-separated region list. With that annotation, a capacity failure in the pinned region (`InsufficientInstanceCapacity`, `UnfulfillableCapacity`, `InvalidFleetConfiguration`, quota errors, an empty instant fleet, or no offered override) moves the launch to the next candidate region. Candidates are ordered by the embedded ticker's best spot placement score for the requested instance types when `ENABLE_TICKER=true`, and by annotation order otherwise. One launch tries at most 3 regions, counting the pinned one. A fallback region uses only its `CLUSTER_FACTS` launch template and subnets, and the provider skips candidates that have no template there before counting the 3-region limit. Fallback is disabled when `KMS_KEY_ID` is a bare key ID or alias rather than an ARN, because workers in other regions could not decrypt the runner token.
+
+Every launch posts a `CloudVMRegionSelected` event on the pod naming the region used and, after a fallback, the error that each earlier region returned. The chart's RBAC grants `create` on `events` for this.
+
+### AWS IAM Permissions
+
+The provider's AWS role needs these actions:
+
+| Action | Used for |
+| :--- | :--- |
+| `ec2:CreateFleet`, `ec2:RunInstances`, `ec2:CreateTags` | Launching tagged instant fleets |
+| `iam:PassRole` | Passing the worker instance profile named in the launch template |
+| `ec2:DescribeInstances`, `ec2:TerminateInstances` | Instance status, inventory, and cleanup |
+| `ec2:DescribeInstanceTypes` | Hardware catalog discovery |
+| `ec2:DescribeInstanceTypeOfferings`, `ec2:DescribeSubnets` | Dropping overrides an AZ does not offer |
+| `ec2:DescribeRegions`, `ec2:DescribeSpotPriceHistory`, `ec2:GetSpotPlacementScores` | Spot price ticker and placement scores |
+| `pricing:GetProducts`, `servicequotas:GetServiceQuota` | On-demand baselines and quota signals |
+| `kms:Encrypt` | Runner token encryption when `KMS_KEY_ID` is set |
+
 ### Reverse Tunnel Configuration
 
 With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers can reach it through the tunnel:

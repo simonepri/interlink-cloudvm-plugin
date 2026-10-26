@@ -229,6 +229,7 @@ func run() error {
 		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval, fallbackRegions...)
 		go spotTicker.Start(ctx)
 		server.SetSpotTicker(spotTicker)
+		awsProv.SetRegionScorer(spotTicker)
 		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(spotTicker.Regions())) //nolint:gosec // log length is safe
 	}
 

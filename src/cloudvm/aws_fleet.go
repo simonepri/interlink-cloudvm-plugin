@@ -140,6 +140,8 @@ type EC2FleetClient interface {
 	DescribeInstances(ctx context.Context, params *ec2.DescribeInstancesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
 	TerminateInstances(ctx context.Context, params *ec2.TerminateInstancesInput, optFns ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error)
 	DescribeInstanceTypes(ctx context.Context, params *ec2.DescribeInstanceTypesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error)
+	DescribeInstanceTypeOfferings(ctx context.Context, params *ec2.DescribeInstanceTypeOfferingsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
+	DescribeSubnets(ctx context.Context, params *ec2.DescribeSubnetsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error)
 }
 
 var (
@@ -491,6 +493,8 @@ type AWSProvider struct {
 	regionStore       *RegionStore
 	instanceRegions   map[string]string
 	missingCount      map[string]int
+	offeringCache     *offeringCache
+	regionScorer      RegionPlacementScorer
 	client            EC2FleetClient
 	mu                sync.RWMutex
 }
@@ -783,12 +787,178 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 	return cl, nil
 }
 
+// Launch starts one VM for spec. It tries the pinned region first and, when the pod sets candidate-regions, falls
+// back to the next candidate region after a capacity failure, up to maxLaunchRegions regions.
 func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
+	instanceTypes := launchInstanceTypes(spec)
+	regions := p.launchRegions(spec, instanceTypes)
+
+	var failures []string
+	for i, region := range regions {
+		inst, err := p.launchInRegion(ctx, spec, region, i == 0, instanceTypes)
+		if err == nil {
+			inst.Metadata["launchRegion"] = region
+			if i > 0 {
+				inst.Metadata["requestedRegion"] = spec.Region
+				inst.Metadata["regionFallbacks"] = strings.Join(failures, "; ")
+				log.Printf("[aws] Launched %s/%s in fallback region %s after: %s", //nolint:gosec // sanitized
+					sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(region), sanitizeLog(strings.Join(failures, "; ")))
+			}
+			return inst, nil
+		}
+		if len(regions) == 1 {
+			return nil, err
+		}
+		failures = append(failures, fmt.Sprintf("%s: %v", region, err))
+		if !isRegionFallbackError(err) || ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, fmt.Errorf("launch failed in %d of %d candidate regions: %s", len(failures), len(regions), strings.Join(failures, "; "))
+}
+
+// launchInstanceTypes lists the preferred instance type followed by its candidates, or a GPU-count default set.
+func launchInstanceTypes(spec *InstanceSpec) []string {
+	instanceTypes := []string{}
+	if spec.InstanceType != "" {
+		instanceTypes = append(instanceTypes, spec.InstanceType)
+	}
+	for _, cand := range spec.CandidateInstanceTypes {
+		if cand != "" && cand != spec.InstanceType {
+			instanceTypes = append(instanceTypes, cand)
+		}
+	}
+	if len(instanceTypes) == 0 {
+		switch {
+		case spec.NumGPUs >= 8:
+			instanceTypes = []string{"p5.48xlarge", "p4de.24xlarge", "g5.48xlarge"}
+		case spec.NumGPUs >= 4:
+			instanceTypes = []string{"g5.12xlarge", "g5.24xlarge", "g6.12xlarge"}
+		default:
+			instanceTypes = []string{"g5.xlarge", "g6.xlarge", "g4dn.xlarge"}
+		}
+	}
+	return instanceTypes
+}
+
+// launchInRegion runs one CreateFleet attempt in region. The pinned region honors the pod's explicit launch template
+// and subnets; a fallback region uses only its ClusterFacts template and subnets, since those IDs are regional.
+func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, region string, pinned bool, instanceTypes []string) (*Instance, error) {
 	startTime := time.Now()
 	capType := "spot"
-	if spec != nil && spec.MarketType == "on-demand" {
+	if spec.MarketType == "on-demand" {
 		capType = "on-demand"
 	}
+
+	ltID, ltName := "", ""
+	var subnetIDs []string
+	if pinned {
+		ltID, ltName = spec.LaunchTemplateID, spec.LaunchTemplateName
+		subnetIDs = spec.SubnetIDs
+	}
+	if ltID == "" && ltName == "" {
+		ltID, ltName = p.ResolveRegionalLaunchTemplate(region, spec.NumGPUs > 0)
+	}
+	if len(subnetIDs) == 0 {
+		subnetIDs = p.ResolveRegionalSubnets(region)
+	}
+
+	encodedUserData, err := renderFleetUserData(spec, region)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := p.getClient(ctx, region)
+	if err != nil {
+		return nil, err
+	}
+
+	overrides, err := p.offeredFleetOverrides(ctx, client, region, instanceTypes, subnetIDs)
+	if err != nil {
+		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "no_capacity")
+		return nil, err
+	}
+
+	req := &FleetRequest{
+		Region:             region,
+		TargetCapacity:     1,
+		InstanceTypes:      instanceTypes,
+		SubnetIDs:          subnetIDs,
+		ClusterTag:         spec.ClusterTag,
+		PodName:            spec.PodName,
+		PodNamespace:       spec.PodNamespace,
+		PodUID:             spec.PodUID,
+		CostCenter:         spec.CostCenter,
+		JobID:              spec.JobID,
+		UserData:           encodedUserData,
+		LaunchTemplateID:   ltID,
+		LaunchTemplateName: ltName,
+		MarketType:         spec.MarketType,
+		MaxPrice:           spec.MaxPrice,
+		PricePolicy:        spec.PricePolicy,
+		AllocationStrategy: func() FleetAllocationStrategy {
+			if spec.PricePolicy == "capacity-optimized" || strings.ToLower(os.Getenv("AWS_FLEET_ALLOCATION_STRATEGY")) == "capacity-optimized" {
+				return StrategyCapacityOptimized
+			}
+			return StrategyPriceCapacityOptimized
+		}(),
+		RunnerAuthToken: spec.RunnerAuthToken,
+	}
+
+	resp, err := LaunchFleetWithClient(ctx, client, req, overrides)
+	if err != nil {
+		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, ClassifyAWSError(err))
+		return nil, fmt.Errorf("launch fleet failed: %w", err)
+	}
+	if len(resp.Instances) == 0 {
+		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "no_capacity")
+		if len(resp.Errors) > 0 {
+			return nil, fmt.Errorf("%w in %s (fleet errors: %s)", errNoInstancesLaunched, region, strings.Join(resp.Errors, "; "))
+		}
+		return nil, fmt.Errorf("%w in %s", errNoInstancesLaunched, region)
+	}
+
+	inst := resp.Instances[0]
+	if inst.Metadata == nil {
+		inst.Metadata = make(map[string]string)
+	}
+	inst.Metadata["podName"] = spec.PodName
+	inst.Metadata["namespace"] = spec.PodNamespace
+	inst.Metadata["podUID"] = spec.PodUID
+	inst.Metadata["runnerToken"] = spec.RunnerAuthToken
+
+	// Query DescribeInstances to populate the instance IP assigned by EC2
+	descOut, descErr := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{inst.ID},
+	})
+	if descErr == nil && len(descOut.Reservations) > 0 && len(descOut.Reservations[0].Instances) > 0 {
+		ec2Inst := descOut.Reservations[0].Instances[0]
+		if ec2Inst.PrivateIpAddress != nil && *ec2Inst.PrivateIpAddress != "" {
+			inst.IP = *ec2Inst.PrivateIpAddress
+		}
+	}
+
+	p.AddConfiguredRegions(region)
+	p.AddConfiguredRegions(spec.CandidateRegions...)
+	p.mu.Lock()
+	if p.instanceRegions == nil {
+		p.instanceRegions = make(map[string]string)
+	}
+	p.instanceRegions[inst.ID] = region
+	if p.missingCount != nil {
+		delete(p.missingCount, inst.ID)
+	}
+	p.mu.Unlock()
+	if p.regionStore != nil {
+		_ = p.regionStore.Set(inst.ID, region)
+	}
+	GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "ok")
+	GlobalFleetTracker.RecordLaunchDuration("aws", region, spec.InstanceType, capType, time.Since(startTime))
+	return inst, nil
+}
+
+// renderFleetUserData renders the VM cloud-init for region and returns it gzip-compressed and base64-encoded.
+func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 	runnerToken := spec.RunnerAuthToken
 	if spec.KMSEncryptedToken || spec.KMSCiphertext != "" {
 		runnerToken = ""
@@ -797,7 +967,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		PodName:               spec.PodName,
 		PodNamespace:          spec.PodNamespace,
 		PodUID:                spec.PodUID,
-		Region:                spec.Region,
+		Region:                region,
 		InstanceType:          spec.InstanceType,
 		NumGPUs:               spec.NumGPUs,
 		AssignedGPUs:          spec.AssignedGPUs,
@@ -831,141 +1001,18 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		RunnerConcurrency:     spec.RunnerConcurrency,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate cloud-init: %w", err)
-	}
-
-	client, err := p.getClient(ctx, spec.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	instanceTypes := []string{}
-	if spec.InstanceType != "" {
-		instanceTypes = append(instanceTypes, spec.InstanceType)
-	}
-	for _, cand := range spec.CandidateInstanceTypes {
-		if cand != "" && cand != spec.InstanceType {
-			instanceTypes = append(instanceTypes, cand)
-		}
-	}
-	if len(instanceTypes) == 0 {
-		switch {
-		case spec.NumGPUs >= 8:
-			instanceTypes = []string{"p5.48xlarge", "p4de.24xlarge", "g5.48xlarge"}
-		case spec.NumGPUs >= 4:
-			instanceTypes = []string{"g5.12xlarge", "g5.24xlarge", "g6.12xlarge"}
-		default:
-			instanceTypes = []string{"g5.xlarge", "g6.xlarge", "g4dn.xlarge"}
-		}
+		return "", fmt.Errorf("failed to generate cloud-init: %w", err)
 	}
 
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	if _, err := gz.Write([]byte(cloudInit)); err != nil {
-		return nil, fmt.Errorf("failed to compress cloud-init with gzip: %w", err)
+		return "", fmt.Errorf("failed to compress cloud-init with gzip: %w", err)
 	}
 	if err := gz.Close(); err != nil {
-		return nil, fmt.Errorf("failed to finalize gzip compression: %w", err)
+		return "", fmt.Errorf("failed to finalize gzip compression: %w", err)
 	}
-	encodedUserData := base64.StdEncoding.EncodeToString(buf.Bytes())
-
-	ltID := spec.LaunchTemplateID
-	ltName := spec.LaunchTemplateName
-	if ltID == "" && ltName == "" {
-		regLTID, regLTName := p.ResolveRegionalLaunchTemplate(spec.Region, spec.NumGPUs > 0)
-		if regLTID != "" {
-			ltID = regLTID
-		} else if regLTName != "" {
-			ltName = regLTName
-		}
-	}
-
-	subnetIDs := spec.SubnetIDs
-	if len(subnetIDs) == 0 {
-		if regSubnets := p.ResolveRegionalSubnets(spec.Region); len(regSubnets) > 0 {
-			subnetIDs = regSubnets
-		}
-	}
-
-	req := &FleetRequest{
-		Region:             spec.Region,
-		TargetCapacity:     1,
-		InstanceTypes:      instanceTypes,
-		SubnetIDs:          subnetIDs,
-		ClusterTag:         spec.ClusterTag,
-		PodName:            spec.PodName,
-		PodNamespace:       spec.PodNamespace,
-		PodUID:             spec.PodUID,
-		CostCenter:         spec.CostCenter,
-		JobID:              spec.JobID,
-		UserData:           encodedUserData,
-		LaunchTemplateID:   ltID,
-		LaunchTemplateName: ltName,
-		MarketType:         spec.MarketType,
-		MaxPrice:           spec.MaxPrice,
-		PricePolicy:        spec.PricePolicy,
-		AllocationStrategy: func() FleetAllocationStrategy {
-			if spec.PricePolicy == "capacity-optimized" || strings.ToLower(os.Getenv("AWS_FLEET_ALLOCATION_STRATEGY")) == "capacity-optimized" {
-				return StrategyCapacityOptimized
-			}
-			return StrategyPriceCapacityOptimized
-		}(),
-		RunnerAuthToken: spec.RunnerAuthToken,
-	}
-
-	overrides := BuildFleetOverrides(req.InstanceTypes, req.SubnetIDs)
-
-	resp, err := LaunchFleetWithClient(ctx, client, req, overrides)
-	if err != nil {
-		GlobalFleetTracker.RecordLaunchAttempt("aws", spec.Region, spec.InstanceType, capType, ClassifyAWSError(err))
-		return nil, fmt.Errorf("launch fleet failed: %w", err)
-	}
-	if len(resp.Instances) == 0 {
-		errMsg := fmt.Sprintf("no instances launched by fleet in %s", spec.Region)
-		if len(resp.Errors) > 0 {
-			errMsg = fmt.Sprintf("%s (fleet errors: %s)", errMsg, strings.Join(resp.Errors, "; "))
-		}
-		GlobalFleetTracker.RecordLaunchAttempt("aws", spec.Region, spec.InstanceType, capType, "no_capacity")
-		return nil, fmt.Errorf("%s", errMsg)
-	}
-
-	inst := resp.Instances[0]
-	if inst.Metadata == nil {
-		inst.Metadata = make(map[string]string)
-	}
-	inst.Metadata["podName"] = spec.PodName
-	inst.Metadata["namespace"] = spec.PodNamespace
-	inst.Metadata["podUID"] = spec.PodUID
-	inst.Metadata["runnerToken"] = spec.RunnerAuthToken
-
-	// Query DescribeInstances to populate the instance IP assigned by EC2
-	descOut, descErr := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: []string{inst.ID},
-	})
-	if descErr == nil && len(descOut.Reservations) > 0 && len(descOut.Reservations[0].Instances) > 0 {
-		ec2Inst := descOut.Reservations[0].Instances[0]
-		if ec2Inst.PrivateIpAddress != nil && *ec2Inst.PrivateIpAddress != "" {
-			inst.IP = *ec2Inst.PrivateIpAddress
-		}
-	}
-
-	p.AddConfiguredRegions(spec.Region)
-	p.AddConfiguredRegions(spec.CandidateRegions...)
-	p.mu.Lock()
-	if p.instanceRegions == nil {
-		p.instanceRegions = make(map[string]string)
-	}
-	p.instanceRegions[inst.ID] = spec.Region
-	if p.missingCount != nil {
-		delete(p.missingCount, inst.ID)
-	}
-	p.mu.Unlock()
-	if p.regionStore != nil {
-		_ = p.regionStore.Set(inst.ID, spec.Region)
-	}
-	GlobalFleetTracker.RecordLaunchAttempt("aws", spec.Region, spec.InstanceType, capType, "ok")
-	GlobalFleetTracker.RecordLaunchDuration("aws", spec.Region, spec.InstanceType, capType, time.Since(startTime))
-	return inst, nil
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
 func (p *AWSProvider) Terminate(ctx context.Context, instanceID string) error {

@@ -74,6 +74,8 @@ type mockEC2FleetClient struct {
 	describeInstancesFn     func(ctx context.Context, params *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error)
 	terminateInstancesFn    func(ctx context.Context, params *ec2.TerminateInstancesInput) (*ec2.TerminateInstancesOutput, error)
 	describeInstanceTypesFn func(ctx context.Context, params *ec2.DescribeInstanceTypesInput) (*ec2.DescribeInstanceTypesOutput, error)
+	describeOfferingsFn     func(ctx context.Context, params *ec2.DescribeInstanceTypeOfferingsInput) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
+	describeSubnetsFn       func(ctx context.Context, params *ec2.DescribeSubnetsInput) (*ec2.DescribeSubnetsOutput, error)
 }
 
 func (m *mockEC2FleetClient) CreateFleet(ctx context.Context, params *ec2.CreateFleetInput, _ ...func(*ec2.Options)) (*ec2.CreateFleetOutput, error) {
@@ -102,6 +104,21 @@ func (m *mockEC2FleetClient) DescribeInstanceTypes(ctx context.Context, params *
 		return m.describeInstanceTypesFn(ctx, params)
 	}
 	return &ec2.DescribeInstanceTypesOutput{}, nil
+}
+
+func (m *mockEC2FleetClient) DescribeInstanceTypeOfferings(ctx context.Context, params *ec2.DescribeInstanceTypeOfferingsInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypeOfferingsOutput, error) {
+	if m.describeOfferingsFn != nil {
+		return m.describeOfferingsFn(ctx, params)
+	}
+	return &ec2.DescribeInstanceTypeOfferingsOutput{}, nil
+}
+
+// DescribeSubnets returns no subnets by default, which leaves subnet AZs unknown and fleet overrides unfiltered.
+func (m *mockEC2FleetClient) DescribeSubnets(ctx context.Context, params *ec2.DescribeSubnetsInput, _ ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error) {
+	if m.describeSubnetsFn != nil {
+		return m.describeSubnetsFn(ctx, params)
+	}
+	return &ec2.DescribeSubnetsOutput{}, nil
 }
 
 func TestAWSProvider_ListActiveInstances_PartialRegionFailureDoesNotBlockOtherRegions(t *testing.T) {

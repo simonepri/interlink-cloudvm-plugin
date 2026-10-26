@@ -53,6 +53,7 @@ type Server struct {
 	kmsClient             KMSClient
 	kmsKeyID              string
 	secretResolver        SecretResolver
+	eventRecorder         PodEventRecorder
 	runner                ContainerRunner
 	tunnel                *tunnelState
 	startRetryInterval    time.Duration
@@ -146,6 +147,9 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	}
 	if sr, err := NewKubeSecretResolverFromConfig(); err == nil {
 		s.secretResolver = sr
+	}
+	if er, err := NewInClusterPodEventRecorder(); err == nil {
+		s.eventRecorder = er
 	}
 	var regMirrors []string
 	if raw := os.Getenv("REGISTRY_MIRRORS"); raw != "" {
@@ -397,6 +401,13 @@ func (s *Server) SetKMSConfig(client KMSClient, keyID string) {
 	defer s.mu.Unlock()
 	s.kmsClient = client
 	s.kmsKeyID = keyID
+}
+
+// SetPodEventRecorder sets the recorder that posts launch events on pods.
+func (s *Server) SetPodEventRecorder(r PodEventRecorder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eventRecorder = r
 }
 
 // SetSecretResolver sets the Kubernetes secret resolver for imagePullSecrets.
@@ -916,6 +927,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		inst.Metadata = make(map[string]string)
 	}
 	inst.Metadata["marketType"] = spec.MarketType
+	s.recordLaunchRegionEvent(launchCtx, spec, inst)
 	if s.tokenStore != nil && spec.RunnerAuthToken != "" {
 		_ = s.tokenStore.Set(inst.ID, spec.RunnerAuthToken)
 	}
@@ -927,7 +939,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var describer InstanceTypeDescriber
 	if p, ok := prov.(*AWSProvider); ok {
-		if cl, err := p.getClient(r.Context(), spec.Region); err == nil {
+		if cl, err := p.getClient(r.Context(), inst.Region); err == nil {
 			if d, ok := cl.(InstanceTypeDescriber); ok {
 				describer = d
 			}
