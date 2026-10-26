@@ -183,10 +183,18 @@ func (c *CloudInitConfig) RenderContainerCommand() string {
 }
 
 const cloudInitTemplate = `#!/usr/bin/env bash
-# Mirror the bootstrap log to the serial console so EC2 get-console-output shows bootstrap errors.
+# Mirror the bootstrap and tunnel agent logs to the serial console so EC2 get-console-output shows them.
 CLOUDVM_SERIAL=/dev/console
 [ -w /dev/ttyS0 ] && CLOUDVM_SERIAL=/dev/ttyS0
-exec > >(tee -a /var/log/cloudvm-bootstrap.log > "$CLOUDVM_SERIAL" 2>/dev/null) 2>&1
+# cloudvm_mirror appends stdin to the file in $1 and reopens the console for every line: the serial getty hangs up
+# ttyS0 while booting, which silences any writer that holds it open.
+cloudvm_mirror() {
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line" >> "$1"
+    printf '%s\n' "$line" > "$CLOUDVM_SERIAL" 2>/dev/null || true
+  done
+}
+exec > >(cloudvm_mirror /var/log/cloudvm-bootstrap.log) 2>&1
 echo "=== INTERLINK CLOUDVM BOOTSTRAP: $(date) ==="
 echo "CLOUDVM_STATUS: {\"status\": \"BOOTING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\", \"type\": \"{{.InstanceType}}\"}" > /dev/console 2>/dev/null || true
 
@@ -246,8 +254,15 @@ fi
 # 2. Reach the tunnel gateway: join the tailnet, or pin the gateway host to the address the footprint routes through its router pair
 {{if eq .TunnelTransport "router"}}
 echo "[cloudvm-bootstrap] Router transport: resolving {{.TunnelHost}} to {{.TunnelGatewayIP}}"
-sed -i '/[[:space:]]{{.TunnelHost}}$/d' /etc/hosts
-echo "{{.TunnelGatewayIP}} {{.TunnelHost}}" >> /etc/hosts
+CLOUDVM_HOSTS=$(grep -vE '[[:space:]]{{.TunnelHost}}([[:space:]]|$)' /etc/hosts || true)
+printf '%s\n%s %s\n' "$CLOUDVM_HOSTS" "{{.TunnelGatewayIP}}" "{{.TunnelHost}}" > /etc/hosts
+# The gateway address sits inside Docker's default bridge (172.17.0.0/16); a host route keeps it on the VPC uplink.
+CLOUDVM_UPLINK_GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+CLOUDVM_UPLINK_DEV=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+if [ -n "$CLOUDVM_UPLINK_GW" ] && [ -n "$CLOUDVM_UPLINK_DEV" ]; then
+  ip route replace "{{.TunnelGatewayIP}}/32" via "$CLOUDVM_UPLINK_GW" dev "$CLOUDVM_UPLINK_DEV"
+fi
+echo "[cloudvm-bootstrap] Gateway route: $(ip -4 route get "{{.TunnelGatewayIP}}" 2>&1 | head -n 1)"
 {{else if or .MeshAuthKey .MeshAuthKeyCiphertext}}
 echo "[cloudvm-bootstrap] Connecting to private mesh network..."
 if ! command -v tailscale >/dev/null 2>&1; then
@@ -1095,7 +1110,7 @@ cat << 'TUNNEL_AGENT_EOF' > /usr/local/bin/cloudvm-tunnel-agent.py
 TUNNEL_AGENT_EOF
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
 CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
-  nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py > /var/log/cloudvm-tunnel-agent.log 2>&1 &
+  nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
 {{end}}
 
 

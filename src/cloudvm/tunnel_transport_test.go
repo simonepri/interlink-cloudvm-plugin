@@ -146,7 +146,7 @@ func TestRenderCloudInit_PerTransport(t *testing.T) {
 		TunnelEndpoint:       FormatTunnelEndpoint("cell-aws-usw2"),
 		TargetContainerImage: "alpine",
 	}
-	hostsLine := `echo "172.17.11.46 clvm-tunnel.cell-aws-usw2.c.corp.boltz.com" >> /etc/hosts`
+	hostsLine := `"172.17.11.46" "clvm-tunnel.cell-aws-usw2.c.corp.boltz.com" > /etc/hosts`
 
 	t.Run("tailnet joins the mesh", func(t *testing.T) {
 		cfg := base
@@ -390,5 +390,118 @@ func TestTunnelAgent_PythonAgentSendsIdentityDocument(t *testing.T) {
 	waitForWithin(t, 60*time.Second, "python agent public session", func() bool { return f.registry.Has(instanceID) })
 	if got, _ := verifier.last(); string(got) != document {
 		t.Fatalf("agent sent document %q, want %q", got, document)
+	}
+}
+
+// scriptSection returns the rendered script from the first line starting with from up to the next line starting with to.
+func scriptSection(t *testing.T, script, from, to string) string {
+	t.Helper()
+	start := strings.Index(script, "\n"+from)
+	if start < 0 {
+		t.Fatalf("script has no section %q", from)
+	}
+	end := strings.Index(script[start+1:], "\n"+to)
+	if end < 0 {
+		t.Fatalf("script has no section %q after %q", to, from)
+	}
+	return script[start+1 : start+1+end]
+}
+
+// runBash runs script with a stub ip command that reports a default route via ens5 and records every call.
+func runBash(t *testing.T, script string) (output, ipCalls string) {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	dir := t.TempDir()
+	stub := `#!/bin/sh
+echo "$*" >> "` + filepath.Join(dir, "ip-calls") + `"
+case "$*" in
+  "-4 route show default") echo "default via 10.20.0.1 dev ens5 proto dhcp src 10.20.3.4 metric 100" ;;
+  "-4 route get "*) echo "172.17.11.46 via 10.20.0.1 dev ens5 src 10.20.3.4" ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(stub), 0o700); err != nil { //nolint:gosec // test stub must be executable
+		t.Fatalf("write stub: %v", err)
+	}
+	cmd := exec.Command(bash, "-c", script) //nolint:gosec // test-rendered script
+	cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+	calls, _ := os.ReadFile(filepath.Join(dir, "ip-calls"))
+	return string(out), string(calls)
+}
+
+// Docker's default bridge owns 172.17.0.0/16, so without a host route a router worker sends its dial to docker0.
+func TestRenderCloudInit_RouterRoutesGatewayAroundDockerBridge(t *testing.T) {
+	cfg := CloudInitConfig{
+		PodName:              "router-gpu",
+		Region:               "us-west-2",
+		NumGPUs:              1,
+		AssignedGPUs:         []int{0},
+		KMSEncryptedToken:    true,
+		KMSKeyID:             "arn:aws:kms:us-west-2:111122223333:key/k",
+		KMSCiphertext:        "Y2lwaGVy",
+		TunnelEndpoint:       FormatTunnelEndpoint("cell-aws-usw2"),
+		TunnelTransport:      "router",
+		TunnelGatewayIP:      "172.17.11.46",
+		TargetContainerImage: "ghcr.io/example/gpu:1",
+	}
+	script := renderTransportScript(t, &cfg)
+	section := scriptSection(t, script, "# 2. Reach the tunnel gateway", "# 3. ")
+	hosts := filepath.Join(t.TempDir(), "hosts")
+	if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n10.9.9.9 clvm-tunnel.cell-aws-usw2.c.corp.boltz.com\n"), 0o600); err != nil {
+		t.Fatalf("write hosts: %v", err)
+	}
+	out, calls := runBash(t, strings.ReplaceAll(section, "/etc/hosts", hosts))
+
+	if !strings.Contains(calls, "route replace 172.17.11.46/32 via 10.20.0.1 dev ens5") {
+		t.Fatalf("router worker must pin a host route for the gateway via the VPC uplink, ip calls:\n%s", calls)
+	}
+	got, _ := os.ReadFile(hosts)
+	if want := "127.0.0.1 localhost\n172.17.11.46 clvm-tunnel.cell-aws-usw2.c.corp.boltz.com\n"; string(got) != want {
+		t.Fatalf("hosts file:\n%s\nwant:\n%s", got, want)
+	}
+	if !strings.Contains(out, "Gateway route: 172.17.11.46 via 10.20.0.1 dev ens5") {
+		t.Errorf("bootstrap must log the gateway route, got:\n%s", out)
+	}
+
+	route := strings.Index(script, "ip route replace")
+	agent := strings.Index(script, "nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py")
+	if route < 0 || agent < 0 || route > agent {
+		t.Fatal("the gateway route must be in place before the tunnel agent starts")
+	}
+	if !strings.Contains(script, "cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &") {
+		t.Error("tunnel agent output must be mirrored to the serial console")
+	}
+}
+
+// The serial getty hangs up ttyS0 during boot; the mirror must keep writing to the console after that.
+func TestRenderCloudInit_ConsoleMirrorSurvivesHangup(t *testing.T) {
+	cfg := CloudInitConfig{PodName: "mirror", Region: "us-west-2", TargetContainerImage: "alpine"}
+	script, err := RenderCloudInit(&cfg)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	dir := t.TempDir()
+	console, logFile := filepath.Join(dir, "console"), filepath.Join(dir, "bootstrap.log")
+	prelude := scriptSection(t, script, "cloudvm_mirror() {", "exec > ")
+	harness := prelude + `
+CLOUDVM_SERIAL="` + console + `"
+{
+  echo first
+  rm -f "$CLOUDVM_SERIAL"
+  echo second
+} | cloudvm_mirror "` + logFile + `"
+`
+	runBash(t, harness)
+	if got, _ := os.ReadFile(console); string(got) != "second\n" {
+		t.Fatalf("console must be reopened per line, got %q", got)
+	}
+	if got, _ := os.ReadFile(logFile); string(got) != "first\nsecond\n" {
+		t.Fatalf("log file got %q", got)
 	}
 }
