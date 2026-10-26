@@ -316,6 +316,11 @@ func (m *ObservabilityMetrics) HideMarketUntilRefreshed() {
 	m.marketShown.Store(false)
 }
 
+// MarketShown reports whether the market gauges are served.
+func (m *ObservabilityMetrics) MarketShown() bool {
+	return m.marketShown.Load()
+}
+
 // ShowMarket serves the market gauges, after a refresh pass has set all of them.
 func (m *ObservabilityMetrics) ShowMarket() {
 	m.marketShown.Store(true)
