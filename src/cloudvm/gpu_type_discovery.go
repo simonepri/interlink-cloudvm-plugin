@@ -139,7 +139,7 @@ func (t *SpotPriceTicker) discoverGPUTypes(ctx context.Context) {
 	t.instanceArch = arch
 	t.lastTypeDiscovery = time.Now()
 	t.mu.Unlock()
-	log.Printf("[cloudvm-ticker] Tracking %d GPU instance types offered in %d regions", len(names), len(t.Regions()))
+	log.Printf("[cloudvm-ticker] Tracking %d GPU instance types offered in %d regions", len(names), len(t.Regions())) //nolint:gosec // logs two counts
 }
 
 // launchable reports whether the worker launch templates can boot an instance type; types discovery has not seen count as x86_64.
