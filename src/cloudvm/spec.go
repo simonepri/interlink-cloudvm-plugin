@@ -98,14 +98,9 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		}
 	}
 
-	// 2. Instance Type
+	// 2. Instance Type: only the annotation names one; node selector and affinity labels filter the catalog instead.
 	instanceType := pod.Metadata.Annotations["cloudvm.vk.io/instance-type"]
-	if instanceType == "" {
-		instanceType = pod.Spec.NodeSelector["node.kubernetes.io/instance-type"]
-	}
-	if instanceType == "" {
-		instanceType = "g5.2xlarge"
-	}
+	instanceRequirements := podInstanceRequirements(pod.Spec.NodeSelector, pod.Spec.Affinity)
 
 	// 3. Market / Capacity Type (spot vs on-demand)
 	marketType := pod.Metadata.Annotations["cloudvm.vk.io/capacity-type"]
@@ -114,6 +109,9 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 	}
 	if marketType == "" {
 		marketType = pod.Spec.NodeSelector["cloudvm.vk.io/capacity-type"]
+	}
+	if marketType == "" {
+		marketType = requiredMarketType(instanceRequirements)
 	}
 	if marketType == "" {
 		marketType = "spot"
@@ -171,15 +169,6 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		for _, t := range strings.Split(cand, ",") {
 			if trimmed := strings.TrimSpace(t); trimmed != "" {
 				candidateInstanceTypes = append(candidateInstanceTypes, trimmed)
-			}
-		}
-	}
-	if len(candidateInstanceTypes) == 0 {
-		if envTypes := os.Getenv("AWS_INSTANCE_TYPES"); envTypes != "" {
-			for _, t := range strings.Split(envTypes, ",") {
-				if trimmed := strings.TrimSpace(t); trimmed != "" {
-					candidateInstanceTypes = append(candidateInstanceTypes, trimmed)
-				}
 			}
 		}
 	}
@@ -348,6 +337,8 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		RunnerConcurrency:      runnerConcurrency,
 		SubnetIDs:              subnetIDs,
 		CandidateInstanceTypes: candidateInstanceTypes,
+		InstanceRequirements:   instanceRequirements,
+		Requests:               ResourceVectorFromPod(pod),
 	}, nil
 }
 

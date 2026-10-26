@@ -38,11 +38,16 @@ func (m *MockProvider) Launch(_ context.Context, spec *InstanceSpec) (*Instance,
 
 	m.counter++
 	id := fmt.Sprintf("i-mock-%04d", m.counter)
+	// Like a real provider, the mock picks a shape when the pod names none.
+	instanceType := spec.InstanceType
+	if instanceType == "" {
+		instanceType = "g5.2xlarge"
+	}
 	inst := &Instance{
 		ID:           id,
 		Provider:     ProviderMock,
 		Region:       spec.Region,
-		InstanceType: spec.InstanceType,
+		InstanceType: instanceType,
 		IP:           fmt.Sprintf("100.64.0.%d", m.counter),
 		State:        StateRunning,
 		CreatedAt:    time.Now(),
