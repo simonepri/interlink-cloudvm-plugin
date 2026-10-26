@@ -57,9 +57,13 @@ func TestSpotPriceTicker_DiscoverGPUTypes(t *testing.T) {
 
 	ticker.discoverGPUTypes(context.Background())
 
-	// Whole-GPU types of both pages and both architectures; no CPU type and no GPU share.
-	if got := strings.Join(ticker.TrackedInstanceTypes(), ","); got != "g5g.xlarge,g7e.2xlarge,gr6.4xlarge" {
-		t.Errorf("tracked = %s, want g5g.xlarge,g7e.2xlarge,gr6.4xlarge", got)
+	// GPU types of both pages and both architectures, GPU slices included; no CPU type.
+	if got := strings.Join(ticker.TrackedInstanceTypes(), ","); got != "g5g.xlarge,g6f.large,g7e.2xlarge,gr6.4xlarge" {
+		t.Errorf("tracked = %s, want g5g.xlarge,g6f.large,g7e.2xlarge,gr6.4xlarge", got)
+	}
+	// g6f.large holds 2861 of the 22888 MiB an L4 has: one eighth, counted as one GPU.
+	if got := ticker.catalog.ResolveCapacity(context.Background(), nil, "g6f.large", ResourceVector{}); got.GPUModel != "L4 1/8 3GB" || got.GPUs != 1 {
+		t.Errorf("g6f.large GPU = %q x%d, want L4 1/8 3GB x1", got.GPUModel, got.GPUs)
 	}
 	if got := ticker.catalog.ResolveCapacity(context.Background(), nil, "gr6.4xlarge", ResourceVector{}).GPUModel; got != "L4 24GB" {
 		t.Errorf("gr6.4xlarge GPU = %q, want the L4 AWS reports", got)
