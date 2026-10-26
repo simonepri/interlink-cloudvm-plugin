@@ -52,7 +52,7 @@ func TestTunnelTransportsFromClusterFacts(t *testing.T) {
 	}
 }
 
-const privateTunnelEndpoint = "tunnel.cell-a.example.internal:443"
+const privateTunnelEndpoint = "tunnel.example.internal:443"
 
 func TestTunnelSettings_ValidateTransportsFailsFastOnMissingEnv(t *testing.T) {
 	cases := map[string]struct {
@@ -62,7 +62,7 @@ func TestTunnelSettings_ValidateTransportsFailsFastOnMissingEnv(t *testing.T) {
 		"tailnet only":                  {TunnelSettings{Endpoint: privateTunnelEndpoint, Transports: TunnelTransports{"us-east-1": TunnelTransportTailnet}}, ""},
 		"default without endpoint":      {TunnelSettings{}, "TUNNEL_ENDPOINT is not set"},
 		"tailnet without endpoint":      {TunnelSettings{Transports: TunnelTransports{"us-east-1": TunnelTransportTailnet}}, "TUNNEL_ENDPOINT is not set"},
-		"tailnet endpoint without port": {TunnelSettings{Endpoint: "tunnel.cell-a.example.internal", Transports: TunnelTransports{"us-east-1": TunnelTransportTailnet}}, "host:port"},
+		"tailnet endpoint without port": {TunnelSettings{Endpoint: "tunnel.example.internal", Transports: TunnelTransports{"us-east-1": TunnelTransportTailnet}}, "host:port"},
 		"router without endpoint":       {TunnelSettings{Transports: TunnelTransports{"us-west-2": TunnelTransportRouter}, GatewayIP: "192.0.2.10"}, "TUNNEL_ENDPOINT is not set"},
 		"router without ip":             {TunnelSettings{Endpoint: privateTunnelEndpoint, Transports: TunnelTransports{"us-west-2": TunnelTransportRouter}}, "TUNNEL_GATEWAY_IP is not set"},
 		"router with bad ip":            {TunnelSettings{Endpoint: privateTunnelEndpoint, Transports: TunnelTransports{"us-west-2": TunnelTransportRouter}, GatewayIP: "gateway"}, "not an IP address"},
@@ -95,13 +95,13 @@ func transportSettings() TunnelSettings {
 			"eu-west-1": TunnelTransportPublic,
 		},
 		GatewayIP:      "192.0.2.10",
-		PublicEndpoint: "tunnel.cell-test.example.com:443",
+		PublicEndpoint: "tunnel.example.com:443",
 	}
 }
 
 func TestApplyTunnelSpec_PerTransport(t *testing.T) {
 	f := newTunnelFixtureWith(t, transportSettings())
-	privateEndpoint := "tunnel.cell-test.example.internal:443"
+	privateEndpoint := "tunnel.example.internal:443"
 
 	tailnet := &InstanceSpec{Region: "us-east-1"}
 	router := &InstanceSpec{Region: "us-west-2", MeshAuthKey: "pod-supplied"}
@@ -118,7 +118,7 @@ func TestApplyTunnelSpec_PerTransport(t *testing.T) {
 	if router.TunnelTransport != "router" || router.TunnelEndpoint != privateEndpoint || router.TunnelGatewayIP != "192.0.2.10" {
 		t.Errorf("router spec must dial the private hostname through the gateway IP: %+v", router)
 	}
-	if public.TunnelTransport != "public" || public.TunnelEndpoint != "tunnel.cell-test.example.com:443" || public.TunnelGatewayIP != "" {
+	if public.TunnelTransport != "public" || public.TunnelEndpoint != "tunnel.example.com:443" || public.TunnelGatewayIP != "" {
 		t.Errorf("public spec must dial the public endpoint: %+v", public)
 	}
 	for _, spec := range []*InstanceSpec{router, public} {
@@ -131,7 +131,7 @@ func TestApplyTunnelSpec_PerTransport(t *testing.T) {
 func TestApplyTunnelSpec_TailnetWithoutMeshKeyFails(t *testing.T) {
 	server := NewServer(NewMockProvider(), "test-cluster")
 	server.EnableTunnel(TunnelSettings{
-		Endpoint:   "tunnel.cell-test.example.internal:443",
+		Endpoint:   "tunnel.example.internal:443",
 		Transports: TunnelTransports{"us-west-2": TunnelTransportRouter},
 		GatewayIP:  "192.0.2.10",
 	})
@@ -148,7 +148,7 @@ func TestApplyTunnelSpec_PrivateTransportWithoutEndpointFails(t *testing.T) {
 	server := NewServer(NewMockProvider(), "test-cluster")
 	server.EnableTunnel(TunnelSettings{
 		Transports:     TunnelTransports{"eu-west-1": TunnelTransportPublic},
-		PublicEndpoint: "tunnel.cell-test.example.com:443",
+		PublicEndpoint: "tunnel.example.com:443",
 		MeshAuthKey:    "tskey-auth-test",
 	})
 	if err := server.applyTunnelSpec(&InstanceSpec{Region: "eu-west-1"}); err != nil {
@@ -165,10 +165,10 @@ func TestRenderCloudInit_PerTransport(t *testing.T) {
 		PodName:              "transport-pod",
 		Region:               "us-west-2",
 		RunnerAuthToken:      "runner-secret",
-		TunnelEndpoint:       "tunnel.cell-a.example.internal:443",
+		TunnelEndpoint:       "tunnel.example.internal:443",
 		TargetContainerImage: "alpine",
 	}
-	hostsLine := `"192.0.2.10" "tunnel.cell-a.example.internal" > /etc/hosts`
+	hostsLine := `"192.0.2.10" "tunnel.example.internal" > /etc/hosts`
 
 	t.Run("tailnet joins the mesh", func(t *testing.T) {
 		cfg := base
@@ -191,7 +191,7 @@ func TestRenderCloudInit_PerTransport(t *testing.T) {
 		if strings.Contains(script, "tailscale up") {
 			t.Error("router workers must not join the tailnet")
 		}
-		if !strings.Contains(script, `CLOUDVM_TUNNEL_ENDPOINT="tunnel.cell-a.example.internal:443"`) {
+		if !strings.Contains(script, `CLOUDVM_TUNNEL_ENDPOINT="tunnel.example.internal:443"`) {
 			t.Error("router workers must dial the private hostname so TLS verifies the gateway certificate")
 		}
 		if !strings.Contains(script, "instance-identity/pkcs7") || strings.Contains(script, "instance-identity/rsa2048") {
@@ -210,13 +210,13 @@ func TestRenderCloudInit_PerTransport(t *testing.T) {
 	t.Run("public sends the identity document", func(t *testing.T) {
 		cfg := base
 		cfg.TunnelTransport = "public"
-		cfg.TunnelEndpoint = "tunnel.cell-test.example.com:443"
+		cfg.TunnelEndpoint = "tunnel.example.com:443"
 		script := renderTransportScript(t, &cfg)
 		if strings.Contains(script, "tailscale up") || strings.Contains(script, "/etc/hosts") {
 			t.Error("public workers must neither join the tailnet nor pin a host")
 		}
 		for _, want := range []string{
-			`CLOUDVM_TUNNEL_ENDPOINT="tunnel.cell-test.example.com:443"`,
+			`CLOUDVM_TUNNEL_ENDPOINT="tunnel.example.com:443"`,
 			"instance-identity/rsa2048 > /etc/cloudvm/attestation",
 		} {
 			if !strings.Contains(script, want) {
@@ -467,7 +467,7 @@ func TestRenderCloudInit_RouterRoutesGatewayAroundDockerBridge(t *testing.T) {
 		KMSEncryptedToken:    true,
 		KMSKeyID:             "arn:aws:kms:us-west-2:111122223333:key/k",
 		KMSCiphertext:        "Y2lwaGVy",
-		TunnelEndpoint:       "tunnel.cell-a.example.internal:443",
+		TunnelEndpoint:       "tunnel.example.internal:443",
 		TunnelTransport:      "router",
 		TunnelGatewayIP:      "192.0.2.10",
 		TargetContainerImage: "ghcr.io/example/gpu:1",
@@ -475,7 +475,7 @@ func TestRenderCloudInit_RouterRoutesGatewayAroundDockerBridge(t *testing.T) {
 	script := renderTransportScript(t, &cfg)
 	section := scriptSection(t, script, "# 2. Reach the tunnel gateway", "# 3. ")
 	hosts := filepath.Join(t.TempDir(), "hosts")
-	if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n10.9.9.9 tunnel.cell-a.example.internal\n"), 0o600); err != nil {
+	if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n10.9.9.9 tunnel.example.internal\n"), 0o600); err != nil {
 		t.Fatalf("write hosts: %v", err)
 	}
 	out, calls := runBash(t, strings.ReplaceAll(section, "/etc/hosts", hosts))
@@ -484,7 +484,7 @@ func TestRenderCloudInit_RouterRoutesGatewayAroundDockerBridge(t *testing.T) {
 		t.Fatalf("router worker must pin a host route for the gateway via the VPC uplink, ip calls:\n%s", calls)
 	}
 	got, _ := os.ReadFile(hosts)
-	if want := "127.0.0.1 localhost\n192.0.2.10 tunnel.cell-a.example.internal\n"; string(got) != want {
+	if want := "127.0.0.1 localhost\n192.0.2.10 tunnel.example.internal\n"; string(got) != want {
 		t.Fatalf("hosts file:\n%s\nwant:\n%s", got, want)
 	}
 	if !strings.Contains(out, "Gateway route: 192.0.2.10 via 10.20.0.1 dev ens5") {

@@ -270,7 +270,7 @@ To avoid hitting AWS/GCP API rate limits when running multiple provider instance
 ```mermaid
 flowchart TD
     classDef central fill:#311042,stroke:#C084FC,stroke-width:2px,color:#F8FAFC
-    classDef cell fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
+    classDef cluster fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC
     classDef otel fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC
 
     subgraph Central["Management Cluster"]
@@ -286,11 +286,11 @@ cloudvm_spot_placement_score"]:::central
 
     Metrics --> OTEL["Prometheus / SigNoz / Grafana"]:::otel
 
-    subgraph Cells["Worker Clusters"]
-        HTTP --> Cell1["Provider 1
-(--ticker-url=http://...)"]:::cell
-        HTTP --> Cell2["Provider 2
-(--ticker-url=http://...)"]:::cell
+    subgraph Clusters["Worker Clusters"]
+        HTTP --> Cluster1["Provider 1
+(--ticker-url=http://...)"]:::cluster
+        HTTP --> Cluster2["Provider 2
+(--ticker-url=http://...)"]:::cluster
     end
 ```
 
