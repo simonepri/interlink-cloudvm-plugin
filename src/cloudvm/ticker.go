@@ -840,6 +840,9 @@ func OnDemandBaselineUSD(instanceType string) float64 {
 
 // Start runs the background polling loop until ctx is canceled.
 func (t *SpotPriceTicker) Start(ctx context.Context) {
+	if t.metrics != nil {
+		t.metrics.HideMarketUntilRefreshed()
+	}
 	if t.autoDiscoverRegions {
 		t.refreshDiscoveredRegions(ctx)
 	}
