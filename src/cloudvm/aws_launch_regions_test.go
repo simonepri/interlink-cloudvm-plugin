@@ -2,8 +2,12 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"errors"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -32,6 +36,7 @@ type regionMock struct {
 	offeringCalls  int
 	lastOverrides  []ec2types.FleetLaunchTemplateOverridesRequest
 	lastTemplateID string
+	lastUserData   string
 }
 
 func (m *regionMock) client() *mockEC2FleetClient {
@@ -42,6 +47,7 @@ func (m *regionMock) client() *mockEC2FleetClient {
 			m.createCalls++
 			m.lastOverrides = in.LaunchTemplateConfigs[0].Overrides
 			m.lastTemplateID = aws.ToString(in.LaunchTemplateConfigs[0].LaunchTemplateSpecification.LaunchTemplateId)
+			m.lastUserData = aws.ToString(in.LaunchTemplateConfigs[0].LaunchTemplateSpecification.LaunchTemplateSpecificationUserData)
 			if m.createErr != nil {
 				return nil, m.createErr
 			}
@@ -369,5 +375,76 @@ func TestKubePodEventRecorderCreatesPodEvent(t *testing.T) {
 	ev := list.Items[0]
 	if ev.InvolvedObject.Kind != "Pod" || ev.InvolvedObject.Name != "burst" || string(ev.InvolvedObject.UID) != "uid-burst" || ev.Reason != "CloudVMRegionSelected" {
 		t.Fatalf("unexpected event %+v", ev)
+	}
+}
+
+func decodeUserData(t *testing.T, encoded string) string {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("user data is not base64: %v", err)
+	}
+	r, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("user data is not gzip: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read user data: %v", err)
+	}
+	return string(out)
+}
+
+func TestLaunchFallbackUsesTheLaunchRegionsTunnelRoute(t *testing.T) {
+	p := newTestProvider(t)
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
+		"us-west-1": {LaunchTemplateID: "lt-usw1"},
+		"eu-west-1": {LaunchTemplateID: "lt-euw1"},
+	}})
+	usw1 := &regionMock{fleetErrorCode: "InsufficientInstanceCapacity"}
+	euw1 := &regionMock{instanceID: "i-euw1"}
+	p.SetRegionClient("us-west-1", usw1.client())
+	p.SetRegionClient("eu-west-1", euw1.client())
+
+	server := NewServer(p, "test-cluster")
+	server.EnableTunnel(TunnelSettings{
+		Endpoint:       "tunnel.example.internal:443",
+		Transports:     TunnelTransports{"us-west-1": TunnelTransportRouter, "eu-west-1": TunnelTransportPublic},
+		GatewayIP:      "192.0.2.10",
+		PublicEndpoint: "tunnel.example.com:443",
+	})
+	spec := fallbackSpec("eu-west-1")
+	spec.RunnerAuthToken = "runner-secret"
+	if err := server.applyTunnelSpec(spec); err != nil {
+		t.Fatalf("applyTunnelSpec: %v", err)
+	}
+
+	if _, err := p.Launch(context.Background(), spec); err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	pinned := decodeUserData(t, usw1.lastUserData)
+	if !strings.Contains(pinned, "Router transport") || !strings.Contains(pinned, "tunnel.example.internal:443") {
+		t.Errorf("pinned us-west-1 attempt must use the router route")
+	}
+	fallback := decodeUserData(t, euw1.lastUserData)
+	if strings.Contains(fallback, "Router transport") || strings.Contains(fallback, "192.0.2.10") {
+		t.Errorf("eu-west-1 fallback must not use the pinned region's router route")
+	}
+	if !strings.Contains(fallback, `CLOUDVM_TUNNEL_ENDPOINT="tunnel.example.com:443"`) || !strings.Contains(fallback, "instance-identity/rsa2048") {
+		t.Errorf("eu-west-1 fallback must dial the public endpoint with an identity document")
+	}
+}
+
+func TestLaunchRegionsSkipsCandidatesWithoutTunnelRoute(t *testing.T) {
+	p := newTestProvider(t)
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
+		"us-east-1": {LaunchTemplateID: "lt-use1"},
+		"us-east-2": {LaunchTemplateID: "lt-use2"},
+	}})
+	spec := fallbackSpec("us-east-1", "us-east-2")
+	spec.TunnelRoutes = map[string]TunnelRoute{"us-west-1": {Transport: "router"}, "us-east-2": {Transport: "public"}}
+	got := strings.Join(p.launchRegions(spec, []string{"g5.xlarge"}), ",")
+	if got != "us-west-1,us-east-2" {
+		t.Fatalf("launchRegions = %s, want us-west-1,us-east-2", got)
 	}
 }

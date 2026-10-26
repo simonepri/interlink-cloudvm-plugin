@@ -1184,6 +1184,10 @@ func RenderCloudInit(cfg *CloudInitConfig) (string, error) {
 	if cfg.RunnerConcurrency < 0 {
 		cfg.RunnerConcurrency = 0
 	}
+	// Router and public workers never join the tailnet, so a mesh key carried for other regions stays out of their user data.
+	if cfg.TunnelTransport == string(TunnelTransportRouter) || cfg.TunnelTransport == string(TunnelTransportPublic) {
+		cfg.MeshAuthKey, cfg.MeshAuthKeyCiphertext, cfg.MeshTags = "", "", ""
+	}
 	if err := cfg.Validate(); err != nil {
 		return "", err
 	}
