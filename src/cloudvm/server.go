@@ -747,7 +747,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			spec.PodNamespace, spec.PodName, warmNode.InstanceID, assignedGPUs, assignedTPUs)
 
 		// Start container via runner
-		cName := "worker"
+		cName := defaultContainerName
 		if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
 			cName = pod.Spec.Containers[0].Name
 		}
@@ -945,7 +945,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	gpus, tpus := s.nodePool.RegisterAndAllocate(newNode, reqVec, spec.PodUID, spec.PodNamespace, spec.PodName)
 
-	cName := "worker"
+	cName := defaultContainerName
 	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
 		cName = pod.Spec.Containers[0].Name
 	}
@@ -1148,17 +1148,30 @@ type statusPodMetadata struct {
 	UID       string `json:"uid"`
 }
 
+type statusContainerSpec struct {
+	Name  string `json:"name"`
+	Image string `json:"image"`
+}
+
+type statusPodSpec struct {
+	Containers     []statusContainerSpec `json:"containers"`
+	InitContainers []statusContainerSpec `json:"initContainers"`
+}
+
 type statusPodItem struct {
 	Pod *struct {
 		Metadata statusPodMetadata `json:"metadata"`
+		Spec     statusPodSpec     `json:"spec"`
 	} `json:"pod"`
 	Metadata statusPodMetadata `json:"metadata"`
+	Spec     statusPodSpec     `json:"spec"`
 }
 
 type statusPodRef struct {
 	Name      string
 	Namespace string
 	UID       string
+	Spec      statusPodSpec
 }
 
 func extractPodRef(item *statusPodItem) *statusPodRef {
@@ -1170,6 +1183,7 @@ func extractPodRef(item *statusPodItem) *statusPodRef {
 			Name:      item.Pod.Metadata.Name,
 			Namespace: item.Pod.Metadata.Namespace,
 			UID:       item.Pod.Metadata.UID,
+			Spec:      item.Pod.Spec,
 		}
 	}
 	if item.Metadata.Name != "" || item.Metadata.UID != "" {
@@ -1177,6 +1191,7 @@ func extractPodRef(item *statusPodItem) *statusPodRef {
 			Name:      item.Metadata.Name,
 			Namespace: item.Metadata.Namespace,
 			UID:       item.Metadata.UID,
+			Spec:      item.Spec,
 		}
 	}
 	return nil
@@ -1271,6 +1286,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		jid           string
 		inst          *Instance
 		completedTerm *ContainerTerminatedState
+		spec          statusPodSpec
 	}
 
 	s.mu.RLock()
@@ -1361,6 +1377,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			jid:           jid,
 			inst:          inst,
 			completedTerm: completedTerm,
+			spec:          pod.Spec,
 		}
 	}
 	s.mu.RUnlock()
@@ -1392,9 +1409,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					}
 					tgt := targets[idx]
 
-					status := ContainerStatus{
-						Name: "worker",
-					}
+					var status ContainerStatus
 
 					completedTerm := tgt.completedTerm
 					if completedTerm == nil && tgt.uid != "" && s.completedStore != nil {
@@ -1547,14 +1562,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 
+					containers, initContainers := specContainerStatuses(tgt.spec, status)
 					responses[idx] = PodStatusResponse{
-						PodUID:    tgt.uid,
-						Name:      tgt.name,
-						Namespace: tgt.ns,
-						JID:       tgt.jid,
-						Containers: []ContainerStatus{
-							status,
-						},
+						PodUID:         tgt.uid,
+						Name:           tgt.name,
+						Namespace:      tgt.ns,
+						JID:            tgt.jid,
+						Containers:     containers,
+						InitContainers: initContainers,
 					}
 				}
 			}()
@@ -1564,6 +1579,38 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(responses)
+}
+
+// specContainerStatuses reports the workload status under the name of every container in the pod spec, because interLink
+// matches remote statuses to in-cluster statuses by container name and appends any name it does not know.
+// The VM runs the pod as one workload, so every regular container mirrors its state; init containers are not
+// executed and are reported as terminated successfully so interLink does not hold the pod in PodInitializing.
+func specContainerStatuses(spec statusPodSpec, workload ContainerStatus) (containers, initContainers []ContainerStatus) {
+	specContainers := spec.Containers
+	if len(specContainers) == 0 {
+		specContainers = []statusContainerSpec{{Name: defaultContainerName}}
+	}
+	containers = make([]ContainerStatus, 0, len(specContainers))
+	for _, c := range specContainers {
+		st := workload
+		st.Name = c.Name
+		st.Image = c.Image
+		containers = append(containers, st)
+	}
+	initContainers = make([]ContainerStatus, 0, len(spec.InitContainers))
+	for _, c := range spec.InitContainers {
+		initContainers = append(initContainers, ContainerStatus{
+			Name:  c.Name,
+			Image: c.Image,
+			State: ContainerStatusState{Terminated: &ContainerTerminatedState{
+				ExitCode:   0,
+				Reason:     "Completed",
+				Message:    "The CloudVM plugin does not run init containers",
+				FinishedAt: time.Now(),
+			}},
+		})
+	}
+	return containers, initContainers
 }
 
 // recordRunnerTermination marks a pod terminated with the runner's exit code, reason, and message and persists it.
