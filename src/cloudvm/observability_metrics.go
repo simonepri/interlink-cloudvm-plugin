@@ -328,12 +328,19 @@ func (m *ObservabilityMetrics) SetSignalAge(provider, region, source string, age
 	m.market.set(m.signalAge, ageSeconds, provider, region, source)
 }
 
-// SetQuota exports GPU quota limits and utilized GPUs.
-func (m *ObservabilityMetrics) SetQuota(provider, region, accelerator, quota string, limitGPUs, usedGPUs float64) {
+// SetQuota exports a quota's limit in approximate GPUs.
+func (m *ObservabilityMetrics) SetQuota(provider, region, accelerator, quota string, limitGPUs float64) {
 	if accelerator == "" {
 		accelerator = "gpu"
 	}
 	m.market.set(m.quotaLimit, limitGPUs, provider, region, accelerator, quota)
+}
+
+// SetQuotaUsed exports how much of a quota the account uses, in approximate GPUs.
+func (m *ObservabilityMetrics) SetQuotaUsed(provider, region, accelerator, quota string, usedGPUs float64) {
+	if accelerator == "" {
+		accelerator = "gpu"
+	}
 	m.market.set(m.quotaUsed, usedGPUs, provider, region, accelerator, quota)
 }
 

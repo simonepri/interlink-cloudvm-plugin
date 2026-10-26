@@ -133,7 +133,7 @@ func (c *GCPMarketCollector) Collect(ctx context.Context, metrics *Observability
 	for _, region := range c.regions {
 		// 1. Quotas
 		for qName, qLimit := range KnownGCPGPUQuotas {
-			metrics.SetQuota("gcp", region, "gpu", qName, qLimit, 0)
+			metrics.SetQuota("gcp", region, "gpu", qName, qLimit)
 		}
 
 		// 2. Machine types & prices

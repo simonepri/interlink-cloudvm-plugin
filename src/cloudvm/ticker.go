@@ -77,6 +77,8 @@ type SpotPriceTicker struct {
 	spotCapacity  map[string]map[int]float64
 	quotasAPI     AWSServiceQuotasAPI
 	quotasFactory func(region string) AWSServiceQuotasAPI
+	usageFactory  func(region string) AWSUsageAPI
+	probeCaps     map[probeCapKey]probeCap
 }
 
 // NewSpotPriceTicker initializes a spot price ticker with full market observability.
@@ -303,6 +305,23 @@ func (t *SpotPriceTicker) SetServiceQuotasFactory(factory func(region string) AW
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.quotasFactory = factory
+}
+
+// SetQuotaUsageFactory sets how the ticker builds a CloudWatch client for each region it reads quota usage in.
+func (t *SpotPriceTicker) SetQuotaUsageFactory(factory func(region string) AWSUsageAPI) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.usageFactory = factory
+}
+
+// usageClient returns the CloudWatch client for a region, or nil when none is configured.
+func (t *SpotPriceTicker) usageClient(region string) AWSUsageAPI {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.usageFactory != nil {
+		return t.usageFactory(region)
+	}
+	return nil
 }
 
 // quotasClient returns the service quotas client for a region, or nil when none is configured.
@@ -685,7 +704,7 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 	quotaVCPUs := make(map[string]float64)
 	var quotaMu sync.Mutex
 	t.forEachRegion(ctx, t.Regions(), func(ctx context.Context, reg string) {
-		limits := QueryAWSGPUQuotas(ctx, t.quotasClient(reg), reg, t.metrics)
+		limits := QueryAWSGPUQuotas(ctx, t.quotasClient(reg), t.usageClient(reg), reg, t.metrics)
 		quotaMu.Lock()
 		defer quotaMu.Unlock()
 		for name, vcpus := range limits {

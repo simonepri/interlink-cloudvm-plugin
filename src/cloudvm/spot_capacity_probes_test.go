@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -13,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 )
 
 type probeFetcher struct {
@@ -26,7 +26,7 @@ func (f *probeFetcher) GetSpotPlacementScores(_ context.Context, in *ec2.GetSpot
 	defer f.mu.Unlock()
 	f.inputs = append(f.inputs, in)
 	if aws.ToInt32(in.TargetCapacity) > 32 {
-		return nil, errors.New("target capacity exceeds the account's spot limit")
+		return nil, &smithy.GenericAPIError{Code: "TargetCapacityLimitExceeded", Message: "The value for targetCapacity exceeds your limit"}
 	}
 	out := &ec2.GetSpotPlacementScoresOutput{}
 	for _, region := range in.RegionNames {
@@ -62,9 +62,44 @@ func TestSpotPriceTicker_ProbeSpotCapacity(t *testing.T) {
 	if oneGPU[8] != 7 {
 		t.Errorf("24 GB 1-GPU scores = %v, want 7 at 8 GPUs", oneGPU)
 	}
-	for _, in := range fetcher.inputs {
-		if aws.ToInt32(in.TargetCapacity) > maxProbeInstances {
-			t.Errorf("probed %d instances, above the %d AWS accepts", aws.ToInt32(in.TargetCapacity), maxProbeInstances)
+	if _, ok := eightGPU[1024]; ok {
+		t.Errorf("1024 GPUs (128 instances) was rejected by AWS but still scored: %v", eightGPU)
+	}
+}
+
+func TestSpotPriceTicker_ProbeSpotCapacityLearnsTheTargetLimit(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"g6.xlarge"}, time.Minute)
+	fetcher := &probeFetcher{}
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
+	rejected := func() int {
+		n := 0
+		for _, in := range fetcher.inputs {
+			if aws.ToInt32(in.TargetCapacity) > 32 {
+				n++
+			}
 		}
+		return n
+	}
+
+	// 1-GPU shapes: 64 GPUs is 64 instances, which the mock rejects; 256 and 1024 are then skipped.
+	ticker.ProbeSpotCapacity(context.Background())
+	if got := rejected(); got != 1 {
+		t.Fatalf("first pass sent %d rejected probes, want 1", got)
+	}
+	ticker.ProbeSpotCapacity(context.Background())
+	if got := rejected(); got != 1 {
+		t.Errorf("second pass retried a probe AWS rejected: %d rejected probes in total", got)
+	}
+
+	// Once the retry window passes, the ticker asks again, so a grown limit is noticed.
+	ticker.mu.Lock()
+	for key, c := range ticker.probeCaps {
+		c.until = time.Now().Add(-time.Second)
+		ticker.probeCaps[key] = c
+	}
+	ticker.mu.Unlock()
+	ticker.ProbeSpotCapacity(context.Background())
+	if got := rejected(); got != 2 {
+		t.Errorf("after the retry window, %d rejected probes in total, want 2", got)
 	}
 }

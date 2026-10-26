@@ -4,12 +4,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
@@ -177,27 +182,78 @@ type mockServiceQuotasClient struct {
 	err error
 }
 
-func (m *mockServiceQuotasClient) GetServiceQuota(_ context.Context, _ *servicequotas.GetServiceQuotaInput, _ ...func(*servicequotas.Options)) (*servicequotas.GetServiceQuotaOutput, error) {
+func (m *mockServiceQuotasClient) GetServiceQuota(_ context.Context, params *servicequotas.GetServiceQuotaInput, _ ...func(*servicequotas.Options)) (*servicequotas.GetServiceQuotaOutput, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
+	code := aws.ToString(params.QuotaCode)
 	return &servicequotas.GetServiceQuotaOutput{
 		Quota: &quotatypes.ServiceQuota{
 			Value: aws.Float64(m.val),
+			UsageMetric: &quotatypes.MetricInfo{
+				MetricNamespace:  aws.String("AWS/Usage"),
+				MetricName:       aws.String("ResourceCount"),
+				MetricDimensions: map[string]string{"Class": code, "Resource": "vCPU", "Service": "EC2", "Type": "Resource"},
+			},
 		},
 	}, nil
 }
 
+// mockUsageClient reports usedVCPUs for the quota whose usage metric has Class usedClass, and no datapoints for the others.
+type mockUsageClient struct {
+	usedClass string
+	usedVCPUs float64
+	err       error
+}
+
+func (m *mockUsageClient) GetMetricData(_ context.Context, params *cloudwatch.GetMetricDataInput, _ ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	out := &cloudwatch.GetMetricDataOutput{}
+	for _, q := range params.MetricDataQueries {
+		result := cwtypes.MetricDataResult{Id: q.Id}
+		for _, d := range q.MetricStat.Metric.Dimensions {
+			if aws.ToString(d.Name) == "Class" && aws.ToString(d.Value) == m.usedClass {
+				result.Values = []float64{m.usedVCPUs, 1}
+			}
+		}
+		out.MetricDataResults = append(out.MetricDataResults, result)
+	}
+	return out, nil
+}
+
 func TestQueryAWSGPUQuotas(t *testing.T) {
 	ctx := context.Background()
-	mockClient := &mockServiceQuotasClient{val: 64.0}
+	quotas := &mockServiceQuotasClient{val: 768}
 	metrics := NewObservabilityMetrics()
 
-	QueryAWSGPUQuotas(ctx, mockClient, "us-west-2", metrics)
+	// The P spot quota (L-7212CCBC) has 192 vCPUs in use; the other quotas have no recent usage datapoints.
+	free := QueryAWSGPUQuotas(ctx, quotas, &mockUsageClient{usedClass: "L-7212CCBC", usedVCPUs: 192}, "us-west-2", metrics)
 
-	val, err := QueryAWSQuota(ctx, mockClient, "L-3819A6DF")
-	if err != nil || val != 64.0 {
-		t.Errorf("expected quota 64.0, got %f (err: %v)", val, err)
+	if free["p_spot"] != 576 || free["g_vt_spot"] != 768 {
+		t.Errorf("free vCPUs = %v, want 576 for p_spot and 768 for g_vt_spot", free)
+	}
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `cloudvm_quota_used_gpus{accelerator="gpu",provider="aws",quota="p_spot",region="us-west-2"} 16`) {
+		t.Errorf("P spot usage not exported as 192/12 = 16 GPUs:\n%s", body)
+	}
+}
+
+func TestQueryAWSGPUQuotas_UnreadableUsageLeavesLimitFree(t *testing.T) {
+	metrics := NewObservabilityMetrics()
+
+	free := QueryAWSGPUQuotas(context.Background(), &mockServiceQuotasClient{val: 768}, &mockUsageClient{err: errors.New("AccessDenied")}, "us-west-2", metrics)
+
+	if free["p_spot"] != 768 {
+		t.Errorf("free p_spot = %v, want the full 768 when usage cannot be read", free["p_spot"])
+	}
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if strings.Contains(rec.Body.String(), "cloudvm_quota_used_gpus{") {
+		t.Errorf("exported quota usage although it could not be read")
 	}
 }
 
