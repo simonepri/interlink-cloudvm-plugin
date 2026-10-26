@@ -4,8 +4,8 @@ description: >-
   CNCF InterLink provider for ultra-fast, multi-cloud, cross-region Spot and
   On-Demand VM bursting in Kubernetes
 type: application
-version: 0.19.0
-appVersion: 0.19.0
+version: 0.19.1
+appVersion: 0.19.1
 keywords:
   - kubernetes
   - interlink
