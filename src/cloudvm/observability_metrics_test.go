@@ -22,7 +22,8 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 	metrics.SetSignalAge("aws", "us-west-2", "aws_spot_advisor", 3600)
 
 	// 3. Record quotas
-	metrics.SetQuota("aws", "us-west-2", "gpu", "g_vt_spot", 64, 8)
+	metrics.SetQuota("aws", "us-west-2", "gpu", "g_vt_spot", 64)
+	metrics.SetQuotaUsed("aws", "us-west-2", "gpu", "g_vt_spot", 8)
 
 	// 4. Record fill quotes
 	metrics.SetFillPlan(FillPlan{MinGPUMemoryGB: 24, TargetGPUs: 64, PlannedGPUs: 64, ExpectedGPUs: 57.6, PricePerGPUHour: 0.45,

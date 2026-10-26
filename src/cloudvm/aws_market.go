@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -14,15 +15,23 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 	pricingtypes "github.com/aws/aws-sdk-go-v2/service/pricing/types"
 	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
+	quotatypes "github.com/aws/aws-sdk-go-v2/service/servicequotas/types"
 )
 
 // AWSPricingAPI abstracts the AWS Price List Service API.
 type AWSPricingAPI interface {
 	GetProducts(ctx context.Context, params *pricing.GetProductsInput, optFns ...func(*pricing.Options)) (*pricing.GetProductsOutput, error)
+}
+
+// AWSUsageAPI abstracts the CloudWatch call that reads EC2 quota usage from the AWS/Usage namespace.
+type AWSUsageAPI interface {
+	GetMetricData(ctx context.Context, params *cloudwatch.GetMetricDataInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error)
 }
 
 // AWSServiceQuotasAPI abstracts the AWS Service Quotas API.
@@ -264,7 +273,7 @@ func parsePricingJSONPrice(raw string) float64 {
 // DefaultAWSGPUQuotaCodes maps standard EC2 quota codes for GPU families.
 var DefaultAWSGPUQuotaCodes = map[string]string{
 	"g_vt_spot":         "L-3819A6DF", // All G and VT Spot Instance Requests
-	"p_spot":            "L-7295265B", // All P Spot Instance Requests
+	"p_spot":            "L-7212CCBC", // All P Spot Instance Requests
 	"standard_spot":     "L-34B43A08", // All Standard (A, C, D, I, M, R, T, Z) Spot
 	"g_vt_ondemand":     "L-DB2E81BA", // Running On-Demand G and VT instances
 	"p_ondemand":        "L-417A185B", // Running On-Demand P instances
@@ -310,43 +319,112 @@ func init() {
 	}
 }
 
-// QueryAWSQuota retrieves an EC2 Service Quota limit in vCPUs and estimates GPU quota.
-func QueryAWSQuota(ctx context.Context, client AWSServiceQuotasAPI, quotaCode string) (float64, error) {
+// QueryAWSQuota retrieves an EC2 Service Quota limit in vCPUs and the AWS/Usage metric that counts its usage, if AWS names one.
+func QueryAWSQuota(ctx context.Context, client AWSServiceQuotasAPI, quotaCode string) (float64, *quotatypes.MetricInfo, error) {
 	if client == nil {
-		return 0, fmt.Errorf("service quotas client not configured")
+		return 0, nil, fmt.Errorf("service quotas client not configured")
 	}
 	out, err := client.GetServiceQuota(ctx, &servicequotas.GetServiceQuotaInput{
 		ServiceCode: aws.String("ec2"),
 		QuotaCode:   aws.String(quotaCode),
 	})
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if out.Quota == nil || out.Quota.Value == nil {
-		return 0, nil
+		return 0, nil, nil
 	}
-	return *out.Quota.Value, nil
+	return *out.Quota.Value, out.Quota.UsageMetric, nil
 }
 
-// QueryAWSGPUQuotas queries configured EC2 quota codes in a region, exports them as approximate GPUs, and returns the vCPU limits by quota name.
-func QueryAWSGPUQuotas(ctx context.Context, client AWSServiceQuotasAPI, region string, metrics *ObservabilityMetrics) map[string]float64 {
-	limits := make(map[string]float64)
-	if client == nil || metrics == nil {
-		return limits
+// quotaUsageWindow is how far back usage is read. AWS/Usage publishes EC2 vCPU usage about every minute while a class has
+// running instances and nothing once it has none, so a quota without a datapoint in the window is read as unused.
+const quotaUsageWindow = 15 * time.Minute
+
+// QueryAWSQuotaUsage reads the latest vCPU usage of each named quota from its AWS/Usage metric.
+// Quotas without a usage metric are left out; ok is false when the read failed, and the error is logged.
+func QueryAWSQuotaUsage(ctx context.Context, client AWSUsageAPI, region string, usageMetrics map[string]*quotatypes.MetricInfo) (map[string]float64, bool) {
+	used := make(map[string]float64)
+	if client == nil {
+		return used, false
 	}
-	for name, code := range KnownAWSGPUQuotaCodes {
-		val, err := QueryAWSQuota(ctx, client, code)
-		if err == nil && val >= 0 {
-			limits[name] = val
-			// Convert vCPUs to approx GPUs using configurable ratios
-			gpus := val / AWSVCPUPerGPUG
-			if strings.HasPrefix(name, "p_") {
-				gpus = val / AWSVCPUPerGPUP
-			}
-			metrics.SetQuota("aws", region, "gpu", name, gpus, 0)
+	names := make([]string, 0, len(usageMetrics))
+	queries := make([]cwtypes.MetricDataQuery, 0, len(usageMetrics))
+	for name, info := range usageMetrics {
+		if info == nil || info.MetricNamespace == nil || info.MetricName == nil {
+			continue
+		}
+		dims := make([]cwtypes.Dimension, 0, len(info.MetricDimensions))
+		for k, v := range info.MetricDimensions {
+			dims = append(dims, cwtypes.Dimension{Name: aws.String(k), Value: aws.String(v)})
+		}
+		queries = append(queries, cwtypes.MetricDataQuery{
+			Id: aws.String(fmt.Sprintf("q%d", len(queries))),
+			MetricStat: &cwtypes.MetricStat{
+				Metric: &cwtypes.Metric{Namespace: info.MetricNamespace, MetricName: info.MetricName, Dimensions: dims},
+				Period: aws.Int32(60),
+				Stat:   aws.String("Maximum"),
+			},
+		})
+		names = append(names, name)
+	}
+	if len(queries) == 0 {
+		return used, true
+	}
+	now := time.Now()
+	out, err := client.GetMetricData(ctx, &cloudwatch.GetMetricDataInput{
+		MetricDataQueries: queries,
+		StartTime:         aws.Time(now.Add(-quotaUsageWindow)),
+		EndTime:           aws.Time(now),
+		ScanBy:            cwtypes.ScanByTimestampDescending,
+	})
+	if err != nil {
+		log.Printf("[cloudvm-ticker] Warning: reading EC2 quota usage in %s failed: %v", sanitizeLog(region), err) //nolint:gosec // region sanitized
+		return used, false
+	}
+	byID := make(map[string]float64, len(out.MetricDataResults))
+	for _, r := range out.MetricDataResults {
+		if len(r.Values) > 0 {
+			byID[aws.ToString(r.Id)] = r.Values[0]
 		}
 	}
-	return limits
+	for i, name := range names {
+		used[name] = byID[fmt.Sprintf("q%d", i)]
+	}
+	return used, true
+}
+
+// QueryAWSGPUQuotas reads the configured EC2 quota limits and their account-wide usage in a region, exports both as
+// approximate GPUs, and returns both in vCPUs by quota name. A quota whose usage could not be read has no usage entry.
+func QueryAWSGPUQuotas(ctx context.Context, client AWSServiceQuotasAPI, usageClient AWSUsageAPI, region string, metrics *ObservabilityMetrics) (limits, used map[string]float64) {
+	limits = make(map[string]float64)
+	used = make(map[string]float64)
+	if client == nil || metrics == nil {
+		return limits, used
+	}
+	usageMetrics := make(map[string]*quotatypes.MetricInfo)
+	for name, code := range KnownAWSGPUQuotaCodes {
+		val, usage, err := QueryAWSQuota(ctx, client, code)
+		if err != nil || val < 0 {
+			continue
+		}
+		limits[name] = val
+		usageMetrics[name] = usage
+	}
+	if read, ok := QueryAWSQuotaUsage(ctx, usageClient, region, usageMetrics); ok {
+		used = read
+	}
+	for name, limit := range limits {
+		perGPU := AWSVCPUPerGPUG
+		if strings.HasPrefix(name, "p_") {
+			perGPU = AWSVCPUPerGPUP
+		}
+		metrics.SetQuota("aws", region, "gpu", name, limit/perGPU)
+		if u, ok := used[name]; ok {
+			metrics.SetQuotaUsed("aws", region, "gpu", name, u/perGPU)
+		}
+	}
+	return limits, used
 }
 
 // EC2PlacementScoreFetcher abstracts GetSpotPlacementScores.

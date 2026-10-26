@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
 )
@@ -65,7 +66,7 @@ func newConfiguredTicker(ctx context.Context, awsProv *AWSProvider) *SpotPriceTi
 	return spotTicker
 }
 
-// configureAWSMarketAPIs gives the shared on-demand price book a Price List API client and the ticker, when present, per-region Service Quotas clients.
+// configureAWSMarketAPIs gives the shared on-demand price book a Price List API client and the ticker, when present, per-region Service Quotas and CloudWatch clients.
 func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsPricingRegion))
 	if err != nil {
@@ -76,6 +77,9 @@ func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker) {
 	if spotTicker != nil {
 		spotTicker.SetServiceQuotasFactory(func(region string) AWSServiceQuotasAPI {
 			return servicequotas.NewFromConfig(cfg, func(o *servicequotas.Options) { o.Region = region })
+		})
+		spotTicker.SetQuotaUsageFactory(func(region string) AWSUsageAPI {
+			return cloudwatch.NewFromConfig(cfg, func(o *cloudwatch.Options) { o.Region = region })
 		})
 	}
 }

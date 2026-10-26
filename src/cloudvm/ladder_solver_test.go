@@ -180,3 +180,17 @@ func TestFillSolver_CoversRemainderWithoutOvershoot(t *testing.T) {
 		t.Errorf("planned %d GPUs at $%v per GPU-hour, want 9 GPUs costing $9.50 per hour", plan.PlannedGPUs, plan.PricePerGPUHour)
 	}
 }
+
+func TestFillSolver_PlansAgainstQuotaLeftAfterUsage(t *testing.T) {
+	solver := NewFillSolver()
+	solver.SetOffers([]*MarketOffer{onDemandOffer("us-east-1", "p5.48xlarge", "H100 80GB", 192, 6.0)})
+	key := quotaKey("aws", "us-east-1", "p_ondemand")
+	// 768 vCPUs of quota with 384 in use leave room for two 192-vCPU instances.
+	solver.SetLimits(FillLimits{QuotaVCPUs: map[string]float64{key: 768}, QuotaUsedVCPUs: map[string]float64{key: 384}})
+
+	plan := solver.plan(80, 64)
+
+	if plan.PlannedGPUs != 16 || plan.LimitedReason != "quota" {
+		t.Errorf("planned %d GPUs (limited %q), want 16 limited by quota", plan.PlannedGPUs, plan.LimitedReason)
+	}
+}
