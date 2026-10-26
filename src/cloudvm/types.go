@@ -6,6 +6,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 // ProviderType represents supported cloud providers.
@@ -56,6 +57,11 @@ type InstanceSpec struct {
 	RegionSelection string `json:"regionSelection,omitempty"`
 	// CandidateInstanceTypes lists alternative instance types for spot capacity diversification.
 	CandidateInstanceTypes []string `json:"candidateInstanceTypes,omitempty"`
+	// InstanceRequirements holds the pod's Karpenter instance type label requirements; types are derived from them
+	// when the pod names no instance type.
+	InstanceRequirements []karpv1.NodeSelectorRequirementWithMinValues `json:"instanceRequirements,omitempty"`
+	// Requests is the pod's total CPU, memory and GPU request.
+	Requests ResourceVector `json:"requests"`
 	// InstanceType is the preferred or target instance type (e.g. g5.2xlarge).
 	InstanceType string `json:"instanceType"`
 	// MarketType indicates spot or on-demand ("spot" default).
@@ -246,6 +252,7 @@ type ContainerSpec struct {
 type PodSpecWrapper struct {
 	NodeName         string                        `json:"nodeName,omitempty"`
 	NodeSelector     map[string]string             `json:"nodeSelector,omitempty"`
+	Affinity         *corev1.Affinity              `json:"affinity,omitempty"`
 	Containers       []ContainerSpec               `json:"containers"`
 	SecurityContext  *PodSecurityContext           `json:"securityContext,omitempty"`
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`

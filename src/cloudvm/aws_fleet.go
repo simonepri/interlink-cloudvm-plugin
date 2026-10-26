@@ -753,7 +753,15 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 // Launch starts one VM for spec. It tries the pinned region first and, when the pod sets candidate-regions, falls
 // back to the next candidate region after a capacity failure, up to maxLaunchRegions regions.
 func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance, error) {
-	instanceTypes := launchInstanceTypes(spec)
+	instanceTypes, err := p.launchInstanceTypes(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	if spec.InstanceType == "" {
+		derived := *spec
+		derived.InstanceType = instanceTypes[0]
+		spec = &derived
+	}
 	regions := p.launchRegions(spec, instanceTypes)
 
 	var failures []string
@@ -778,30 +786,6 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		}
 	}
 	return nil, fmt.Errorf("launch failed in %d of %d candidate regions: %s", len(failures), len(regions), strings.Join(failures, "; "))
-}
-
-// launchInstanceTypes lists the preferred instance type followed by its candidates, or a GPU-count default set.
-func launchInstanceTypes(spec *InstanceSpec) []string {
-	instanceTypes := []string{}
-	if spec.InstanceType != "" {
-		instanceTypes = append(instanceTypes, spec.InstanceType)
-	}
-	for _, cand := range spec.CandidateInstanceTypes {
-		if cand != "" && cand != spec.InstanceType {
-			instanceTypes = append(instanceTypes, cand)
-		}
-	}
-	if len(instanceTypes) == 0 {
-		switch {
-		case spec.NumGPUs >= 8:
-			instanceTypes = []string{"p5.48xlarge", "p4de.24xlarge", "g5.48xlarge"}
-		case spec.NumGPUs >= 4:
-			instanceTypes = []string{"g5.12xlarge", "g5.24xlarge", "g6.12xlarge"}
-		default:
-			instanceTypes = []string{"g5.xlarge", "g6.xlarge", "g4dn.xlarge"}
-		}
-	}
-	return instanceTypes
 }
 
 // launchInRegion runs one CreateFleet attempt in region. The pinned region honors the pod's explicit launch template

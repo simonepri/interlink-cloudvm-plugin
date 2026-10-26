@@ -756,6 +756,13 @@ func (t *SpotPriceTicker) QuotaVCPUs(region, quota string) (float64, bool) {
 	return t.solver.QuotaVCPUs("aws", region, quota)
 }
 
+// TrackedInstanceTypes returns the instance types the ticker prices and scores.
+func (t *SpotPriceTicker) TrackedInstanceTypes() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return append([]string(nil), t.instanceTypes...)
+}
+
 // AllScores returns a snapshot of all tracked placement scores.
 func (t *SpotPriceTicker) AllScores() map[string]*PlacementScoreEntry {
 	t.mu.RLock()
