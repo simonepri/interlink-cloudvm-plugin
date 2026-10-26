@@ -271,8 +271,13 @@ type ContainerTerminatedState struct {
 	ContainerID string    `json:"containerID,omitempty"`
 }
 
+// defaultContainerName names the workload container when the pod spec carries no container name.
+const defaultContainerName = "worker"
+
+// ContainerStatus mirrors the k8s.io/api/core/v1 ContainerStatus fields that interLink copies into the pod.
 type ContainerStatus struct {
 	Name  string               `json:"name"`
+	Image string               `json:"image,omitempty"`
 	State ContainerStatusState `json:"state"`
 	Ready bool                 `json:"ready"`
 }
@@ -286,9 +291,10 @@ type CreateStruct struct {
 // PodStatusResponse represents the status response contract sent back to InterLink.
 // Matches CNCF InterLink pkg/interlink/types.go PodStatus definition.
 type PodStatusResponse struct {
-	PodUID     string            `json:"UID"`
-	Name       string            `json:"name"`
-	Namespace  string            `json:"namespace"`
-	JID        string            `json:"JID"`
-	Containers []ContainerStatus `json:"containers"`
+	PodUID         string            `json:"UID"`
+	Name           string            `json:"name"`
+	Namespace      string            `json:"namespace"`
+	JID            string            `json:"JID"`
+	Containers     []ContainerStatus `json:"containers"`
+	InitContainers []ContainerStatus `json:"initContainers"`
 }
