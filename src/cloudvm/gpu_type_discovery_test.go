@@ -169,3 +169,18 @@ func TestSpotPriceTicker_ProbeGroupsSkipArmTypes(t *testing.T) {
 		}
 	}
 }
+
+func TestSpotPriceTicker_PartialFirstDiscoveryKeepsBuiltInTypesLaunchable(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1", "us-west-2"}, nil, time.Minute)
+	ticker.catalog = NewHardwareCatalog()
+	ticker.SetFetcherFactory(func(_ context.Context, region string) (SpotPriceFetcher, error) {
+		return &regionTypesFetcher{region: region, failing: map[string]bool{"us-west-2": true}}, nil
+	})
+
+	ticker.discoverGPUTypes(context.Background())
+
+	// g5.xlarge comes from the built-in list, which carries no architecture; it is x86_64.
+	if !ticker.launchable("g5.xlarge") {
+		t.Errorf("g5.xlarge from the built-in list stopped being launchable after a partial first discovery")
+	}
+}

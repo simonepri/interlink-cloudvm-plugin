@@ -178,8 +178,8 @@ func (t *SpotPriceTicker) launchable(instanceType string) bool {
 
 // launchableLocked is launchable for callers that hold t.mu.
 func (t *SpotPriceTicker) launchableLocked(instanceType string) bool {
-	arch, ok := t.instanceArch[instanceType]
-	if !ok {
+	arch := t.instanceArch[instanceType]
+	if arch == "" {
 		arch = "amd64"
 	}
 	for _, a := range launchableArchitectures {
