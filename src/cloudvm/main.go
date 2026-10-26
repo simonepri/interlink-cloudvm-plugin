@@ -343,10 +343,11 @@ func run() error {
 	}()
 
 	httpServer := &http.Server{
-		Addr:         ":" + port,
-		Handler:      server.Routes(),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		Addr:        ":" + port,
+		Handler:     server.Routes(),
+		ReadTimeout: 15 * time.Second,
+		// A create call launches the VM before it responds, so the response deadline covers the launch timeout.
+		WriteTimeout: server.LaunchTimeout() + time.Minute,
 	}
 
 	stopChan := make(chan os.Signal, 1)

@@ -469,6 +469,14 @@ func (s *Server) SetLaunchTimeout(d time.Duration) {
 	}
 }
 
+// LaunchTimeout returns the maximum allowed duration for bare VM creation and bootstrap.
+func (s *Server) LaunchTimeout() time.Duration {
+	if s.launchTimeout <= 0 {
+		return 5 * time.Minute
+	}
+	return s.launchTimeout
+}
+
 // SetPodSightingTimeout overrides the TTL for keeping active pod sightings before garbage collection.
 func (s *Server) SetPodSightingTimeout(d time.Duration) {
 	if d > 0 {
@@ -912,11 +920,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	spec.AssignedGPUs = preAssignedGPUs
 
 	// Detach from client HTTP request context so client timeouts or cancellations do not abort in-flight VM launch
-	launchTimeout := s.launchTimeout
-	if launchTimeout <= 0 {
-		launchTimeout = 5 * time.Minute
-	}
-	launchCtx, launchCancel := context.WithTimeout(context.WithoutCancel(r.Context()), launchTimeout)
+	launchCtx, launchCancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.LaunchTimeout())
 	defer launchCancel()
 
 	inst, err := prov.Launch(launchCtx, spec)
