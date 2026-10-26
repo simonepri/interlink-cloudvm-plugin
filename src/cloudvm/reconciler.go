@@ -57,9 +57,46 @@ type RegionalInstanceScanner interface {
 	DescribeInstancesInRegion(ctx context.Context, region, clusterTag string) ([]*Instance, error)
 }
 
-// Reconciler handles background garbage collection for opportunistic VMs.
 const defaultMaxPingConcurrency = 20
 
+// markFailedConcurrency bounds parallel MarkPodFailed calls, each of which may wait up to consoleFetchTimeout for
+// the dead VM's console output.
+const markFailedConcurrency = 16
+
+// deadPod is a pod whose VM the reconciler found dead, with the reason it was lost.
+type deadPod struct {
+	key    string
+	reason string
+}
+
+// markPodsFailed marks every dead pod failed with bounded concurrency and returns the keys it marked.
+func (r *Reconciler) markPodsFailed(ctx context.Context, pods []deadPod) []string {
+	var (
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		marked []string
+	)
+	sem := make(chan struct{}, markFailedConcurrency)
+	for _, p := range pods {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := r.tracker.MarkPodFailed(ctx, p.key, p.reason); err != nil {
+				log.Printf("[reconciler] Error marking pod %s failed: %v", sanitizeLog(p.key), err) //nolint:gosec // sanitized
+				return
+			}
+			mu.Lock()
+			marked = append(marked, p.key)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return marked
+}
+
+// Reconciler handles background garbage collection for opportunistic VMs.
 type Reconciler struct {
 	inventory         CloudInventory
 	tracker           PodStateTracker
@@ -465,6 +502,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	}
 
 	// 1. Forward check: detect pods whose cloud VM vanished or terminated
+	var deadPods []deadPod
 	for podKey, instID := range activePods {
 		if instID == "" {
 			continue
@@ -525,13 +563,10 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 				}
 				GlobalFleetTracker.RecordInterruption(prov, reg, itype, capType)
 			}
-			if err := r.tracker.MarkPodFailed(ctx, podKey, reason); err != nil {
-				log.Printf("[reconciler] Error marking pod %s failed: %v", cleanKey, err)
-			} else {
-				result.EvictedPods = append(result.EvictedPods, podKey)
-			}
+			deadPods = append(deadPods, deadPod{key: podKey, reason: reason})
 		}
 	}
+	result.EvictedPods = append(result.EvictedPods, r.markPodsFailed(ctx, deadPods)...)
 
 	// 2. Reverse check: detect zombie VMs whose pods vanished from tracker
 	activeInstanceIDs := make(map[string]bool, len(activePods))

@@ -163,6 +163,8 @@ type Instance struct {
 	CreatedAt    time.Time         `json:"createdAt"`
 	TerminatedAt *time.Time        `json:"terminatedAt,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
+	// FailureMessage is the terminal message, including any console tail, recorded when the VM died under its pods.
+	FailureMessage string `json:"failureMessage,omitempty"`
 }
 
 // Provider defines the interface for provisioning and managing opportunistic cloud VMs.

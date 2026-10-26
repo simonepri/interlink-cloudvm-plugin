@@ -425,6 +425,7 @@ func TestReconciler_EC2StateReasonQueriedFromStatus(t *testing.T) {
 type mockTrackerWrapper struct {
 	activePods  map[string]string
 	podRegions  map[string]string
+	mu          sync.Mutex
 	failedCalls []string
 }
 
@@ -441,6 +442,8 @@ func (m *mockTrackerWrapper) GetPodRegion(_ context.Context, podKey string) (str
 }
 
 func (m *mockTrackerWrapper) MarkPodFailed(_ context.Context, podName string, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.failedCalls = append(m.failedCalls, podName)
 	return nil
 }

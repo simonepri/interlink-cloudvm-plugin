@@ -1306,6 +1306,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		inst          *Instance
 		completedTerm *ContainerTerminatedState
 		spec          statusPodSpec
+		// failureMessage snapshots inst.FailureMessage under s.mu.
+		failureMessage string
 	}
 
 	s.mu.RLock()
@@ -1397,6 +1399,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			inst:          inst,
 			completedTerm: completedTerm,
 			spec:          pod.Spec,
+		}
+		if inst != nil {
+			targets[i].failureMessage = inst.FailureMessage
 		}
 	}
 	s.mu.RUnlock()
@@ -1567,10 +1572,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								FinishedAt: time.Now(),
 							}
 						case StateFailed:
+							msg := tgt.failureMessage
+							if msg == "" {
+								msg = "Cloud instance failed"
+							}
 							status.State.Terminated = &ContainerTerminatedState{
 								ExitCode:   1,
 								Reason:     "Failed",
-								Message:    "Cloud instance failed",
+								Message:    msg,
 								FinishedAt: time.Now(),
 							}
 						}
