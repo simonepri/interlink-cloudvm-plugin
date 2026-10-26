@@ -425,6 +425,7 @@ func TestSpotPriceTicker_MarketMetricsReflectKnownData(t *testing.T) {
 	ticker.SetMetrics(metrics)
 	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
 	ticker.SetPricingAPI(&countingPricingClient{err: errors.New("throttled")})
+	ticker.SetAdvisorCollector(NewSpotAdvisorCollector("", &mockHTTPClient{err: errors.New("offline")}))
 	var quotaRegions []string
 	ticker.SetServiceQuotasFactory(func(region string) AWSServiceQuotasAPI {
 		return regionQuotasClient{region: region, regions: &quotaRegions}
@@ -441,6 +442,9 @@ func TestSpotPriceTicker_MarketMetricsReflectKnownData(t *testing.T) {
 	}
 	if strings.Contains(body, `cloudvm_gpu_price_usd_per_hour{accelerator="gpu",capacity_type="on-demand"`) {
 		t.Errorf("exported an on-demand price for a shape whose price is unknown:\n%s", body)
+	}
+	if strings.Contains(body, "cloudvm_ondemand_price_usd_per_hour{") {
+		t.Errorf("exported a legacy on-demand price for a shape whose price is unknown:\n%s", body)
 	}
 	if strings.Contains(body, `provider="gcp"`) {
 		t.Errorf("exported GCP market data without configured GCP regions:\n%s", body)

@@ -468,15 +468,17 @@ func (m *ObservabilityMetrics) AddInstanceSeconds(provider, region, accelerator,
 	m.instanceSeconds.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Add(seconds)
 }
 
-// SetLegacySpotMetrics updates legacy gauges for backward compatibility.
+// SetLegacySpotMetrics updates legacy gauges for backward compatibility; an onDemandPrice of 0 means unknown and exports no on-demand or savings series.
 func (m *ObservabilityMetrics) SetLegacySpotMetrics(region, az, itype string, spotPrice, onDemandPrice, savingsPct float64) {
 	zone := az
 	if zone == "" {
 		zone = "all"
 	}
 	m.market.set(m.legacySpotPrice, spotPrice, region, zone, itype)
-	m.market.set(m.legacyOnDemandPrice, onDemandPrice, region, itype)
-	m.market.set(m.legacySpotSavings, savingsPct, region, zone, itype)
+	if onDemandPrice > 0 {
+		m.market.set(m.legacyOnDemandPrice, onDemandPrice, region, itype)
+		m.market.set(m.legacySpotSavings, savingsPct, region, zone, itype)
+	}
 }
 
 // SetLegacyPlacementScore updates legacy placement score gauge.

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,12 +12,19 @@ import (
 )
 
 type countingPricingClient struct {
+	mu    sync.Mutex
 	calls int
 	price string
 	err   error
+	gate  chan struct{}
 }
 
 func (c *countingPricingClient) GetProducts(_ context.Context, _ *pricing.GetProductsInput, _ ...func(*pricing.Options)) (*pricing.GetProductsOutput, error) {
+	if c.gate != nil {
+		<-c.gate
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.calls++
 	if c.err != nil {
 		return nil, c.err
@@ -67,5 +75,39 @@ func TestOnDemandPriceBook_RetriesFailedLookup(t *testing.T) {
 	now = now.Add(onDemandPriceRetry + time.Second)
 	if got := book.Price(context.Background(), "us-east-1", "p5.48xlarge"); got != 98.32 {
 		t.Errorf("Price() after retry interval = %v, want 98.32", got)
+	}
+}
+
+func TestOnDemandPriceBook_RetriesCatalogFallback(t *testing.T) {
+	client := &countingPricingClient{err: fmt.Errorf("throttled")}
+	book := NewOnDemandPriceBook(client)
+	now := time.Now()
+	book.now = func() time.Time { return now }
+
+	if got := book.Price(context.Background(), "us-east-1", "g5.xlarge"); got != 1.006 {
+		t.Fatalf("Price() = %v, want catalog rate 1.006 while the API fails", got)
+	}
+	client.err = nil
+	client.price = "1.2"
+	now = now.Add(onDemandPriceRetry + time.Second)
+	if got := book.Price(context.Background(), "us-east-1", "g5.xlarge"); got != 1.2 {
+		t.Errorf("Price() = %v, want the list price 1.2 once the fallback expires", got)
+	}
+}
+
+func TestOnDemandPriceBook_CachedDoesNotWait(t *testing.T) {
+	client := &countingPricingClient{price: "98.32", gate: make(chan struct{})}
+	book := NewOnDemandPriceBook(client)
+
+	if got := book.Cached("us-east-1", "p5.48xlarge"); got != 0 {
+		t.Fatalf("Cached() = %v, want 0 before any lookup finished", got)
+	}
+	book.Cached("us-east-1", "p5.48xlarge")
+	close(client.gate)
+	if got := book.Price(context.Background(), "us-east-1", "p5.48xlarge"); got != 98.32 {
+		t.Errorf("Price() = %v, want 98.32 from the background lookup", got)
+	}
+	if client.calls != 1 {
+		t.Errorf("GetProducts called %d times, want 1 for concurrent misses", client.calls)
 	}
 }

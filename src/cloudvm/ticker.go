@@ -543,9 +543,13 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 
 	var offers []*MarketOffer
 
+	t.mu.RLock()
+	onDemandPrices := t.onDemand
+	t.mu.RUnlock()
+
 	// 1. AWS Prices & Signals
 	for _, p := range prices {
-		ondemand := t.onDemand.Price(ctx, p.Region, p.InstanceType)
+		ondemand := onDemandPrices.Price(ctx, p.Region, p.InstanceType)
 		savingsPct := 0.0
 		if ondemand > 0 && p.SpotPriceUSD > 0 && p.SpotPriceUSD < ondemand {
 			savingsPct = ((ondemand - p.SpotPriceUSD) / ondemand) * 100.0
