@@ -36,6 +36,9 @@ func TestCloudInitGeneration(t *testing.T) {
 	if !bytes.Contains([]byte(script), []byte("/dev/console")) {
 		t.Errorf("cloud-init missing serial console telemetry logging")
 	}
+	if !strings.Contains(script, "tee -a /var/log/cloudvm-bootstrap.log") || !strings.Contains(script, "/dev/ttyS0") {
+		t.Errorf("cloud-init does not mirror the bootstrap log to the serial console")
+	}
 }
 
 func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
