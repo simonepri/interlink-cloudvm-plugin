@@ -289,9 +289,14 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 
 // Handler returns the HTTP handler exposing Prometheus metrics for scraping.
 func (m *ObservabilityMetrics) Handler() http.Handler {
-	return promhttp.HandlerFor(prometheus.Gatherers{m.Registry, marketGatherer{m}}, promhttp.HandlerOpts{
+	return promhttp.HandlerFor(m.Gatherer(), promhttp.HandlerOpts{
 		EnableOpenMetrics: false,
 	})
+}
+
+// Gatherer returns every metric this instance serves: the fleet metrics, and the market gauges while they are shown.
+func (m *ObservabilityMetrics) Gatherer() prometheus.Gatherer {
+	return prometheus.Gatherers{m.Registry, marketGatherer{m}}
 }
 
 // marketGatherer serves the market gauges once they are shown, and nothing before.
@@ -304,11 +309,16 @@ func (g marketGatherer) Gather() ([]*dto.MetricFamily, error) {
 	return g.m.marketRegistry.Gather()
 }
 
-// HideMarketUntilRefreshed withholds the market gauges until the next market refresh pass ends. A refresh sets
-// gauges one by one, slowly on a cold start while on-demand prices load, so a scrape during the first pass would
-// see part of the market, and per-model minimums would jump to whichever offers happened to be set.
+// HideMarketUntilRefreshed withholds the market gauges until ShowMarket. A refresh sets gauges one by one, slowly
+// on a cold start while on-demand prices load, so a scrape during the first pass would see part of the market, and
+// per-model minimums would jump to whichever offers happened to be set.
 func (m *ObservabilityMetrics) HideMarketUntilRefreshed() {
 	m.marketShown.Store(false)
+}
+
+// ShowMarket serves the market gauges, after a refresh pass has set all of them.
+func (m *ObservabilityMetrics) ShowMarket() {
+	m.marketShown.Store(true)
 }
 
 // SetGPUPrice exports all-in price per GPU-hour and full instance price.
@@ -429,7 +439,6 @@ func (s *marketSeries) sweep() {
 // SweepMarketGauges ends a market refresh pass: it deletes market series the previous pass set and this pass did not.
 func (m *ObservabilityMetrics) SweepMarketGauges() {
 	m.market.sweep()
-	m.marketShown.Store(true)
 }
 
 // ResetFleetGauges resets running instance, vCPU, memory, GPU, VRAM, and spend gauges before a fresh reconciliation pass.

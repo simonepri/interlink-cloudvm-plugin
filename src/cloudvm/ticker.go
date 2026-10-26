@@ -798,6 +798,11 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 	}
 
 	t.metrics.SweepMarketGauges()
+	// A pass that found no AWS prices skipped the slow on-demand lookups, so the next pass would still set the market
+	// piece by piece; only a pass with prices has set it whole.
+	if len(prices) > 0 {
+		t.metrics.ShowMarket()
+	}
 }
 
 // QuotaVCPUs returns the measured vCPU limit of an EC2 quota in a region.

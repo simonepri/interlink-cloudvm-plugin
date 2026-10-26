@@ -302,3 +302,21 @@ func scrapeMetrics(t *testing.T, s *Server) string {
 	}
 	return rec.Body.String()
 }
+
+func TestServerMetricsServeTheEmbeddedTickersMarket(t *testing.T) {
+	s := NewServer(NewMockProvider(), "test-cluster")
+	ticker := NewSpotPriceTicker([]string{"us-west-2"}, []string{"g5.xlarge"}, time.Minute)
+	metrics := NewObservabilityMetrics()
+	ticker.SetMetrics(metrics)
+	s.SetSpotTicker(ticker)
+
+	metrics.HideMarketUntilRefreshed()
+	metrics.SetGPUPrice("aws", "us-west-2", "us-west-2a", "gpu", "A10G 24GB", 24, 1, "spot", "g5.xlarge", 0.40)
+	if strings.Contains(scrapeMetrics(t, s), "cloudvm_gpu_price_usd_per_hour{") {
+		t.Errorf("embedded /metrics served the market before the first refresh ended")
+	}
+	metrics.ShowMarket()
+	if !strings.Contains(scrapeMetrics(t, s), "cloudvm_gpu_price_usd_per_hour{") {
+		t.Errorf("embedded /metrics omits the ticker's market gauges")
+	}
+}

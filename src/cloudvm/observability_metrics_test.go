@@ -144,6 +144,7 @@ func TestObservabilityMetrics_HidesMarketUntilRefreshed(t *testing.T) {
 	}
 
 	metrics.SweepMarketGauges()
+	metrics.ShowMarket()
 	if !strings.Contains(scrape(), "cloudvm_gpu_price_usd_per_hour{") {
 		t.Errorf("market gauges still hidden after the refresh ended")
 	}
