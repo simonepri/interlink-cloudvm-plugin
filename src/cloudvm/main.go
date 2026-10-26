@@ -119,6 +119,7 @@ func run() error {
 			}
 		}
 	}
+	ConfigureAWSLaunchPacingFromEnv()
 	awsProv := NewAWSProvider(awsRegion, additionalRegions...)
 
 	// Standalone spot price ticker microservice mode

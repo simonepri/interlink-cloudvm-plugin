@@ -28,6 +28,10 @@ provider:
   idleGracePeriod: "60s"
   reconcileIntervalSeconds: 60
   reconcileLaunchGraceSeconds: 120
+  # EC2 launch calls per second and burst per region, and the SDK retry quota; empty keeps the defaults (4, 20, 2500).
+  awsLaunchRate: ""
+  awsLaunchBurst: ""
+  awsRetryQuota: ""
 
 database:
   url: ""
