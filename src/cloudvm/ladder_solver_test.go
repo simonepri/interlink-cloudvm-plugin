@@ -164,3 +164,19 @@ func TestSpotCapacity_StopsAtFirstLowScore(t *testing.T) {
 		t.Errorf("spotCapacity = %d, want 64", got)
 	}
 }
+
+func TestFillSolver_CoversRemainderWithoutOvershoot(t *testing.T) {
+	small := onDemandOffer("us-east-1", "g6.xlarge", "L4 24GB", 4, 1.5)
+	small.GPUCount, small.PricePerHour = 1, 1.5
+	big := onDemandOffer("us-east-1", "g6.48xlarge", "L4 24GB", 192, 1.0)
+	solver := NewFillSolver()
+	solver.SetOffers([]*MarketOffer{big, small})
+	solver.SetLimits(FillLimits{QuotaVCPUs: map[string]float64{quotaKey("aws", "us-east-1", "g_vt_ondemand"): 1e6}})
+
+	plan := solver.plan(24, 9)
+
+	// One 8-GPU instance plus one 1-GPU instance costs $9.50, against $13.50 for nine 1-GPU instances or $16 for two 8-GPU ones.
+	if plan.PlannedGPUs != 9 || math.Abs(plan.PricePerGPUHour*9-9.5) > 1e-9 {
+		t.Errorf("planned %d GPUs at $%v per GPU-hour, want 9 GPUs costing $9.50 per hour", plan.PlannedGPUs, plan.PricePerGPUHour)
+	}
+}

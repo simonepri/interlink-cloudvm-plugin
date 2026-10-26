@@ -225,10 +225,10 @@ func (s *FillSolver) plan(minMem, targetGPUs int) FillPlan {
 	}
 	if p.remaining > 0 {
 		switch {
-		case p.quotaBound:
-			plan.LimitedReason = "quota"
 		case p.quotaUnknown:
 			plan.LimitedReason = "no_quota_data"
+		case p.quotaBound:
+			plan.LimitedReason = "quota"
 		default:
 			plan.LimitedReason = "capacity"
 		}
@@ -256,12 +256,15 @@ func (p *planner) fill(offers []*MarketOffer) {
 		bestInstances, bestCost := 0, math.Inf(1)
 		for _, o := range offers {
 			instances := p.available(o)
-			if instances == 0 {
-				continue
-			}
-			unitCost := float64(instances) * o.PricePerHour / float64(min(instances*o.GPUCount, p.remaining))
-			if unitCost < bestCost {
-				best, bestInstances, bestCost = o, instances, unitCost
+			// Also consider stopping short of the remainder, so smaller instances can cover the rest without overshoot.
+			for _, n := range []int{instances, min(instances, p.remaining/o.GPUCount)} {
+				if n == 0 {
+					continue
+				}
+				unitCost := float64(n) * o.PricePerHour / float64(min(n*o.GPUCount, p.remaining))
+				if unitCost < bestCost {
+					best, bestInstances, bestCost = o, n, unitCost
+				}
 			}
 		}
 		if best == nil {

@@ -139,7 +139,7 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 
 		fillLimited: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_fill_limited",
-			Help: "1 when the fill plan for N GPUs falls short, labeled by what stopped it: quota or capacity",
+			Help: "1 when the fill plan for N GPUs falls short, labeled by what stopped it: quota, no_quota_data, or capacity",
 		}, []string{"min_gpu_memory_gb", "gpus", "reason"}),
 
 		spotCapacity: prometheus.NewGaugeVec(prometheus.GaugeOpts{

@@ -14,6 +14,9 @@ import (
 // AWS caps the explorable target capacity by recent spot usage; 1024 GPUs (128 8-GPU instances) already exceeds it.
 var ProbeGPUCounts = []int{8, 64, 256}
 
+// maxProbeInstances is the largest target AWS accepted for this account in testing (32 accepted, 128 rejected); larger probes are skipped.
+const maxProbeInstances = 32
+
 // maxPlacementScoreRegions is the most regions GetSpotPlacementScores accepts and scores in one request.
 const maxPlacementScoreRegions = 10
 
@@ -69,6 +72,9 @@ func (t *SpotPriceTicker) ProbeSpotCapacity(ctx context.Context) map[string]map[
 
 	for _, group := range t.probeGroups(ctx) {
 		for _, gpus := range ProbeGPUCounts {
+			if ceilDiv(gpus, group.gpusPerInstance) > maxProbeInstances {
+				continue
+			}
 			for start := 0; start < len(regions); start += maxPlacementScoreRegions {
 				batch := regions[start:min(start+maxPlacementScoreRegions, len(regions))]
 				callCtx, cancel := context.WithTimeout(ctx, t.regionCallTimeout)

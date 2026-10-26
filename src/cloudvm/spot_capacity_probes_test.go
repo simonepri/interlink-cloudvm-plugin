@@ -62,7 +62,9 @@ func TestSpotPriceTicker_ProbeSpotCapacity(t *testing.T) {
 	if oneGPU[8] != 7 {
 		t.Errorf("24 GB 1-GPU scores = %v, want 7 at 8 GPUs", oneGPU)
 	}
-	if _, ok := oneGPU[256]; ok {
-		t.Errorf("256 1-GPU instances was rejected by AWS but still scored: %v", oneGPU)
+	for _, in := range fetcher.inputs {
+		if aws.ToInt32(in.TargetCapacity) > maxProbeInstances {
+			t.Errorf("probed %d instances, above the %d AWS accepts", aws.ToInt32(in.TargetCapacity), maxProbeInstances)
+		}
 	}
 }
