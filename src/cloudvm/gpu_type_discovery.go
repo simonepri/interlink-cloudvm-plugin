@@ -1,7 +1,7 @@
 // Package main implements the interlink-cloudvm-plugin daemon.
 package main
 
-// This file discovers every EC2 instance type with whole GPUs in the tracked regions, so the ticker tracks what AWS offers instead of a fixed list.
+// This file discovers every EC2 GPU instance type in the tracked regions, GPU slices included, so the ticker tracks what AWS offers instead of a fixed list.
 
 import (
 	"context"
@@ -39,8 +39,7 @@ type discoveredGPUType struct {
 	capacity  ResourceVector
 }
 
-// describeGPUTypes returns every instance type in the region whose GPUs AWS counts as whole devices.
-// Types that share one GPU between instances report a GPU count of 0 and are left out.
+// describeGPUTypes returns every instance type in the region with named GPUs, GPU slices included.
 func describeGPUTypes(ctx context.Context, client SpotPriceFetcher) ([]discoveredGPUType, error) {
 	var out []discoveredGPUType
 	input := &ec2.DescribeInstanceTypesInput{MaxResults: aws.Int32(100)}
@@ -197,6 +196,11 @@ func labelGPUSlices(types map[string]discoveredGPUType) {
 			continue
 		}
 		share := int(math.Round(float64(full) / float64(gt.gpuMemMiB)))
+		if share < 2 {
+			continue
+		}
+		// AWS sells slices as fractions of the GPU's marketed memory, such as 12 GB for half of a 24 GB L4.
+		gt.capacity.GPUMemoryGB = roundGPUMemoryGB(full) / share
 		gt.capacity.GPUModel = fmt.Sprintf("%s 1/%d %dGB", gt.gpuName, share, gt.capacity.GPUMemoryGB)
 		types[name] = gt
 	}
