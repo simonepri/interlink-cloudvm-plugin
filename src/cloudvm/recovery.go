@@ -267,8 +267,10 @@ func (s *Server) GetActivePods(_ context.Context) (map[string]string, error) {
 	return res, nil
 }
 
-// MarkPodFailed marks a pod instance state as failed and commits terminal execution telemetry.
-func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) error {
+// MarkPodFailed marks a pod instance state as failed and commits terminal execution telemetry, attaching the tail of
+// the dead VM's boot console to the container message.
+func (s *Server) MarkPodFailed(ctx context.Context, podKey string, reason string) error {
+	console := s.deadInstanceConsole(ctx, podKey)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -327,10 +329,13 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 	term := &ContainerTerminatedState{
 		ExitCode:   exitCode,
 		Reason:     reason,
-		Message:    fmt.Sprintf("Underlying cloud VM terminated (%s)", reason),
+		Message:    appendConsoleTail(fmt.Sprintf("Underlying cloud VM terminated (%s)", reason), console),
 		FinishedAt: finAt,
 	}
 	s.completedPods[uid] = term
+	if inst != nil {
+		inst.FailureMessage = term.Message
+	}
 
 	if s.nodePool != nil {
 		s.nodePool.MarkPodCompleted(uid, exitCode, reason, term.Message, finAt)
@@ -351,6 +356,27 @@ func (s *Server) MarkPodFailed(_ context.Context, podKey string, reason string) 
 		})
 	}
 	return nil
+}
+
+// deadInstanceConsole fetches and logs the console tail of the VM behind podKey, best effort.
+func (s *Server) deadInstanceConsole(ctx context.Context, podKey string) string {
+	s.mu.RLock()
+	inst := s.instances[podKey]
+	var provider ProviderType
+	var region, instanceID string
+	if inst != nil {
+		provider, region, instanceID = inst.Provider, inst.Region, inst.ID
+	}
+	s.mu.RUnlock()
+	if instanceID == "" {
+		return ""
+	}
+	tail := s.consoleTail(ctx, provider, region, instanceID)
+	if tail != "" {
+		log.Printf("[cloudvm] Console output of dead instance %s in %s for pod %s (last 4 KiB): %q", //nolint:gosec // sanitized; tail is quoted
+			sanitizeLog(instanceID), sanitizeLog(region), sanitizeLog(podKey), tail)
+	}
+	return tail
 }
 
 // RetryUnknownCoTenants attempts to query the in-VM runner for nodes whose startup listing failed.
