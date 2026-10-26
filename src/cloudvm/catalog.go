@@ -62,7 +62,7 @@ func roundGPUMemoryGB(sizeMiB int64) int {
 		return 32
 	case sizeMiB >= 38000 && sizeMiB <= 44000:
 		return 40
-	case sizeMiB >= 46000 && sizeMiB <= 52000:
+	case sizeMiB > 44000 && sizeMiB <= 52000: // L40S reports 45776 MiB
 		return 48
 	case sizeMiB >= 76000 && sizeMiB <= 88000:
 		return 80

@@ -224,3 +224,22 @@ func (m *mockSpotPriceFetcher) GetSpotPlacementScores(_ context.Context, _ *ec2.
 func (m *mockMultiAZSpotFetcher) GetSpotPlacementScores(_ context.Context, _ *ec2.GetSpotPlacementScoresInput, _ ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error) {
 	return &ec2.GetSpotPlacementScoresOutput{}, nil
 }
+
+func TestRoundGPUMemoryGB_MarketedSizes(t *testing.T) {
+	for _, tc := range []struct {
+		mib  int64
+		want int
+	}{
+		{15360, 16},   // T4
+		{22888, 24},   // L4
+		{40960, 40},   // A100 40GB
+		{45776, 48},   // L40S
+		{81920, 80},   // A100 80GB
+		{98304, 96},   // RTX PRO Server 6000
+		{144384, 141}, // H200
+	} {
+		if got := roundGPUMemoryGB(tc.mib); got != tc.want {
+			t.Errorf("roundGPUMemoryGB(%d) = %d, want %d", tc.mib, got, tc.want)
+		}
+	}
+}
