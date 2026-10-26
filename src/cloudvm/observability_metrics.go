@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -29,10 +30,13 @@ type ObservabilityMetrics struct {
 	quotaLimit *prometheus.GaugeVec
 	quotaUsed  *prometheus.GaugeVec
 
-	// Ladder Fill Quotes
-	fillPrice   *prometheus.GaugeVec
-	fillGPUs    *prometheus.GaugeVec
-	fillLimited *prometheus.GaugeVec
+	// Ladder fill plans and the spot placement scores they rest on
+	fillPrice        *prometheus.GaugeVec
+	fillPlannedGPUs  *prometheus.GaugeVec
+	fillExpectedGPUs *prometheus.GaugeVec
+	fillGPUs         *prometheus.GaugeVec
+	fillLimited      *prometheus.GaugeVec
+	spotCapacity     *prometheus.GaugeVec
 
 	// Fleet Metrics
 	instancesRunning     *prometheus.GaugeVec
@@ -115,18 +119,33 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 
 		fillPrice: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_fill_price_usd_per_gpu_hour",
-			Help: "Blended fill quote price in USD per GPU-hour for N GPUs at a given memory floor",
-		}, []string{"min_gpu_memory_gb", "gpus", "max_regions", "capacity_type"}),
+			Help: "Blended price in USD per GPU-hour of the cheapest spot and on-demand plan for N GPUs at a memory floor",
+		}, []string{"min_gpu_memory_gb", "gpus"}),
+
+		fillPlannedGPUs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_fill_planned_gpus",
+			Help: "GPUs the fill plan for N GPUs found within quotas and spot placement scores; whole instances can exceed N",
+		}, []string{"min_gpu_memory_gb", "gpus"}),
+
+		fillExpectedGPUs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_fill_expected_gpus",
+			Help: "GPUs the fill plan is expected to obtain, counting spot GPUs at their placement score divided by 10 and on-demand GPUs in full",
+		}, []string{"min_gpu_memory_gb", "gpus"}),
 
 		fillGPUs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_fill_gpus",
-			Help: "Number of GPUs allocated from a provider, region, and GPU model to satisfy a fill quote",
-		}, []string{"min_gpu_memory_gb", "gpus", "max_regions", "capacity_type", "provider", "region", "gpu_model"}),
+			Help: "GPUs a fill plan takes from one provider, region, GPU model, and capacity type",
+		}, []string{"min_gpu_memory_gb", "gpus", "provider", "region", "gpu_model", "capacity_type"}),
 
 		fillLimited: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_fill_limited",
-			Help: "Flag indicating whether a fill quote was constrained short of the target capacity (1 if limited, 0 otherwise)",
-		}, []string{"min_gpu_memory_gb", "gpus", "max_regions", "capacity_type", "reason"}),
+			Help: "1 when the fill plan for N GPUs falls short, labeled by what stopped it: quota, no_quota_data, or capacity",
+		}, []string{"min_gpu_memory_gb", "gpus", "reason"}),
+
+		spotCapacity: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_spot_capacity_score",
+			Help: "AWS spot placement score (1-10) for getting N GPUs in instances with gpus_per_instance GPUs at a memory floor in a region",
+		}, []string{"provider", "region", "min_gpu_memory_gb", "gpus_per_instance", "gpus"}),
 
 		instancesRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_instances_running",
@@ -231,8 +250,11 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.quotaLimit,
 		m.quotaUsed,
 		m.fillPrice,
+		m.fillPlannedGPUs,
+		m.fillExpectedGPUs,
 		m.fillGPUs,
 		m.fillLimited,
+		m.spotCapacity,
 		m.instancesRunning,
 		m.vcpusRunning,
 		m.memoryGiBRunning,
@@ -315,25 +337,26 @@ func (m *ObservabilityMetrics) SetQuota(provider, region, accelerator, quota str
 	m.market.set(m.quotaUsed, usedGPUs, provider, region, accelerator, quota)
 }
 
-// SetFillQuote exports solver fill quotes for a specific request.
-func (m *ObservabilityMetrics) SetFillQuote(minGPUMemoryGB, gpus int, maxRegions, capacityType string, pricePerGPUHour float64, _ map[string]float64, limitedReason string) {
-	memStr := fmt.Sprintf("%d", minGPUMemoryGB)
-	gpusStr := fmt.Sprintf("%d", gpus)
-
-	m.market.set(m.fillPrice, pricePerGPUHour, memStr, gpusStr, maxRegions, capacityType)
-
-	if limitedReason != "" {
-		m.market.set(m.fillLimited, 1, memStr, gpusStr, maxRegions, capacityType, limitedReason)
-	} else {
-		m.market.set(m.fillLimited, 0, memStr, gpusStr, maxRegions, capacityType, "none")
+// SetFillPlan exports one ladder point's fill plan: price, planned and expected GPUs, allocations, and why it fell short.
+func (m *ObservabilityMetrics) SetFillPlan(plan FillPlan) {
+	memStr := strconv.Itoa(plan.MinGPUMemoryGB)
+	gpusStr := strconv.Itoa(plan.TargetGPUs)
+	if plan.PlannedGPUs > 0 {
+		m.market.set(m.fillPrice, plan.PricePerGPUHour, memStr, gpusStr)
+	}
+	m.market.set(m.fillPlannedGPUs, float64(plan.PlannedGPUs), memStr, gpusStr)
+	m.market.set(m.fillExpectedGPUs, plan.ExpectedGPUs, memStr, gpusStr)
+	for _, a := range plan.Allocations {
+		m.market.set(m.fillGPUs, float64(a.GPUs), memStr, gpusStr, a.Provider, a.Region, a.GPUModel, a.CapacityType)
+	}
+	if plan.LimitedReason != "" {
+		m.market.set(m.fillLimited, 1, memStr, gpusStr, plan.LimitedReason)
 	}
 }
 
-// SetFillGPUAllocation exports individual allocation contributions to a fill quote.
-func (m *ObservabilityMetrics) SetFillGPUAllocation(minGPUMemoryGB, gpus int, maxRegions, capacityType, provider, region, gpuModel string, count float64) {
-	memStr := fmt.Sprintf("%d", minGPUMemoryGB)
-	gpusStr := fmt.Sprintf("%d", gpus)
-	m.market.set(m.fillGPUs, count, memStr, gpusStr, maxRegions, capacityType, provider, region, gpuModel)
+// SetSpotCapacityScore exports the spot placement score for getting gpus GPUs in instances of gpusPerInstance GPUs at a memory floor in a region.
+func (m *ObservabilityMetrics) SetSpotCapacityScore(provider, region string, minGPUMemoryGB, gpusPerInstance, gpus int, score float64) {
+	m.market.set(m.spotCapacity, score, provider, region, strconv.Itoa(minGPUMemoryGB), strconv.Itoa(gpusPerInstance), strconv.Itoa(gpus))
 }
 
 // marketSeries remembers which label sets each market refresh pass set, so the next sweep drops series no pass reports anymore.
