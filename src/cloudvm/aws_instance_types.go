@@ -262,6 +262,9 @@ func (p *AWSProvider) launchInstanceTypes(ctx context.Context, spec *InstanceSpe
 func (p *AWSProvider) deriveInstanceTypes(ctx context.Context, spec *InstanceSpec) ([]string, error) {
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(spec.InstanceRequirements...)
 	gpus := spec.Requests.GPUs
+	// Workers boot only the architectures their launch templates have an AMI for, so a pod that names no
+	// architecture gets those and a pod that names another one gets no type.
+	reqs.Add(scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, launchableArchitectures...))
 	if !reqs.Has(labelInstanceGPUCount) {
 		if gpus > 0 {
 			reqs.Add(scheduling.NewRequirement(labelInstanceGPUCount, corev1.NodeSelectorOpIn, strconv.Itoa(gpus)))

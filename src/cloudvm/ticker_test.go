@@ -17,12 +17,20 @@ import (
 )
 
 type mockEC2TickerFetcher struct {
+	typesOutput        *ec2.DescribeInstanceTypesOutput
 	historyOutput      *ec2.DescribeSpotPriceHistoryOutput
 	scoresOutput       *ec2.GetSpotPlacementScoresOutput
 	regionsOutput      *ec2.DescribeRegionsOutput
 	err                error
 	describeRegionsErr error
 	lastRegionsInput   *ec2.DescribeRegionsInput
+}
+
+func (m *mockEC2TickerFetcher) DescribeInstanceTypes(_ context.Context, _ *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	if m.typesOutput != nil {
+		return m.typesOutput, nil
+	}
+	return &ec2.DescribeInstanceTypesOutput{}, nil
 }
 
 func (m *mockEC2TickerFetcher) DescribeSpotPriceHistory(_ context.Context, _ *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
@@ -321,6 +329,11 @@ func TestSpotPriceTicker_RediscoveryAfterExpiration(t *testing.T) {
 
 // blockingTickerFetcher blocks every call until its context ends, emulating an unreachable regional endpoint.
 type blockingTickerFetcher struct{}
+
+func (blockingTickerFetcher) DescribeInstanceTypes(ctx context.Context, _ *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
 
 func (blockingTickerFetcher) DescribeSpotPriceHistory(ctx context.Context, _ *ec2.DescribeSpotPriceHistoryInput, _ ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error) {
 	<-ctx.Done()
