@@ -7,14 +7,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // ObservabilityMetrics manages Prometheus metric collectors and exposition for GPU market and fleet observability.
 type ObservabilityMetrics struct {
 	Registry *prometheus.Registry
+	// marketRegistry holds the market gauges, served only while marketShown is true.
+	marketRegistry *prometheus.Registry
+	marketShown    atomic.Bool
 
 	// Market & Pricing metrics
 	gpuPrice      *prometheus.GaugeVec
@@ -240,7 +245,8 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		}, []string{"region", "availability_zone", "instance_type"}),
 	}
 
-	reg.MustRegister(
+	m.marketRegistry = prometheus.NewRegistry()
+	m.marketRegistry.MustRegister(
 		m.gpuPrice,
 		m.vcpuPrice,
 		m.instancePrice,
@@ -255,6 +261,13 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.fillGPUs,
 		m.fillLimited,
 		m.spotCapacity,
+		m.legacySpotPrice,
+		m.legacyOnDemandPrice,
+		m.legacySpotSavings,
+		m.legacyPlacementScore,
+	)
+	m.marketShown.Store(true)
+	reg.MustRegister(
 		m.instancesRunning,
 		m.vcpusRunning,
 		m.memoryGiBRunning,
@@ -269,10 +282,6 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.instanceSeconds,
 		m.networkRxBytes,
 		m.networkTxBytes,
-		m.legacySpotPrice,
-		m.legacyOnDemandPrice,
-		m.legacySpotSavings,
-		m.legacyPlacementScore,
 	)
 
 	return m
@@ -280,9 +289,41 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 
 // Handler returns the HTTP handler exposing Prometheus metrics for scraping.
 func (m *ObservabilityMetrics) Handler() http.Handler {
-	return promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{
+	return promhttp.HandlerFor(m.Gatherer(), promhttp.HandlerOpts{
 		EnableOpenMetrics: false,
 	})
+}
+
+// Gatherer returns every metric this instance serves: the fleet metrics, and the market gauges while they are shown.
+func (m *ObservabilityMetrics) Gatherer() prometheus.Gatherer {
+	return prometheus.Gatherers{m.Registry, marketGatherer{m}}
+}
+
+// marketGatherer serves the market gauges once they are shown, and nothing before.
+type marketGatherer struct{ m *ObservabilityMetrics }
+
+func (g marketGatherer) Gather() ([]*dto.MetricFamily, error) {
+	if !g.m.marketShown.Load() {
+		return nil, nil
+	}
+	return g.m.marketRegistry.Gather()
+}
+
+// HideMarketUntilRefreshed withholds the market gauges until ShowMarket. A refresh sets gauges one by one, slowly
+// on a cold start while on-demand prices load, so a scrape during the first pass would see part of the market, and
+// per-model minimums would jump to whichever offers happened to be set.
+func (m *ObservabilityMetrics) HideMarketUntilRefreshed() {
+	m.marketShown.Store(false)
+}
+
+// MarketShown reports whether the market gauges are served.
+func (m *ObservabilityMetrics) MarketShown() bool {
+	return m.marketShown.Load()
+}
+
+// ShowMarket serves the market gauges, after a refresh pass has set all of them.
+func (m *ObservabilityMetrics) ShowMarket() {
+	m.marketShown.Store(true)
 }
 
 // SetGPUPrice exports all-in price per GPU-hour and full instance price.

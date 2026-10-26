@@ -261,7 +261,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	var gatherers prometheus.Gatherers
 	if ticker != nil && ticker.Metrics() != nil {
-		gatherers = append(gatherers, ticker.Metrics().Registry)
+		gatherers = append(gatherers, ticker.Metrics().Gatherer())
 	}
 	if tunnel != nil {
 		gatherers = append(gatherers, tunnel.metrics.Registry)

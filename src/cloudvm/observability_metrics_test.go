@@ -122,3 +122,30 @@ func TestObservabilityMetrics_SweepDropsSeriesAPassNoLongerSets(t *testing.T) {
 		t.Errorf("current fill allocation missing:\n%s", body)
 	}
 }
+
+func TestObservabilityMetrics_HidesMarketUntilRefreshed(t *testing.T) {
+	metrics := NewObservabilityMetrics()
+	scrape := func() string {
+		rec := httptest.NewRecorder()
+		metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		return rec.Body.String()
+	}
+
+	// A starting ticker hides the market while its first pass sets gauges one by one.
+	metrics.HideMarketUntilRefreshed()
+	metrics.SetGPUPrice("aws", "us-west-2", "us-west-2a", "gpu", "A10G 24GB", 24, 1, "spot", "g5.xlarge", 0.40)
+	metrics.SetFleetGauges("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", 1, 4, 16, 1, 24, 0.40)
+	body := scrape()
+	if strings.Contains(body, "cloudvm_gpu_price_usd_per_hour{") {
+		t.Errorf("market gauges served before the first refresh ended:\n%s", body)
+	}
+	if !strings.Contains(body, "cloudvm_instances_running{") {
+		t.Errorf("fleet gauges were hidden with the market:\n%s", body)
+	}
+
+	metrics.SweepMarketGauges()
+	metrics.ShowMarket()
+	if !strings.Contains(scrape(), "cloudvm_gpu_price_usd_per_hour{") {
+		t.Errorf("market gauges still hidden after the refresh ended")
+	}
+}
