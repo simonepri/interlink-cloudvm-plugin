@@ -545,6 +545,18 @@ The provider's AWS role needs these actions:
 | `pricing:GetProducts`, `servicequotas:GetServiceQuota` | On-demand baselines and quota signals |
 | `kms:Encrypt` | Runner token encryption when `KMS_KEY_ID` is set |
 
+### EC2 Launch Pacing
+
+EC2 throttles `CreateFleet` per account and region with a token bucket of 50 requests refilled at 5 per second ([request throttling](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-throttling.html)). The plugin paces its own `CreateFleet` calls with a client-side token bucket per region, so a burst of pod creates queues inside the create request, within `VM_LAUNCH_TIMEOUT`, instead of failing with `RequestLimitExceeded`.
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `AWS_LAUNCH_RATE` | `4` | Launch calls per second per region |
+| `AWS_LAUNCH_BURST` | `20` | Launch calls a region may make at once before pacing starts |
+| `AWS_RETRY_QUOTA` | `2500` | Retry quota of each regional EC2 client; the SDK default of 500 tokens fails every call with `retry quota exceeded` after 100 throttled retries |
+
+`AWS_RETRY_MODE=adaptive` keeps the raised quota and adds the SDK's client-side rate limiter for all calls of a regional client.
+
 ### Reverse Tunnel Configuration
 
 With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers can reach it through the tunnel:

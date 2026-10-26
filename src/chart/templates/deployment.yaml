@@ -45,6 +45,18 @@ spec:
             {{- end }}
             - name: RECONCILE_LAUNCH_GRACE_SECONDS
               value: "{{ .Values.provider.reconcileLaunchGraceSeconds | default 120 }}"
+            {{- with .Values.provider.awsLaunchRate }}
+            - name: AWS_LAUNCH_RATE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.provider.awsLaunchBurst }}
+            - name: AWS_LAUNCH_BURST
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.provider.awsRetryQuota }}
+            - name: AWS_RETRY_QUOTA
+              value: {{ . | quote }}
+            {{- end }}
             - name: REGION_STORE_PATH
               value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/instance-regions.json"
             - name: GCP_PROJECT

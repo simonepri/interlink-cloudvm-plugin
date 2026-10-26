@@ -23,7 +23,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
-	"golang.org/x/time/rate"
 )
 
 // FleetAllocationStrategy specifies the spot allocation behavior.
@@ -147,50 +146,11 @@ type EC2FleetClient interface {
 }
 
 var (
-	fleetRateLimitMu  sync.RWMutex
-	fleetRateLimiters = make(map[string]*rate.Limiter)
-	fleetRateLimit    = rate.Limit(15) // ~15 calls/second
-	fleetBurstSize    = 15
-
 	fleetRetryMu        sync.RWMutex
 	fleetInitialBackoff = 100 * time.Millisecond
 	fleetMaxBackoff     = 3 * time.Second
 	fleetMaxRetries     = 5
 )
-
-// getFleetRateLimiter returns the rate.Limiter for a given region (or global if region is empty).
-func getFleetRateLimiter(region string) *rate.Limiter {
-	fleetRateLimitMu.RLock()
-	limiter, exists := fleetRateLimiters[region]
-	fleetRateLimitMu.RUnlock()
-	if exists && limiter != nil {
-		return limiter
-	}
-
-	fleetRateLimitMu.Lock()
-	defer fleetRateLimitMu.Unlock()
-	if limiter, exists := fleetRateLimiters[region]; exists && limiter != nil {
-		return limiter
-	}
-
-	limiter = rate.NewLimiter(fleetRateLimit, fleetBurstSize)
-	fleetRateLimiters[region] = limiter
-	return limiter
-}
-
-// SetFleetRateLimiter configures the rate limiter for a specific region (or empty string for global).
-func SetFleetRateLimiter(region string, limiter *rate.Limiter) {
-	fleetRateLimitMu.Lock()
-	defer fleetRateLimitMu.Unlock()
-	fleetRateLimiters[region] = limiter
-}
-
-// ResetFleetRateLimiters resets the regional rate limiters map.
-func ResetFleetRateLimiters() {
-	fleetRateLimitMu.Lock()
-	defer fleetRateLimitMu.Unlock()
-	fleetRateLimiters = make(map[string]*rate.Limiter)
-}
 
 func getFleetRetryParams() (time.Duration, time.Duration, int) {
 	fleetRetryMu.RLock()
@@ -412,8 +372,8 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		if attempt > 0 {
 			sleepDur := jitterDuration(backoff)
 			cleanRegion := sanitizeLog(req.Region)
-			log.Printf("[aws] CreateFleet throttled (RequestLimitExceeded) for region %s, attempt %d/%d; retrying after %v",
-				cleanRegion, attempt, maxRetries, sleepDur) //nolint:gosec // sanitized
+			log.Printf("[aws] CreateFleet throttled for region %s (%v), attempt %d/%d; retrying after %v",
+				cleanRegion, lastErr, attempt, maxRetries, sleepDur) //nolint:gosec // sanitized
 			timer := time.NewTimer(sleepDur)
 			select {
 			case <-ctx.Done():
@@ -777,7 +737,7 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config for %s: %w", region, err)
 	}
-	cl := ec2.NewFromConfig(cfg)
+	cl := ec2.NewFromConfig(cfg, func(o *ec2.Options) { o.Retryer = newEC2Retryer(cfg.RetryMode) })
 	if p.clients == nil {
 		p.clients = make(map[string]EC2FleetClient)
 	}
