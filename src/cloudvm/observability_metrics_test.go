@@ -90,3 +90,32 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 		}
 	}
 }
+
+func TestObservabilityMetrics_SweepDropsSeriesAPassNoLongerSets(t *testing.T) {
+	metrics := NewObservabilityMetrics()
+
+	// Pass 1: a quote is limited by capacity and draws GPUs from two regions.
+	metrics.SetFillQuote(80, 64, "unlimited", "spot", 2.5, nil, "capacity")
+	metrics.SetFillGPUAllocation(80, 64, "unlimited", "spot", "aws", "us-east-1", "H100 80GB", 32)
+	metrics.SetFillGPUAllocation(80, 64, "unlimited", "spot", "aws", "us-west-2", "H100 80GB", 32)
+	metrics.SweepMarketGauges()
+
+	// Pass 2: the same quote fills from one region without limits.
+	metrics.SetFillQuote(80, 64, "unlimited", "spot", 2.4, nil, "")
+	metrics.SetFillGPUAllocation(80, 64, "unlimited", "spot", "aws", "us-east-1", "H100 80GB", 64)
+	metrics.SweepMarketGauges()
+
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if strings.Contains(body, `reason="capacity"`) {
+		t.Errorf("stale fill_limited reason survived the sweep:\n%s", body)
+	}
+	if strings.Contains(body, `region="us-west-2"`) {
+		t.Errorf("stale fill allocation survived the sweep:\n%s", body)
+	}
+	if !strings.Contains(body, `cloudvm_fill_gpus{capacity_type="spot",gpu_model="H100 80GB",gpus="64",max_regions="unlimited",min_gpu_memory_gb="80",provider="aws",region="us-east-1"} 64`) {
+		t.Errorf("current fill allocation missing:\n%s", body)
+	}
+}

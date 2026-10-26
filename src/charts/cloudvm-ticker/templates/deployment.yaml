@@ -33,6 +33,8 @@ spec:
               value: "{{ join "," .Values.ticker.regions }}"
             - name: TICKER_INSTANCE_TYPES
               value: "{{ join "," .Values.ticker.instanceTypes }}"
+            - name: TICKER_GCP_REGIONS
+              value: "{{ join "," .Values.ticker.gcpRegions }}"
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

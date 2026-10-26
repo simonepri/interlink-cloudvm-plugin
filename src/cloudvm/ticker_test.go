@@ -12,6 +12,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
+	quotatypes "github.com/aws/aws-sdk-go-v2/service/servicequotas/types"
 )
 
 type mockEC2TickerFetcher struct {
@@ -225,15 +227,13 @@ func TestSpotPriceTicker_DescribeRegionsSuccess(t *testing.T) {
 		t.Errorf("expected filter with Name opt-in-status not found")
 	}
 
-	// PollOnce and verify regions are populated and synced to gcpMarket and advisor
+	// PollOnce and verify regions are populated and synced to the advisor; AWS regions never become GCP regions
 	ticker.PollOnce(context.Background())
 	if !reflect.DeepEqual(ticker.Regions(), expected) {
 		t.Errorf("ticker.Regions() = %v, want %v", ticker.Regions(), expected)
 	}
-	if gcp := ticker.GCPMarket(); gcp != nil {
-		if !reflect.DeepEqual(gcp.Regions(), expected) {
-			t.Errorf("gcpMarket.Regions() = %v, want %v", gcp.Regions(), expected)
-		}
+	if gcp := ticker.GCPMarket(); gcp != nil && len(gcp.Regions()) != 0 {
+		t.Errorf("gcpMarket.Regions() = %v, want none", gcp.Regions())
 	}
 	if adv := ticker.Advisor(); adv != nil {
 		if !reflect.DeepEqual(adv.Regions(), expected) {
@@ -398,5 +398,54 @@ func TestSpotPriceTicker_DiscoverRegionsTimesOut(t *testing.T) {
 	got := ticker.DiscoverRegions(context.Background())
 	if !reflect.DeepEqual(got, []string{"us-west-2"}) {
 		t.Fatalf("expected fallback regions after discovery timeout, got %v", got)
+	}
+}
+
+type regionQuotasClient struct {
+	region  string
+	regions *[]string
+}
+
+func (c regionQuotasClient) GetServiceQuota(_ context.Context, _ *servicequotas.GetServiceQuotaInput, _ ...func(*servicequotas.Options)) (*servicequotas.GetServiceQuotaOutput, error) {
+	*c.regions = append(*c.regions, c.region)
+	return &servicequotas.GetServiceQuotaOutput{Quota: &quotatypes.ServiceQuota{Value: aws.Float64(96)}}, nil
+}
+
+func TestSpotPriceTicker_MarketMetricsReflectKnownData(t *testing.T) {
+	now := time.Now()
+	fetcher := &mockEC2TickerFetcher{
+		historyOutput: &ec2.DescribeSpotPriceHistoryOutput{
+			SpotPriceHistory: []ec2types.SpotPrice{
+				{InstanceType: ec2types.InstanceType("p5.48xlarge"), AvailabilityZone: aws.String("us-east-1a"), SpotPrice: aws.String("40.00"), Timestamp: aws.Time(now)},
+			},
+		},
+	}
+	metrics := NewObservabilityMetrics()
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"p5.48xlarge"}, time.Minute)
+	ticker.SetMetrics(metrics)
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
+	ticker.SetPricingAPI(&countingPricingClient{err: errors.New("throttled")})
+	var quotaRegions []string
+	ticker.SetServiceQuotasFactory(func(region string) AWSServiceQuotasAPI {
+		return regionQuotasClient{region: region, regions: &quotaRegions}
+	})
+
+	ticker.PollOnce(context.Background())
+
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `cloudvm_gpu_price_usd_per_hour{accelerator="gpu",capacity_type="spot"`) {
+		t.Errorf("spot price missing:\n%s", body)
+	}
+	if strings.Contains(body, `cloudvm_gpu_price_usd_per_hour{accelerator="gpu",capacity_type="on-demand"`) {
+		t.Errorf("exported an on-demand price for a shape whose price is unknown:\n%s", body)
+	}
+	if strings.Contains(body, `provider="gcp"`) {
+		t.Errorf("exported GCP market data without configured GCP regions:\n%s", body)
+	}
+	if len(quotaRegions) == 0 || quotaRegions[0] != "us-east-1" {
+		t.Errorf("quota clients built for regions %v, want us-east-1", quotaRegions)
 	}
 }

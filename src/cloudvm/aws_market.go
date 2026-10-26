@@ -191,7 +191,7 @@ func (c *SpotAdvisorCollector) Regions() []string {
 }
 
 // GetAWSOnDemandPrice queries the AWS Price List API for the current Linux shared on-demand price.
-// If the API call fails or returns no products, it falls back to OnDemandBaselineUSD.
+// If the API call fails or returns no products, it falls back to OnDemandBaselineUSD, which is 0 for shapes the catalog lacks.
 func GetAWSOnDemandPrice(ctx context.Context, client AWSPricingAPI, region, instanceType string) float64 {
 	baseline := OnDemandBaselineUSD(instanceType)
 	if client == nil {

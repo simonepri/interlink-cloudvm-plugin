@@ -151,6 +151,12 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 	if f.metrics == nil {
 		return
 	}
+	// Look up uncached prices before taking the lock, so a slow Price List call does not block launch recording.
+	for _, inst := range instances {
+		if inst != nil && inst.Provider == ProviderAWS {
+			GlobalOnDemandPrices.Price(context.Background(), inst.Region, inst.InstanceType)
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -253,7 +259,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 		if hourlyPrice == 0 {
 			switch provider {
 			case "aws":
-				hourlyPrice = OnDemandBaselineUSD(itype)
+				hourlyPrice = GlobalOnDemandPrices.Price(context.Background(), region, itype)
 			case "gcp":
 				onDemand, _ := GetGCPPrice(itype)
 				hourlyPrice = onDemand
@@ -279,7 +285,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 		ondemandBaseline := 0.0
 		switch provider {
 		case "aws":
-			ondemandBaseline = OnDemandBaselineUSD(itype)
+			ondemandBaseline = GlobalOnDemandPrices.Price(context.Background(), region, itype)
 		case "gcp":
 			onDemand, _ := GetGCPPrice(itype)
 			ondemandBaseline = onDemand

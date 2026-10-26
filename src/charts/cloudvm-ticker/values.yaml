@@ -31,6 +31,8 @@ ticker:
     - g6.24xlarge
     - p4d.24xlarge
     - p5.48xlarge
+  # GCP regions to export catalog prices and capacity estimates for; empty exports no GCP market data.
+  gcpRegions: []
 
 service:
   type: ClusterIP

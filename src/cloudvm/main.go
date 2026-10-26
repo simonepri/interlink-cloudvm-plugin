@@ -13,6 +13,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/pricing"
+	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
 )
 
 func parseCommaList(val string) []string {
@@ -40,6 +44,40 @@ func parseTickerRegions(val string) []string {
 		}
 	}
 	return regions
+}
+
+// awsPricingRegion hosts the AWS Price List API endpoint; prices for every region are read from it.
+const awsPricingRegion = "us-east-1"
+
+// newConfiguredTicker builds the spot price ticker from TICKER_* and SCRAPE_INTERVAL_SECONDS and connects its AWS market APIs.
+func newConfiguredTicker(ctx context.Context, awsProv *AWSProvider) *SpotPriceTicker {
+	tickerRegions := parseTickerRegions(os.Getenv("TICKER_REGIONS"))
+	interval := 10 * time.Minute
+	if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
+		if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
+			interval = time.Duration(s) * time.Second
+		}
+	}
+	tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
+	spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval, awsProv.ConfiguredRegions()...)
+	spotTicker.GCPMarket().SetRegions(parseCommaList(os.Getenv("TICKER_GCP_REGIONS")))
+	configureAWSMarketAPIs(ctx, spotTicker)
+	return spotTicker
+}
+
+// configureAWSMarketAPIs gives the shared on-demand price book a Price List API client and the ticker, when present, per-region Service Quotas clients.
+func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsPricingRegion))
+	if err != nil {
+		log.Printf("[cloudvm] Warning: AWS on-demand prices and quotas unavailable: %v", err)
+		return
+	}
+	GlobalOnDemandPrices.SetClient(pricing.NewFromConfig(cfg))
+	if spotTicker != nil {
+		spotTicker.SetServiceQuotasFactory(func(region string) AWSServiceQuotasAPI {
+			return servicequotas.NewFromConfig(cfg, func(o *servicequotas.Options) { o.Region = region })
+		})
+	}
 }
 
 func main() {
@@ -88,16 +126,7 @@ func run() error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		tickerRegions := parseTickerRegions(os.Getenv("TICKER_REGIONS"))
-		interval := 10 * time.Minute
-		if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
-			if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
-				interval = time.Duration(s) * time.Second
-			}
-		}
-		tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
-		fallbackRegions := awsProv.ConfiguredRegions()
-		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval, fallbackRegions...)
+		spotTicker := newConfiguredTicker(ctx, awsProv)
 		go spotTicker.Start(ctx)
 		log.Printf("[cloudvm-ticker] Running standalone spot ticker on port %s for %d regions", port, len(spotTicker.Regions())) //nolint:gosec // length safe
 
@@ -217,19 +246,12 @@ func run() error {
 
 	// Embedded spot price ticker
 	if os.Getenv("ENABLE_TICKER") == "true" {
-		tickerRegions := parseTickerRegions(os.Getenv("TICKER_REGIONS"))
-		interval := 10 * time.Minute
-		if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
-			if s, err := strconv.Atoi(intervalSec); err == nil && s > 0 {
-				interval = time.Duration(s) * time.Second
-			}
-		}
-		tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
-		fallbackRegions := awsProv.ConfiguredRegions()
-		spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval, fallbackRegions...)
+		spotTicker := newConfiguredTicker(ctx, awsProv)
 		go spotTicker.Start(ctx)
 		server.SetSpotTicker(spotTicker)
 		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(spotTicker.Regions())) //nolint:gosec // log length is safe
+	} else if providerType == "aws" {
+		configureAWSMarketAPIs(ctx, nil)
 	}
 
 	// Background reconciler

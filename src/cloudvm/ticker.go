@@ -68,13 +68,14 @@ type SpotPriceTicker struct {
 	regionCallTimeout   time.Duration
 	fetcherFactory      func(ctx context.Context, region string) (SpotPriceFetcher, error)
 
-	metrics    *ObservabilityMetrics
-	advisor    *SpotAdvisorCollector
-	gcpMarket  *GCPMarketCollector
-	solver     *FillSolver
-	catalog    *HardwareCatalog
-	pricingAPI AWSPricingAPI
-	quotasAPI  AWSServiceQuotasAPI
+	metrics       *ObservabilityMetrics
+	advisor       *SpotAdvisorCollector
+	gcpMarket     *GCPMarketCollector
+	solver        *FillSolver
+	catalog       *HardwareCatalog
+	onDemand      *OnDemandPriceBook
+	quotasAPI     AWSServiceQuotasAPI
+	quotasFactory func(region string) AWSServiceQuotasAPI
 }
 
 // NewSpotPriceTicker initializes a spot price ticker with full market observability.
@@ -146,7 +147,7 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 	metrics := GlobalMetrics
 	catalog := GlobalCatalog
 	advisor := NewSpotAdvisorCollector("", nil)
-	gcpMarket := NewGCPMarketCollector(initialRegions, nil)
+	gcpMarket := NewGCPMarketCollector(nil, nil)
 	solver := NewFillSolver()
 
 	return &SpotPriceTicker{
@@ -164,6 +165,7 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		gcpMarket:           gcpMarket,
 		solver:              solver,
 		catalog:             catalog,
+		onDemand:            GlobalOnDemandPrices,
 		fetcherFactory: func(ctx context.Context, region string) (SpotPriceFetcher, error) {
 			cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 			if err != nil {
@@ -281,18 +283,38 @@ func (t *SpotPriceTicker) GCPMarket() *GCPMarketCollector {
 	return t.gcpMarket
 }
 
-// SetPricingAPI overrides the AWS pricing API client.
+// SetPricingAPI gives this ticker its own on-demand price book backed by api instead of GlobalOnDemandPrices.
 func (t *SpotPriceTicker) SetPricingAPI(api AWSPricingAPI) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.pricingAPI = api
+	t.onDemand = NewOnDemandPriceBook(api)
 }
 
-// SetServiceQuotasAPI overrides the AWS service quotas API client.
+// SetServiceQuotasAPI overrides the AWS service quotas client used for every region.
 func (t *SpotPriceTicker) SetServiceQuotasAPI(api AWSServiceQuotasAPI) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.quotasAPI = api
+}
+
+// SetServiceQuotasFactory sets how the ticker builds a service quotas client for each region it reads quotas in.
+func (t *SpotPriceTicker) SetServiceQuotasFactory(factory func(region string) AWSServiceQuotasAPI) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.quotasFactory = factory
+}
+
+// quotasClient returns the service quotas client for a region, or nil when none is configured.
+func (t *SpotPriceTicker) quotasClient(region string) AWSServiceQuotasAPI {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.quotasAPI != nil {
+		return t.quotasAPI
+	}
+	if t.quotasFactory != nil {
+		return t.quotasFactory(region)
+	}
+	return nil
 }
 
 // Metrics returns the observability metrics collector.
@@ -383,9 +405,6 @@ func (t *SpotPriceTicker) refreshDiscoveredRegions(ctx context.Context) {
 		t.mu.Lock()
 		t.regions = discovered
 		t.lastRegionDiscovery = time.Now()
-		if t.gcpMarket != nil {
-			t.gcpMarket.SetRegions(discovered)
-		}
 		if t.advisor != nil {
 			t.advisor.SetRegions(discovered)
 		}
@@ -526,7 +545,7 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 
 	// 1. AWS Prices & Signals
 	for _, p := range prices {
-		ondemand := GetAWSOnDemandPrice(ctx, t.pricingAPI, p.Region, p.InstanceType)
+		ondemand := t.onDemand.Price(ctx, p.Region, p.InstanceType)
 		savingsPct := 0.0
 		if ondemand > 0 && p.SpotPriceUSD > 0 && p.SpotPriceUSD < ondemand {
 			savingsPct = ((ondemand - p.SpotPriceUSD) / ondemand) * 100.0
@@ -551,14 +570,18 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 
 		if resCap.GPUs > 0 {
 			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, accelerator, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "spot", p.InstanceType, p.SpotPriceUSD)
-			t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, accelerator, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "on-demand", p.InstanceType, ondemand)
+			if ondemand > 0 {
+				t.metrics.SetGPUPrice("aws", p.Region, p.AvailabilityZone, accelerator, gpuModel, resCap.GPUMemoryGB, resCap.GPUs, "on-demand", p.InstanceType, ondemand)
+			}
 		} else {
 			cpuCount, _ := strconv.Atoi(resCap.CPU.String())
 			if cpuCount <= 0 {
 				cpuCount = 2
 			}
 			t.metrics.SetVCPUPrice("aws", p.Region, p.AvailabilityZone, "spot", p.InstanceType, p.SpotPriceUSD/float64(cpuCount))
-			t.metrics.SetVCPUPrice("aws", p.Region, p.AvailabilityZone, "on-demand", p.InstanceType, ondemand/float64(cpuCount))
+			if ondemand > 0 {
+				t.metrics.SetVCPUPrice("aws", p.Region, p.AvailabilityZone, "on-demand", p.InstanceType, ondemand/float64(cpuCount))
+			}
 		}
 
 		// Add to solver offers
@@ -581,6 +604,9 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			QuotaRemaining:  64,
 		})
 
+		if ondemand <= 0 {
+			continue
+		}
 		onDemandPerGPU := ondemand
 		if resCap.GPUs > 0 {
 			onDemandPerGPU = ondemand / float64(resCap.GPUs)
@@ -647,16 +673,14 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 	}
 
 	// 4. AWS Quotas
-	if t.quotasAPI != nil {
-		t.forEachRegion(ctx, t.Regions(), func(ctx context.Context, reg string) {
-			QueryAWSGPUQuotas(ctx, t.quotasAPI, reg, t.metrics)
-		})
-	}
+	t.forEachRegion(ctx, t.Regions(), func(ctx context.Context, reg string) {
+		QueryAWSGPUQuotas(ctx, t.quotasClient(reg), reg, t.metrics)
+	})
 
 	// 5. GCP Market Collection
 	if t.gcpMarket != nil {
 		t.gcpMarket.Collect(ctx, t.metrics)
-		for _, reg := range t.gcpMarket.regions {
+		for _, reg := range t.gcpMarket.Regions() {
 			for mtype, profile := range KnownGCPHardwareProfiles {
 				if profile.GPUs <= 0 {
 					continue
@@ -699,6 +723,8 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 		t.solver.SetOffers(offers)
 		t.solver.SolveAll(t.metrics)
 	}
+
+	t.metrics.SweepMarketGauges()
 }
 
 // AllScores returns a snapshot of all tracked placement scores.
@@ -712,14 +738,14 @@ func (t *SpotPriceTicker) AllScores() map[string]*PlacementScoreEntry {
 	return out
 }
 
-// OnDemandBaselineUSD returns standard AWS on-demand pricing baseline from the pricing catalog.
+// OnDemandBaselineUSD returns the AWS on-demand rate from the pricing catalog, or 0 when the catalog lacks the shape.
 func OnDemandBaselineUSD(instanceType string) float64 {
 	if GlobalPricingCatalog != nil {
 		if rate, ok := GlobalPricingCatalog.GetAWSRate(instanceType); ok {
 			return rate
 		}
 	}
-	return 1.000
+	return 0
 }
 
 // Start runs the background polling loop until ctx is canceled.
