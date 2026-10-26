@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -364,4 +365,15 @@ func parsePodFromPayload(body []byte) (*Pod, error) {
 	}
 
 	return nil, fmt.Errorf("invalid pod JSON payload")
+}
+
+// parseSecretsFromPayload returns the Secrets the virtual kubelet sends in a create request ({"secrets": [...]}).
+func parseSecretsFromPayload(body []byte) []corev1.Secret {
+	var req struct {
+		Secrets []corev1.Secret `json:"secrets"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
+	}
+	return req.Secrets
 }

@@ -622,17 +622,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve imagePullSecrets via Kubernetes SecretResolver
 	if len(pod.Spec.ImagePullSecrets) > 0 {
-		if s.secretResolver != nil {
-			dockerConfigJSON, err := ResolveImagePullSecrets(r.Context(), s.secretResolver, spec.PodNamespace, pod.Spec.ImagePullSecrets)
-			if err != nil {
-				finalErr = fmt.Errorf("failed to resolve imagePullSecrets: %w", err)
-				http.Error(w, finalErr.Error(), http.StatusInternalServerError)
-				return
-			}
-			spec.DockerConfigJSON = dockerConfigJSON
-		}
+		s.mu.RLock()
+		resolver := s.secretResolver
+		s.mu.RUnlock()
+		spec.DockerConfigJSON = ResolveImagePullSecrets(r.Context(), parseSecretsFromPayload(body), resolver, spec.PodNamespace, pod.Spec.ImagePullSecrets)
 	}
 
 	s.mu.Lock()

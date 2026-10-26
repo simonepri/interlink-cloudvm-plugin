@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestParseDockerConfigJSON_Standard(t *testing.T) {
@@ -275,48 +276,56 @@ func TestResolveImagePullSecrets(t *testing.T) {
 	}
 
 	// 1. Single secret
-	res1, err := ResolveImagePullSecrets(ctx, resolver, "default", []corev1.LocalObjectReference{{Name: "regcred1"}})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	res1 := ResolveImagePullSecrets(ctx, nil, resolver, "default", []corev1.LocalObjectReference{{Name: "regcred1"}})
 	if !strings.Contains(res1, "ghcr.io") {
 		t.Errorf("expected ghcr.io in resolved config, got: %s", res1)
 	}
 
 	// 2. Multiple secrets merged
-	res2, err := ResolveImagePullSecrets(ctx, resolver, "default", []corev1.LocalObjectReference{
+	res2 := ResolveImagePullSecrets(ctx, nil, resolver, "default", []corev1.LocalObjectReference{
 		{Name: "regcred1"},
 		{Name: "regcred2"},
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	if !strings.Contains(res2, "ghcr.io") || !strings.Contains(res2, "docker.io") {
 		t.Errorf("expected ghcr.io and docker.io in merged config, got: %s", res2)
 	}
 
-	// 3. Missing secret returns error
-	_, err = ResolveImagePullSecrets(ctx, resolver, "default", []corev1.LocalObjectReference{{Name: "missing"}})
-	if err == nil {
-		t.Fatal("expected error for missing secret, got nil")
+	// 3. Missing and malformed secrets are skipped, the readable one is kept
+	res3 := ResolveImagePullSecrets(ctx, nil, resolver, "default", []corev1.LocalObjectReference{
+		{Name: "missing"}, {Name: "invalid"}, {Name: "regcred2"},
+	})
+	if strings.Contains(res3, "ghcr.io") || !strings.Contains(res3, "docker.io") {
+		t.Errorf("expected only docker.io after skipping unreadable secrets, got: %s", res3)
 	}
 
-	// 4. Invalid secret content returns error
-	_, err = ResolveImagePullSecrets(ctx, resolver, "default", []corev1.LocalObjectReference{{Name: "invalid"}})
-	if err == nil {
-		t.Fatal("expected error for malformed secret content, got nil")
+	// 4. Only unreadable secrets yield no config
+	if res := ResolveImagePullSecrets(ctx, nil, resolver, "default", []corev1.LocalObjectReference{{Name: "missing"}}); res != "" {
+		t.Fatalf("expected empty config for missing secret, got %q", res)
 	}
 
-	// 5. Empty secretRefs returns empty string and nil error
-	emptyRes, err := ResolveImagePullSecrets(ctx, resolver, "default", nil)
-	if err != nil || emptyRes != "" {
-		t.Fatalf("expected empty string and nil error, got %q (err: %v)", emptyRes, err)
+	// 5. Empty secretRefs returns empty string
+	if res := ResolveImagePullSecrets(ctx, nil, resolver, "default", nil); res != "" {
+		t.Fatalf("expected empty string, got %q", res)
 	}
 
-	// 6. Nil resolver returns empty string and nil error
-	nilRes, err := ResolveImagePullSecrets(ctx, nil, "default", []corev1.LocalObjectReference{{Name: "regcred1"}})
-	if err != nil || nilRes != "" {
-		t.Fatalf("expected empty string and nil error for nil resolver, got %q (err: %v)", nilRes, err)
+	// 6. Nil resolver and no request secrets returns empty string
+	if res := ResolveImagePullSecrets(ctx, nil, nil, "default", []corev1.LocalObjectReference{{Name: "regcred1"}}); res != "" {
+		t.Fatalf("expected empty string for nil resolver, got %q", res)
+	}
+
+	// 7. Request secrets take precedence over the resolver, which serves only the ones the request lacks
+	provided := []corev1.Secret{{
+		ObjectMeta: metav1.ObjectMeta{Name: "regcred1", Namespace: "default"},
+		Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"quay.io":{"username":"u3","password":"p3"}}}`)},
+	}}
+	res7 := ResolveImagePullSecrets(ctx, provided, resolver, "default", []corev1.LocalObjectReference{{Name: "regcred1"}, {Name: "regcred2"}})
+	if !strings.Contains(res7, "quay.io") || strings.Contains(res7, "ghcr.io") || !strings.Contains(res7, "docker.io") {
+		t.Errorf("expected quay.io from the request and docker.io from the resolver, got: %s", res7)
+	}
+
+	// 8. Request secrets work without a resolver
+	if res := ResolveImagePullSecrets(ctx, provided, nil, "default", []corev1.LocalObjectReference{{Name: "regcred1"}}); !strings.Contains(res, "quay.io") {
+		t.Errorf("expected quay.io from the request without a resolver, got: %s", res)
 	}
 }
 
@@ -556,5 +565,49 @@ func TestServer_SecretResolver_EndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(startReq.DockerConfigJSON, "deployer") {
 		t.Errorf("expected DockerConfigJSON in StartContainerRequest to contain username deployer, got: %s", startReq.DockerConfigJSON)
+	}
+}
+
+func TestServer_RequestPullSecrets_EndToEnd(t *testing.T) {
+	server := NewServer(NewMockProvider(), "test-cluster")
+	mockRunner := NewMockContainerRunner()
+	server.SetContainerRunner(mockRunner)
+	// The resolver knows no secrets, as when the API denies access; the launch must not fail.
+	resolver := &mockSecretResolver{secrets: map[string]map[string][]byte{}}
+	server.SetSecretResolver(resolver)
+
+	payload := map[string]any{
+		"pod": Pod{
+			Metadata: PodMeta{Name: "vk-workload", Namespace: "production", UID: "pod-request-secret-1"},
+			Spec: PodSpecWrapper{
+				ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-hub-credentials"}, {Name: "unreadable"}},
+				Containers:       []ContainerSpec{{Name: "worker", Image: "docker.io/private/app:v1"}},
+			},
+		},
+		"secrets": []corev1.Secret{{
+			ObjectMeta: metav1.ObjectMeta{Name: "docker-hub-credentials", Namespace: "production"},
+			Type:       corev1.SecretTypeDockerConfigJson,
+			Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"docker.io":{"username":"hub","password":"hub-token"}}}`)},
+		}},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload failed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("expected the resolver to be asked only for the secret the request lacks, got %d calls", resolver.calls)
+	}
+	startReq := mockRunner.GetStartRequest("pod-request-secret-1")
+	if startReq == nil {
+		t.Fatal("expected recorded StartContainerRequest on runner")
+	}
+	if !strings.Contains(startReq.DockerConfigJSON, "hub-token") {
+		t.Errorf("expected DockerConfigJSON from the request secret, got: %s", startReq.DockerConfigJSON)
 	}
 }
