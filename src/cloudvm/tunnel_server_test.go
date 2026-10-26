@@ -26,28 +26,33 @@ type tunnelFixture struct {
 
 func newTunnelFixture(t *testing.T, connectTimeout time.Duration) *tunnelFixture {
 	t.Helper()
+	return newTunnelFixtureWith(t, TunnelSettings{ConnectTimeout: connectTimeout})
+}
+
+// newTunnelFixtureWith fills the endpoint and mesh key the shared fixture uses into settings.
+func newTunnelFixtureWith(t *testing.T, settings TunnelSettings) *tunnelFixture {
+	t.Helper()
 	cleanTempStores()
 	t.Cleanup(cleanTempStores)
 	provider := NewMockProvider()
 	server := NewServer(provider, "test-cluster")
 	server.RegisterProvider(ProviderMock, provider)
 	registry := NewSessionRegistry()
-	metrics := server.EnableTunnel(TunnelSettings{
-		Registry:       registry,
-		Endpoint:       "clvm-tunnel.cell-test.c.corp.boltz.com:443",
-		MeshAuthKey:    "tskey-auth-test",
-		ConnectTimeout: connectTimeout,
-	})
+	settings.Registry = registry
+	settings.Endpoint = "clvm-tunnel.cell-test.c.corp.boltz.com:443"
+	settings.MeshAuthKey = "tskey-auth-test"
+	metrics := server.EnableTunnel(settings)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
-		Listener:       listener,
-		Registry:       registry,
-		TokenValidator: server.ValidateTunnelToken,
-		OnReject:       metrics.RecordRejection,
-		LogSink:        server,
+		Listener:          listener,
+		Registry:          registry,
+		TokenValidator:    server.ValidateTunnelToken,
+		IdentityValidator: server.ValidateTunnelIdentity,
+		OnReject:          metrics.RecordRejection,
+		LogSink:           server,
 	})
 	if err != nil {
 		t.Fatalf("gateway: %v", err)
@@ -274,7 +279,9 @@ func TestServer_KeepsWorkerWhoseTunnelConnects(t *testing.T) {
 func TestApplyTunnelSpec_EncryptsMeshKeyWithKMS(t *testing.T) {
 	f := newTunnelFixture(t, time.Minute)
 	spec := &InstanceSpec{MeshAuthKey: "pod-supplied"}
-	f.server.applyTunnelSpec(spec)
+	if err := f.server.applyTunnelSpec(spec); err != nil {
+		t.Fatalf("applyTunnelSpec: %v", err)
+	}
 	if spec.MeshAuthKey != "tskey-auth-test" {
 		t.Fatalf("plugin mesh key must override pod env, got %q", spec.MeshAuthKey)
 	}

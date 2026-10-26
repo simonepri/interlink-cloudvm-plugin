@@ -368,9 +368,13 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		}
 		endpoint = FormatTunnelEndpoint(cell)
 	}
+	transports, err := TunnelTransportsFromClusterFacts(os.Getenv("CLUSTER_FACTS"))
+	if err != nil {
+		return nil, err
+	}
 	meshKey := os.Getenv("TAILSCALE_AUTHKEY")
-	if meshKey == "" {
-		return nil, fmt.Errorf("TAILSCALE_AUTHKEY is required so workers can join the tailnet")
+	if meshKey == "" && transports.meshKeyRequired() {
+		return nil, fmt.Errorf("TAILSCALE_AUTHKEY is required so tailnet-transport workers can join the tailnet")
 	}
 	connectTimeout := DefaultTunnelConnectTimeout
 	if raw := os.Getenv("TUNNEL_CONNECT_TIMEOUT"); raw != "" {
@@ -385,15 +389,29 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		listenAddr = ":7443"
 	}
 
-	registry := NewSessionRegistry()
-	metrics := server.EnableTunnel(TunnelSettings{
-		Registry:       registry,
+	settings := TunnelSettings{
 		Endpoint:       endpoint,
+		Transports:     transports,
+		GatewayIP:      strings.TrimSpace(os.Getenv("TUNNEL_GATEWAY_IP")),
+		PublicEndpoint: strings.TrimSpace(os.Getenv("TUNNEL_PUBLIC_ENDPOINT")),
 		MeshAuthKey:    meshKey,
 		MeshTags:       os.Getenv("TAILSCALE_TAGS"),
 		ConnectTimeout: connectTimeout,
 		DirectFallback: os.Getenv("RUNNER_DIRECT_FALLBACK") == "true",
-	})
+	}
+	if err := settings.validateTransports(); err != nil {
+		return nil, err
+	}
+	if transports.Uses(TunnelTransportPublic) {
+		verifier, err := publicIdentityVerifier(server, os.Getenv(TunnelIdentityVerificationEnv), AllowedAccountsFromEnv())
+		if err != nil {
+			return nil, err
+		}
+		settings.IdentityVerifier = verifier
+	}
+	registry := NewSessionRegistry()
+	settings.Registry = registry
+	metrics := server.EnableTunnel(settings)
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen for reverse tunnels on %s: %w", listenAddr, err)
@@ -409,11 +427,12 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		log.Printf("[cloudvm-logs] Forwarding worker logs to %s", endpoint) //nolint:gosec // configuration value
 	}
 	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
-		Listener:       listener,
-		Registry:       registry,
-		TokenValidator: server.ValidateTunnelToken,
-		OnReject:       metrics.RecordRejection,
-		LogSink:        server,
+		Listener:          listener,
+		Registry:          registry,
+		TokenValidator:    server.ValidateTunnelToken,
+		IdentityValidator: server.ValidateTunnelIdentity,
+		OnReject:          metrics.RecordRejection,
+		LogSink:           server,
 	})
 	if err != nil {
 		_ = listener.Close()

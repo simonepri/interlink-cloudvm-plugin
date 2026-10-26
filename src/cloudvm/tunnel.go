@@ -155,6 +155,7 @@ type TunnelGateway struct {
 	registry            *SessionRegistry
 	attestationVerifier AttestationVerifier
 	tokenValidator      func(ctx context.Context, instanceID, token string) error
+	identityValidator   func(ctx context.Context, req *TunnelHandshakeRequest) error
 	yamuxConfig         *yamux.Config
 	handshakeTimeout    time.Duration
 	onReject            func(reason string)
@@ -175,6 +176,8 @@ type TunnelGatewayConfig struct {
 	OnReject func(reason string)
 	// LogSink receives the log stream each worker opens on its session; workers' log streams are closed when nil.
 	LogSink WorkerLogSink
+	// IdentityValidator, when set, runs after the token check and may demand proof of the worker's cloud identity.
+	IdentityValidator func(ctx context.Context, req *TunnelHandshakeRequest) error
 }
 
 // WorkerLogSink consumes the newline-delimited WorkerLogRecord stream a worker opens on its tunnel session.
@@ -214,6 +217,7 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		registry:            cfg.Registry,
 		attestationVerifier: cfg.AttestationVerifier,
 		tokenValidator:      cfg.TokenValidator,
+		identityValidator:   cfg.IdentityValidator,
 		yamuxConfig:         cfg.YamuxConfig,
 		handshakeTimeout:    cfg.HandshakeTimeout,
 		onReject:            cfg.OnReject,
@@ -280,6 +284,12 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 	if err := g.tokenValidator(ctx, req.InstanceID, req.AuthToken); err != nil {
 		g.reject(conn, req.InstanceID, "unauthorized", fmt.Sprintf("unauthorized runner token: %v", err))
 		return
+	}
+	if g.identityValidator != nil {
+		if err := g.identityValidator(ctx, &req); err != nil {
+			g.reject(conn, req.InstanceID, "identity", fmt.Sprintf("instance identity rejected: %v", err))
+			return
+		}
 	}
 
 	// Acknowledge handshake success

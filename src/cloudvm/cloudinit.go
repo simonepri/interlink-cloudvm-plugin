@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"text/template"
 )
@@ -39,6 +40,8 @@ type CloudInitConfig struct {
 	MeshAuthKeyCiphertext  string
 	MeshTags               string
 	TunnelEndpoint         string
+	TunnelTransport        string
+	TunnelGatewayIP        string
 	RunnerDirectHTTP       bool
 	Region                 string
 	InstanceType           string
@@ -72,6 +75,9 @@ func (c *CloudInitConfig) Validate() error {
 	if c.IsKMSEncrypted() && c.KMSCiphertext == "" {
 		return fmt.Errorf("KMS token encryption is enabled but KMSCiphertext is empty")
 	}
+	if c.TunnelTransport == string(TunnelTransportRouter) && net.ParseIP(c.TunnelGatewayIP) == nil {
+		return fmt.Errorf("router tunnel transport needs a gateway IP, got %q", c.TunnelGatewayIP)
+	}
 	return nil
 }
 
@@ -81,6 +87,11 @@ func (c *CloudInitConfig) KMSRegion() string {
 		return parts[3]
 	}
 	return c.Region
+}
+
+// TunnelHost returns the hostname the worker dials and verifies the gateway certificate against.
+func (c *CloudInitConfig) TunnelHost() string {
+	return tunnelHost(c.TunnelEndpoint)
 }
 
 // TunnelAgentScript returns the embedded in-VM reverse tunnel agent source.
@@ -232,8 +243,12 @@ if command -v iptables-save >/dev/null 2>&1; then
   iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 fi
 
-# 2. Join Private Network Mesh (Tailscale / WireGuard)
-{{if or .MeshAuthKey .MeshAuthKeyCiphertext}}
+# 2. Reach the tunnel gateway: join the tailnet, or pin the gateway host to the address the footprint routes through its router pair
+{{if eq .TunnelTransport "router"}}
+echo "[cloudvm-bootstrap] Router transport: resolving {{.TunnelHost}} to {{.TunnelGatewayIP}}"
+sed -i '/[[:space:]]{{.TunnelHost}}$/d' /etc/hosts
+echo "{{.TunnelGatewayIP}} {{.TunnelHost}}" >> /etc/hosts
+{{else if or .MeshAuthKey .MeshAuthKeyCiphertext}}
 echo "[cloudvm-bootstrap] Connecting to private mesh network..."
 if ! command -v tailscale >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
@@ -1069,7 +1084,8 @@ TUNNEL_PLATFORM="aws"
 IMDS_TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
 TUNNEL_INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
 if [ -n "$TUNNEL_INSTANCE_ID" ]; then
-  ( umask 077; curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/pkcs7 > /etc/cloudvm/attestation 2>/dev/null || rm -f /etc/cloudvm/attestation )
+  # The signed identity document rides in the handshake; public workers send the RSA-2048 envelope the gateway verifies.
+  ( umask 077; curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/{{if eq .TunnelTransport "public"}}rsa2048{{else}}pkcs7{{end}} > /etc/cloudvm/attestation 2>/dev/null || rm -f /etc/cloudvm/attestation )
 else
   TUNNEL_PLATFORM="gcp"
   TUNNEL_INSTANCE_ID=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2>/dev/null || hostname)

@@ -547,10 +547,22 @@ With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers ca
 | `TUNNEL_CELL` | (required unless `TUNNEL_ENDPOINT` is set) | Cell name; workers dial `clvm-tunnel.<cell>.c.corp.boltz.com:443` |
 | `TUNNEL_ENDPOINT` | | Overrides the `host:port` workers dial |
 | `TUNNEL_GATEWAY_LISTEN` | `:7443` | Plain TCP listener for worker sessions behind the TLS-terminating gateway |
-| `TAILSCALE_AUTHKEY` | (required) | Reusable, ephemeral, pre-tagged tailnet auth key workers join with |
+| `TAILSCALE_AUTHKEY` | (required while any region uses `tailnet`) | Reusable, ephemeral, pre-tagged tailnet auth key workers join with |
+| `TUNNEL_GATEWAY_IP` | (required while any region uses `router`) | Gateway ClusterIP router workers pin the tunnel host to in `/etc/hosts` |
+| `TUNNEL_PUBLIC_ENDPOINT` | (required while any region uses `public`) | `host:port` of the public listener public workers dial |
+| `TUNNEL_ALLOWED_ACCOUNTS` | (required while any region uses `public`) | Comma-separated AWS account IDs whose identity documents the gateway accepts |
+| `TUNNEL_IDENTITY_VERIFICATION` | `enabled` | `disabled` admits public workers on their launch token alone |
 | `TAILSCALE_TAGS` | `tag:clvm-worker` | Tags workers advertise |
 | `TUNNEL_CONNECT_TIMEOUT` | `10m` | Deadline for a new worker's first tunnel session |
 | `RUNNER_DIRECT_FALLBACK` | `false` | Also call the runner on the worker's private IP |
+
+`CLUSTER_FACTS` picks each region's path to the gateway with `regions.<region>.tunnelTransport`:
+
+- `tailnet` (default): the worker joins the tailnet and dials the tunnel endpoint.
+- `router`: the worker skips the tailnet, maps the tunnel host to `TUNNEL_GATEWAY_IP` (which the footprint VPC routes through its router pair), and dials the tunnel endpoint with normal TLS and SNI.
+- `public`: the worker dials `TUNNEL_PUBLIC_ENDPOINT` and adds its RSA-2048 signed AWS instance identity document to the handshake; the gateway rejects a public-region worker whose document is missing, names another instance, or fails `AWSIdentityVerifier` (signature, `TUNNEL_ALLOWED_ACCOUNTS`, launch record).
+
+The plugin refuses to start when a transport in use lacks its variable or `CLUSTER_FACTS` names an unknown transport.
 
 `/metrics` exports `cloudvm_tunnel_sessions{region}` and `cloudvm_tunnel_handshake_rejections_total{reason}`. Sessions live in one plugin process, so run a single replica while the tunnel is enabled.
 

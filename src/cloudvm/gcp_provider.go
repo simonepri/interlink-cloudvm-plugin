@@ -350,6 +350,8 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		MeshAuthKeyCiphertext: spec.MeshAuthKeyCiphertext,
 		MeshTags:              spec.MeshTags,
 		TunnelEndpoint:        spec.TunnelEndpoint,
+		TunnelTransport:       spec.TunnelTransport,
+		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                region,
 		InstanceType:          spec.InstanceType,

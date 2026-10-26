@@ -25,8 +25,16 @@ const DefaultMeshTags = "tag:clvm-worker"
 type TunnelSettings struct {
 	// Registry holds the worker sessions accepted by the gateway.
 	Registry *SessionRegistry
-	// Endpoint is the host:port workers dial, verified against the public CA.
+	// Endpoint is the host:port tailnet and router workers dial, verified against the public CA.
 	Endpoint string
+	// Transports maps each region to the path its workers take to the gateway; unlisted regions use tailnet.
+	Transports TunnelTransports
+	// GatewayIP is the gateway ClusterIP router workers pin the Endpoint host to.
+	GatewayIP string
+	// PublicEndpoint is the host:port of the public listener public workers dial.
+	PublicEndpoint string
+	// IdentityVerifier checks the signed instance identity document of public workers; nil accepts every document.
+	IdentityVerifier AttestationVerifier
 	// MeshAuthKey is the tailnet auth key workers use to join the mesh at boot.
 	MeshAuthKey string
 	// MeshTags is the comma-separated list of tailnet tags workers advertise.
@@ -97,18 +105,36 @@ func (s *Server) ValidateTunnelToken(_ context.Context, instanceID, token string
 	return nil
 }
 
-// applyTunnelSpec stamps the tunnel endpoint and mesh credentials onto a launch spec.
-func (s *Server) applyTunnelSpec(spec *InstanceSpec) {
+// applyTunnelSpec stamps the endpoint, transport and mesh credentials of the spec's region onto a launch spec.
+func (s *Server) applyTunnelSpec(spec *InstanceSpec) error {
 	t := s.tunnelConfig()
 	if t == nil || spec == nil {
-		return
+		return nil
 	}
-	spec.TunnelEndpoint = t.Endpoint
+	transport := t.Transports.For(spec.Region)
+	spec.TunnelTransport = string(transport)
 	spec.RunnerDirectHTTP = t.DirectFallback
-	spec.MeshTags = t.MeshTags
-	if t.MeshAuthKey != "" {
-		spec.MeshAuthKey = t.MeshAuthKey
+	switch transport {
+	case TunnelTransportRouter:
+		spec.TunnelEndpoint = t.Endpoint
+		spec.TunnelGatewayIP = t.GatewayIP
+	case TunnelTransportPublic:
+		spec.TunnelEndpoint = t.PublicEndpoint
+	default:
+		spec.TunnelEndpoint = t.Endpoint
+		spec.MeshTags = t.MeshTags
+		if t.MeshAuthKey != "" {
+			spec.MeshAuthKey = t.MeshAuthKey
+		}
+		if spec.MeshAuthKey == "" {
+			return fmt.Errorf("region %q uses the tailnet tunnel transport but TAILSCALE_AUTHKEY is not set", spec.Region)
+		}
+		return nil
 	}
+	// Router and public workers never join the tailnet, so a pod-supplied key must not reach their user data.
+	spec.MeshAuthKey = ""
+	spec.MeshTags = ""
+	return nil
 }
 
 // encryptMeshAuthKey moves the mesh auth key into a KMS envelope so only ciphertext reaches user data.
