@@ -812,6 +812,17 @@ func (t *SpotPriceTicker) GetPrice(region, instanceType string) (*SpotPriceEntry
 	return nil, false
 }
 
+// SpotPrice returns the current spot price of an instance type in a zone, or the cheapest zone of the region when the zone is unknown or untracked.
+func (t *SpotPriceTicker) SpotPrice(region, zone, instanceType string) (float64, bool) {
+	if entry, ok := t.GetPriceAZ(region, zone, instanceType); ok {
+		return entry.SpotPriceUSD, true
+	}
+	if entry, ok := t.GetPrice(region, instanceType); ok {
+		return entry.SpotPriceUSD, true
+	}
+	return 0, false
+}
+
 // GetPriceAZ returns the spot price for a specific availability zone.
 func (t *SpotPriceTicker) GetPriceAZ(region, az, instanceType string) (*SpotPriceEntry, bool) {
 	t.mu.RLock()
