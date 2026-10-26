@@ -453,3 +453,31 @@ func TestSpotPriceTicker_MarketMetricsReflectKnownData(t *testing.T) {
 		t.Errorf("quota clients built for regions %v, want us-east-1", quotaRegions)
 	}
 }
+
+func TestSpotPriceTicker_SpotPrice(t *testing.T) {
+	now := time.Now()
+	fetcher := &mockEC2TickerFetcher{historyOutput: &ec2.DescribeSpotPriceHistoryOutput{SpotPriceHistory: []ec2types.SpotPrice{
+		{InstanceType: ec2types.InstanceType("g5.xlarge"), AvailabilityZone: aws.String("us-east-1a"), SpotPrice: aws.String("0.40"), Timestamp: aws.Time(now)},
+		{InstanceType: ec2types.InstanceType("g5.xlarge"), AvailabilityZone: aws.String("us-east-1b"), SpotPrice: aws.String("0.30"), Timestamp: aws.Time(now)},
+	}}}
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"g5.xlarge"}, time.Minute)
+	ticker.SetMetrics(NewObservabilityMetrics())
+	ticker.SetAdvisorCollector(NewSpotAdvisorCollector("", &mockHTTPClient{err: errors.New("offline")}))
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
+	ticker.PollOnce(context.Background())
+
+	for _, tc := range []struct {
+		zone   string
+		want   float64
+		wantOK bool
+	}{
+		{"us-east-1a", 0.40, true},
+		{"", 0.30, true},
+		{"us-east-1c", 0, false},
+	} {
+		got, ok := ticker.SpotPrice("us-east-1", tc.zone, "g5.xlarge")
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("SpotPrice(zone %q) = %v, %v; want %v, %v", tc.zone, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
