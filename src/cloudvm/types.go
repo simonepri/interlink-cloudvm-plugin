@@ -104,6 +104,10 @@ type InstanceSpec struct {
 	MeshTags string `json:"meshTags,omitempty"`
 	// TunnelEndpoint is the reverse tunnel gateway host:port the worker dials.
 	TunnelEndpoint string `json:"tunnelEndpoint,omitempty"`
+	// TunnelTransport is the path the worker takes to the gateway: tailnet, router or public.
+	TunnelTransport string `json:"tunnelTransport,omitempty"`
+	// TunnelGatewayIP is the gateway address a router-transport worker pins the TunnelEndpoint host to.
+	TunnelGatewayIP string `json:"tunnelGatewayIP,omitempty"`
 	// RunnerDirectHTTP keeps the in-VM runner listening on all interfaces for same-VPC direct HTTP access.
 	RunnerDirectHTTP bool `json:"runnerDirectHTTP,omitempty"`
 	// RegionalAMI maps cloud regions to pre-baked golden AMI / image IDs.

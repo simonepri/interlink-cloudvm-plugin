@@ -297,6 +297,8 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		MeshAuthKeyCiphertext: spec.MeshAuthKeyCiphertext,
 		MeshTags:              spec.MeshTags,
 		TunnelEndpoint:        spec.TunnelEndpoint,
+		TunnelTransport:       spec.TunnelTransport,
+		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                spec.Region,
 		InstanceType:          spec.InstanceType,
@@ -866,7 +868,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	spec.RunnerAuthToken = tok
-	s.applyTunnelSpec(spec)
+	if err := s.applyTunnelSpec(spec); err != nil {
+		finalErr = err
+		http.Error(w, finalErr.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// Resolve KMS token encryption (AWS EC2 instances only, key taken strictly from provider configuration)
 	_, isAWS := prov.(*AWSProvider)

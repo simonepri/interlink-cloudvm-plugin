@@ -126,6 +126,8 @@ type RegionalClusterFact struct {
 	LaunchTemplateName  string   `json:"launchTemplateName,omitempty"`
 	SubnetIDs           []string `json:"subnetIds,omitempty"`
 	SecurityGroupIDs    []string `json:"securityGroupIds,omitempty"`
+	// TunnelTransport is the path the region's workers take to the tunnel gateway; empty means tailnet.
+	TunnelTransport string `json:"tunnelTransport,omitempty"`
 }
 
 // ClusterFacts holds the regional deployment facts for dynamic Launch Template and subnet selection.
@@ -982,6 +984,8 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		MeshAuthKeyCiphertext: spec.MeshAuthKeyCiphertext,
 		MeshTags:              spec.MeshTags,
 		TunnelEndpoint:        spec.TunnelEndpoint,
+		TunnelTransport:       spec.TunnelTransport,
+		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		TargetContainerImage:  spec.TargetContainerImage,
 		Command:               spec.Command,
