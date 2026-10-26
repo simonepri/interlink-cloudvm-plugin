@@ -83,10 +83,16 @@ func (c *CloudInitConfig) Validate() error {
 
 // KMSRegion returns the region encoded in a KMS key ARN, falling back to the VM region for bare key IDs and aliases.
 func (c *CloudInitConfig) KMSRegion() string {
-	if parts := strings.Split(c.KMSKeyID, ":"); len(parts) >= 6 && parts[0] == "arn" && parts[2] == "kms" && parts[3] != "" {
+	return kmsKeyRegion(c.KMSKeyID, c.Region)
+}
+
+// kmsKeyRegion returns the region named in a KMS key ARN, or fallback for a bare key ID or alias, because a KMS
+// endpoint only serves keys of its own region.
+func kmsKeyRegion(keyID, fallback string) string {
+	if parts := strings.Split(keyID, ":"); len(parts) >= 6 && parts[0] == "arn" && parts[2] == "kms" && parts[3] != "" {
 		return parts[3]
 	}
-	return c.Region
+	return fallback
 }
 
 // TunnelHost returns the hostname the worker dials and verifies the gateway certificate against.

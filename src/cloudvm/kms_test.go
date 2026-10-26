@@ -303,3 +303,22 @@ func TestServer_KMS_EndToEnd(t *testing.T) {
 		t.Errorf("expected TokenStore to hold plaintext token %s, got %s", string(kmsMock.lastInput.Plaintext), storedTok)
 	}
 }
+
+func TestKMSKeyRegion(t *testing.T) {
+	tests := []struct {
+		name, keyID, fallback, want string
+	}{
+		{"key ARN names its region", "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab", "eu-west-1", "us-west-2"},
+		{"alias ARN names its region", "arn:aws:kms:ap-south-1:111122223333:alias/runner-token", "eu-west-1", "ap-south-1"},
+		{"bare key ID uses the fallback", "1234abcd-12ab-34cd-56ef-1234567890ab", "eu-west-1", "eu-west-1"},
+		{"alias name uses the fallback", "alias/runner-token", "eu-west-1", "eu-west-1"},
+		{"empty key uses the fallback", "", "eu-west-1", "eu-west-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := kmsKeyRegion(tt.keyID, tt.fallback); got != tt.want {
+				t.Errorf("kmsKeyRegion(%q, %q) = %q, want %q", tt.keyID, tt.fallback, got, tt.want)
+			}
+		})
+	}
+}
