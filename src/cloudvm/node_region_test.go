@@ -9,7 +9,7 @@ import (
 )
 
 func TestCreateLaunchesInBoundNodeRegion(t *testing.T) {
-	t.Setenv("NODE_REGIONS", `{"virtual-node-clvm-aws-euw1":"eu-west-1","virtual-node-clvm-aws-use1":"us-east-1"}`)
+	t.Setenv("NODE_REGIONS", `{"virtual-node-region-a":"eu-west-1","virtual-node-region-b":"us-east-1"}`)
 
 	cases := []struct {
 		name        string
@@ -17,8 +17,8 @@ func TestCreateLaunchesInBoundNodeRegion(t *testing.T) {
 		annotations string
 		want        string
 	}{
-		{name: "mapped node", nodeName: "virtual-node-clvm-aws-euw1", want: "eu-west-1"},
-		{name: "annotation overrides node", nodeName: "virtual-node-clvm-aws-euw1", annotations: `"cloudvm.vk.io/region": "ap-south-1"`, want: "ap-south-1"},
+		{name: "mapped node", nodeName: "virtual-node-region-a", want: "eu-west-1"},
+		{name: "annotation overrides node", nodeName: "virtual-node-region-a", annotations: `"cloudvm.vk.io/region": "ap-south-1"`, want: "ap-south-1"},
 		{name: "unmapped node uses default", nodeName: "virtual-node-other", want: "us-west-2"},
 	}
 	for _, tc := range cases {

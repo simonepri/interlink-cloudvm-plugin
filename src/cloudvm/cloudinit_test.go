@@ -44,7 +44,7 @@ func TestCloudInitGeneration(t *testing.T) {
 func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	testToken := fmt.Sprintf("auth-token-%d", time.Now().UnixNano())
 	cfg := &CloudInitConfig{
-		PodName:              "multi-tenant-pod",
+		PodName:              "bin-packed-pod",
 		PodNamespace:         "ai-workloads",
 		PodUID:               "pod-uid-456",
 		RunnerAuthToken:      testToken,
@@ -773,7 +773,7 @@ func TestRenderCloudInit_TunnelWorker(t *testing.T) {
 		PodName:              "tunnel-pod",
 		Region:               "eu-west-1",
 		RunnerAuthToken:      "runner-secret",
-		TunnelEndpoint:       FormatTunnelEndpoint("cell-aws-usw2"),
+		TunnelEndpoint:       "tunnel.example.internal:443",
 		MeshTags:             DefaultMeshTags,
 		MeshAuthKey:          "tskey-auth-plaintext",
 		TargetContainerImage: "alpine",
@@ -789,7 +789,7 @@ func TestRenderCloudInit_TunnelWorker(t *testing.T) {
 			"tailscale up --auth-key=file:/etc/cloudvm/mesh-authkey",
 			`--advertise-tags="tag:clvm-worker"`,
 			"ExecStop=/usr/bin/tailscale logout",
-			`CLOUDVM_TUNNEL_ENDPOINT="clvm-tunnel.cell-aws-usw2.c.corp.boltz.com:443"`,
+			`CLOUDVM_TUNNEL_ENDPOINT="tunnel.example.internal:443"`,
 			"instance-identity/pkcs7",
 			"ThreadingHTTPServer(('127.0.0.1', PORT)",
 			"class Session(object):",

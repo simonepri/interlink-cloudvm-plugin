@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,11 +74,9 @@ func TestSessionRegistry(t *testing.T) {
 	}
 }
 
-func TestFormatTunnelEndpoint(t *testing.T) {
-	endpoint := FormatTunnelEndpoint("us-east-cell1")
-	expected := "clvm-tunnel.us-east-cell1.c.corp.boltz.com:443"
-	if endpoint != expected {
-		t.Errorf("expected %q, got %q", expected, endpoint)
+func TestNewReverseTunnelDialer_RequiresEndpoint(t *testing.T) {
+	if _, err := NewReverseTunnelDialer(ReverseTunnelDialerConfig{InstanceID: "i-123"}); err == nil || !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("a dialer without an endpoint must fail, got %v", err)
 	}
 }
 

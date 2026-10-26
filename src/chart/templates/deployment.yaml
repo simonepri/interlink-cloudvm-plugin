@@ -85,10 +85,6 @@ spec:
             {{- end }}
             - name: TUNNEL_GATEWAY_LISTEN
               value: ":{{ .Values.tunnel.port }}"
-            {{- if .Values.tunnel.cell }}
-            - name: TUNNEL_CELL
-              value: {{ .Values.tunnel.cell | quote }}
-            {{- end }}
             {{- if .Values.tunnel.endpoint }}
             - name: TUNNEL_ENDPOINT
               value: {{ .Values.tunnel.endpoint | quote }}

@@ -1,4 +1,4 @@
-"""In-VM reverse tunnel agent: dials the cell's tunnel gateway over TLS, bridges Yamux streams to the local runner, and streams worker logs.
+"""In-VM reverse tunnel agent: dials the plugin's tunnel gateway over TLS, bridges Yamux streams to the local runner, and streams worker logs.
 
 Implements the client half of the github.com/hashicorp/yamux framing on one asyncio loop (stdlib only, Python 3.7+).
 """

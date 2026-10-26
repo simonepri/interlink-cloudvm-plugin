@@ -19,7 +19,7 @@ type TunnelTransport string
 const (
 	// TunnelTransportTailnet makes workers join the tailnet and dial the private gateway hostname.
 	TunnelTransportTailnet TunnelTransport = "tailnet"
-	// TunnelTransportRouter makes workers dial the gateway ClusterIP that the footprint VPC routes through its router pair.
+	// TunnelTransportRouter makes workers dial the gateway ClusterIP that the worker VPC routes through its router pair.
 	TunnelTransportRouter TunnelTransport = "router"
 	// TunnelTransportPublic makes workers dial the public listener and prove their identity with the AWS instance identity document.
 	TunnelTransportPublic TunnelTransport = "public"
@@ -86,6 +86,14 @@ func TunnelTransportsFromClusterFacts(raw string) (TunnelTransports, error) {
 
 // validateTransports fails when a transport some region uses lacks the settings it needs.
 func (s *TunnelSettings) validateTransports() error {
+	if s.Transports.privateEndpointRequired() {
+		if s.Endpoint == "" {
+			return errors.New("TUNNEL_ENDPOINT is not set: tailnet and router workers dial it as host:port")
+		}
+		if _, port, err := net.SplitHostPort(s.Endpoint); err != nil || port == "" {
+			return fmt.Errorf("TUNNEL_ENDPOINT %q must be host:port", s.Endpoint)
+		}
+	}
 	if regions := s.Transports.regionsUsing(TunnelTransportRouter); len(regions) > 0 {
 		if s.GatewayIP == "" {
 			return fmt.Errorf("regions %v use the router tunnel transport but TUNNEL_GATEWAY_IP is not set", regions)
@@ -103,6 +111,11 @@ func (s *TunnelSettings) validateTransports() error {
 		}
 	}
 	return nil
+}
+
+// privateEndpointRequired reports whether some launch may dial TUNNEL_ENDPOINT: every unlisted region uses tailnet.
+func (t TunnelTransports) privateEndpointRequired() bool {
+	return len(t) == 0 || t.Uses(TunnelTransportTailnet) || t.Uses(TunnelTransportRouter)
 }
 
 // meshKeyRequired reports whether some launch may need the tailnet key: every unlisted region uses tailnet.

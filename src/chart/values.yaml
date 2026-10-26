@@ -36,8 +36,7 @@ database:
 # Reverse tunnel: aws/gcp workers dial back to the plugin instead of the plugin reaching their private IPs.
 tunnel:
   port: 7443
-  cell: ""  # Workers dial clvm-tunnel.<cell>.c.corp.boltz.com:443
-  endpoint: ""  # Overrides the cell-derived host:port
+  endpoint: ""  # host:port tailnet and router workers dial; required with provider aws or gcp
   connectTimeout: "10m"
   directFallback: false  # Also try the worker's private IP for same-VPC workers
   tailscaleTags: "tag:clvm-worker"

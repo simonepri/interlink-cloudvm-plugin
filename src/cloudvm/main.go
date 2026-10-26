@@ -383,13 +383,6 @@ func run() error {
 // startTunnelGateway listens for worker reverse tunnels and routes every runner call through them.
 func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, error) {
 	endpoint := strings.TrimSpace(os.Getenv("TUNNEL_ENDPOINT"))
-	if endpoint == "" {
-		cell := strings.TrimSpace(os.Getenv("TUNNEL_CELL"))
-		if cell == "" {
-			return nil, fmt.Errorf("TUNNEL_CELL or TUNNEL_ENDPOINT is required so workers can dial the tunnel gateway")
-		}
-		endpoint = FormatTunnelEndpoint(cell)
-	}
 	transports, err := TunnelTransportsFromClusterFacts(os.Getenv("CLUSTER_FACTS"))
 	if err != nil {
 		return nil, err
