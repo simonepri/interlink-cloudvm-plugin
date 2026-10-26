@@ -448,3 +448,130 @@ func TestLaunchRegionsSkipsCandidatesWithoutTunnelRoute(t *testing.T) {
 		t.Fatalf("launchRegions = %s, want us-west-1,us-east-2", got)
 	}
 }
+
+// marketScorer serves placement scores, spot prices and quota limits by region for every instance type.
+type marketScorer struct {
+	scores map[string]int32
+	prices map[string]float64
+	quotas map[string]float64
+}
+
+func (m marketScorer) AllScores() map[string]*PlacementScoreEntry {
+	out := map[string]*PlacementScoreEntry{}
+	for r, s := range m.scores {
+		out[r+"//g5.xlarge"] = &PlacementScoreEntry{Region: r, InstanceType: "g5.xlarge", Score: s}
+	}
+	return out
+}
+
+func (m marketScorer) GetPrice(region, instanceType string) (*SpotPriceEntry, bool) {
+	p, ok := m.prices[region]
+	return &SpotPriceEntry{Region: region, InstanceType: instanceType, SpotPriceUSD: p}, ok
+}
+
+func (m marketScorer) QuotaVCPUs(region, _ string) (float64, bool) {
+	q, ok := m.quotas[region]
+	return q, ok
+}
+
+func scoredProvider(t *testing.T, m marketScorer) *AWSProvider {
+	t.Helper()
+	p := newTestProvider(t)
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
+		"us-west-1": {LaunchTemplateID: "lt-usw1"},
+		"us-east-1": {LaunchTemplateID: "lt-use1"},
+		"us-east-2": {LaunchTemplateID: "lt-use2"},
+		"eu-west-1": {LaunchTemplateID: "lt-euw1"},
+	}})
+	p.SetRegionScorer(m)
+	p.quotaUsage = func(_, region, _ string) float64 {
+		if region == "us-east-2" {
+			return 60
+		}
+		return 0
+	}
+	return p
+}
+
+func scoredSpec(candidates ...string) *InstanceSpec {
+	spec := fallbackSpec(candidates...)
+	spec.RegionSelection = RegionSelectionScored
+	return spec
+}
+
+func TestLaunchRegionsScoredRanksThePinnedRegionWithCandidates(t *testing.T) {
+	p := scoredProvider(t, marketScorer{
+		scores: map[string]int32{"us-west-1": 2, "us-east-1": 9, "us-east-2": 9, "eu-west-1": 9},
+		prices: map[string]float64{"us-west-1": 0.30, "us-east-1": 0.50, "us-east-2": 0.20, "eu-west-1": 0.40},
+		quotas: map[string]float64{"us-east-2": 64},
+	})
+	got := strings.Join(p.launchRegions(scoredSpec("us-east-1", "us-east-2", "eu-west-1"), []string{"g5.xlarge"}), ",")
+	// us-east-2 has 4 of its 64 quota vCPUs left, exactly one 4 vCPU g5.xlarge, so it still ranks by price.
+	if want := "us-east-2,eu-west-1,us-east-1"; got != want {
+		t.Fatalf("launchRegions = %s, want %s: score first, then price, the weak pinned region dropped", got, want)
+	}
+}
+
+func TestLaunchRegionsScoredDemotesRegionsOutOfQuota(t *testing.T) {
+	p := scoredProvider(t, marketScorer{
+		scores: map[string]int32{"us-west-1": 5, "us-east-2": 9},
+		prices: map[string]float64{"us-west-1": 0.30, "us-east-2": 0.20},
+		quotas: map[string]float64{"us-east-2": 62},
+	})
+	got := strings.Join(p.launchRegions(scoredSpec("us-east-2"), []string{"g5.xlarge"}), ",")
+	if want := "us-west-1,us-east-2"; got != want {
+		t.Fatalf("launchRegions = %s, want %s: us-east-2 has 2 vCPUs of quota left for a 4 vCPU type", got, want)
+	}
+}
+
+func TestLaunchRegionsScoredOnDemandIgnoresPlacementScores(t *testing.T) {
+	p := scoredProvider(t, marketScorer{
+		scores: map[string]int32{"us-west-1": 9, "us-east-1": 1},
+		prices: map[string]float64{"us-west-1": 0.10, "us-east-1": 0.10},
+	})
+	spec := scoredSpec("us-east-1")
+	spec.MarketType = "on-demand"
+	got := strings.Join(p.launchRegions(spec, []string{"g5.xlarge"}), ",")
+	if want := "us-west-1,us-east-1"; got != want {
+		t.Fatalf("launchRegions = %s, want %s: equal on-demand prices keep the pinned region first", got, want)
+	}
+}
+
+func TestLaunchRegionsDefaultKeepsThePinnedRegionFirst(t *testing.T) {
+	p := scoredProvider(t, marketScorer{scores: map[string]int32{"us-west-1": 1, "us-east-1": 9}})
+	got := strings.Join(p.launchRegions(fallbackSpec("us-east-1"), []string{"g5.xlarge"}), ",")
+	if want := "us-west-1,us-east-1"; got != want {
+		t.Fatalf("launchRegions = %s, want %s without region-selection", got, want)
+	}
+}
+
+func TestLaunchScoredResolvesTheLaunchRegionsTemplate(t *testing.T) {
+	p := scoredProvider(t, marketScorer{scores: map[string]int32{"us-west-1": 2, "us-east-1": 9}})
+	usw1 := &regionMock{instanceID: "i-usw1"}
+	use1 := &regionMock{fleetErrorCode: "InsufficientInstanceCapacity"}
+	p.SetRegionClient("us-west-1", usw1.client())
+	p.SetRegionClient("us-east-1", use1.client())
+	spec := scoredSpec("us-east-1")
+	spec.LaunchTemplateID = "lt-pod-pinned"
+
+	inst, err := p.Launch(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	if use1.lastTemplateID != "lt-use1" {
+		t.Errorf("us-east-1, tried first, used template %q, want its cluster facts template", use1.lastTemplateID)
+	}
+	if usw1.lastTemplateID != "lt-pod-pinned" || inst.Region != "us-west-1" || inst.Metadata["requestedRegion"] != "" {
+		t.Errorf("the pinned region must keep the pod's template and record no fallback: template %q, metadata %v", usw1.lastTemplateID, inst.Metadata)
+	}
+}
+
+func TestPodToInstanceSpecReadsRegionSelection(t *testing.T) {
+	pod := &Pod{Metadata: PodMeta{Name: "p", Annotations: map[string]string{
+		"cloudvm.vk.io/candidate-regions": "us-east-1", "cloudvm.vk.io/region-selection": "scored",
+	}}}
+	spec, err := PodToInstanceSpec(pod, "test-cluster")
+	if err != nil || spec.RegionSelection != RegionSelectionScored {
+		t.Fatalf("RegionSelection = %q (err %v), want scored", spec.RegionSelection, err)
+	}
+}

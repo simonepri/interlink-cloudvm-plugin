@@ -21,6 +21,7 @@ type FleetTracker struct {
 	defaultProvider string
 	defaultRegion   string
 	spotPrices      func(region, zone, instanceType string) (float64, bool)
+	quotaInUse      map[string]float64 // quotaKey -> vCPUs of live instances
 }
 
 // GlobalFleetTracker is the singleton instance of the fleet tracker.
@@ -180,6 +181,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 	podCounts := make(map[fleetKey]int)
 	spendBaselineRates := make(map[fleetKey]float64)
 
+	quotaInUse := make(map[string]float64)
 	podCountsByInstance := make(map[string]int)
 	if len(activePods) > 0 && activePods[0] != nil {
 		for _, instID := range activePods[0] {
@@ -299,6 +301,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 
 		instanceCounts[key]++
 		vcpuCounts[key] += cpuCount
+		quotaInUse[quotaKey(provider, region, awsQuotaName(itype, capacityType))] += float64(cpuCount)
 		memGiBCounts[key] += memGiB
 		gpuCounts[key] += gpuCount
 		vramGBCounts[key] += vramGB
@@ -331,6 +334,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 		}
 	}
 
+	f.quotaInUse = quotaInUse
 	f.metrics.ResetFleetGauges()
 	if len(instanceCounts) == 0 {
 		defProv := f.defaultProvider
@@ -348,6 +352,13 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 			f.metrics.SetFleetGauges(k.provider, k.region, k.accelerator, k.instanceType, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k], float64(podCounts[k]), spendBaselineRates[k])
 		}
 	}
+}
+
+// QuotaVCPUsInUse returns the vCPUs the live fleet counts against a quota in a region, as of the last reconcile pass.
+func (f *FleetTracker) QuotaVCPUsInUse(provider, region, quota string) float64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.quotaInUse[quotaKey(provider, region, quota)]
 }
 
 // RecordNetworkBytes directly increments network receive and transmit counters by delta bytes.

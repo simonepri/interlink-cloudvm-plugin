@@ -52,6 +52,8 @@ type InstanceSpec struct {
 	Region string `json:"region"`
 	// CandidateRegions lists allowable regions for cross-region spot arbitrage.
 	CandidateRegions []string `json:"candidateRegions,omitempty"`
+	// RegionSelection is "scored" to rank Region with CandidateRegions instead of trying Region first.
+	RegionSelection string `json:"regionSelection,omitempty"`
 	// CandidateInstanceTypes lists alternative instance types for spot capacity diversification.
 	CandidateInstanceTypes []string `json:"candidateInstanceTypes,omitempty"`
 	// InstanceType is the preferred or target instance type (e.g. g5.2xlarge).

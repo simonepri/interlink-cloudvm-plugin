@@ -457,6 +457,7 @@ type AWSProvider struct {
 	missingCount      map[string]int
 	offeringCache     *offeringCache
 	regionScorer      RegionPlacementScorer
+	quotaUsage        func(provider, region, quota string) float64
 	client            EC2FleetClient
 	mu                sync.RWMutex
 }
@@ -756,14 +757,14 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	regions := p.launchRegions(spec, instanceTypes)
 
 	var failures []string
-	for i, region := range regions {
-		inst, err := p.launchInRegion(ctx, spec.forLaunchRegion(region), region, i == 0, instanceTypes)
+	for _, region := range regions {
+		inst, err := p.launchInRegion(ctx, spec.forLaunchRegion(region), region, region == spec.Region, instanceTypes)
 		if err == nil {
 			inst.Metadata["launchRegion"] = region
-			if i > 0 {
+			if region != spec.Region {
 				inst.Metadata["requestedRegion"] = spec.Region
 				inst.Metadata["regionFallbacks"] = strings.Join(failures, "; ")
-				log.Printf("[aws] Launched %s/%s in fallback region %s after: %s", //nolint:gosec // sanitized
+				log.Printf("[aws] Launched %s/%s outside its pinned region in %s after: %s", //nolint:gosec // sanitized
 					sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(region), sanitizeLog(strings.Join(failures, "; ")))
 			}
 			return inst, nil

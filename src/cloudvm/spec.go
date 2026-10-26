@@ -318,6 +318,7 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		LaunchTemplateName:     launchTemplateName,
 		Region:                 region,
 		CandidateRegions:       candidateRegions,
+		RegionSelection:        strings.TrimSpace(pod.Metadata.Annotations["cloudvm.vk.io/region-selection"]),
 		InstanceType:           instanceType,
 		MarketType:             marketType,
 		AMIMode:                amiMode,
