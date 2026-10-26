@@ -454,6 +454,7 @@ type marketScorer struct {
 	scores map[string]int32
 	prices map[string]float64
 	quotas map[string]float64
+	used   map[string]float64
 }
 
 func (m marketScorer) AllScores() map[string]*PlacementScoreEntry {
@@ -472,6 +473,11 @@ func (m marketScorer) GetPrice(region, instanceType string) (*SpotPriceEntry, bo
 func (m marketScorer) QuotaVCPUs(region, _ string) (float64, bool) {
 	q, ok := m.quotas[region]
 	return q, ok
+}
+
+func (m marketScorer) QuotaUsedVCPUs(region, _ string) (float64, bool) {
+	u, ok := m.used[region]
+	return u, ok
 }
 
 func scoredProvider(t *testing.T, m marketScorer) *AWSProvider {
@@ -521,6 +527,20 @@ func TestLaunchRegionsScoredDemotesRegionsOutOfQuota(t *testing.T) {
 	got := strings.Join(p.launchRegions(scoredSpec("us-east-2"), []string{"g5.xlarge"}), ",")
 	if want := "us-west-1,us-east-2"; got != want {
 		t.Fatalf("launchRegions = %s, want %s: us-east-2 has 2 vCPUs of quota left for a 4 vCPU type", got, want)
+	}
+}
+
+func TestLaunchRegionsScoredPrefersAccountWideQuotaUsage(t *testing.T) {
+	// AWS reports 4 vCPUs in use in us-east-2. The plugin's own 60 vCPUs are not added on top: they are part of that count.
+	p := scoredProvider(t, marketScorer{
+		scores: map[string]int32{"us-west-1": 5, "us-east-2": 9},
+		prices: map[string]float64{"us-west-1": 0.30, "us-east-2": 0.20},
+		quotas: map[string]float64{"us-east-2": 62},
+		used:   map[string]float64{"us-east-2": 4},
+	})
+	got := strings.Join(p.launchRegions(scoredSpec("us-east-2"), []string{"g5.xlarge"}), ",")
+	if want := "us-east-2,us-west-1"; got != want {
+		t.Fatalf("launchRegions = %s, want %s: 58 vCPUs remain in us-east-2 by the account-wide count", got, want)
 	}
 }
 

@@ -86,9 +86,10 @@ func (p *AWSProvider) launchRegions(spec *InstanceSpec, instanceTypes []string) 
 	return regions
 }
 
-// regionQuotas exposes measured EC2 quota limits; SpotPriceTicker implements it.
+// regionQuotas exposes measured EC2 quota limits and account-wide usage; SpotPriceTicker implements it.
 type regionQuotas interface {
 	QuotaVCPUs(region, quota string) (float64, bool)
+	QuotaUsedVCPUs(region, quota string) (float64, bool)
 }
 
 // regionSpotPrices exposes current spot prices; SpotPriceTicker implements it.
@@ -154,7 +155,8 @@ func (p *AWSProvider) rankRegions(scorer RegionPlacementScorer, regions, instanc
 }
 
 // quotaFits reports whether some requested type fits the region's remaining quota: the measured limit less the
-// vCPUs this plugin's live fleet already counts against it. A quota the ticker has not measured fits.
+// account-wide usage AWS reports, or less this plugin's live fleet when that usage could not be read. A quota the
+// ticker has not measured fits.
 func (p *AWSProvider) quotaFits(quotas regionQuotas, region string, instanceTypes []string, capacityType string) bool {
 	usage := p.quotaUsage
 	if usage == nil {
@@ -166,8 +168,12 @@ func (p *AWSProvider) quotaFits(quotas regionQuotas, region string, instanceType
 		if !ok {
 			return true
 		}
+		inUse, known := quotas.QuotaUsedVCPUs(region, quota)
+		if !known {
+			inUse = usage("aws", region, quota)
+		}
 		capacity := CapacityForInstanceType(t, ResourceVector{})
-		if limit-usage("aws", region, quota) >= float64(capacity.CPU.Value()) {
+		if limit-inUse >= float64(capacity.CPU.Value()) {
 			return true
 		}
 	}

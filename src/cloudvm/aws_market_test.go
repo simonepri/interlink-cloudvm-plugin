@@ -218,7 +218,8 @@ func (m *mockUsageClient) GetMetricData(_ context.Context, params *cloudwatch.Ge
 				result.Values = []float64{m.usedVCPUs, 1}
 			}
 		}
-		out.MetricDataResults = append(out.MetricDataResults, result)
+		// Prepend, so a result's position differs from its query's and only the ID ties them together.
+		out.MetricDataResults = append([]cwtypes.MetricDataResult{result}, out.MetricDataResults...)
 	}
 	return out, nil
 }
@@ -229,10 +230,10 @@ func TestQueryAWSGPUQuotas(t *testing.T) {
 	metrics := NewObservabilityMetrics()
 
 	// The P spot quota (L-7212CCBC) has 192 vCPUs in use; the other quotas have no recent usage datapoints.
-	free := QueryAWSGPUQuotas(ctx, quotas, &mockUsageClient{usedClass: "L-7212CCBC", usedVCPUs: 192}, "us-west-2", metrics)
+	limits, used := QueryAWSGPUQuotas(ctx, quotas, &mockUsageClient{usedClass: "L-7212CCBC", usedVCPUs: 192}, "us-west-2", metrics)
 
-	if free["p_spot"] != 576 || free["g_vt_spot"] != 768 {
-		t.Errorf("free vCPUs = %v, want 576 for p_spot and 768 for g_vt_spot", free)
+	if limits["p_spot"] != 768 || used["p_spot"] != 192 || used["g_vt_spot"] != 0 {
+		t.Errorf("limits = %v, used = %v; want p_spot 768 with 192 used, g_vt_spot with 0 used", limits, used)
 	}
 	rec := httptest.NewRecorder()
 	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -245,10 +246,10 @@ func TestQueryAWSGPUQuotas(t *testing.T) {
 func TestQueryAWSGPUQuotas_UnreadableUsageLeavesLimitFree(t *testing.T) {
 	metrics := NewObservabilityMetrics()
 
-	free := QueryAWSGPUQuotas(context.Background(), &mockServiceQuotasClient{val: 768}, &mockUsageClient{err: errors.New("AccessDenied")}, "us-west-2", metrics)
+	limits, used := QueryAWSGPUQuotas(context.Background(), &mockServiceQuotasClient{val: 768}, &mockUsageClient{err: errors.New("AccessDenied")}, "us-west-2", metrics)
 
-	if free["p_spot"] != 768 {
-		t.Errorf("free p_spot = %v, want the full 768 when usage cannot be read", free["p_spot"])
+	if limits["p_spot"] != 768 || len(used) != 0 {
+		t.Errorf("limits = %v, used = %v; want the limit with no usage entries when usage cannot be read", limits, used)
 	}
 	rec := httptest.NewRecorder()
 	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))

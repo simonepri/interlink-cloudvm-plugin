@@ -72,6 +72,8 @@ func init() {
 type FillLimits struct {
 	// QuotaVCPUs maps quotaKey(provider, region, quota name) to the vCPU limit; offers under a missing key are not planned.
 	QuotaVCPUs map[string]float64
+	// QuotaUsedVCPUs maps quotaKey to the account-wide vCPUs in use; a missing key means usage is unknown and plans use the full limit.
+	QuotaUsedVCPUs map[string]float64
 	// SpotScores maps spotScoreKey(provider, region, memory tier, GPUs per instance) to the placement score (1-10) per probed GPU count.
 	SpotScores map[string]map[int]float64
 }
@@ -166,6 +168,14 @@ func (s *FillSolver) QuotaVCPUs(provider, region, quota string) (float64, bool) 
 	defer s.mu.RUnlock()
 	limit, ok := s.limits.QuotaVCPUs[quotaKey(provider, region, quota)]
 	return limit, ok
+}
+
+// QuotaUsedVCPUs returns the account-wide vCPUs in use under a quota in a region, if the last market sync read them.
+func (s *FillSolver) QuotaUsedVCPUs(provider, region, quota string) (float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	used, ok := s.limits.QuotaUsedVCPUs[quotaKey(provider, region, quota)]
+	return used, ok
 }
 
 // AllOffers returns a copy of current offers.
@@ -298,7 +308,7 @@ func (p *planner) available(o *MarketOffer) int {
 		p.quotaUnknown = true
 		return 0
 	}
-	if allowed := int((limit - p.quotaUsed[qKey]) / float64(o.VCPUCount)); allowed < instances {
+	if allowed := int((limit - p.solver.limits.QuotaUsedVCPUs[qKey] - p.quotaUsed[qKey]) / float64(o.VCPUCount)); allowed < instances {
 		p.quotaBound = true
 		instances = max(allowed, 0)
 	}
