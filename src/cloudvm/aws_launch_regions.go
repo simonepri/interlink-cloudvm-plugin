@@ -58,7 +58,7 @@ func (p *AWSProvider) launchRegions(spec *InstanceSpec, instanceTypes []string) 
 				sanitizeLog(r), sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName))
 			continue
 		}
-		if ltID, ltName := p.ResolveRegionalLaunchTemplate(r, spec.NumGPUs > 0); ltID == "" && ltName == "" {
+		if len(p.configuredTemplates(r)) == 0 {
 			log.Printf("[aws] Skipping candidate region %s for %s/%s: no launch template in cluster facts", //nolint:gosec // sanitized
 				sanitizeLog(r), sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName))
 			continue

@@ -57,6 +57,8 @@ type InstanceTypeFacts struct {
 	GPUName         string
 	GPUManufacturer string
 	GPUMemoryMiB    int64
+	// GPUSlice marks a type whose GPU is part of one GPU shared between instances, such as g6f.
+	GPUSlice bool
 }
 
 // instanceTypeMarket is the part of the spot ticker that knows the tracked instance types and their spot prices.
@@ -153,6 +155,7 @@ func instanceFactsFromInfo(info ec2types.InstanceTypeInfo) InstanceTypeFacts {
 		// AWS reports a GPU slice, part of one GPU shared between instances, as zero GPUs; it serves one GPU device.
 		if f.GPUs == 0 && g.MemoryInfo != nil && aws.ToInt32(g.MemoryInfo.SizeInMiB) > 0 {
 			f.GPUs = 1
+			f.GPUSlice = true
 		}
 		f.GPUName = labelValue(aws.ToString(g.Name))
 		f.GPUManufacturer = labelValue(aws.ToString(g.Manufacturer))
@@ -211,6 +214,7 @@ func (f InstanceTypeFacts) requirements() scheduling.Requirements {
 		in(labelInstanceGPUManufacturer, f.GPUManufacturer),
 		in(labelInstanceGPUCount, gpuCount),
 		in(labelInstanceGPUMemory, gpuMemory),
+		in(labelGPUSlice, strconv.FormatBool(f.GPUSlice)),
 	)
 }
 

@@ -1040,9 +1040,8 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 	}
 
 	// Dynamic resolution
-	ltID, ltName := p.ResolveRegionalLaunchTemplate("us-west-2", false)
-	if ltID != "lt-west-001" || ltName != "" {
-		t.Errorf("expected lt-west-001, got id=%s name=%s", ltID, ltName)
+	if got := p.configuredTemplates("us-west-2"); len(got) != 1 || got[0].ID != "lt-west-001" || got[0].Name != "" {
+		t.Errorf("expected lt-west-001, got %+v", got)
 	}
 	subnets := p.ResolveRegionalSubnets("us-west-2")
 	if len(subnets) != 2 || subnets[0] != "subnet-west-a" || subnets[1] != "subnet-west-b" {
@@ -1052,9 +1051,8 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 	// Update regional facts dynamically
 	p.SetRegionalLaunchTemplate("eu-west-1", "lt-eu-999")
 	p.SetRegionalSubnets("eu-west-1", []string{"subnet-eu-1"})
-	euLTID, _ := p.ResolveRegionalLaunchTemplate("eu-west-1", false)
-	if euLTID != "lt-eu-999" {
-		t.Errorf("expected lt-eu-999 for eu-west-1, got %s", euLTID)
+	if got := p.configuredTemplates("eu-west-1"); len(got) != 1 || got[0].ID != "lt-eu-999" {
+		t.Errorf("expected lt-eu-999 for eu-west-1, got %+v", got)
 	}
 
 	// 3. Launch with regional fact resolution
@@ -1157,42 +1155,31 @@ func TestAWSProvider_UnreachableRegionDoesNotStallInventory(t *testing.T) {
 	}
 }
 
-func TestAWSProvider_ResolveRegionalLaunchTemplatePrefersGPUTemplate(t *testing.T) {
-	p := NewAWSProvider("us-west-2")
-	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
-		"us-west-2": {LaunchTemplateID: "lt-cpu", GPULaunchTemplateID: "lt-gpu"},
-		"eu-west-1": {LaunchTemplateID: "lt-cpu-eu"},
-	}})
-
-	cases := []struct {
-		region string
-		gpu    bool
-		want   string
-	}{
-		{"us-west-2", true, "lt-gpu"},
-		{"us-west-2", false, "lt-cpu"},
-		{"eu-west-1", true, "lt-cpu-eu"},
-		{"eu-west-1", false, "lt-cpu-eu"},
+func TestAWSProvider_ClusterFactsTemplates(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
+	ids := func(templates []LaunchTemplateFact) string {
+		var out []string
+		for _, lt := range templates {
+			out = append(out, lt.ID+lt.Name)
+		}
+		return strings.Join(out, ",")
 	}
-	for _, tc := range cases {
-		if got, _ := p.ResolveRegionalLaunchTemplate(tc.region, tc.gpu); got != tc.want {
-			t.Errorf("ResolveRegionalLaunchTemplate(%q, %v) = %q, want %q", tc.region, tc.gpu, got, tc.want)
+	for _, tc := range []struct {
+		facts, want string
+	}{
+		{`{"launchTemplateId":"lt-cpu","subnetIds":["subnet-a"]}`, "lt-cpu"},
+		{`{"launchTemplateId":"lt-cpu","gpuLaunchTemplateId":"lt-gpu"}`, "lt-gpu,lt-cpu"},
+		{`{"launchTemplateId":"lt-cpu","launchTemplates":[{"id":"lt-arm","requirements":[{"key":"kubernetes.io/arch","operator":"In","values":["arm64"]}]},{"name":"x86"}]}`, "lt-arm,x86"},
+	} {
+		t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":`+tc.facts+`}}`)
+		p := NewAWSProvider("us-west-2")
+		if got := ids(p.configuredTemplates("us-west-2")); got != tc.want {
+			t.Errorf("templates for %s = %s, want %s", tc.facts, got, tc.want)
 		}
 	}
-}
-
-func TestAWSProvider_ClusterFactsWithoutGPUTemplateParse(t *testing.T) {
-	t.Setenv("REGION_STORE_PATH", filepath.Join(t.TempDir(), "regions.json"))
-	t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":{"launchTemplateId":"lt-cpu","subnetIds":["subnet-a"]}}}`)
-	p := NewAWSProvider("us-west-2")
-	if got, _ := p.ResolveRegionalLaunchTemplate("us-west-2", true); got != "lt-cpu" {
-		t.Fatalf("expected fallback to lt-cpu when gpuLaunchTemplateId is absent, got %q", got)
-	}
-
-	t.Setenv("CLUSTER_FACTS", `{"regions":{"us-west-2":{"launchTemplateId":"lt-cpu","gpuLaunchTemplateId":"lt-gpu"}}}`)
-	p = NewAWSProvider("us-west-2")
-	if got, _ := p.ResolveRegionalLaunchTemplate("us-west-2", true); got != "lt-gpu" {
-		t.Fatalf("expected lt-gpu from gpuLaunchTemplateId, got %q", got)
+	t.Setenv("CLUSTER_FACTS", "")
+	if got := ids(NewAWSProvider("us-west-2").regionTemplates("us-west-2")); got != defaultLaunchTemplateName {
+		t.Errorf("templates without cluster facts = %s, want the default %s", got, defaultLaunchTemplateName)
 	}
 }
 

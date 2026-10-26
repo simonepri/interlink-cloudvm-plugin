@@ -4,9 +4,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -380,5 +382,56 @@ func TestInstanceFactsFromInfo_GPUSliceCountsAsOneGPU(t *testing.T) {
 	})
 	if f.GPUs != 1 || f.GPUMemoryMiB != 2861 {
 		t.Errorf("facts = %d GPUs with %d MiB, want 1 GPU with 2861 MiB", f.GPUs, f.GPUMemoryMiB)
+	}
+}
+
+func TestRegionTemplates_LegacyGPUTemplateLeavesGPUSlicesOut(t *testing.T) {
+	templates := resolveTemplates(context.Background(), nil, "us-west-1", regionTemplates(RegionalClusterFact{LaunchTemplateID: "lt-cpu", GPULaunchTemplateID: "lt-gpu"}))
+	slice := InstanceTypeFacts{Name: "g6f.xlarge", Arch: "amd64", VCPUs: 4, MemoryMiB: 16384, GPUs: 1, GPUName: "l4", GPUManufacturer: "nvidia", GPUMemoryMiB: 2861, GPUSlice: true}
+	whole := slice
+	whole.Name, whole.GPUMemoryMiB, whole.GPUSlice = "g6.xlarge", 22888, false
+
+	if lt, _ := templateFor(templates, whole); lt.ID != "lt-gpu" {
+		t.Errorf("whole L4 boots %q, want lt-gpu", lt.ID)
+	}
+	// Neither template is known to ship the GRID driver slices need, so no template boots a slice.
+	if lt, ok := templateFor(templates, slice); ok {
+		t.Errorf("GPU slice boots %q, want no template", lt.ID)
+	}
+}
+
+func TestLaunchRegions_FallbackRegionWithOnlyLaunchTemplates(t *testing.T) {
+	p := newTestProvider(t)
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
+		"us-west-1": {LaunchTemplateID: "lt-usw1"},
+		"us-east-1": {LaunchTemplates: []LaunchTemplateFact{{ID: "lt-use1"}}},
+	}})
+	if got := strings.Join(p.launchRegions(fallbackSpec("us-east-1"), []string{"g5.xlarge"}), ","); got != "us-west-1,us-east-1" {
+		t.Errorf("launchRegions = %s, want us-east-1 kept as a fallback although it lists only launchTemplates", got)
+	}
+}
+
+// failingTemplateClient fails every read of a template's image.
+type failingTemplateClient struct{ calls int }
+
+func (c *failingTemplateClient) DescribeLaunchTemplateVersions(context.Context, *ec2.DescribeLaunchTemplateVersionsInput, ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplateVersionsOutput, error) {
+	c.calls++
+	return nil, errors.New("RequestLimitExceeded")
+}
+
+func (c *failingTemplateClient) DescribeImages(context.Context, *ec2.DescribeImagesInput, ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	return nil, errors.New("unexpected")
+}
+
+func TestTemplateArchCache_RetriesFailedReadsSoon(t *testing.T) {
+	cache := &templateArchCache{entries: make(map[string]templateArchEntry)}
+	client := &failingTemplateClient{}
+	cache.arch(context.Background(), client, "us-west-1", LaunchTemplateFact{ID: "lt-x"})
+
+	cache.mu.Lock()
+	expires := cache.entries["us-west-1/lt-x/"].expires
+	cache.mu.Unlock()
+	if time.Until(expires) > templateArchRetry {
+		t.Errorf("a failed read is cached for %v, want at most %v", time.Until(expires), templateArchRetry)
 	}
 }

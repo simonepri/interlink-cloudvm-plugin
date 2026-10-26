@@ -536,17 +536,17 @@ Every launch posts a `CloudVMRegionSelected` event on the pod naming the region 
 
 ### Launch Templates
 
-Each region boots workers from launch templates that `CLUSTER_FACTS` names. `regions.<region>.launchTemplates` lists them in the order launches try them, each with an `id` or `name` and optional `requirements` in the [Karpenter well-known label](https://karpenter.sh/docs/concepts/scheduling/#well-known-labels) format. Every candidate instance type boots from the first template whose requirements it satisfies, so one fleet request can mix templates, and a type no template accepts is not launched in that region. The plugin adds each template's image architecture to its requirements by reading its `$Latest` version and image (`ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeImages`); when EC2 cannot tell, as for an image resolved from an SSM parameter, the template counts as `amd64` unless its requirements name `kubernetes.io/arch`. For example, GPU slices need NVIDIA's GRID driver:
+Each region boots workers from launch templates that `CLUSTER_FACTS` names. `regions.<region>.launchTemplates` lists them in the order launches try them, each with an `id` or `name` and optional `requirements` in the [Karpenter well-known label](https://karpenter.sh/docs/concepts/scheduling/#well-known-labels) format. Every candidate instance type boots from the first template whose requirements it satisfies, so one fleet request can mix templates, and a type no template accepts is not launched in that region. The plugin adds each template's image architecture to its requirements by reading its `$Latest` version and image (`ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeImages`); when EC2 cannot tell, as for an image resolved from an SSM parameter, the template counts as `amd64` unless its requirements name `kubernetes.io/arch`. Besides the Karpenter labels, requirements can use `cloudvm.vk.io/gpu-slice`, which is `true` for a GPU slice and `false` for every other type. For example, GPU slices need NVIDIA's GRID driver:
 
 ```json
 {"launchTemplates": [
-  {"id": "lt-grid", "requirements": [{"key": "karpenter.k8s.aws/instance-family", "operator": "In", "values": ["g6f", "gr6f"]}]},
+  {"id": "lt-grid", "requirements": [{"key": "cloudvm.vk.io/gpu-slice", "operator": "In", "values": ["true"]}]},
   {"id": "lt-gpu", "requirements": [{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "Exists"}]},
-  {"id": "lt-cpu"}
+  {"id": "lt-cpu", "requirements": [{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "DoesNotExist"}]}
 ]}
 ```
 
-Without `launchTemplates`, `gpuLaunchTemplateId` boots types with GPUs and `launchTemplateId` or `launchTemplateName` boots the rest; without either, the `interlink-cloudvm-worker` template boots every type. A template a pod names through its annotation boots every candidate.
+Without `launchTemplates`, `gpuLaunchTemplateId` boots types with whole GPUs and `launchTemplateId` or `launchTemplateName` boots the rest, and no template boots a GPU slice; without either, the `interlink-cloudvm-worker` template boots every type except GPU slices. A template a pod names through its annotation boots every candidate.
 
 ### AWS IAM Permissions
 

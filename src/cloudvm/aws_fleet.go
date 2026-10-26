@@ -610,22 +610,14 @@ func (p *AWSProvider) SetRegionalSubnets(region string, subnets []string) {
 	p.clusterFacts.Regions[region] = fact
 }
 
-// ResolveRegionalLaunchTemplate resolves launch template ID and Name for a region from cluster facts.
-// A GPU request prefers the region's GPU template and falls back to the default template when none is published.
-func (p *AWSProvider) ResolveRegionalLaunchTemplate(region string, gpu bool) (string, string) {
+// configuredTemplates returns the launch templates cluster facts name for a region, in the order launches try them.
+func (p *AWSProvider) configuredTemplates(region string) []LaunchTemplateFact {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.clusterFacts == nil || p.clusterFacts.Regions == nil {
-		return "", ""
+		return nil
 	}
-	fact, ok := p.clusterFacts.Regions[region]
-	if !ok {
-		return "", ""
-	}
-	if gpu && fact.GPULaunchTemplateID != "" {
-		return fact.GPULaunchTemplateID, ""
-	}
-	return fact.LaunchTemplateID, fact.LaunchTemplateName
+	return regionTemplates(p.clusterFacts.Regions[region])
 }
 
 // defaultLaunchTemplateName is the template launches use in a region whose cluster facts name none.
@@ -634,12 +626,7 @@ const defaultLaunchTemplateName = "interlink-cloudvm-worker"
 // regionTemplates returns the region's launch templates from cluster facts, in the order launches try them, or the
 // default template when the facts name none.
 func (p *AWSProvider) regionTemplates(region string) []LaunchTemplateFact {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	var templates []LaunchTemplateFact
-	if p.clusterFacts != nil && p.clusterFacts.Regions != nil {
-		templates = regionTemplates(p.clusterFacts.Regions[region])
-	}
+	templates := p.configuredTemplates(region)
 	if len(templates) == 0 {
 		templates = []LaunchTemplateFact{{Name: defaultLaunchTemplateName}}
 	}

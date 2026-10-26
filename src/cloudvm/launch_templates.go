@@ -33,20 +33,25 @@ var errNoLaunchTemplateFits = errors.New("no launch template of the region accep
 // templateArchTTL bounds how long a template's image architecture stays cached; launches use the template's $Latest version.
 const templateArchTTL = time.Hour
 
+// templateArchRetry is how soon a failed architecture read is retried, so a throttled call does not pin a guess for an hour.
+const templateArchRetry = time.Minute
+
 // regionTemplates returns a region's launch templates in the order launches try them. Without a launchTemplates
-// list, the GPU template takes types with GPUs and the default template takes every type.
+// list, the GPU template takes types with whole GPUs and the default template every other type except GPU slices,
+// which need NVIDIA's GRID driver that neither template is known to ship; only a launchTemplates entry boots them.
 func regionTemplates(fact RegionalClusterFact) []LaunchTemplateFact {
 	if len(fact.LaunchTemplates) > 0 {
 		return fact.LaunchTemplates
 	}
+	noSlices := corev1.NodeSelectorRequirement{Key: labelGPUSlice, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}}
 	var out []LaunchTemplateFact
 	if fact.GPULaunchTemplateID != "" {
 		out = append(out, LaunchTemplateFact{ID: fact.GPULaunchTemplateID, Requirements: []corev1.NodeSelectorRequirement{
-			{Key: labelInstanceGPUCount, Operator: corev1.NodeSelectorOpExists},
+			{Key: labelInstanceGPUCount, Operator: corev1.NodeSelectorOpExists}, noSlices,
 		}})
 	}
 	if fact.LaunchTemplateID != "" || fact.LaunchTemplateName != "" {
-		out = append(out, LaunchTemplateFact{ID: fact.LaunchTemplateID, Name: fact.LaunchTemplateName})
+		out = append(out, LaunchTemplateFact{ID: fact.LaunchTemplateID, Name: fact.LaunchTemplateName, Requirements: []corev1.NodeSelectorRequirement{noSlices}})
 	}
 	return out
 }
@@ -82,11 +87,13 @@ func (c *templateArchCache) arch(ctx context.Context, client launchTemplateClien
 	c.mu.Unlock()
 
 	arch, err := readTemplateArch(ctx, client, t)
+	ttl := templateArchTTL
 	if err != nil {
+		ttl = templateArchRetry
 		log.Printf("[aws] Reading the image architecture of launch template %s in %s failed: %v", sanitizeLog(t.ID+t.Name), sanitizeLog(region), err) //nolint:gosec // sanitized
 	}
 	c.mu.Lock()
-	c.entries[key] = templateArchEntry{arch: arch, expires: time.Now().Add(templateArchTTL)}
+	c.entries[key] = templateArchEntry{arch: arch, expires: time.Now().Add(ttl)}
 	c.mu.Unlock()
 	return arch
 }
