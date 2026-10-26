@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"log"
+	"math"
 	"sort"
 	"strings"
 )
@@ -27,9 +28,13 @@ func (p *AWSProvider) SetRegionScorer(s RegionPlacementScorer) {
 	p.regionScorer = s
 }
 
-// launchRegions returns the regions to try for spec, in order. The pinned region always comes first and is the only
-// one unless the pod sets candidate-regions; the candidates with a ClusterFacts launch template follow in descending
-// placement score for instanceTypes, keeping annotation order for ties and unscored regions.
+// RegionSelectionScored is the cloudvm.vk.io/region-selection value that ranks the pinned region with its candidates.
+const RegionSelectionScored = "scored"
+
+// launchRegions returns the regions to try for spec, in order, at most maxLaunchRegions. Without candidate-regions
+// only the pinned region is tried. With them, candidates need a ClusterFacts launch template and a tunnel route. By
+// default the pinned region comes first and the candidates follow in descending placement score, keeping annotation
+// order for ties; with region-selection "scored" the pinned region is ranked with them by rankRegions.
 func (p *AWSProvider) launchRegions(spec *InstanceSpec, instanceTypes []string) []string {
 	regions := []string{spec.Region}
 	if len(spec.CandidateRegions) == 0 {
@@ -64,18 +69,109 @@ func (p *AWSProvider) launchRegions(spec *InstanceSpec, instanceTypes []string) 
 	p.mu.RLock()
 	scorer := p.regionScorer
 	p.mu.RUnlock()
-	if scorer != nil {
-		scores := regionScores(scorer.AllScores(), instanceTypes)
-		sort.SliceStable(fallbacks, func(i, j int) bool {
-			return scoreOrUnscored(scores, fallbacks[i]) > scoreOrUnscored(scores, fallbacks[j])
-		})
+	if spec.RegionSelection == RegionSelectionScored {
+		regions = p.rankRegions(scorer, append(regions, fallbacks...), instanceTypes, spec.MarketType)
+	} else {
+		if scorer != nil {
+			scores := regionScores(scorer.AllScores(), instanceTypes)
+			sort.SliceStable(fallbacks, func(i, j int) bool {
+				return scoreOrUnscored(scores, fallbacks[i]) > scoreOrUnscored(scores, fallbacks[j])
+			})
+		}
+		regions = append(regions, fallbacks...)
 	}
-
-	regions = append(regions, fallbacks...)
 	if len(regions) > maxLaunchRegions {
 		regions = regions[:maxLaunchRegions]
 	}
 	return regions
+}
+
+// regionQuotas exposes measured EC2 quota limits; SpotPriceTicker implements it.
+type regionQuotas interface {
+	QuotaVCPUs(region, quota string) (float64, bool)
+}
+
+// regionSpotPrices exposes current spot prices; SpotPriceTicker implements it.
+type regionSpotPrices interface {
+	GetPrice(region, instanceType string) (*SpotPriceEntry, bool)
+}
+
+// regionRank is what rankRegions orders a region by.
+type regionRank struct {
+	quotaShort bool    // the remaining quota is known and cannot fit the smallest requested type
+	score      int32   // best spot placement score across the requested types, -1 when unscored or on-demand
+	price      float64 // cheapest hourly price across the requested types, +Inf when unknown
+}
+
+// rankRegions orders regions by expected launch success, then cost: regions whose known remaining quota cannot fit
+// the smallest requested type go last; then higher spot placement score first (spot launches only); then lower
+// hourly price. Ties keep the given order, which puts the pinned region first.
+func (p *AWSProvider) rankRegions(scorer RegionPlacementScorer, regions, instanceTypes []string, marketType string) []string {
+	capacityType := "spot"
+	if marketType == "on-demand" {
+		capacityType = "on-demand"
+	}
+	var scores map[string]int32
+	if scorer != nil && capacityType == "spot" {
+		scores = regionScores(scorer.AllScores(), instanceTypes)
+	}
+	quotas, _ := scorer.(regionQuotas)
+	prices, _ := scorer.(regionSpotPrices)
+
+	ranks := make(map[string]regionRank, len(regions))
+	for _, r := range regions {
+		rank := regionRank{score: scoreOrUnscored(scores, r), price: math.Inf(1)}
+		rank.quotaShort = quotas != nil && !p.quotaFits(quotas, r, instanceTypes, capacityType)
+		for _, t := range instanceTypes {
+			price := 0.0
+			if prices != nil && capacityType == "spot" {
+				if e, ok := prices.GetPrice(r, t); ok {
+					price = e.SpotPriceUSD
+				}
+			}
+			if price <= 0 {
+				price = GlobalOnDemandPrices.Cached(r, t)
+			}
+			if price > 0 && price < rank.price {
+				rank.price = price
+			}
+		}
+		ranks[r] = rank
+	}
+	out := append([]string(nil), regions...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := ranks[out[i]], ranks[out[j]]
+		if a.quotaShort != b.quotaShort {
+			return !a.quotaShort
+		}
+		if a.score != b.score {
+			return a.score > b.score
+		}
+		return a.price < b.price
+	})
+	log.Printf("[aws] Ranked launch regions %s by quota, placement score and price", sanitizeLog(strings.Join(out, ","))) //nolint:gosec // sanitized
+	return out
+}
+
+// quotaFits reports whether some requested type fits the region's remaining quota: the measured limit less the
+// vCPUs this plugin's live fleet already counts against it. A quota the ticker has not measured fits.
+func (p *AWSProvider) quotaFits(quotas regionQuotas, region string, instanceTypes []string, capacityType string) bool {
+	usage := p.quotaUsage
+	if usage == nil {
+		usage = GlobalFleetTracker.QuotaVCPUsInUse
+	}
+	for _, t := range instanceTypes {
+		quota := awsQuotaName(t, capacityType)
+		limit, ok := quotas.QuotaVCPUs(region, quota)
+		if !ok {
+			return true
+		}
+		capacity := CapacityForInstanceType(t, ResourceVector{})
+		if limit-usage("aws", region, quota) >= float64(capacity.CPU.Value()) {
+			return true
+		}
+	}
+	return false
 }
 
 // regionScores returns each region's best placement score across instanceTypes.

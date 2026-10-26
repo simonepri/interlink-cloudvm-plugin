@@ -751,6 +751,11 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 	t.metrics.SweepMarketGauges()
 }
 
+// QuotaVCPUs returns the measured vCPU limit of an EC2 quota in a region.
+func (t *SpotPriceTicker) QuotaVCPUs(region, quota string) (float64, bool) {
+	return t.solver.QuotaVCPUs("aws", region, quota)
+}
+
 // AllScores returns a snapshot of all tracked placement scores.
 func (t *SpotPriceTicker) AllScores() map[string]*PlacementScoreEntry {
 	t.mu.RLock()

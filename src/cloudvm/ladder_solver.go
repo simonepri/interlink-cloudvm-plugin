@@ -160,6 +160,14 @@ func (s *FillSolver) SetLimits(limits FillLimits) {
 	s.limits = limits
 }
 
+// QuotaVCPUs returns the measured vCPU limit of a quota in a region, if the last market sync read it.
+func (s *FillSolver) QuotaVCPUs(provider, region, quota string) (float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	limit, ok := s.limits.QuotaVCPUs[quotaKey(provider, region, quota)]
+	return limit, ok
+}
+
 // AllOffers returns a copy of current offers.
 func (s *FillSolver) AllOffers() []*MarketOffer {
 	s.mu.RLock()
