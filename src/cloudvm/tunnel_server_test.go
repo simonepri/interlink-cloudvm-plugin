@@ -47,6 +47,7 @@ func newTunnelFixture(t *testing.T, connectTimeout time.Duration) *tunnelFixture
 		Registry:       registry,
 		TokenValidator: server.ValidateTunnelToken,
 		OnReject:       metrics.RecordRejection,
+		LogSink:        server,
 	})
 	if err != nil {
 		t.Fatalf("gateway: %v", err)

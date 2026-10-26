@@ -114,6 +114,10 @@ spec:
             - name: OTEL_ENDPOINT
               value: {{ .Values.otelEndpoint | quote }}
             {{- end }}
+            {{- if .Values.otlpLogsEndpoint }}
+            - name: CLOUDVM_OTLP_LOGS_ENDPOINT
+              value: {{ .Values.otlpLogsEndpoint | quote }}
+            {{- end }}
             {{- if and .Values.nodeProblemDetector .Values.nodeProblemDetector.enabled }}
             - name: ENABLE_NPD
               value: "true"
