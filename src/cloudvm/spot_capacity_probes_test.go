@@ -50,18 +50,19 @@ func TestSpotPriceTicker_ProbeSpotCapacity(t *testing.T) {
 		if len(in.RegionNames) > maxPlacementScoreRegions {
 			t.Errorf("request scored %d regions, want at most %d", len(in.RegionNames), maxPlacementScoreRegions)
 		}
-		if slices.Contains(in.InstanceTypes, "g6.xlarge") {
-			t.Errorf("probe asked about the 1-GPU g6.xlarge: %v", in.InstanceTypes)
+		if slices.Contains(in.InstanceTypes, "g6.xlarge") && len(in.InstanceTypes) != 1 {
+			t.Errorf("probe mixed the 1-GPU g6.xlarge with other GPU counts: %v", in.InstanceTypes)
 		}
 	}
-	h100 := scores[spotScoreKey("aws", "region-11", 80)]
-	if h100[8] != 7 || h100[256] != 7 {
-		t.Errorf("80 GB scores in region-11 = %v, want 7 at 8 and 256 GPUs", h100)
+	eightGPU := scores[spotScoreKey("aws", "region-11", 80, 8)]
+	if eightGPU[8] != 7 || eightGPU[256] != 7 {
+		t.Errorf("80 GB 8-GPU scores in region-11 = %v, want 7 at 8 and 256 GPUs", eightGPU)
 	}
-	if _, ok := h100[1024]; ok {
-		t.Errorf("1024 GPUs (128 instances) was rejected by AWS but still scored: %v", h100)
+	oneGPU := scores[spotScoreKey("aws", "region-00", 24, 1)]
+	if oneGPU[8] != 7 {
+		t.Errorf("24 GB 1-GPU scores = %v, want 7 at 8 GPUs", oneGPU)
 	}
-	if _, ok := scores[spotScoreKey("aws", "region-00", 24)]; !ok {
-		t.Errorf("no 24 GB scores; the g6.48xlarge, p4d, and p5 shapes all qualify")
+	if _, ok := oneGPU[256]; ok {
+		t.Errorf("256 1-GPU instances was rejected by AWS but still scored: %v", oneGPU)
 	}
 }

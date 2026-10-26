@@ -566,7 +566,7 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 
 		// Catalog specs
 		resCap := t.catalog.ResolveCapacity(ctx, nil, p.InstanceType, ResourceVector{})
-		vcpus, _ := strconv.Atoi(resCap.CPU.String())
+		vcpus := int(resCap.CPU.Value())
 		gpuModel := resCap.GPUModel
 		if gpuModel == "" {
 			gpuModel = p.InstanceType
@@ -735,10 +735,11 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 	spotCapacity := t.spotCapacity
 	t.mu.RUnlock()
 	for key, byGPUs := range spotCapacity {
-		parts := strings.SplitN(key, "/", 3)
+		parts := strings.SplitN(key, "/", 4)
 		tier, _ := strconv.Atoi(parts[2])
+		perInstance, _ := strconv.Atoi(parts[3])
 		for gpus, score := range byGPUs {
-			t.metrics.SetSpotCapacityScore(parts[0], parts[1], tier, gpus, score)
+			t.metrics.SetSpotCapacityScore(parts[0], parts[1], tier, perInstance, gpus, score)
 		}
 	}
 	if t.solver != nil {

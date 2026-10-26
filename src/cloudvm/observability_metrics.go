@@ -144,8 +144,8 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 
 		spotCapacity: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_spot_capacity_score",
-			Help: "AWS spot placement score (1-10) for getting N GPUs in 8-GPU instances at a memory floor in a region",
-		}, []string{"provider", "region", "min_gpu_memory_gb", "gpus"}),
+			Help: "AWS spot placement score (1-10) for getting N GPUs in instances with gpus_per_instance GPUs at a memory floor in a region",
+		}, []string{"provider", "region", "min_gpu_memory_gb", "gpus_per_instance", "gpus"}),
 
 		instancesRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_instances_running",
@@ -354,9 +354,9 @@ func (m *ObservabilityMetrics) SetFillPlan(plan FillPlan) {
 	}
 }
 
-// SetSpotCapacityScore exports the spot placement score for getting gpus GPUs at a memory floor in a region.
-func (m *ObservabilityMetrics) SetSpotCapacityScore(provider, region string, minGPUMemoryGB, gpus int, score float64) {
-	m.market.set(m.spotCapacity, score, provider, region, strconv.Itoa(minGPUMemoryGB), strconv.Itoa(gpus))
+// SetSpotCapacityScore exports the spot placement score for getting gpus GPUs in instances of gpusPerInstance GPUs at a memory floor in a region.
+func (m *ObservabilityMetrics) SetSpotCapacityScore(provider, region string, minGPUMemoryGB, gpusPerInstance, gpus int, score float64) {
+	m.market.set(m.spotCapacity, score, provider, region, strconv.Itoa(minGPUMemoryGB), strconv.Itoa(gpusPerInstance), strconv.Itoa(gpus))
 }
 
 // marketSeries remembers which label sets each market refresh pass set, so the next sweep drops series no pass reports anymore.

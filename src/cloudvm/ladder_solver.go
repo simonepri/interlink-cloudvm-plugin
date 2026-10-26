@@ -70,16 +70,16 @@ func init() {
 
 // FillLimits holds the measured limits a fill plan must respect.
 type FillLimits struct {
-	// QuotaVCPUs maps quotaKey(provider, region, quota name) to the vCPU limit; a missing key leaves that quota uncapped.
+	// QuotaVCPUs maps quotaKey(provider, region, quota name) to the vCPU limit; offers under a missing key are not planned.
 	QuotaVCPUs map[string]float64
-	// SpotScores maps spotScoreKey(provider, region, memory tier) to the placement score (1-10) per probed GPU count.
+	// SpotScores maps spotScoreKey(provider, region, memory tier, GPUs per instance) to the placement score (1-10) per probed GPU count.
 	SpotScores map[string]map[int]float64
 }
 
 func quotaKey(provider, region, quota string) string { return provider + "/" + region + "/" + quota }
 
-func spotScoreKey(provider, region string, minGPUMemoryGB int) string {
-	return provider + "/" + region + "/" + strconv.Itoa(minGPUMemoryGB)
+func spotScoreKey(provider, region string, minGPUMemoryGB, gpusPerInstance int) string {
+	return provider + "/" + region + "/" + strconv.Itoa(minGPUMemoryGB) + "/" + strconv.Itoa(gpusPerInstance)
 }
 
 // awsQuotaName returns the EC2 quota an instance type counts against, matching KnownAWSGPUQuotaCodes names.
@@ -192,13 +192,12 @@ func (s *FillSolver) SolveAll(metrics *ObservabilityMetrics) {
 	}
 }
 
-// plan fills targetGPUs from the cheapest spot offers the placement scores support, then from the cheapest on-demand offers, all within quotas.
+// plan fills targetGPUs from spot offers the placement scores support, then from on-demand offers, all within known quotas.
+// Each step takes the offer with the lowest cost per GPU still needed, so whole instances larger than the remainder cost what they cost.
 func (s *FillSolver) plan(minMem, targetGPUs int) FillPlan {
-	plan := FillPlan{MinGPUMemoryGB: minMem, TargetGPUs: targetGPUs}
-
 	var spot, onDemand []*MarketOffer
 	for _, o := range s.offers {
-		if o.GPUCount <= 0 || o.GPUMemoryGB < minMem || o.PricePerGPUHour <= 0 {
+		if o.GPUCount <= 0 || o.VCPUCount <= 0 || o.GPUMemoryGB < minMem || o.PricePerHour <= 0 {
 			continue
 		}
 		switch o.CapacityType {
@@ -208,96 +207,126 @@ func (s *FillSolver) plan(minMem, targetGPUs int) FillPlan {
 			onDemand = append(onDemand, o)
 		}
 	}
-	byPrice := func(offers []*MarketOffer) {
-		sort.SliceStable(offers, func(i, j int) bool { return offers[i].PricePerGPUHour < offers[j].PricePerGPUHour })
-	}
-	byPrice(spot)
-	byPrice(onDemand)
 
-	quotaUsed := make(map[string]float64)
-	spotUsed := make(map[string]int)
-	allocations := make(map[FillAllocation]*FillAllocation)
-	remaining := targetGPUs
-	cost := 0.0
-	quotaLimited := false
+	p := planner{solver: s, minMem: minMem, remaining: targetGPUs,
+		quotaUsed: make(map[string]float64), spotUsed: make(map[string]int), allocations: make(map[FillAllocation]*FillAllocation)}
+	p.fill(spot)
+	p.fill(onDemand)
 
-	take := func(o *MarketOffer, maxGPUs int, scores map[int]float64) {
-		instances := ceilDiv(min(remaining, maxGPUs), o.GPUCount)
-		if instances*o.GPUCount > maxGPUs {
-			instances = maxGPUs / o.GPUCount
-		}
-		qKey := quotaKey(o.Provider, o.Region, awsQuotaName(o.InstanceType, o.CapacityType))
-		if limit, ok := s.limits.QuotaVCPUs[qKey]; ok && o.VCPUCount > 0 {
-			allowed := int((limit - quotaUsed[qKey]) / float64(o.VCPUCount))
-			if allowed < instances {
-				instances = max(allowed, 0)
-				quotaLimited = true
-			}
-		}
-		if instances <= 0 {
-			return
-		}
-		gpus := instances * o.GPUCount
-		quotaUsed[qKey] += float64(instances * o.VCPUCount)
-		expected := float64(gpus)
-		if scores != nil {
-			poolKey := spotScoreKey(o.Provider, o.Region, minMem)
-			expected = float64(gpus) * scoreAt(scores, spotUsed[poolKey]+gpus) / 10
-			spotUsed[poolKey] += gpus
-		}
-		remaining -= min(gpus, remaining)
-		cost += float64(gpus) * o.PricePerGPUHour
-		key := FillAllocation{Provider: o.Provider, Region: o.Region, GPUModel: o.GPUModel, CapacityType: o.CapacityType}
-		if allocations[key] == nil {
-			a := key
-			allocations[key] = &a
-		}
-		allocations[key].GPUs += gpus
-		allocations[key].ExpectedGPUs += expected
-	}
-
-	for _, o := range spot {
-		if remaining == 0 {
-			break
-		}
-		poolKey := spotScoreKey(o.Provider, o.Region, minMem)
-		scores := s.limits.SpotScores[poolKey]
-		if capacity := spotCapacity(scores) - spotUsed[poolKey]; capacity > 0 {
-			take(o, capacity, scores)
-		}
-	}
-	for _, o := range onDemand {
-		if remaining == 0 {
-			break
-		}
-		take(o, math.MaxInt32, nil)
-	}
-
-	for _, a := range allocations {
+	plan := FillPlan{MinGPUMemoryGB: minMem, TargetGPUs: targetGPUs}
+	for _, a := range p.allocations {
 		plan.Allocations = append(plan.Allocations, *a)
 		plan.PlannedGPUs += a.GPUs
 		plan.ExpectedGPUs += a.ExpectedGPUs
 	}
 	sort.Slice(plan.Allocations, func(i, j int) bool { return plan.Allocations[i].GPUs > plan.Allocations[j].GPUs })
-	if plan.PlannedGPUs > 0 {
-		plan.PricePerGPUHour = cost / float64(plan.PlannedGPUs)
+	if useful := min(plan.PlannedGPUs, targetGPUs); useful > 0 {
+		plan.PricePerGPUHour = p.cost / float64(useful)
 	}
-	if remaining > 0 {
-		plan.LimitedReason = "capacity"
-		if quotaLimited {
+	if p.remaining > 0 {
+		switch {
+		case p.quotaBound:
 			plan.LimitedReason = "quota"
+		case p.quotaUnknown:
+			plan.LimitedReason = "no_quota_data"
+		default:
+			plan.LimitedReason = "capacity"
 		}
 	}
 	return plan
 }
 
-// spotCapacity returns the largest probed GPU count whose placement score still meets MinSpotPlacementScore, or 0.
-func spotCapacity(scores map[int]float64) int {
-	capacity := 0
-	for gpus, score := range scores {
-		if score >= MinSpotPlacementScore && gpus > capacity {
-			capacity = gpus
+// planner holds the running state of one fill plan.
+type planner struct {
+	solver       *FillSolver
+	minMem       int
+	remaining    int
+	cost         float64
+	quotaUsed    map[string]float64
+	spotUsed     map[string]int
+	allocations  map[FillAllocation]*FillAllocation
+	quotaBound   bool
+	quotaUnknown bool
+}
+
+// fill repeatedly takes the offer with the lowest cost per still-needed GPU until the target is met or no offer has room.
+func (p *planner) fill(offers []*MarketOffer) {
+	for p.remaining > 0 {
+		var best *MarketOffer
+		bestInstances, bestCost := 0, math.Inf(1)
+		for _, o := range offers {
+			instances := p.available(o)
+			if instances == 0 {
+				continue
+			}
+			unitCost := float64(instances) * o.PricePerHour / float64(min(instances*o.GPUCount, p.remaining))
+			if unitCost < bestCost {
+				best, bestInstances, bestCost = o, instances, unitCost
+			}
 		}
+		if best == nil {
+			return
+		}
+		p.take(best, bestInstances)
+	}
+}
+
+// available returns how many instances of o the plan can still take: enough for the remainder, within spot capacity and quota.
+func (p *planner) available(o *MarketOffer) int {
+	instances := ceilDiv(p.remaining, o.GPUCount)
+	if o.CapacityType == "spot" {
+		pool := spotScoreKey(o.Provider, o.Region, p.minMem, o.GPUCount)
+		instances = min(instances, (spotCapacity(p.solver.limits.SpotScores[pool])-p.spotUsed[pool])/o.GPUCount)
+	}
+	if instances <= 0 {
+		return 0
+	}
+	qKey := quotaKey(o.Provider, o.Region, awsQuotaName(o.InstanceType, o.CapacityType))
+	limit, ok := p.solver.limits.QuotaVCPUs[qKey]
+	if !ok {
+		p.quotaUnknown = true
+		return 0
+	}
+	if allowed := int((limit - p.quotaUsed[qKey]) / float64(o.VCPUCount)); allowed < instances {
+		p.quotaBound = true
+		instances = max(allowed, 0)
+	}
+	return instances
+}
+
+func (p *planner) take(o *MarketOffer, instances int) {
+	gpus := instances * o.GPUCount
+	p.quotaUsed[quotaKey(o.Provider, o.Region, awsQuotaName(o.InstanceType, o.CapacityType))] += float64(instances * o.VCPUCount)
+	expected := float64(gpus)
+	if o.CapacityType == "spot" {
+		pool := spotScoreKey(o.Provider, o.Region, p.minMem, o.GPUCount)
+		p.spotUsed[pool] += gpus
+		expected = float64(gpus) * scoreAt(p.solver.limits.SpotScores[pool], p.spotUsed[pool]) / 10
+	}
+	p.remaining -= min(gpus, p.remaining)
+	p.cost += float64(instances) * o.PricePerHour
+	key := FillAllocation{Provider: o.Provider, Region: o.Region, GPUModel: o.GPUModel, CapacityType: o.CapacityType}
+	if p.allocations[key] == nil {
+		a := key
+		p.allocations[key] = &a
+	}
+	p.allocations[key].GPUs += gpus
+	p.allocations[key].ExpectedGPUs += expected
+}
+
+// spotCapacity returns the largest probed GPU count up to which every probed count scores at least MinSpotPlacementScore, or 0.
+func spotCapacity(scores map[int]float64) int {
+	sizes := make([]int, 0, len(scores))
+	for gpus := range scores {
+		sizes = append(sizes, gpus)
+	}
+	sort.Ints(sizes)
+	capacity := 0
+	for _, gpus := range sizes {
+		if scores[gpus] < MinSpotPlacementScore {
+			break
+		}
+		capacity = gpus
 	}
 	return capacity
 }
