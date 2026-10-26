@@ -336,11 +336,6 @@ func (m *MockContainerRunner) GetHostStats(_ context.Context, _ *CloudVMNode) (*
 	return &HostStatsResult{}, nil
 }
 
-// FormatTunnelEndpoint constructs the reverse tunnel gateway address for a given cell.
-func FormatTunnelEndpoint(cell string) string {
-	return fmt.Sprintf("clvm-tunnel.%s.c.corp.boltz.com:443", cell)
-}
-
 // ComputeJitter applies random jitter within [1-fraction, 1+fraction] to the provided duration.
 func ComputeJitter(d time.Duration, fraction float64) time.Duration {
 	if fraction <= 0 {
@@ -526,7 +521,6 @@ func NewRunnerHTTPMux(handler ContainerRunnerHandler, authToken string) *http.Se
 // ReverseTunnelDialerConfig configures the reverse dialer connecting to the tunnel gateway.
 type ReverseTunnelDialerConfig struct {
 	Endpoint       string
-	Cell           string
 	InstanceID     string
 	AuthToken      string
 	Platform       string // "aws" or "gcp"
@@ -550,11 +544,7 @@ type ReverseTunnelDialer struct {
 // NewReverseTunnelDialer creates a new ReverseTunnelDialer.
 func NewReverseTunnelDialer(cfg ReverseTunnelDialerConfig) (*ReverseTunnelDialer, error) {
 	if cfg.Endpoint == "" {
-		if cfg.Cell != "" {
-			cfg.Endpoint = FormatTunnelEndpoint(cfg.Cell)
-		} else {
-			cfg.Endpoint = "clvm-tunnel.default.c.corp.boltz.com:443"
-		}
+		return nil, errors.New("endpoint is required")
 	}
 	if cfg.InstanceID == "" {
 		return nil, errors.New("instanceID is required")

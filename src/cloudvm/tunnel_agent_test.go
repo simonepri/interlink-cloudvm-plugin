@@ -1,5 +1,5 @@
 // Package main implements the interlink-cloudvm-plugin daemon.
-// This file runs the embedded Python tunnel agent against the Go gateway behind a TLS-terminating proxy, as deployed in a cell.
+// This file runs the embedded Python tunnel agent against the Go gateway behind a TLS-terminating proxy, as deployed in a cluster.
 package main
 
 import (
@@ -43,7 +43,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// startTLSTerminator mimics the cell's private gateway: it terminates TLS for "localhost" and forwards plaintext to backend.
+// startTLSTerminator mimics the private gateway: it terminates TLS for "localhost" and forwards plaintext to backend.
 func startTLSTerminator(t *testing.T, backend string) (addr, caFile string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

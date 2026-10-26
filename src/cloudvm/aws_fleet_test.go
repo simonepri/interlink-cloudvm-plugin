@@ -384,7 +384,7 @@ func TestAWSFleetCandidateTypesAndSubnets(t *testing.T) {
 		},
 	}
 
-	spec, err := PodToInstanceSpec(pod, "cell-aws-usw2", "us-west-2")
+	spec, err := PodToInstanceSpec(pod, "cell-a", "us-west-2")
 	if err != nil {
 		t.Fatalf("PodToInstanceSpec failed: %v", err)
 	}

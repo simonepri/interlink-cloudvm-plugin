@@ -39,7 +39,7 @@ func newTunnelFixtureWith(t *testing.T, settings TunnelSettings) *tunnelFixture 
 	server.RegisterProvider(ProviderMock, provider)
 	registry := NewSessionRegistry()
 	settings.Registry = registry
-	settings.Endpoint = "clvm-tunnel.cell-test.c.corp.boltz.com:443"
+	settings.Endpoint = "tunnel.cell-test.example.internal:443"
 	settings.MeshAuthKey = "tskey-auth-test"
 	metrics := server.EnableTunnel(settings)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -227,7 +227,7 @@ func TestServer_TerminatesWorkerWhoseTunnelNeverConnects(t *testing.T) {
 		t.Fatalf("/create: %d %s", rec.Code, rec.Body.String())
 	}
 	spec := f.provider.LastSpec()
-	if spec.TunnelEndpoint != "clvm-tunnel.cell-test.c.corp.boltz.com:443" || spec.MeshAuthKey != "tskey-auth-test" || spec.MeshTags != DefaultMeshTags {
+	if spec.TunnelEndpoint != "tunnel.cell-test.example.internal:443" || spec.MeshAuthKey != "tskey-auth-test" || spec.MeshTags != DefaultMeshTags {
 		t.Fatalf("launch spec missing tunnel settings: endpoint=%q tags=%q", spec.TunnelEndpoint, spec.MeshTags)
 	}
 

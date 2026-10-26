@@ -168,7 +168,7 @@ func TestVerifyGCP_Valid(t *testing.T) {
 	}
 
 	kid := "test-key-1"
-	expectedAud := "https://clvm-tunnel.cell-us.c.corp.boltz.com"
+	expectedAud := "https://tunnel.cell-a.example.internal"
 	claims := map[string]any{
 		"iss":   "https://accounts.google.com",
 		"sub":   "service-account-id-123",

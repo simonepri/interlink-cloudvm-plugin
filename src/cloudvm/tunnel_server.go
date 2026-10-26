@@ -114,6 +114,9 @@ func (s *Server) applyTunnelSpec(spec *InstanceSpec) error {
 	transport := t.Transports.For(spec.Region)
 	spec.TunnelTransport = string(transport)
 	spec.RunnerDirectHTTP = t.DirectFallback
+	if transport != TunnelTransportPublic && t.Endpoint == "" {
+		return fmt.Errorf("region %q uses the %s tunnel transport but TUNNEL_ENDPOINT is not set", spec.Region, transport)
+	}
 	switch transport {
 	case TunnelTransportRouter:
 		spec.TunnelEndpoint = t.Endpoint

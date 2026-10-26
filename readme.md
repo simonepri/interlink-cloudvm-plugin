@@ -351,10 +351,10 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 3. **No Inbound SSH**: VMs join the WireGuard/Tailscale mesh without `--ssh` enabled and with no inbound ports open on the cloud security group.
 4. **Ephemeral Mesh Keys**: Mesh auth keys are scoped to short-lived tags.
 5. **Non-Root Container Execution & IMDS Lockdown**: Workload containers run as non-root (defaulting to UID `65532:65532` unless configured via pod or container `securityContext.runAsUser`), dropping `SETUID` and `SETGID` with `no-new-privileges`. Pods or containers specifying `runAsUser: 0` or `runAsGroup: 0` are rejected to prevent accessing cloud instance metadata under host networking. Host iptables rules drop all non-root outbound traffic to `169.254.169.254`, preventing containers from reading cloud instance metadata (IMDS) or user-data while allowing host system daemons (dockerd, SSM, AWS CLI, spot-monitor) full access.
-6. **Same-Namespace Host Network Sharing**: Bin-packed multi-tenant containers on a shared VM run with `--net=host` to provide native throughput for Ray workers and distributed training. Co-tenants on the same VM share localhost networking within the same Kubernetes namespace (bin-packing across different namespaces is disallowed).
+6. **Same-Namespace Host Network Sharing**: Bin-packed containers from several pods on a shared VM run with `--net=host` to provide native throughput for Ray workers and distributed training. Co-tenants on the same VM share localhost networking within the same Kubernetes namespace (bin-packing across different namespaces is disallowed).
 7. **AWS KMS Runner Token Encryption**: When `KMS_KEY_ID` is configured, runner authentication tokens are encrypted using AWS KMS before rendering instance user-data. The VM decrypts the token at boot using its instance profile (`kms:Decrypt`), ensuring zero plaintext tokens are present in user-data or cloud instance metadata.
 8. **Private Registry Auth & Ephemeral Credentials**: Kubernetes `imagePullSecrets` arrive in the virtual kubelet's create request (or, when the request lacks one, are read through the Kubernetes API if the plugin has access) and are transferred exclusively over the authenticated runner channel. The in-VM runner creates an ephemeral, permission-restricted (`0700`) temporary directory for `docker --config` during image pull and deletes it immediately in a `finally:` block, preventing co-tenant credential leakage.
-9. **Reverse Tunnel Runner Channel**: Workers accept no inbound traffic. At boot each worker joins the tailnet with the plugin's ephemeral, pre-tagged `TAILSCALE_AUTHKEY` (advertising `tag:clvm-worker`, read from a `0600` file and deleted after join, KMS-enveloped when `KMS_KEY_ID` is set), then a small agent dials `clvm-tunnel.<cell>.c.corp.boltz.com:443` over TLS verified against the public CA. The plugin's gateway (plain TCP on `TUNNEL_GATEWAY_LISTEN`, TLS terminated in front of it) accepts a session only from a tracked instance presenting the runner token issued at its launch, and every container call travels over that Yamux session to the runner, which listens on loopback only. A worker that has not connected within `TUNNEL_CONNECT_TIMEOUT` is failed and terminated. `RUNNER_DIRECT_FALLBACK=true` restores direct private-IP calls for same-VPC workers.
+9. **Reverse Tunnel Runner Channel**: Workers accept no inbound traffic. At boot each worker joins the tailnet with the plugin's ephemeral, pre-tagged `TAILSCALE_AUTHKEY` (advertising `tag:clvm-worker`, read from a `0600` file and deleted after join, KMS-enveloped when `KMS_KEY_ID` is set), then a small agent dials `TUNNEL_ENDPOINT` over TLS verified against the public CA. The plugin's gateway (plain TCP on `TUNNEL_GATEWAY_LISTEN`, TLS terminated in front of it) accepts a session only from a tracked instance presenting the runner token issued at its launch, and every container call travels over that Yamux session to the runner, which listens on loopback only. A worker that has not connected within `TUNNEL_CONNECT_TIMEOUT` is failed and terminated. `RUNNER_DIRECT_FALLBACK=true` restores direct private-IP calls for same-VPC workers.
 10. **Boot Console Diagnostics**: The bootstrap log is mirrored to the serial console. When a worker fails to boot or open its tunnel, the daemon fetches the last 4 KiB of EC2 console output and appends it to the pod's terminal container message. The daemon role needs `ec2:GetConsoleOutput`; without it the fetch is skipped.
 
 ---
@@ -513,7 +513,7 @@ When the provider restarts while an in-VM runner is unreachable, the node is fla
 
 ### Regional Virtual Nodes
 
-Run one Virtual Kubelet per region and map each node name to its region with `NODE_REGIONS` (`provider.nodeRegions` in Helm), a JSON object such as `{"virtual-node-clvm-aws-euw1":"eu-west-1"}`. A pod bound to a mapped node launches in that node's region. The region is chosen in this order: the `cloudvm.vk.io/region` annotation, the bound node's region, the pod's `topology.kubernetes.io/region` node selector, then `AWS_REGION`.
+Run one Virtual Kubelet per region and map each node name to its region with `NODE_REGIONS` (`provider.nodeRegions` in Helm), a JSON object such as `{"virtual-node-region-a":"eu-west-1"}`. A pod bound to a mapped node launches in that node's region. The region is chosen in this order: the `cloudvm.vk.io/region` annotation, the bound node's region, the pod's `topology.kubernetes.io/region` node selector, then `AWS_REGION`.
 
 ### Availability Zone Filtering and Region Fallback
 
@@ -544,8 +544,7 @@ With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers ca
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `TUNNEL_CELL` | (required unless `TUNNEL_ENDPOINT` is set) | Cell name; workers dial `clvm-tunnel.<cell>.c.corp.boltz.com:443` |
-| `TUNNEL_ENDPOINT` | | Overrides the `host:port` workers dial |
+| `TUNNEL_ENDPOINT` | (required while any region uses `tailnet` or `router`) | `host:port` tailnet and router workers dial, such as `tunnel.example.internal:443`; router workers also map its host in `/etc/hosts` |
 | `TUNNEL_GATEWAY_LISTEN` | `:7443` | Plain TCP listener for worker sessions behind the TLS-terminating gateway |
 | `TAILSCALE_AUTHKEY` | (required while any region uses `tailnet`) | Reusable, ephemeral, pre-tagged tailnet auth key workers join with |
 | `TUNNEL_GATEWAY_IP` | (required while any region uses `router`) | Gateway ClusterIP router workers pin the tunnel host to in `/etc/hosts` |
@@ -559,7 +558,7 @@ With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers ca
 `CLUSTER_FACTS` picks each region's path to the gateway with `regions.<region>.tunnelTransport`:
 
 - `tailnet` (default): the worker joins the tailnet and dials the tunnel endpoint.
-- `router`: the worker skips the tailnet, maps the tunnel host to `TUNNEL_GATEWAY_IP` (which the footprint VPC routes through its router pair), and dials the tunnel endpoint with normal TLS and SNI.
+- `router`: the worker skips the tailnet, maps the tunnel host to `TUNNEL_GATEWAY_IP` (which the worker VPC routes through its router pair), and dials the tunnel endpoint with normal TLS and SNI.
 - `public`: the worker dials `TUNNEL_PUBLIC_ENDPOINT` and adds its RSA-2048 signed AWS instance identity document to the handshake; the gateway rejects a public-region worker whose document is missing, names another instance, or fails `AWSIdentityVerifier` (signature, `TUNNEL_ALLOWED_ACCOUNTS`, launch record).
 
 The plugin refuses to start when a transport in use lacks its variable or `CLUSTER_FACTS` names an unknown transport.

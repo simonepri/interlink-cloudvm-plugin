@@ -251,7 +251,7 @@ if command -v iptables-save >/dev/null 2>&1; then
   iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 fi
 
-# 2. Reach the tunnel gateway: join the tailnet, or pin the gateway host to the address the footprint routes through its router pair
+# 2. Reach the tunnel gateway: join the tailnet, or pin the gateway host to the address the worker VPC routes through its router pair
 {{if eq .TunnelTransport "router"}}
 echo "[cloudvm-bootstrap] Router transport: resolving {{.TunnelHost}} to {{.TunnelGatewayIP}}"
 CLOUDVM_HOSTS=$(grep -vE '[[:space:]]{{.TunnelHost}}([[:space:]]|$)' /etc/hosts || true)
@@ -1093,7 +1093,7 @@ if command -v python3 >/dev/null 2>&1; then
   nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
 {{if .TunnelEndpoint}}
-# 5b. Reverse Tunnel Agent: dials the cell gateway outbound and carries every provider call to the local runner
+# 5b. Reverse Tunnel Agent: dials the tunnel gateway outbound and carries every provider call to the local runner
 echo "[cloudvm-bootstrap] Starting reverse tunnel agent towards {{.TunnelEndpoint}}..."
 TUNNEL_PLATFORM="aws"
 IMDS_TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
