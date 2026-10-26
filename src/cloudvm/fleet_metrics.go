@@ -253,7 +253,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 		if hourlyPrice == 0 {
 			switch provider {
 			case "aws":
-				hourlyPrice = OnDemandBaselineUSD(itype)
+				hourlyPrice = GlobalOnDemandPrices.Cached(region, itype)
 			case "gcp":
 				onDemand, _ := GetGCPPrice(itype)
 				hourlyPrice = onDemand
@@ -279,7 +279,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 		ondemandBaseline := 0.0
 		switch provider {
 		case "aws":
-			ondemandBaseline = OnDemandBaselineUSD(itype)
+			ondemandBaseline = GlobalOnDemandPrices.Cached(region, itype)
 		case "gcp":
 			onDemand, _ := GetGCPPrice(itype)
 			ondemandBaseline = onDemand

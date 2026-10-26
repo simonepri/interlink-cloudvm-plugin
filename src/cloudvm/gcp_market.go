@@ -87,16 +87,13 @@ type GCPMarketCollector struct {
 	adviceClient GCPAdviceCapacityClient
 }
 
-// NewGCPMarketCollector creates a new collector for GCP market observability.
+// NewGCPMarketCollector creates a collector for GCP market observability; it exports nothing until it has GCP regions.
 func NewGCPMarketCollector(regions []string, adviceClient GCPAdviceCapacityClient) *GCPMarketCollector {
-	if len(regions) == 0 {
-		regions = []string{"us-central1"}
-	}
 	if adviceClient == nil {
 		adviceClient = &DefaultGCPAdviceClient{}
 	}
 	return &GCPMarketCollector{
-		regions:      regions,
+		regions:      append([]string(nil), regions...),
 		adviceClient: adviceClient,
 	}
 }

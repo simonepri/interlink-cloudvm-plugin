@@ -4,6 +4,8 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -53,6 +55,8 @@ type ObservabilityMetrics struct {
 	legacyOnDemandPrice  *prometheus.GaugeVec
 	legacySpotSavings    *prometheus.GaugeVec
 	legacyPlacementScore *prometheus.GaugeVec
+
+	market marketSeries
 }
 
 // GlobalMetrics is the singleton metrics registry.
@@ -271,13 +275,13 @@ func (m *ObservabilityMetrics) SetGPUPrice(provider, region, zone, accelerator, 
 	memGBStr := fmt.Sprintf("%d", gpuMemoryGB)
 	countStr := fmt.Sprintf("%d", gpuCount)
 
-	m.gpuPrice.WithLabelValues(provider, region, zone, accelerator, gpuModel, memGBStr, countStr, capacityType, instanceType).Set(pricePerGPU)
-	m.instancePrice.WithLabelValues(provider, region, zone, accelerator, gpuModel, memGBStr, countStr, capacityType, instanceType).Set(instancePriceUSD)
+	m.market.set(m.gpuPrice, pricePerGPU, provider, region, zone, accelerator, gpuModel, memGBStr, countStr, capacityType, instanceType)
+	m.market.set(m.instancePrice, instancePriceUSD, provider, region, zone, accelerator, gpuModel, memGBStr, countStr, capacityType, instanceType)
 }
 
 // SetVCPUPrice exports price per vCPU-hour for CPU-only shapes.
 func (m *ObservabilityMetrics) SetVCPUPrice(provider, region, zone, capacityType, instanceType string, vcpuPriceUSD float64) {
-	m.vcpuPrice.WithLabelValues(provider, region, zone, "none", capacityType, instanceType).Set(vcpuPriceUSD)
+	m.market.set(m.vcpuPrice, vcpuPriceUSD, provider, region, zone, "none", capacityType, instanceType)
 }
 
 // SetAvailabilityScore exports availability score (0.0 to 1.0).
@@ -286,7 +290,7 @@ func (m *ObservabilityMetrics) SetAvailabilityScore(provider, region, zone, acce
 		accelerator = "gpu"
 	}
 	targetStr := fmt.Sprintf("%d", targetGPUs)
-	m.availScore.WithLabelValues(provider, region, zone, accelerator, gpuModel, instanceType, source, targetStr).Set(score)
+	m.market.set(m.availScore, score, provider, region, zone, accelerator, gpuModel, instanceType, source, targetStr)
 }
 
 // SetExpectedUptime exports expected uptime in seconds before interruption.
@@ -294,12 +298,12 @@ func (m *ObservabilityMetrics) SetExpectedUptime(provider, region, accelerator, 
 	if accelerator == "" {
 		accelerator = "gpu"
 	}
-	m.expectedUptime.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, source).Set(uptimeSeconds)
+	m.market.set(m.expectedUptime, uptimeSeconds, provider, region, accelerator, instanceType, gpuModel, source)
 }
 
 // SetSignalAge exports signal age in seconds.
 func (m *ObservabilityMetrics) SetSignalAge(provider, region, source string, ageSeconds float64) {
-	m.signalAge.WithLabelValues(provider, region, source).Set(ageSeconds)
+	m.market.set(m.signalAge, ageSeconds, provider, region, source)
 }
 
 // SetQuota exports GPU quota limits and utilized GPUs.
@@ -307,8 +311,8 @@ func (m *ObservabilityMetrics) SetQuota(provider, region, accelerator, quota str
 	if accelerator == "" {
 		accelerator = "gpu"
 	}
-	m.quotaLimit.WithLabelValues(provider, region, accelerator, quota).Set(limitGPUs)
-	m.quotaUsed.WithLabelValues(provider, region, accelerator, quota).Set(usedGPUs)
+	m.market.set(m.quotaLimit, limitGPUs, provider, region, accelerator, quota)
+	m.market.set(m.quotaUsed, usedGPUs, provider, region, accelerator, quota)
 }
 
 // SetFillQuote exports solver fill quotes for a specific request.
@@ -316,12 +320,12 @@ func (m *ObservabilityMetrics) SetFillQuote(minGPUMemoryGB, gpus int, maxRegions
 	memStr := fmt.Sprintf("%d", minGPUMemoryGB)
 	gpusStr := fmt.Sprintf("%d", gpus)
 
-	m.fillPrice.WithLabelValues(memStr, gpusStr, maxRegions, capacityType).Set(pricePerGPUHour)
+	m.market.set(m.fillPrice, pricePerGPUHour, memStr, gpusStr, maxRegions, capacityType)
 
 	if limitedReason != "" {
-		m.fillLimited.WithLabelValues(memStr, gpusStr, maxRegions, capacityType, limitedReason).Set(1)
+		m.market.set(m.fillLimited, 1, memStr, gpusStr, maxRegions, capacityType, limitedReason)
 	} else {
-		m.fillLimited.WithLabelValues(memStr, gpusStr, maxRegions, capacityType, "none").Set(0)
+		m.market.set(m.fillLimited, 0, memStr, gpusStr, maxRegions, capacityType, "none")
 	}
 }
 
@@ -329,7 +333,46 @@ func (m *ObservabilityMetrics) SetFillQuote(minGPUMemoryGB, gpus int, maxRegions
 func (m *ObservabilityMetrics) SetFillGPUAllocation(minGPUMemoryGB, gpus int, maxRegions, capacityType, provider, region, gpuModel string, count float64) {
 	memStr := fmt.Sprintf("%d", minGPUMemoryGB)
 	gpusStr := fmt.Sprintf("%d", gpus)
-	m.fillGPUs.WithLabelValues(memStr, gpusStr, maxRegions, capacityType, provider, region, gpuModel).Set(count)
+	m.market.set(m.fillGPUs, count, memStr, gpusStr, maxRegions, capacityType, provider, region, gpuModel)
+}
+
+// marketSeries remembers which label sets each market refresh pass set, so the next sweep drops series no pass reports anymore.
+type marketSeries struct {
+	mu       sync.Mutex
+	current  map[*prometheus.GaugeVec]map[string][]string
+	previous map[*prometheus.GaugeVec]map[string][]string
+}
+
+func (s *marketSeries) set(vec *prometheus.GaugeVec, value float64, labels ...string) {
+	vec.WithLabelValues(labels...).Set(value)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current == nil {
+		s.current = make(map[*prometheus.GaugeVec]map[string][]string)
+	}
+	if s.current[vec] == nil {
+		s.current[vec] = make(map[string][]string)
+	}
+	s.current[vec][strings.Join(labels, "\x00")] = labels
+}
+
+func (s *marketSeries) sweep() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for vec, series := range s.previous {
+		for key, labels := range series {
+			if _, ok := s.current[vec][key]; !ok {
+				vec.DeleteLabelValues(labels...)
+			}
+		}
+	}
+	s.previous = s.current
+	s.current = nil
+}
+
+// SweepMarketGauges ends a market refresh pass: it deletes market series the previous pass set and this pass did not.
+func (m *ObservabilityMetrics) SweepMarketGauges() {
+	m.market.sweep()
 }
 
 // ResetFleetGauges resets running instance, vCPU, memory, GPU, VRAM, and spend gauges before a fresh reconciliation pass.
@@ -425,15 +468,17 @@ func (m *ObservabilityMetrics) AddInstanceSeconds(provider, region, accelerator,
 	m.instanceSeconds.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Add(seconds)
 }
 
-// SetLegacySpotMetrics updates legacy gauges for backward compatibility.
+// SetLegacySpotMetrics updates legacy gauges for backward compatibility; an onDemandPrice of 0 means unknown and exports no on-demand or savings series.
 func (m *ObservabilityMetrics) SetLegacySpotMetrics(region, az, itype string, spotPrice, onDemandPrice, savingsPct float64) {
 	zone := az
 	if zone == "" {
 		zone = "all"
 	}
-	m.legacySpotPrice.WithLabelValues(region, zone, itype).Set(spotPrice)
-	m.legacyOnDemandPrice.WithLabelValues(region, itype).Set(onDemandPrice)
-	m.legacySpotSavings.WithLabelValues(region, zone, itype).Set(savingsPct)
+	m.market.set(m.legacySpotPrice, spotPrice, region, zone, itype)
+	if onDemandPrice > 0 {
+		m.market.set(m.legacyOnDemandPrice, onDemandPrice, region, itype)
+		m.market.set(m.legacySpotSavings, savingsPct, region, zone, itype)
+	}
 }
 
 // SetLegacyPlacementScore updates legacy placement score gauge.
@@ -442,7 +487,7 @@ func (m *ObservabilityMetrics) SetLegacyPlacementScore(region, az, itype string,
 	if zone == "" {
 		zone = "all"
 	}
-	m.legacyPlacementScore.WithLabelValues(region, zone, itype).Set(score)
+	m.market.set(m.legacyPlacementScore, score, region, zone, itype)
 }
 
 // AddNetworkReceiveBytes increments cumulative network receive byte counter.

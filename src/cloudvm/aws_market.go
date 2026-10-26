@@ -191,11 +191,18 @@ func (c *SpotAdvisorCollector) Regions() []string {
 }
 
 // GetAWSOnDemandPrice queries the AWS Price List API for the current Linux shared on-demand price.
-// If the API call fails or returns no products, it falls back to OnDemandBaselineUSD.
+// If the API call fails or returns no products, it falls back to OnDemandBaselineUSD, which is 0 for shapes the catalog lacks.
 func GetAWSOnDemandPrice(ctx context.Context, client AWSPricingAPI, region, instanceType string) float64 {
-	baseline := OnDemandBaselineUSD(instanceType)
+	if price, ok := listAWSOnDemandPrice(ctx, client, region, instanceType); ok {
+		return price
+	}
+	return OnDemandBaselineUSD(instanceType)
+}
+
+// listAWSOnDemandPrice returns the Price List API price and whether the API supplied one.
+func listAWSOnDemandPrice(ctx context.Context, client AWSPricingAPI, region, instanceType string) (float64, bool) {
 	if client == nil {
-		return baseline
+		return 0, false
 	}
 
 	// Filter on Linux, Shared tenancy, NA preinstalled software, Used capacity
@@ -213,17 +220,16 @@ func GetAWSOnDemandPrice(ctx context.Context, client AWSPricingAPI, region, inst
 
 	out, err := client.GetProducts(ctx, input)
 	if err != nil || len(out.PriceList) == 0 {
-		return baseline
+		return 0, false
 	}
 
 	for _, itemJSON := range out.PriceList {
-		price := parsePricingJSONPrice(itemJSON)
-		if price > 0 {
-			return price
+		if price := parsePricingJSONPrice(itemJSON); price > 0 {
+			return price, true
 		}
 	}
 
-	return baseline
+	return 0, false
 }
 
 // parsePricingJSONPrice traverses AWS Pricing product JSON to extract the hourly USD price.
