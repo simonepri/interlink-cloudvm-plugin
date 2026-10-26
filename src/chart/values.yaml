@@ -47,6 +47,8 @@ tunnel:
 
 registryMirrors: []
 otelEndpoint: ""
+# OTLP/HTTP collector URL that receives worker bootstrap, runner, and container logs; empty disables forwarding.
+otlpLogsEndpoint: ""
 nodeProblemDetector:
   enabled: false
 customBootstrapScript: ""

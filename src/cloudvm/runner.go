@@ -538,6 +538,8 @@ type ReverseTunnelDialerConfig struct {
 	BackoffFactor  float64
 	JitterFraction float64
 	YamuxConfig    *yamux.Config
+	// LogSource, when set, writes newline-delimited WorkerLogRecord lines into a log stream opened on every session.
+	LogSource func(ctx context.Context, w io.Writer) error
 }
 
 // ReverseTunnelDialer continuously dials the reverse tunnel gateway and serves the runner HTTP mux.
@@ -682,6 +684,9 @@ func (d *ReverseTunnelDialer) DialAndServeOnce(ctx context.Context, handler http
 	go func() {
 		errChan <- server.Serve(session)
 	}()
+	if d.cfg.LogSource != nil {
+		go d.streamLogs(ctx, session)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -693,6 +698,22 @@ func (d *ReverseTunnelDialer) DialAndServeOnce(ctx context.Context, handler http
 		return errors.New("yamux session closed by remote peer")
 	case err := <-errChan:
 		return err
+	}
+}
+
+// streamLogs opens the session's log stream, announces it, and lets LogSource write records until either side closes it.
+func (d *ReverseTunnelDialer) streamLogs(ctx context.Context, session *yamux.Session) {
+	stream, err := session.OpenStream()
+	if err != nil {
+		return
+	}
+	defer stream.Close()
+	header, _ := json.Marshal(WorkerStreamHeader{Stream: WorkerLogStreamKind, Version: 1})
+	if _, err := stream.Write(append(header, '\n')); err != nil {
+		return
+	}
+	if err := d.cfg.LogSource(ctx, stream); err != nil && ctx.Err() == nil {
+		log.Printf("[cloudvm-runner] Log stream ended: %v", err)
 	}
 }
 

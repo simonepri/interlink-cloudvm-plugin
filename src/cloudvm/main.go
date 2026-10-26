@@ -398,11 +398,22 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen for reverse tunnels on %s: %w", listenAddr, err)
 	}
+	if endpoint := strings.TrimSpace(os.Getenv("CLOUDVM_OTLP_LOGS_ENDPOINT")); endpoint != "" {
+		forwarder, err := NewOTLPLogForwarder(endpoint)
+		if err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
+		server.SetLogForwarder(forwarder)
+		go forwarder.Run(ctx)
+		log.Printf("[cloudvm-logs] Forwarding worker logs to %s", endpoint) //nolint:gosec // configuration value
+	}
 	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
 		Listener:       listener,
 		Registry:       registry,
 		TokenValidator: server.ValidateTunnelToken,
 		OnReject:       metrics.RecordRejection,
+		LogSink:        server,
 	})
 	if err != nil {
 		_ = listener.Close()

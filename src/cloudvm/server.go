@@ -75,6 +75,8 @@ type Server struct {
 	launchTokens          map[string]string                    // podUID -> runnerAuthToken (reused across retries)
 	completedPods         map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
 	inFlightCreates       map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
+	podLogs               *PodLogBuffer                        // recent container output served to kubectl logs
+	logForwarder          *OTLPLogForwarder                    // optional OTLP export of worker logs
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -122,6 +124,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		launchTokens:       make(map[string]string),
 		completedPods:      make(map[string]*ContainerTerminatedState),
 		inFlightCreates:    make(map[string]*inFlightCreate),
+		podLogs:            NewPodLogBuffer(defaultPodLogPods, defaultPodLogBytes),
 	}
 	if tombStore != nil {
 		for k, v := range tombStore.GetAll() {
@@ -1661,12 +1664,7 @@ func (s *Server) recordRunnerTermination(uid, jid string, cResult *ContainerStat
 	}
 }
 
-// AdoptInstance re-adopts an active cloud VM into the server tracked state if it has valid pod tags
-func (s *Server) handleGetLogs(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("[cloudvm] Logs streamed directly via cluster logging stack or cloudwatch.\n"))
-}
-
+// handleHealthz answers liveness and interLink ping probes.
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))

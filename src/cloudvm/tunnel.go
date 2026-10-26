@@ -158,6 +158,7 @@ type TunnelGateway struct {
 	yamuxConfig         *yamux.Config
 	handshakeTimeout    time.Duration
 	onReject            func(reason string)
+	logSink             WorkerLogSink
 	closeOnce           sync.Once
 	closed              chan struct{}
 }
@@ -172,6 +173,22 @@ type TunnelGatewayConfig struct {
 	HandshakeTimeout    time.Duration
 	// OnReject is called with a short machine-readable reason for every refused handshake.
 	OnReject func(reason string)
+	// LogSink receives the log stream each worker opens on its session; workers' log streams are closed when nil.
+	LogSink WorkerLogSink
+}
+
+// WorkerLogSink consumes the newline-delimited WorkerLogRecord stream a worker opens on its tunnel session.
+type WorkerLogSink interface {
+	ConsumeWorkerLogs(instanceID string, r io.Reader)
+}
+
+// WorkerLogStreamKind names the worker-opened stream that carries logs.
+const WorkerLogStreamKind = "logs"
+
+// WorkerStreamHeader is the first line of every stream a worker opens and says what the stream carries.
+type WorkerStreamHeader struct {
+	Stream  string `json:"stream"`
+	Version int    `json:"version"`
 }
 
 // NewTunnelGateway creates a new TunnelGateway.
@@ -200,6 +217,7 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		yamuxConfig:         cfg.YamuxConfig,
 		handshakeTimeout:    cfg.HandshakeTimeout,
 		onReject:            cfg.OnReject,
+		logSink:             cfg.LogSink,
 		closed:              make(chan struct{}),
 	}
 	return gw, nil
@@ -286,6 +304,8 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 	g.registry.Register(req.InstanceID, session)
 	log.Printf("[cloudvm-tunnel] Registered reverse tunnel session for instance %s from %s", sanitizeLog(req.InstanceID), conn.RemoteAddr()) //nolint:gosec // sanitized
 
+	go g.acceptWorkerStreams(req.InstanceID, session)
+
 	// Wait for session termination to unregister
 	go func(id string, s *yamux.Session) {
 		<-s.CloseChan()
@@ -293,6 +313,38 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 			g.registry.Unregister(id)
 		}
 	}(req.InstanceID, session)
+}
+
+// acceptWorkerStreams serves the streams a worker opens on its session until the session closes.
+func (g *TunnelGateway) acceptWorkerStreams(instanceID string, session *yamux.Session) {
+	for {
+		stream, err := session.AcceptStream()
+		if err != nil {
+			return
+		}
+		go g.serveWorkerStream(instanceID, stream)
+	}
+}
+
+// serveWorkerStream reads the stream header and hands a log stream to the log sink; it closes any other stream.
+func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Stream) {
+	defer stream.Close()
+	if err := stream.SetReadDeadline(time.Now().Add(g.handshakeTimeout)); err != nil {
+		return
+	}
+	reader := bufio.NewReaderSize(stream, maxWorkerLogLine)
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		return
+	}
+	var header WorkerStreamHeader
+	if err := json.Unmarshal(line, &header); err != nil || header.Stream != WorkerLogStreamKind || g.logSink == nil {
+		return
+	}
+	if err := stream.SetReadDeadline(time.Time{}); err != nil {
+		return
+	}
+	g.logSink.ConsumeWorkerLogs(instanceID, reader)
 }
 
 // verifyAttestation checks the platform identity document when a verifier is configured and the worker sent one.
