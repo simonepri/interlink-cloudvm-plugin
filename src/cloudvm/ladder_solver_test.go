@@ -2,112 +2,122 @@
 package main
 
 import (
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-func TestFillSolver_CheapestFillAndRegionCap(t *testing.T) {
-	solver := NewFillSolver()
-
-	// 3 offers across 2 regions
-	offers := []*MarketOffer{
-		{
-			Provider:        "aws",
-			Region:          "us-west-2",
-			Zone:            "us-west-2a",
-			InstanceType:    "g5.xlarge",
-			GPUModel:        "A10G 24GB",
-			GPUMemoryGB:     24,
-			GPUCount:        1,
-			CapacityType:    "spot",
-			PricePerHour:    0.40,
-			PricePerGPUHour: 0.40,
-			QuotaRemaining:  10,
-		},
-		{
-			Provider:        "aws",
-			Region:          "us-east-1",
-			Zone:            "us-east-1a",
-			InstanceType:    "g5.xlarge",
-			GPUModel:        "A10G 24GB",
-			GPUMemoryGB:     24,
-			GPUCount:        1,
-			CapacityType:    "spot",
-			PricePerHour:    0.30, // Cheapest
-			PricePerGPUHour: 0.30,
-			QuotaRemaining:  4, // Limited to 4 GPUs in us-east-1
-		},
-		{
-			Provider:        "gcp",
-			Region:          "us-central1",
-			Zone:            "",
-			InstanceType:    "g2-standard-4",
-			GPUModel:        "L4 24GB",
-			GPUMemoryGB:     24,
-			GPUCount:        1,
-			CapacityType:    "spot",
-			PricePerHour:    0.23, // Cheapest overall
-			PricePerGPUHour: 0.23,
-			QuotaRemaining:  64,
-		},
-	}
-	solver.SetOffers(offers)
-
-	// Test solving for 8 GPUs, minMem=24GB, maxRegions="1"
-	res1 := solver.solveOne(24, 8, "1", "spot")
-	if res1.TargetGPUs != 8 {
-		t.Errorf("expected target 8 GPUs, got %d", res1.TargetGPUs)
-	}
-	// With maxRegions=1, cheapest single region that can fulfill 8 GPUs is us-central1 (64 quota @ 0.23)
-	// (since us-east-1 is limited to 4 GPUs)
-	if res1.FulfilledGPUs != 8 {
-		t.Errorf("expected 8 fulfilled GPUs, got %d", res1.FulfilledGPUs)
-	}
-	if res1.BlendedPriceUSD != 0.23 {
-		t.Errorf("expected blended price 0.23, got %f", res1.BlendedPriceUSD)
-	}
-	if res1.LimitedReason != "" {
-		t.Errorf("expected not limited, got %s", res1.LimitedReason)
-	}
-
-	// Test solving for 1000 GPUs where total quota is 10 + 4 + 64 = 78
-	resLimited := solver.solveOne(24, 1000, "unlimited", "spot")
-	if resLimited.FulfilledGPUs != 78 {
-		t.Errorf("expected 78 fulfilled GPUs, got %d", resLimited.FulfilledGPUs)
-	}
-	if resLimited.LimitedReason != "quota" {
-		t.Errorf("expected quota limited reason, got %s", resLimited.LimitedReason)
-	}
-
-	// Test memory floor filtering: asking for ≥40GB should return 0 when only 24GB shapes exist
-	res40GB := solver.solveOne(40, 8, "unlimited", "spot")
-	if res40GB.FulfilledGPUs != 0 {
-		t.Errorf("expected 0 fulfilled GPUs for 40GB floor, got %d", res40GB.FulfilledGPUs)
-	}
-	if res40GB.LimitedReason != "capacity" {
-		t.Errorf("expected capacity limited reason, got %s", res40GB.LimitedReason)
+// spotOffer returns an 8-GPU, 80 GB spot offer, the shape of every probed tier in these tests.
+func spotOffer(region, itype, model string, vcpus int, pricePerGPU float64) *MarketOffer {
+	return &MarketOffer{
+		Provider: "aws", Region: region, InstanceType: itype, GPUModel: model, GPUMemoryGB: 80,
+		GPUCount: 8, VCPUCount: vcpus, CapacityType: "spot",
+		PricePerHour: pricePerGPU * 8, PricePerGPUHour: pricePerGPU,
 	}
 }
 
-func TestFillSolver_SolveAllExportsMetrics(t *testing.T) {
+func onDemandOffer(region, itype, model string, vcpus int, pricePerGPU float64) *MarketOffer {
+	o := spotOffer(region, itype, model, vcpus, pricePerGPU)
+	o.CapacityType = "on-demand"
+	return o
+}
+
+func TestFillSolver_SpotUpToScoredCapacityThenOnDemand(t *testing.T) {
 	solver := NewFillSolver()
 	solver.SetOffers([]*MarketOffer{
-		{
-			Provider:        "aws",
-			Region:          "us-west-2",
-			InstanceType:    "p4d.24xlarge",
-			GPUModel:        "A100 40GB",
-			GPUMemoryGB:     40,
-			GPUCount:        8,
-			CapacityType:    "spot",
-			PricePerHour:    10.0,
-			PricePerGPUHour: 1.25,
-			QuotaRemaining:  64,
-		},
+		spotOffer("us-east-1", "p5.48xlarge", "H100 80GB", 192, 2.0),
+		onDemandOffer("us-west-2", "p5.48xlarge", "H100 80GB", 192, 6.0),
 	})
+	solver.SetLimits(FillLimits{SpotScores: map[string]map[int]float64{
+		// Spot is likely up to 64 GPUs and unlikely at 256, so the plan counts on 64.
+		spotScoreKey("aws", "us-east-1", 80): {8: 9, 64: 5, 256: 2},
+	}})
 
+	plan := solver.plan(80, 128)
+
+	if plan.PlannedGPUs != 128 || plan.LimitedReason != "" {
+		t.Fatalf("planned %d GPUs (limited %q), want 128 unlimited", plan.PlannedGPUs, plan.LimitedReason)
+	}
+	got := map[string]int{}
+	for _, a := range plan.Allocations {
+		got[a.Region+"/"+a.CapacityType] = a.GPUs
+	}
+	if got["us-east-1/spot"] != 64 || got["us-west-2/on-demand"] != 64 {
+		t.Errorf("allocations = %v, want 64 spot in us-east-1 and 64 on-demand in us-west-2", got)
+	}
+	// 64 spot GPUs at score 5 (the 64-GPU probe) count as 32; on-demand counts in full.
+	if plan.ExpectedGPUs != 96 {
+		t.Errorf("expected GPUs = %v, want 96", plan.ExpectedGPUs)
+	}
+	if want := (64*2.0 + 64*6.0) / 128; math.Abs(plan.PricePerGPUHour-want) > 1e-9 {
+		t.Errorf("price = %v, want %v", plan.PricePerGPUHour, want)
+	}
+}
+
+func TestFillSolver_NoSpotWithoutPlacementScores(t *testing.T) {
+	solver := NewFillSolver()
+	solver.SetOffers([]*MarketOffer{spotOffer("us-east-1", "p5.48xlarge", "H100 80GB", 192, 2.0)})
+
+	plan := solver.plan(80, 8)
+
+	if plan.PlannedGPUs != 0 || plan.LimitedReason != "capacity" {
+		t.Errorf("planned %d GPUs (limited %q), want 0 limited by capacity", plan.PlannedGPUs, plan.LimitedReason)
+	}
+}
+
+func TestFillSolver_QuotaCapsWholeInstances(t *testing.T) {
+	solver := NewFillSolver()
+	solver.SetOffers([]*MarketOffer{onDemandOffer("us-east-1", "p5.48xlarge", "H100 80GB", 192, 6.0)})
+	// 400 vCPUs of P on-demand quota fit two 192-vCPU instances.
+	solver.SetLimits(FillLimits{QuotaVCPUs: map[string]float64{quotaKey("aws", "us-east-1", "p_ondemand"): 400}})
+
+	plan := solver.plan(80, 64)
+
+	if plan.PlannedGPUs != 16 || plan.LimitedReason != "quota" {
+		t.Errorf("planned %d GPUs (limited %q), want 16 limited by quota", plan.PlannedGPUs, plan.LimitedReason)
+	}
+}
+
+func TestFillSolver_QuotaIsSharedAcrossOffers(t *testing.T) {
+	solver := NewFillSolver()
+	solver.SetOffers([]*MarketOffer{
+		onDemandOffer("us-east-1", "p5.48xlarge", "H100 80GB", 192, 6.0),
+		onDemandOffer("us-east-1", "p4de.24xlarge", "A100 80GB", 96, 7.0),
+	})
+	solver.SetLimits(FillLimits{QuotaVCPUs: map[string]float64{quotaKey("aws", "us-east-1", "p_ondemand"): 288}})
+
+	plan := solver.plan(80, 64)
+
+	// One p5 (192 vCPUs) leaves 96 vCPUs, enough for one p4de.
+	if plan.PlannedGPUs != 16 {
+		t.Errorf("planned %d GPUs, want 16 from one p5 and one p4de sharing the P quota", plan.PlannedGPUs)
+	}
+}
+
+func TestFillSolver_SolveAllExportsPlans(t *testing.T) {
+	solver := NewFillSolver()
+	solver.SetLadderSizes([]int{8, 1024})
+	solver.SetMemoryTiers([]int{80})
+	solver.SetOffers([]*MarketOffer{spotOffer("us-east-1", "p5.48xlarge", "H100 80GB", 192, 2.0)})
+	solver.SetLimits(FillLimits{SpotScores: map[string]map[int]float64{spotScoreKey("aws", "us-east-1", 80): {8: 8}}})
 	metrics := NewObservabilityMetrics()
-	results := solver.SolveAll(metrics)
-	if len(results) == 0 {
-		t.Fatalf("expected solved ladder results")
+
+	solver.SolveAll(metrics)
+
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`cloudvm_fill_price_usd_per_gpu_hour{gpus="8",min_gpu_memory_gb="80"} 2`,
+		`cloudvm_fill_expected_gpus{gpus="8",min_gpu_memory_gb="80"} 6.4`,
+		`cloudvm_fill_gpus{capacity_type="spot",gpu_model="H100 80GB",gpus="8",min_gpu_memory_gb="80",provider="aws",region="us-east-1"} 8`,
+		`cloudvm_fill_planned_gpus{gpus="1024",min_gpu_memory_gb="80"} 8`,
+		`cloudvm_fill_limited{gpus="1024",min_gpu_memory_gb="80",reason="capacity"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %s\n%s", want, body)
+		}
 	}
 }

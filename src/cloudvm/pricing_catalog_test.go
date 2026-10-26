@@ -59,7 +59,6 @@ func TestPricingCatalog_FileOverride(t *testing.T) {
 func TestLadderSolver_CustomConfig(t *testing.T) {
 	t.Setenv("LADDER_SIZES", "2,16,64,512")
 	t.Setenv("LADDER_MEMORY_TIERS", "16,80")
-	t.Setenv("LADDER_REGION_CAPS", "1,unlimited")
 
 	LoadLadderConfigFromEnv()
 
@@ -69,12 +68,8 @@ func TestLadderSolver_CustomConfig(t *testing.T) {
 	if len(LadderMemoryTiers) != 2 || LadderMemoryTiers[0] != 16 {
 		t.Fatalf("unexpected LadderMemoryTiers from env: %v", LadderMemoryTiers)
 	}
-	if len(LadderRegionCaps) != 2 || LadderRegionCaps[0] != "1" {
-		t.Fatalf("unexpected LadderRegionCaps from env: %v", LadderRegionCaps)
-	}
 
 	// Reset to defaults
 	LadderSizes = DefaultLadderSizes
 	LadderMemoryTiers = DefaultLadderMemoryTiers
-	LadderRegionCaps = DefaultLadderRegionCaps
 }

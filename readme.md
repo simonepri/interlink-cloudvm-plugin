@@ -302,6 +302,13 @@ cloudvm_spot_placement_score"]:::central
   - `cloudvm_spot_savings_percentage{region, instance_type}`: Percentage savings of Spot compared to On-Demand ((OnDemand - Spot) / OnDemand * 100).
   - `cloudvm_spot_placement_score{region, instance_type}`: Real-time AWS Spot Placement Score (1 to 10 scale) indicating likelihood of successful spot instance fulfillment with low preemption risk.
 
+**Fill plans.** For every GPU count in `LADDER_SIZES` and memory floor in `LADDER_MEMORY_TIERS`, the ticker plans the cheapest way to get that many GPUs. It takes spot GPUs by price, but in each region only up to the largest probed count whose spot placement score is at least 3, then covers the rest with on-demand GPUs. Both stay within the region's EC2 quotas, which every instance type of a family (G or P) shares. To score spot capacity, the ticker asks [`GetSpotPlacementScores`](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_GetSpotPlacementScores.html) about the tracked 8-GPU shapes of each memory floor at 8, 64, 256, and 1024 GPUs; a region with no score gets no spot GPUs in a plan. Expected GPUs count each spot GPU at its score divided by 10 and each on-demand GPU in full; AWS does not calibrate the scores as probabilities, so treat the result as a ranking signal.
+
+  - `cloudvm_spot_capacity_score{provider, region, min_gpu_memory_gb, gpus}`: Spot placement score for getting that many GPUs at that memory floor.
+  - `cloudvm_fill_price_usd_per_gpu_hour{min_gpu_memory_gb, gpus}`, `cloudvm_fill_planned_gpus{...}`, `cloudvm_fill_expected_gpus{...}`: Blended price, planned GPUs (whole instances can exceed the target), and expected GPUs of each plan.
+  - `cloudvm_fill_gpus{min_gpu_memory_gb, gpus, provider, region, gpu_model, capacity_type}`: GPUs a plan takes from one region, GPU model, and capacity type.
+  - `cloudvm_fill_limited{min_gpu_memory_gb, gpus, reason}`: 1 when a plan falls short, with `reason` `quota` or `capacity`.
+
 ---
 
 ### 7. Cost Allocation (OpenCost)

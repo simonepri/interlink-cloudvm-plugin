@@ -328,14 +328,16 @@ func QueryAWSQuota(ctx context.Context, client AWSServiceQuotasAPI, quotaCode st
 	return *out.Quota.Value, nil
 }
 
-// QueryAWSGPUQuotas queries configured GPU quota codes and exports them.
-func QueryAWSGPUQuotas(ctx context.Context, client AWSServiceQuotasAPI, region string, metrics *ObservabilityMetrics) {
+// QueryAWSGPUQuotas queries configured EC2 quota codes in a region, exports them as approximate GPUs, and returns the vCPU limits by quota name.
+func QueryAWSGPUQuotas(ctx context.Context, client AWSServiceQuotasAPI, region string, metrics *ObservabilityMetrics) map[string]float64 {
+	limits := make(map[string]float64)
 	if client == nil || metrics == nil {
-		return
+		return limits
 	}
 	for name, code := range KnownAWSGPUQuotaCodes {
 		val, err := QueryAWSQuota(ctx, client, code)
 		if err == nil && val >= 0 {
+			limits[name] = val
 			// Convert vCPUs to approx GPUs using configurable ratios
 			gpus := val / AWSVCPUPerGPUG
 			if strings.HasPrefix(name, "p_") {
@@ -344,6 +346,7 @@ func QueryAWSGPUQuotas(ctx context.Context, client AWSServiceQuotasAPI, region s
 			metrics.SetQuota("aws", region, "gpu", name, gpus, 0)
 		}
 	}
+	return limits
 }
 
 // EC2PlacementScoreFetcher abstracts GetSpotPlacementScores.

@@ -74,6 +74,7 @@ type SpotPriceTicker struct {
 	solver        *FillSolver
 	catalog       *HardwareCatalog
 	onDemand      *OnDemandPriceBook
+	spotCapacity  map[string]map[int]float64
 	quotasAPI     AWSServiceQuotasAPI
 	quotasFactory func(region string) AWSServiceQuotasAPI
 }
@@ -529,6 +530,11 @@ func (t *SpotPriceTicker) PollPlacementScores(ctx context.Context) {
 		t.mu.Unlock()
 	})
 
+	spotCapacity := t.ProbeSpotCapacity(ctx)
+	t.mu.Lock()
+	t.spotCapacity = spotCapacity
+	t.mu.Unlock()
+
 	t.syncMarketMetrics(ctx)
 }
 
@@ -560,6 +566,7 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 
 		// Catalog specs
 		resCap := t.catalog.ResolveCapacity(ctx, nil, p.InstanceType, ResourceVector{})
+		vcpus, _ := strconv.Atoi(resCap.CPU.String())
 		gpuModel := resCap.GPUModel
 		if gpuModel == "" {
 			gpuModel = p.InstanceType
@@ -601,11 +608,10 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			GPUModel:        gpuModel,
 			GPUMemoryGB:     resCap.GPUMemoryGB,
 			GPUCount:        resCap.GPUs,
+			VCPUCount:       vcpus,
 			CapacityType:    "spot",
 			PricePerHour:    p.SpotPriceUSD,
 			PricePerGPUHour: pricePerGPU,
-			Availability:    0.8,
-			QuotaRemaining:  64,
 		})
 
 		if ondemand <= 0 {
@@ -623,11 +629,10 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			GPUModel:        gpuModel,
 			GPUMemoryGB:     resCap.GPUMemoryGB,
 			GPUCount:        resCap.GPUs,
+			VCPUCount:       vcpus,
 			CapacityType:    "on-demand",
 			PricePerHour:    ondemand,
 			PricePerGPUHour: onDemandPerGPU,
-			Availability:    1.0,
-			QuotaRemaining:  64,
 		})
 	}
 
@@ -677,8 +682,15 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 	}
 
 	// 4. AWS Quotas
+	quotaVCPUs := make(map[string]float64)
+	var quotaMu sync.Mutex
 	t.forEachRegion(ctx, t.Regions(), func(ctx context.Context, reg string) {
-		QueryAWSGPUQuotas(ctx, t.quotasClient(reg), reg, t.metrics)
+		limits := QueryAWSGPUQuotas(ctx, t.quotasClient(reg), reg, t.metrics)
+		quotaMu.Lock()
+		defer quotaMu.Unlock()
+		for name, vcpus := range limits {
+			quotaVCPUs[quotaKey("aws", reg, name)] = vcpus
+		}
 	})
 
 	// 5. GCP Market Collection
@@ -701,8 +713,6 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 					CapacityType:    "spot",
 					PricePerHour:    spot,
 					PricePerGPUHour: spot / float64(profile.GPUs),
-					Availability:    0.85,
-					QuotaRemaining:  64,
 				})
 				offers = append(offers, &MarketOffer{
 					Provider:        "gcp",
@@ -715,16 +725,25 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 					CapacityType:    "on-demand",
 					PricePerHour:    onDemand,
 					PricePerGPUHour: onDemand / float64(profile.GPUs),
-					Availability:    1.0,
-					QuotaRemaining:  64,
 				})
 			}
 		}
 	}
 
-	// 6. Ladder Probing and Fill Solver
+	// 6. Spot capacity probes and fill plans
+	t.mu.RLock()
+	spotCapacity := t.spotCapacity
+	t.mu.RUnlock()
+	for key, byGPUs := range spotCapacity {
+		parts := strings.SplitN(key, "/", 3)
+		tier, _ := strconv.Atoi(parts[2])
+		for gpus, score := range byGPUs {
+			t.metrics.SetSpotCapacityScore(parts[0], parts[1], tier, gpus, score)
+		}
+	}
 	if t.solver != nil {
 		t.solver.SetOffers(offers)
+		t.solver.SetLimits(FillLimits{QuotaVCPUs: quotaVCPUs, SpotScores: spotCapacity})
 		t.solver.SolveAll(t.metrics)
 	}
 

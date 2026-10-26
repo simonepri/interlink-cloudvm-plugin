@@ -25,9 +25,9 @@ func TestObservabilityMetrics_Exposition(t *testing.T) {
 	metrics.SetQuota("aws", "us-west-2", "gpu", "g_vt_spot", 64, 8)
 
 	// 4. Record fill quotes
-	metrics.SetFillQuote(24, 64, "1", "spot", 0.4500, nil, "")
-	metrics.SetFillGPUAllocation(24, 64, "1", "spot", "aws", "us-west-2", "A10G 24GB", 64)
-	metrics.SetFillQuote(80, 1000, "1", "spot", 0.0, nil, "capacity")
+	metrics.SetFillPlan(FillPlan{MinGPUMemoryGB: 24, TargetGPUs: 64, PlannedGPUs: 64, ExpectedGPUs: 57.6, PricePerGPUHour: 0.45,
+		Allocations: []FillAllocation{{Provider: "aws", Region: "us-west-2", GPUModel: "A10G 24GB", CapacityType: "spot", GPUs: 64, ExpectedGPUs: 57.6}}})
+	metrics.SetFillPlan(FillPlan{MinGPUMemoryGB: 80, TargetGPUs: 1000, LimitedReason: "capacity"})
 
 	// 5. Record fleet metrics
 	metrics.SetFleetGauges("aws", "us-west-2", "gpu", "g5.xlarge", "A10G 24GB", "spot", 4, 16, 64, 4, 96, 1.6096)
@@ -95,14 +95,16 @@ func TestObservabilityMetrics_SweepDropsSeriesAPassNoLongerSets(t *testing.T) {
 	metrics := NewObservabilityMetrics()
 
 	// Pass 1: a quote is limited by capacity and draws GPUs from two regions.
-	metrics.SetFillQuote(80, 64, "unlimited", "spot", 2.5, nil, "capacity")
-	metrics.SetFillGPUAllocation(80, 64, "unlimited", "spot", "aws", "us-east-1", "H100 80GB", 32)
-	metrics.SetFillGPUAllocation(80, 64, "unlimited", "spot", "aws", "us-west-2", "H100 80GB", 32)
+	metrics.SetFillPlan(FillPlan{MinGPUMemoryGB: 80, TargetGPUs: 64, PlannedGPUs: 64, PricePerGPUHour: 2.5, LimitedReason: "capacity", Allocations: []FillAllocation{
+		{Provider: "aws", Region: "us-east-1", GPUModel: "H100 80GB", CapacityType: "spot", GPUs: 32},
+		{Provider: "aws", Region: "us-west-2", GPUModel: "H100 80GB", CapacityType: "spot", GPUs: 32},
+	}})
 	metrics.SweepMarketGauges()
 
 	// Pass 2: the same quote fills from one region without limits.
-	metrics.SetFillQuote(80, 64, "unlimited", "spot", 2.4, nil, "")
-	metrics.SetFillGPUAllocation(80, 64, "unlimited", "spot", "aws", "us-east-1", "H100 80GB", 64)
+	metrics.SetFillPlan(FillPlan{MinGPUMemoryGB: 80, TargetGPUs: 64, PlannedGPUs: 64, PricePerGPUHour: 2.4, Allocations: []FillAllocation{
+		{Provider: "aws", Region: "us-east-1", GPUModel: "H100 80GB", CapacityType: "spot", GPUs: 64},
+	}})
 	metrics.SweepMarketGauges()
 
 	rec := httptest.NewRecorder()
@@ -115,7 +117,7 @@ func TestObservabilityMetrics_SweepDropsSeriesAPassNoLongerSets(t *testing.T) {
 	if strings.Contains(body, `region="us-west-2"`) {
 		t.Errorf("stale fill allocation survived the sweep:\n%s", body)
 	}
-	if !strings.Contains(body, `cloudvm_fill_gpus{capacity_type="spot",gpu_model="H100 80GB",gpus="64",max_regions="unlimited",min_gpu_memory_gb="80",provider="aws",region="us-east-1"} 64`) {
+	if !strings.Contains(body, `cloudvm_fill_gpus{capacity_type="spot",gpu_model="H100 80GB",gpus="64",min_gpu_memory_gb="80",provider="aws",region="us-east-1"} 64`) {
 		t.Errorf("current fill allocation missing:\n%s", body)
 	}
 }
