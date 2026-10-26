@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -105,5 +106,66 @@ func TestSpotPriceTicker_ReadsEverySpotPricePage(t *testing.T) {
 
 	if _, ok := ticker.GetPrice("us-east-1", "g6.xlarge"); !ok {
 		t.Errorf("no price for g6.xlarge, which only the second page holds")
+	}
+}
+
+// regionTypesFetcher lists one GPU type per region, or fails for regions in failing.
+type regionTypesFetcher struct {
+	mockEC2TickerFetcher
+	region  string
+	failing map[string]bool
+}
+
+func (f *regionTypesFetcher) DescribeInstanceTypes(_ context.Context, _ *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	if f.failing[f.region] {
+		return nil, errors.New("RequestLimitExceeded")
+	}
+	name := map[string]string{"us-east-1": "p5en.48xlarge", "us-west-2": "g7e.2xlarge"}[f.region]
+	return &ec2.DescribeInstanceTypesOutput{InstanceTypes: []ec2types.InstanceTypeInfo{gpuInfo(name, ec2types.ArchitectureTypeX8664, "H200", 8, 144384)}}, nil
+}
+
+func TestSpotPriceTicker_DiscoverGPUTypesKeepsTypesOfFailedRegions(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1", "us-west-2"}, nil, time.Minute)
+	ticker.catalog = NewHardwareCatalog()
+	failing := map[string]bool{}
+	ticker.SetFetcherFactory(func(_ context.Context, region string) (SpotPriceFetcher, error) {
+		return &regionTypesFetcher{region: region, failing: failing}, nil
+	})
+	ticker.discoverGPUTypes(context.Background())
+	ticker.mu.Lock()
+	ticker.prices[tickerKey("us-east-1", "us-east-1a", "g4dn.xlarge")] = &SpotPriceEntry{Region: "us-east-1", InstanceType: "g4dn.xlarge", SpotPriceUSD: 0.2}
+	ticker.mu.Unlock()
+
+	// us-west-2 fails: its g7e stays tracked, and the next read comes within the hour instead of a day.
+	failing["us-west-2"] = true
+	ticker.discoverGPUTypes(context.Background())
+
+	if got := strings.Join(ticker.TrackedInstanceTypes(), ","); got != "g7e.2xlarge,p5en.48xlarge" {
+		t.Errorf("tracked = %s, want both types although us-west-2 failed", got)
+	}
+	ticker.mu.RLock()
+	due := time.Since(ticker.lastTypeDiscovery) > gpuTypeDiscoveryInterval-2*gpuTypeDiscoveryRetry
+	_, stale := ticker.prices[tickerKey("us-east-1", "us-east-1a", "g4dn.xlarge")]
+	ticker.mu.RUnlock()
+	if !due {
+		t.Errorf("a partial read waits the full day before retrying")
+	}
+	if stale {
+		t.Errorf("the price of g4dn.xlarge, which is no longer tracked, was kept")
+	}
+}
+
+func TestSpotPriceTicker_ProbeGroupsSkipArmTypes(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, nil, time.Minute)
+	ticker.catalog = NewHardwareCatalog()
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return &pagedTypesFetcher{}, nil })
+	ticker.discoverGPUTypes(context.Background())
+
+	for _, g := range ticker.probeGroups(context.Background()) {
+		for _, itype := range g.instanceTypes {
+			if itype == "g5g.xlarge" {
+				t.Errorf("probe group %+v includes the Arm g5g.xlarge, which fill plans never use", g)
+			}
+		}
 	}
 }

@@ -20,11 +20,14 @@ import (
 // gpuTypeDiscoveryInterval is how often the ticker re-reads the GPU instance types AWS offers; AWS adds families rarely.
 const gpuTypeDiscoveryInterval = 24 * time.Hour
 
+// gpuTypeDiscoveryRetry is how soon the ticker reads again after some regions failed to list their types.
+const gpuTypeDiscoveryRetry = time.Hour
+
 // launchableArchitectures are the CPU architectures the worker launch templates have an AMI for.
 // NOTE(simonepri): the worker AMI is x86_64 only, so Arm GPU types are tracked for prices but never launched or planned.
 var launchableArchitectures = []string{"amd64"}
 
-// discoveredGPUType is one EC2 instance type with whole GPUs, as DescribeInstanceTypes reports it.
+// discoveredGPUType is one EC2 instance type with whole, named GPUs, as DescribeInstanceTypes reports it.
 type discoveredGPUType struct {
 	name     string
 	arch     string
@@ -73,6 +76,9 @@ func gpuTypeFromInfo(info ec2types.InstanceTypeInfo) (discoveredGPUType, bool) {
 	if g.MemoryInfo != nil {
 		memGB = roundGPUMemoryGB(int64(aws.ToInt32(g.MemoryInfo.SizeInMiB)))
 	}
+	if aws.ToString(g.Name) == "" || memGB == 0 {
+		return discoveredGPUType{}, false
+	}
 	vcpus := int32(0)
 	if info.VCpuInfo != nil {
 		vcpus = aws.ToInt32(info.VCpuInfo.DefaultVCpus)
@@ -106,47 +112,73 @@ func gpuTypeFromInfo(info ec2types.InstanceTypeInfo) (discoveredGPUType, bool) {
 // and makes their union the tracked set. Regions whose read fails are skipped; if every read fails, the set is kept.
 func (t *SpotPriceTicker) discoverGPUTypes(ctx context.Context) {
 	found := make(map[string]discoveredGPUType)
+	failed := false
 	var mu sync.Mutex
 	t.forEachRegion(ctx, t.Regions(), func(ctx context.Context, reg string) {
 		fetcher, err := t.fetcherFactory(ctx, reg)
-		if err != nil {
-			return
-		}
-		types, err := describeGPUTypes(ctx, fetcher)
-		if err != nil {
-			log.Printf("[cloudvm-ticker] Warning: listing GPU instance types in %s failed: %v", sanitizeLog(reg), err) //nolint:gosec // region sanitized
-			return
+		var types []discoveredGPUType
+		if err == nil {
+			types, err = describeGPUTypes(ctx, fetcher)
 		}
 		mu.Lock()
 		defer mu.Unlock()
+		if err != nil {
+			failed = true
+			log.Printf("[cloudvm-ticker] Warning: listing GPU instance types in %s failed: %v", sanitizeLog(reg), err) //nolint:gosec // region sanitized
+			return
+		}
 		for _, gt := range types {
 			found[gt.name] = gt
 		}
 	})
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// A failed region may offer types no other region lists, so a partial read keeps the previous set too and
+	// retries within the hour; a complete read replaces it, and a read where every region failed changes nothing.
+	t.lastTypeDiscovery = time.Now()
+	if failed {
+		t.lastTypeDiscovery = t.lastTypeDiscovery.Add(gpuTypeDiscoveryRetry - gpuTypeDiscoveryInterval)
+	}
 	if len(found) == 0 {
 		return
 	}
-	names := make([]string, 0, len(found))
 	arch := make(map[string]string, len(found))
+	if failed {
+		for _, name := range t.instanceTypes {
+			arch[name] = t.instanceArch[name]
+		}
+	}
 	for name, gt := range found {
-		names = append(names, name)
 		arch[name] = gt.arch
 		t.catalog.Put(name, gt.capacity)
 	}
+	names := make([]string, 0, len(arch))
+	for name := range arch {
+		names = append(names, name)
+	}
 	sort.Strings(names)
-	t.mu.Lock()
 	t.instanceTypes = names
 	t.instanceArch = arch
-	t.lastTypeDiscovery = time.Now()
-	t.mu.Unlock()
-	log.Printf("[cloudvm-ticker] Tracking %d GPU instance types offered in %d regions", len(names), len(t.Regions())) //nolint:gosec // logs two counts
+	// Prices of types no longer tracked would keep feeding metrics, fill plans, and launch ranking.
+	for key, p := range t.prices {
+		if _, ok := arch[p.InstanceType]; !ok {
+			delete(t.prices, key)
+		}
+	}
+	log.Printf("[cloudvm-ticker] Tracking %d GPU instance types offered in %d regions", len(names), len(t.regions)) //nolint:gosec // logs two counts
 }
 
 // launchable reports whether the worker launch templates can boot an instance type; types discovery has not seen count as x86_64.
 func (t *SpotPriceTicker) launchable(instanceType string) bool {
 	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.launchableLocked(instanceType)
+}
+
+// launchableLocked is launchable for callers that hold t.mu.
+func (t *SpotPriceTicker) launchableLocked(instanceType string) bool {
 	arch, ok := t.instanceArch[instanceType]
-	t.mu.RUnlock()
 	if !ok {
 		arch = "amd64"
 	}

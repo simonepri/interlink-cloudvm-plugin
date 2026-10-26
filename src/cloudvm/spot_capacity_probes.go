@@ -42,10 +42,14 @@ type probeGroup struct {
 	instanceTypes   []string
 }
 
-// probeGroups splits the tracked GPU instance types by memory floor and GPUs per instance, so a target of N GPUs is N/GPUs instances.
+// probeGroups splits the tracked, launchable GPU instance types by memory floor and GPUs per instance, so a target of N GPUs is N/GPUs instances.
 func (t *SpotPriceTicker) probeGroups(ctx context.Context) []probeGroup {
 	byKey := make(map[[2]int][]string)
 	for _, itype := range t.TrackedInstanceTypes() {
+		// Probe scores feed fill plans, which only use types the workers can boot.
+		if !t.launchable(itype) {
+			continue
+		}
 		resCap := t.catalog.ResolveCapacity(ctx, nil, itype, ResourceVector{})
 		if resCap.GPUs <= 0 {
 			continue
