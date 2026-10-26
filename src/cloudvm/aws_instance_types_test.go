@@ -269,7 +269,8 @@ func TestPodInstanceRequirements_KeepsOnlyInstanceLabels(t *testing.T) {
 
 func TestDeriveInstanceTypes_LaunchesOnlyArchitecturesWithAnAMI(t *testing.T) {
 	p, _ := derivationProvider(t)
-	// The Arm g5g.xlarge is the cheapest 1-GPU type, but the worker AMI is x86_64 only.
+	// The Arm g5g.xlarge is the cheapest 1-GPU type, but the region's only template, the default one, has no image
+	// architecture EC2 reports, so it counts as amd64.
 	got, err := p.launchInstanceTypes(context.Background(), derivationSpec(t, gpuPod(1, "2", "8Gi")))
 	if err != nil {
 		t.Fatalf("launchInstanceTypes: %v", err)
@@ -282,5 +283,102 @@ func TestDeriveInstanceTypes_LaunchesOnlyArchitecturesWithAnAMI(t *testing.T) {
 	pod.Spec.NodeSelector["kubernetes.io/arch"] = "arm64"
 	if _, err := p.Launch(context.Background(), derivationSpec(t, pod)); err == nil || !strings.Contains(err.Error(), errNoInstanceTypeFits.Error()) {
 		t.Fatalf("Launch error = %v, want errNoInstanceTypeFits for an arm64 pod", err)
+	}
+}
+
+// armProvider is derivationProvider with an x86 and an Arm launch template in us-west-1.
+func armProvider(t *testing.T) *AWSProvider {
+	t.Helper()
+	p, _ := derivationProvider(t)
+	client, err := p.getClient(context.Background(), "us-west-1")
+	if err != nil {
+		t.Fatalf("getClient: %v", err)
+	}
+	client.(*mockEC2FleetClient).templateImages = map[string]ec2types.ArchitectureValues{
+		"lt-x86": ec2types.ArchitectureValuesX8664, "lt-arm": ec2types.ArchitectureValuesArm64,
+	}
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{
+		"us-west-1": {LaunchTemplates: []LaunchTemplateFact{{ID: "lt-x86"}, {ID: "lt-arm"}}, SubnetIDs: []string{"subnet-a"}},
+	}})
+	globalTemplateArch = &templateArchCache{entries: make(map[string]templateArchEntry)}
+	return p
+}
+
+func TestDeriveInstanceTypes_ArmTemplateEnablesArmTypes(t *testing.T) {
+	p := armProvider(t)
+
+	got, err := p.launchInstanceTypes(context.Background(), derivationSpec(t, gpuPod(1, "2", "8Gi")))
+	if err != nil {
+		t.Fatalf("launchInstanceTypes: %v", err)
+	}
+	if got[0] != "g5g.xlarge" {
+		t.Errorf("types = %v, want the cheapest g5g.xlarge first now that an Arm template exists", got)
+	}
+
+	pod := gpuPod(1, "2", "8Gi")
+	pod.Spec.NodeSelector["kubernetes.io/arch"] = "arm64"
+	got, err = p.launchInstanceTypes(context.Background(), derivationSpec(t, pod))
+	if err != nil || strings.Join(got, ",") != "g5g.xlarge" {
+		t.Errorf("arm64 pod types = %v (err %v), want g5g.xlarge", got, err)
+	}
+}
+
+func TestLaunch_GroupsCandidatesByTemplate(t *testing.T) {
+	p := armProvider(t)
+	client, _ := p.getClient(context.Background(), "us-west-1")
+	mock := client.(*mockEC2FleetClient)
+	var configs []ec2types.FleetLaunchTemplateConfigRequest
+	mock.createFleetFn = func(_ context.Context, in *ec2.CreateFleetInput) (*ec2.CreateFleetOutput, error) {
+		configs = in.LaunchTemplateConfigs
+		return &ec2.CreateFleetOutput{}, nil
+	}
+	spec := derivationSpec(t, gpuPod(1, "2", "8Gi"))
+	spec.PodUID = "uid-arm"
+
+	_, _ = p.Launch(context.Background(), spec)
+
+	got := map[string][]string{}
+	for _, c := range configs {
+		for _, o := range c.Overrides {
+			id := aws.ToString(c.LaunchTemplateSpecification.LaunchTemplateId)
+			got[id] = append(got[id], string(o.InstanceType))
+		}
+	}
+	if strings.Join(got["lt-arm"], ",") != "g5g.xlarge" || len(got["lt-x86"]) == 0 || strings.Contains(strings.Join(got["lt-x86"], ","), "g5g") {
+		t.Errorf("fleet configs = %v, want g5g.xlarge on lt-arm and the x86 types on lt-x86", got)
+	}
+}
+
+func TestGroupByTemplate_DeclaredRequirementsRouteGPUSlices(t *testing.T) {
+	slice := InstanceTypeFacts{Name: "g6f.xlarge", Arch: "amd64", VCPUs: 4, MemoryMiB: 16384, GPUs: 1, GPUName: "l4", GPUManufacturer: "nvidia", GPUMemoryMiB: 2861}
+	whole := InstanceTypeFacts{Name: "g6.xlarge", Arch: "amd64", VCPUs: 4, MemoryMiB: 16384, GPUs: 1, GPUName: "l4", GPUManufacturer: "nvidia", GPUMemoryMiB: 22888}
+	family := func(op corev1.NodeSelectorOperator) []corev1.NodeSelectorRequirement {
+		return []corev1.NodeSelectorRequirement{{Key: labelInstanceFamily, Operator: op, Values: []string{"g6f", "gr6f"}}}
+	}
+	templates := resolveTemplates(context.Background(), nil, "us-west-1", []LaunchTemplateFact{
+		{ID: "lt-gpu", Requirements: family(corev1.NodeSelectorOpNotIn)},
+		{ID: "lt-grid", Requirements: family(corev1.NodeSelectorOpIn)},
+	})
+
+	groups := groupByTemplate(templates, []string{"g6f.xlarge", "g6.xlarge"}, map[string]InstanceTypeFacts{"g6f.xlarge": slice, "g6.xlarge": whole})
+
+	got := map[string]string{}
+	for _, g := range groups {
+		got[g.ID] = strings.Join(g.InstanceTypes, ",")
+	}
+	if got["lt-grid"] != "g6f.xlarge" || got["lt-gpu"] != "g6.xlarge" {
+		t.Errorf("groups = %v, want the slice on lt-grid and the whole L4 on lt-gpu", got)
+	}
+}
+
+func TestInstanceFactsFromInfo_GPUSliceCountsAsOneGPU(t *testing.T) {
+	f := instanceFactsFromInfo(ec2types.InstanceTypeInfo{
+		InstanceType: "g6f.xlarge",
+		GpuInfo: &ec2types.GpuInfo{Gpus: []ec2types.GpuDeviceInfo{{
+			Name: aws.String("L4"), Count: aws.Int32(0), MemoryInfo: &ec2types.GpuDeviceMemoryInfo{SizeInMiB: aws.Int32(2861)},
+		}}},
+	})
+	if f.GPUs != 1 || f.GPUMemoryMiB != 2861 {
+		t.Errorf("facts = %d GPUs with %d MiB, want 1 GPU with 2861 MiB", f.GPUs, f.GPUMemoryMiB)
 	}
 }

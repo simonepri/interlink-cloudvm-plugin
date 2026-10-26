@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -70,9 +71,6 @@ func TestSpotPriceTicker_DiscoverGPUTypes(t *testing.T) {
 	}
 	if got := ticker.catalog.ResolveCapacity(context.Background(), nil, "g7e.2xlarge", ResourceVector{}).GPUModel; got != "RTX PRO Server 6000 96GB" {
 		t.Errorf("g7e.2xlarge GPU = %q, want RTX PRO Server 6000 96GB", got)
-	}
-	if !ticker.launchable("g7e.2xlarge") || ticker.launchable("g5g.xlarge") {
-		t.Errorf("launchable: g7e %v, g5g %v; want only the x86 type", ticker.launchable("g7e.2xlarge"), ticker.launchable("g5g.xlarge"))
 	}
 }
 
@@ -159,22 +157,7 @@ func TestSpotPriceTicker_DiscoverGPUTypesKeepsTypesOfFailedRegions(t *testing.T)
 	}
 }
 
-func TestSpotPriceTicker_ProbeGroupsSkipArmTypes(t *testing.T) {
-	ticker := NewSpotPriceTicker([]string{"us-east-1"}, nil, time.Minute)
-	ticker.catalog = NewHardwareCatalog()
-	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return &pagedTypesFetcher{}, nil })
-	ticker.discoverGPUTypes(context.Background())
-
-	for _, g := range ticker.probeGroups(context.Background()) {
-		for _, itype := range g.instanceTypes {
-			if itype == "g5g.xlarge" {
-				t.Errorf("probe group %+v includes the Arm g5g.xlarge, which fill plans never use", g)
-			}
-		}
-	}
-}
-
-func TestSpotPriceTicker_PartialFirstDiscoveryKeepsBuiltInTypesLaunchable(t *testing.T) {
+func TestSpotPriceTicker_PartialFirstDiscoveryKeepsBuiltInTypes(t *testing.T) {
 	ticker := NewSpotPriceTicker([]string{"us-east-1", "us-west-2"}, nil, time.Minute)
 	ticker.catalog = NewHardwareCatalog()
 	ticker.SetFetcherFactory(func(_ context.Context, region string) (SpotPriceFetcher, error) {
@@ -183,8 +166,8 @@ func TestSpotPriceTicker_PartialFirstDiscoveryKeepsBuiltInTypesLaunchable(t *tes
 
 	ticker.discoverGPUTypes(context.Background())
 
-	// g5.xlarge comes from the built-in list, which carries no architecture; it is x86_64.
-	if !ticker.launchable("g5.xlarge") {
-		t.Errorf("g5.xlarge from the built-in list stopped being launchable after a partial first discovery")
+	// g5.xlarge comes from the built-in list; a region that failed may offer it, so it stays tracked.
+	if !slices.Contains(ticker.TrackedInstanceTypes(), "g5.xlarge") {
+		t.Errorf("g5.xlarge from the built-in list was dropped after a partial first discovery")
 	}
 }

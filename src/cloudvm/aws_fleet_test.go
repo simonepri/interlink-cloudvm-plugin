@@ -76,6 +76,28 @@ type mockEC2FleetClient struct {
 	describeInstanceTypesFn func(ctx context.Context, params *ec2.DescribeInstanceTypesInput) (*ec2.DescribeInstanceTypesOutput, error)
 	describeOfferingsFn     func(ctx context.Context, params *ec2.DescribeInstanceTypeOfferingsInput) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
 	describeSubnetsFn       func(ctx context.Context, params *ec2.DescribeSubnetsInput) (*ec2.DescribeSubnetsOutput, error)
+	// templateImages maps a launch template ID or name to its image's architecture, x86_64 or arm64.
+	templateImages map[string]ec2types.ArchitectureValues
+}
+
+func (m *mockEC2FleetClient) DescribeLaunchTemplateVersions(_ context.Context, params *ec2.DescribeLaunchTemplateVersionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplateVersionsOutput, error) {
+	key := aws.ToString(params.LaunchTemplateId) + aws.ToString(params.LaunchTemplateName)
+	if _, ok := m.templateImages[key]; !ok {
+		return &ec2.DescribeLaunchTemplateVersionsOutput{}, nil
+	}
+	return &ec2.DescribeLaunchTemplateVersionsOutput{LaunchTemplateVersions: []ec2types.LaunchTemplateVersion{{
+		LaunchTemplateData: &ec2types.ResponseLaunchTemplateData{ImageId: aws.String("ami-" + key)},
+	}}}, nil
+}
+
+func (m *mockEC2FleetClient) DescribeImages(_ context.Context, params *ec2.DescribeImagesInput, _ ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	out := &ec2.DescribeImagesOutput{}
+	for _, id := range params.ImageIds {
+		if arch, ok := m.templateImages[strings.TrimPrefix(id, "ami-")]; ok {
+			out.Images = append(out.Images, ec2types.Image{ImageId: aws.String(id), Architecture: arch})
+		}
+	}
+	return out, nil
 }
 
 func (m *mockEC2FleetClient) CreateFleet(ctx context.Context, params *ec2.CreateFleetInput, _ ...func(*ec2.Options)) (*ec2.CreateFleetOutput, error) {
@@ -1199,24 +1221,26 @@ func TestAWSProvider_LaunchUsesGPUTemplateForGPUPods(t *testing.T) {
 		},
 	})
 
+	// The instance type picks the template: a GPU type boots the GPU image even for a pod without a GPU request.
 	for _, tc := range []struct {
-		gpus int
-		want string
-	}{{1, "lt-gpu"}, {0, "lt-cpu"}} {
+		gpus  int
+		itype string
+		want  string
+	}{{1, "g4dn.xlarge", "lt-gpu"}, {0, "g4dn.xlarge", "lt-gpu"}, {0, "m7i.large", "lt-cpu"}} {
 		capturedLT = ""
 		spec := &InstanceSpec{
 			PodName:      "gpu-pod",
 			PodNamespace: "default",
 			PodUID:       "uid-gpu",
 			Region:       "us-west-2",
-			InstanceType: "g4dn.xlarge",
+			InstanceType: tc.itype,
 			NumGPUs:      tc.gpus,
 		}
 		if _, err := p.Launch(context.Background(), spec); err != nil {
 			t.Fatalf("Launch(gpus=%d) failed: %v", tc.gpus, err)
 		}
 		if capturedLT != tc.want {
-			t.Errorf("Launch(gpus=%d) used launch template %q, want %q", tc.gpus, capturedLT, tc.want)
+			t.Errorf("Launch(gpus=%d, %s) used launch template %q, want %q", tc.gpus, tc.itype, capturedLT, tc.want)
 		}
 	}
 }

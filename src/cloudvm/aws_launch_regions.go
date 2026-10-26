@@ -208,7 +208,7 @@ func scoreOrUnscored(scores map[string]int32, region string) int32 {
 // isRegionFallbackError reports whether a launch failure is specific to the region's capacity or configuration, so
 // another region may still succeed.
 func isRegionFallbackError(err error) bool {
-	if errors.Is(err, errNoInstancesLaunched) || errors.Is(err, errNoOfferedPlacements) {
+	if errors.Is(err, errNoInstancesLaunched) || errors.Is(err, errNoOfferedPlacements) || errors.Is(err, errNoLaunchTemplateFits) {
 		return true
 	}
 	if class := ClassifyAWSError(err); class == "no_capacity" || class == "quota" {
