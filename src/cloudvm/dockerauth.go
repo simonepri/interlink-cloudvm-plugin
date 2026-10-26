@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,11 +67,11 @@ func (r *KubeSecretResolver) GetSecret(ctx context.Context, namespace, name stri
 	return sec.Data, nil
 }
 
-// ResolveImagePullSecrets retrieves and consolidates Docker configs from Kubernetes imagePullSecrets using SecretResolver.
-func ResolveImagePullSecrets(ctx context.Context, resolver SecretResolver, namespace string, secretRefs []corev1.LocalObjectReference) (string, error) {
-	if resolver == nil || len(secretRefs) == 0 {
-		return "", nil
-	}
+// ResolveImagePullSecrets merges the registry credentials of the pod's imagePullSecrets into one
+// Docker config JSON. It reads each Secret from the create request's secrets, as the virtual kubelet
+// supplies them, and asks resolver only for a Secret the request lacks. Like the kubelet, it logs a
+// warning and skips a Secret it cannot find, read, or parse, so the launch proceeds without it.
+func ResolveImagePullSecrets(ctx context.Context, provided []corev1.Secret, resolver SecretResolver, namespace string, secretRefs []corev1.LocalObjectReference) string {
 	if namespace == "" {
 		namespace = "default"
 	}
@@ -79,25 +80,41 @@ func ResolveImagePullSecrets(ctx context.Context, resolver SecretResolver, names
 		if ref.Name == "" {
 			continue
 		}
-		data, err := resolver.GetSecret(ctx, namespace, ref.Name)
+		data, err := pullSecretData(ctx, provided, resolver, namespace, ref.Name)
 		if err != nil {
-			return "", fmt.Errorf("failed to get imagePullSecret %s/%s: %w", namespace, ref.Name, err)
+			log.Printf("[cloudvm] WARNING skipping imagePullSecret %s/%s, the image pull may not succeed: %v", namespace, ref.Name, err)
+			continue
 		}
 		cfg, err := ExtractDockerConfigFromSecretData(data)
 		if err != nil {
-			return "", fmt.Errorf("failed to extract docker auth from secret %s/%s: %w", namespace, ref.Name, err)
+			log.Printf("[cloudvm] WARNING skipping imagePullSecret %s/%s, the image pull may not succeed: %v", namespace, ref.Name, err)
+			continue
 		}
 		configs = append(configs, cfg)
 	}
 	merged := MergeDockerConfigs(configs...)
 	if merged == nil {
-		return "", nil
+		return ""
 	}
 	b, err := json.Marshal(merged)
 	if err != nil {
-		return "", fmt.Errorf("failed to serialize resolved docker config: %w", err)
+		log.Printf("[cloudvm] WARNING dropping imagePullSecrets of %s: %v", namespace, err)
+		return ""
 	}
-	return string(b), nil
+	return string(b)
+}
+
+// pullSecretData returns the named Secret's data from the request, or from resolver when the request lacks it.
+func pullSecretData(ctx context.Context, provided []corev1.Secret, resolver SecretResolver, namespace, name string) (map[string][]byte, error) {
+	for _, sec := range provided {
+		if sec.Name == name && (sec.Namespace == "" || sec.Namespace == namespace) {
+			return sec.Data, nil
+		}
+	}
+	if resolver == nil {
+		return nil, fmt.Errorf("secret not in the create request and no Kubernetes API access")
+	}
+	return resolver.GetSecret(ctx, namespace, name)
 }
 
 // Annotation keys for Docker registry credentials on Pods.
