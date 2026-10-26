@@ -757,7 +757,7 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 
 	var failures []string
 	for i, region := range regions {
-		inst, err := p.launchInRegion(ctx, spec, region, i == 0, instanceTypes)
+		inst, err := p.launchInRegion(ctx, spec.forLaunchRegion(region), region, i == 0, instanceTypes)
 		if err == nil {
 			inst.Metadata["launchRegion"] = region
 			if i > 0 {

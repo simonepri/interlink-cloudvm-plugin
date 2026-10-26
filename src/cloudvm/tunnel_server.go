@@ -105,39 +105,101 @@ func (s *Server) ValidateTunnelToken(_ context.Context, instanceID, token string
 	return nil
 }
 
-// applyTunnelSpec stamps the endpoint, transport and mesh credentials of the spec's region onto a launch spec.
+// TunnelRoute is the path and endpoint a worker launched in one region uses to reach the gateway.
+type TunnelRoute struct {
+	Transport string `json:"transport"`
+	Endpoint  string `json:"endpoint,omitempty"`
+	GatewayIP string `json:"gatewayIP,omitempty"`
+}
+
+// route resolves the tunnel route of workers launched in region, failing when a setting its transport needs is unset.
+func (t *tunnelState) route(region, meshKey string) (TunnelRoute, error) {
+	transport := t.Transports.For(region)
+	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint}
+	if transport == TunnelTransportPublic {
+		route.Endpoint = t.PublicEndpoint
+		return route, nil
+	}
+	if t.Endpoint == "" {
+		return TunnelRoute{}, fmt.Errorf("region %q uses the %s tunnel transport but TUNNEL_ENDPOINT is not set", region, transport)
+	}
+	if transport == TunnelTransportRouter {
+		route.GatewayIP = t.GatewayIP
+	} else if meshKey == "" {
+		return TunnelRoute{}, fmt.Errorf("region %q uses the tailnet tunnel transport but TAILSCALE_AUTHKEY is not set", region)
+	}
+	return route, nil
+}
+
+// applyTunnelSpec resolves the tunnel route of the pinned region and of every candidate region onto a launch spec.
+// The pinned route must resolve; a candidate whose route does not is left out, and the provider skips it.
 func (s *Server) applyTunnelSpec(spec *InstanceSpec) error {
 	t := s.tunnelConfig()
 	if t == nil || spec == nil {
 		return nil
 	}
-	transport := t.Transports.For(spec.Region)
-	spec.TunnelTransport = string(transport)
+	meshKey := spec.MeshAuthKey
+	if t.MeshAuthKey != "" {
+		meshKey = t.MeshAuthKey
+	}
+	pinned, err := t.route(spec.Region, meshKey)
+	if err != nil {
+		return err
+	}
+	routes := map[string]TunnelRoute{spec.Region: pinned}
+	for _, region := range spec.CandidateRegions {
+		if _, ok := routes[region]; ok || region == "" {
+			continue
+		}
+		route, err := t.route(region, meshKey)
+		if err != nil {
+			log.Printf("[cloudvm-tunnel] Candidate region unusable for %s/%s: %v", //nolint:gosec // sanitized
+				sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(err.Error()))
+			continue
+		}
+		routes[region] = route
+	}
+	spec.TunnelRoutes = routes
 	spec.RunnerDirectHTTP = t.DirectFallback
-	if transport != TunnelTransportPublic && t.Endpoint == "" {
-		return fmt.Errorf("region %q uses the %s tunnel transport but TUNNEL_ENDPOINT is not set", spec.Region, transport)
-	}
-	switch transport {
-	case TunnelTransportRouter:
-		spec.TunnelEndpoint = t.Endpoint
-		spec.TunnelGatewayIP = t.GatewayIP
-	case TunnelTransportPublic:
-		spec.TunnelEndpoint = t.PublicEndpoint
-	default:
-		spec.TunnelEndpoint = t.Endpoint
-		spec.MeshTags = t.MeshTags
-		if t.MeshAuthKey != "" {
-			spec.MeshAuthKey = t.MeshAuthKey
+	spec.applyTunnelRoute(pinned)
+
+	// Only tailnet workers join the mesh, so the key travels with the spec only when some route needs it; the
+	// cloud-init renderer drops it again for router and public workers.
+	spec.MeshAuthKey, spec.MeshTags = "", ""
+	for _, route := range routes {
+		if route.Transport == string(TunnelTransportTailnet) {
+			spec.MeshAuthKey, spec.MeshTags = meshKey, t.MeshTags
+			break
 		}
-		if spec.MeshAuthKey == "" {
-			return fmt.Errorf("region %q uses the tailnet tunnel transport but TAILSCALE_AUTHKEY is not set", spec.Region)
-		}
-		return nil
 	}
-	// Router and public workers never join the tailnet, so a pod-supplied key must not reach their user data.
-	spec.MeshAuthKey = ""
-	spec.MeshTags = ""
 	return nil
+}
+
+// applyTunnelRoute sets the tunnel fields the cloud-init renderer reads.
+func (spec *InstanceSpec) applyTunnelRoute(route TunnelRoute) {
+	spec.TunnelTransport = route.Transport
+	spec.TunnelEndpoint = route.Endpoint
+	spec.TunnelGatewayIP = route.GatewayIP
+}
+
+// hasTunnelRoute reports whether a launch may use region: every region may when the spec carries no routes.
+func (spec *InstanceSpec) hasTunnelRoute(region string) bool {
+	if spec.TunnelRoutes == nil {
+		return true
+	}
+	_, ok := spec.TunnelRoutes[region]
+	return ok
+}
+
+// forLaunchRegion returns spec with the tunnel route of region, the region the VM is actually launched in.
+func (spec *InstanceSpec) forLaunchRegion(region string) *InstanceSpec {
+	route, ok := spec.TunnelRoutes[region]
+	if !ok {
+		return spec
+	}
+	out := *spec
+	out.applyTunnelRoute(route)
+	return &out
 }
 
 // encryptMeshAuthKey moves the mesh auth key into a KMS envelope so only ciphertext reaches user data.

@@ -527,3 +527,77 @@ CLOUDVM_SERIAL="` + console + `"
 		t.Fatalf("log file got %q", got)
 	}
 }
+
+func TestApplyTunnelSpec_ResolvesEveryCandidateRegion(t *testing.T) {
+	server := NewServer(NewMockProvider(), "test-cluster")
+	server.EnableTunnel(TunnelSettings{
+		Endpoint:       "tunnel.example.internal:443",
+		Transports:     TunnelTransports{"us-west-2": TunnelTransportRouter, "eu-west-1": TunnelTransportPublic},
+		GatewayIP:      "192.0.2.10",
+		PublicEndpoint: "tunnel.example.com:443",
+		MeshAuthKey:    "tskey-auth-test",
+	})
+	spec := &InstanceSpec{Region: "us-west-2", CandidateRegions: []string{"eu-west-1", "us-east-1"}}
+	if err := server.applyTunnelSpec(spec); err != nil {
+		t.Fatalf("applyTunnelSpec: %v", err)
+	}
+	want := map[string]TunnelRoute{
+		"us-west-2": {Transport: "router", Endpoint: "tunnel.example.internal:443", GatewayIP: "192.0.2.10"},
+		"eu-west-1": {Transport: "public", Endpoint: "tunnel.example.com:443"},
+		"us-east-1": {Transport: "tailnet", Endpoint: "tunnel.example.internal:443"},
+	}
+	for region, route := range want {
+		if got := spec.TunnelRoutes[region]; got != route {
+			t.Errorf("route of %s = %+v, want %+v", region, got, route)
+		}
+	}
+	if spec.TunnelTransport != "router" || spec.TunnelGatewayIP != "192.0.2.10" {
+		t.Errorf("pinned fields must hold the pinned region's route: %+v", spec)
+	}
+	if spec.MeshAuthKey != "tskey-auth-test" || spec.MeshTags != DefaultMeshTags {
+		t.Errorf("the tailnet candidate needs the mesh key on the spec: %+v", spec)
+	}
+
+	public := spec.forLaunchRegion("eu-west-1")
+	if public.TunnelTransport != "public" || public.TunnelEndpoint != "tunnel.example.com:443" || public.TunnelGatewayIP != "" {
+		t.Errorf("forLaunchRegion(eu-west-1) = %+v, want the public route", public)
+	}
+	if spec.TunnelTransport != "router" {
+		t.Errorf("forLaunchRegion must not modify the original spec")
+	}
+}
+
+func TestApplyTunnelSpec_DropsCandidateWithoutSettings(t *testing.T) {
+	server := NewServer(NewMockProvider(), "test-cluster")
+	server.EnableTunnel(TunnelSettings{
+		Endpoint:   "tunnel.example.internal:443",
+		Transports: TunnelTransports{"us-west-2": TunnelTransportRouter},
+		GatewayIP:  "192.0.2.10",
+	})
+	spec := &InstanceSpec{Region: "us-west-2", CandidateRegions: []string{"us-east-1"}}
+	if err := server.applyTunnelSpec(spec); err != nil {
+		t.Fatalf("a candidate without a mesh key must not fail the launch: %v", err)
+	}
+	if spec.hasTunnelRoute("us-east-1") || !spec.hasTunnelRoute("us-west-2") {
+		t.Errorf("routes = %+v, want only the pinned router region", spec.TunnelRoutes)
+	}
+	if spec.MeshAuthKey != "" {
+		t.Errorf("no route uses tailnet, so the spec must carry no mesh key")
+	}
+}
+
+func TestRenderCloudInit_DropsMeshKeyOutsideTailnet(t *testing.T) {
+	for _, transport := range []string{"router", "public"} {
+		out, err := RenderCloudInit(&CloudInitConfig{
+			PodName: "p", Region: "eu-west-1", RunnerAuthToken: "runner-secret", TargetContainerImage: "alpine",
+			TunnelEndpoint: "tunnel.example.com:443", TunnelTransport: transport, TunnelGatewayIP: "192.0.2.10",
+			MeshAuthKey: "tskey-auth-test", MeshTags: DefaultMeshTags,
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", transport, err)
+		}
+		if strings.Contains(out, "tskey-auth-test") || strings.Contains(out, "tailscale up") {
+			t.Errorf("%s user data must not join the tailnet", transport)
+		}
+	}
+}
