@@ -74,6 +74,7 @@ type Server struct {
 	statusPolled          bool                                 // set true when first /status query is received
 	launchTokens          map[string]string                    // podUID -> runnerAuthToken (reused across retries)
 	completedPods         map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
+	statusErrLogged       map[string]time.Time                 // podUID -> when its last runner status error was logged
 	inFlightCreates       map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
 	podLogs               *PodLogBuffer                        // recent container output served to kubectl logs
 	logForwarder          *OTLPLogForwarder                    // optional OTLP export of worker logs
@@ -1504,6 +1505,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								}
 								cResult, err := s.runner.GetStatus(r.Context(), node, tgt.uid)
 								if err != nil {
+									s.logStatusError(tgt.uid, node.InstanceID, err)
 									status.Ready = false
 									status.State.Waiting = &ContainerWaitingState{
 										Reason:  "ContainerCreating",
@@ -1659,6 +1661,27 @@ func specContainerStatuses(spec statusPodSpec, workload ContainerStatus) (contai
 		})
 	}
 	return containers, initContainers
+}
+
+// statusErrLogInterval spaces repeated runner status error logs of one pod.
+const statusErrLogInterval = 10 * time.Minute
+
+// logStatusError logs a failed runner status call at most once per interval for each pod, so a runner that keeps
+// answering with errors shows up in the logs without flooding them on every status poll.
+func (s *Server) logStatusError(uid, instanceID string, err error) {
+	s.mu.Lock()
+	if s.statusErrLogged == nil {
+		s.statusErrLogged = map[string]time.Time{}
+	}
+	last, seen := s.statusErrLogged[uid]
+	due := !seen || time.Since(last) >= statusErrLogInterval
+	if due {
+		s.statusErrLogged[uid] = time.Now()
+	}
+	s.mu.Unlock()
+	if due {
+		log.Printf("[cloudvm] Runner status call for pod %s on %s failed: %v", sanitizeLog(uid), sanitizeLog(instanceID), sanitizeLog(err.Error())) //nolint:gosec // sanitized
+	}
 }
 
 // recordRunnerTermination marks a pod terminated with the runner's exit code, reason, and message and persists it.

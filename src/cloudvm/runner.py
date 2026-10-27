@@ -122,6 +122,12 @@ def pull_image(img, auth_cfg, lazy):
         if cfg_dir:
             shutil.rmtree(cfg_dir, ignore_errors=True)
 
+def clean_time(value):
+    """Returns value when it is an RFC 3339 timestamp, else Go's zero time, which the plugin decodes as unset."""
+    if isinstance(value, str) and re.match(r'^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}:\d{2})$', value):
+        return value
+    return "0001-01-01T00:00:00Z"
+
 def get_pod_lock(uid):
     with pod_locks_guard:
         if uid not in pod_locks:
@@ -260,8 +266,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     status_str = state.get('Status', '')
                     running = state.get('Running', False)
                     exit_code = state.get('ExitCode', 0)
-                    started_at = state.get('StartedAt', '')
-                    finished_at = state.get('FinishedAt', '')
+                    started_at = clean_time(state.get('StartedAt'))
+                    finished_at = clean_time(state.get('FinishedAt'))
                     start_error = state.get('Error', '')
                     message = ''
                     if not running and start_error:

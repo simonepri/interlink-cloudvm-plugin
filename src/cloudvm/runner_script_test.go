@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -344,5 +345,34 @@ func TestRunnerScript_StargzUnpackErrorFallsBackToDefaultSnapshotter(t *testing.
 	run, _ := os.ReadFile(filepath.Join(state, "run"))
 	if strings.Contains(string(run), "--snapshotter") || !strings.Contains(string(run), "ghcr.io/example/app:1") {
 		t.Errorf("run must use the default snapshotter the image was pulled into, got %q", run)
+	}
+}
+
+// fakeRunningNerdctl reports a running container the way nerdctl does: no finish time, and a start time with sub-second digits.
+const fakeRunningNerdctl = `#!/usr/bin/env bash
+case "$1" in
+  inspect) printf '[{"State":{"Status":"running","Running":true,"Pid":42,"ExitCode":0,"StartedAt":"2026-01-02T03:04:05.123456789Z","FinishedAt":""}}]'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`
+
+func TestRunnerScript_RunningContainerStatusDecodesInGoClient(t *testing.T) {
+	h := newRunnerHarness(t)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(h.script), "bin", "nerdctl"), []byte(fakeRunningNerdctl), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	defer h.start()()
+
+	var port int
+	if _, err := fmt.Sscanf(h.url, "http://127.0.0.1:%d", &port); err != nil {
+		t.Fatal(err)
+	}
+	node := &CloudVMNode{InstanceID: "i-running", MeshIP: "127.0.0.1", RunnerAuthToken: h.token}
+	res, err := NewHTTPContainerRunner(port).GetStatus(context.Background(), node, "running-pod")
+	if err != nil {
+		t.Fatalf("GetStatus must decode the runner's reply for a running container: %v", err)
+	}
+	if !res.Running || res.Status != "running" || res.StartedAt.IsZero() {
+		t.Errorf("want a running container with its start time, got %+v", res)
 	}
 }
