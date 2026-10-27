@@ -161,7 +161,7 @@ type TunnelGateway struct {
 	onReject            func(reason string)
 	logSink             WorkerLogSink
 	resolver            InstanceAddressResolver
-	directTCP           bool
+	directTCPNetworks   []*net.IPNet
 	closeOnce           sync.Once
 	closed              chan struct{}
 }
@@ -182,8 +182,9 @@ type TunnelGatewayConfig struct {
 	IdentityValidator func(ctx context.Context, req *TunnelHandshakeRequest) error
 	// Resolver maps a worker VM address to its instance, so tcp streams and CONNECT requests reach that worker.
 	Resolver InstanceAddressResolver
-	// DirectTCP lets workers' tcp streams connect to any address the gateway can reach, not only other workers.
-	DirectTCP bool
+	// DirectTCPNetworks lists the networks workers' tcp streams may reach directly, besides other workers, on ports
+	// from 1024 up; direct forwarding is off when empty.
+	DirectTCPNetworks []*net.IPNet
 }
 
 // WorkerLogSink consumes the newline-delimited WorkerLogRecord stream a worker opens on its tunnel session.
@@ -231,7 +232,7 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		onReject:            cfg.OnReject,
 		logSink:             cfg.LogSink,
 		resolver:            cfg.Resolver,
-		directTCP:           cfg.DirectTCP,
+		directTCPNetworks:   cfg.DirectTCPNetworks,
 		closed:              make(chan struct{}),
 	}
 	return gw, nil
