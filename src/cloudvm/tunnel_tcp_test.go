@@ -19,7 +19,12 @@ import (
 
 func startEchoServer(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	return startEchoServerOn(t, "127.0.0.1:0")
+}
+
+func startEchoServerOn(t *testing.T, addr string) string {
+	t.Helper()
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		t.Fatalf("echo listen: %v", err)
 	}
@@ -141,6 +146,8 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 		"CLOUDVM_ATTESTATION_FILE="+filepath.Join(dir, "absent"),
 		"CLOUDVM_CONTAINER_LOGS=0",
 		fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort),
+		// The gateway forwards only to 127.0.0.0/8, so a target on ::1 succeeds only when the agent connects it directly.
+		"CLOUDVM_DIRECT_CIDRS=::1/128",
 	)
 	cmd.Stderr = &agentLog
 	if err := cmd.Start(); err != nil {
@@ -170,6 +177,9 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 	})
 	t.Run("worker to worker", func(t *testing.T) {
 		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, echoPort))
+	})
+	t.Run("worker connects its direct networks without the tunnel", func(t *testing.T) {
+		connectAndEcho(t, agentProxy, startEchoServerOn(t, "[::1]:0"))
 	})
 	t.Run("a reset on the worker closes the cluster connection", func(t *testing.T) {
 		_, resetPort, _ := net.SplitHostPort(startResetServer(t))

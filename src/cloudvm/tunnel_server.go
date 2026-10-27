@@ -29,6 +29,8 @@ type TunnelSettings struct {
 	Endpoint string
 	// Transports maps each region to the path its workers take to the gateway; unlisted regions use tailnet.
 	Transports TunnelTransports
+	// DirectCIDRs maps each region to the private networks its workers reach each other on without the tunnel.
+	DirectCIDRs map[string][]string
 	// GatewayIP is the gateway ClusterIP router workers pin the Endpoint host to.
 	GatewayIP string
 	// PublicEndpoint is the host:port of the public listener public workers dial.
@@ -107,15 +109,16 @@ func (s *Server) ValidateTunnelToken(_ context.Context, instanceID, token string
 
 // TunnelRoute is the path and endpoint a worker launched in one region uses to reach the gateway.
 type TunnelRoute struct {
-	Transport string `json:"transport"`
-	Endpoint  string `json:"endpoint,omitempty"`
-	GatewayIP string `json:"gatewayIP,omitempty"`
+	Transport   string   `json:"transport"`
+	Endpoint    string   `json:"endpoint,omitempty"`
+	GatewayIP   string   `json:"gatewayIP,omitempty"`
+	DirectCIDRs []string `json:"directCidrs,omitempty"`
 }
 
 // route resolves the tunnel route of workers launched in region, failing when a setting its transport needs is unset.
 func (t *tunnelState) route(region, meshKey string) (TunnelRoute, error) {
 	transport := t.Transports.For(region)
-	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint}
+	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region]}
 	if transport == TunnelTransportPublic {
 		route.Endpoint = t.PublicEndpoint
 		return route, nil
@@ -180,6 +183,7 @@ func (spec *InstanceSpec) applyTunnelRoute(route TunnelRoute) {
 	spec.TunnelTransport = route.Transport
 	spec.TunnelEndpoint = route.Endpoint
 	spec.TunnelGatewayIP = route.GatewayIP
+	spec.TunnelDirectCIDRs = route.DirectCIDRs
 }
 
 // hasTunnelRoute reports whether a launch may use region: every region may when the spec carries no routes.

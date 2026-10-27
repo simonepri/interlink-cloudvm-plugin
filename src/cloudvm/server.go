@@ -299,6 +299,7 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		TunnelEndpoint:        spec.TunnelEndpoint,
 		TunnelTransport:       spec.TunnelTransport,
 		TunnelGatewayIP:       spec.TunnelGatewayIP,
+		TunnelDirectCIDRs:     spec.TunnelDirectCIDRs,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                spec.Region,
 		InstanceType:          spec.InstanceType,

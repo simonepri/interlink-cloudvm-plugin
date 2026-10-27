@@ -601,6 +601,8 @@ With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers ca
 
 The plugin refuses to start when a transport in use lacks its variable or `CLUSTER_FACTS` names an unknown transport.
 
+`regions.<region>.directCidrs` lists the private networks that region's workers share, such as the region's worker VPC. A worker's local CONNECT proxy on `127.0.0.1:13128` connects targets inside those networks directly and carries every other target through the tunnel, so traffic between workers of one region stays inside its network. The plugin refuses to start when an entry is not a CIDR.
+
 `/metrics` exports `cloudvm_tunnel_sessions{region}` and `cloudvm_tunnel_handshake_rejections_total{reason}`. Sessions live in one plugin process, so run a single replica while the tunnel is enabled.
 
 ### AWS KMS Runner Token Encryption

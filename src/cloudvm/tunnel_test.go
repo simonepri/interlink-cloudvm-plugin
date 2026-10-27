@@ -22,8 +22,8 @@ func TestDefaultYamuxConfig(t *testing.T) {
 	if cfg.KeepAliveInterval != 30*time.Second {
 		t.Errorf("expected KeepAliveInterval 30s, got %v", cfg.KeepAliveInterval)
 	}
-	if cfg.MaxStreamWindowSize != 256*1024 {
-		t.Errorf("expected MaxStreamWindowSize 64 KiB, got %d", cfg.MaxStreamWindowSize)
+	if cfg.MaxStreamWindowSize != 2*1024*1024 {
+		t.Errorf("expected MaxStreamWindowSize 2 MiB, got %d", cfg.MaxStreamWindowSize)
 	}
 }
 

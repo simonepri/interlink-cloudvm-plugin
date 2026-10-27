@@ -42,6 +42,7 @@ type CloudInitConfig struct {
 	TunnelEndpoint         string
 	TunnelTransport        string
 	TunnelGatewayIP        string
+	TunnelDirectCIDRs      []string
 	RunnerDirectHTTP       bool
 	Region                 string
 	InstanceType           string
@@ -93,6 +94,11 @@ func kmsKeyRegion(keyID, fallback string) string {
 		return parts[3]
 	}
 	return fallback
+}
+
+// DirectCIDRList returns the comma-separated private networks the worker's agent dials without the tunnel.
+func (c *CloudInitConfig) DirectCIDRList() string {
+	return strings.Join(c.TunnelDirectCIDRs, ",")
 }
 
 // TunnelHost returns the hostname the worker dials and verifies the gateway certificate against.
@@ -1116,6 +1122,7 @@ cat << 'TUNNEL_AGENT_EOF' > /usr/local/bin/cloudvm-tunnel-agent.py
 TUNNEL_AGENT_EOF
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
 CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
+  CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" \
   nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
 {{end}}
 
