@@ -168,6 +168,8 @@ type RegionalClusterFact struct {
 	TunnelTransport string `json:"tunnelTransport,omitempty"`
 	// DirectCIDRs are the private networks the region's workers reach each other on without the tunnel.
 	DirectCIDRs []string `json:"directCidrs,omitempty"`
+	// ImageMirrors maps an upstream registry host to the mirror reference prefix the region's workers pull from instead.
+	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
 }
 
 // ClusterFacts holds the regional deployment facts for dynamic Launch Template and subnet selection.
@@ -988,6 +990,7 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		TunnelTransport:       spec.TunnelTransport,
 		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		TunnelDirectCIDRs:     spec.TunnelDirectCIDRs,
+		ImageMirrors:          spec.ImageMirrors,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		TargetContainerImage:  spec.TargetContainerImage,
 		Command:               spec.Command,

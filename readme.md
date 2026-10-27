@@ -622,6 +622,8 @@ The plugin refuses to start when a transport in use lacks its variable or `CLUST
 
 `regions.<region>.directCidrs` lists the private networks that region's workers share, such as the region's worker VPC. A worker's local CONNECT proxy on `127.0.0.1:13128` connects targets inside those networks directly and carries every other target through the tunnel, so traffic between workers of one region stays inside its network. The plugin refuses to start when an entry is not a CIDR.
 
+`regions.<region>.imageMirrors` maps an upstream registry host to the mirror reference prefix that region's workers pull from, for example `{"docker.io": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}`. The in-VM runner rewrites an image whose registry host matches before pulling: `rayproject/ray:2.9` becomes `<prefix>/rayproject/ray:2.9`, Docker Hub images without a namespace gain `library/`, and a digest stays attached. ECR mirrors authenticate through the ECR credential helper with the VM's instance role. The plugin refuses to start when a host is not a bare registry host or a prefix is empty or carries a scheme. Mirrors apply only when the tunnel is enabled, because the region facts reach workers through the tunnel route.
+
 `/metrics` exports `cloudvm_tunnel_sessions{region}` and `cloudvm_tunnel_handshake_rejections_total{reason}`. Sessions live in one plugin process, so run a single replica while the tunnel is enabled.
 
 ### AWS KMS Runner Token Encryption

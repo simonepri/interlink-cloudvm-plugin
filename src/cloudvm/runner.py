@@ -1,4 +1,4 @@
-"""In-VM container runner: serves the plugin's create, status, logs, and delete calls by driving the VM's container engine.
+"""In-VM container runner: serves the plugin's create, status, logs, and delete calls by driving the VM's containerd through nerdctl.
 
 The bootstrap sets CLOUDVM_RUNNER_BIND and CLOUDVM_RUNNER_CONCURRENCY; the plugin reaches it through the tunnel agent.
 """
@@ -15,6 +15,10 @@ import time
 import urllib.parse
 
 PORT = 9090
+CONTAINER_CLI = 'nerdctl'
+STARGZ_SOCKET = '/run/containerd-stargz-grpc/containerd-stargz-grpc.sock'
+IMAGE_MIRRORS_PATH = '/etc/cloudvm/image-mirrors.json'
+DOCKER_HUB_HOSTS = ('docker.io', 'index.docker.io', 'registry-1.docker.io')
 AUTH_TOKEN = ""
 try:
     with open('/etc/cloudvm/runner-token', 'r') as f:
@@ -28,7 +32,44 @@ starting_pods = set()
 start_failures = {}
 DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)
 RUNNER_CONCURRENCY = int(os.environ.get("CLOUDVM_RUNNER_CONCURRENCY") or DEFAULT_RUNNER_CONCURRENCY)
-DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)
+CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)
+
+def snapshotter_args():
+    # Lazy pulls need the stargz snapshotter; without it containerd's default snapshotter pulls in full.
+    return ['--snapshotter=stargz'] if os.path.exists(STARGZ_SOCKET) else []
+
+def split_image_ref(ref):
+    """Returns the registry host and the repository path plus tag or digest of an image reference."""
+    first, sep, rest = ref.partition('/')
+    if sep and ('.' in first or ':' in first or first == 'localhost'):
+        host, path = first, rest
+    else:
+        host, path = 'docker.io', ref
+    if host in DOCKER_HUB_HOSTS:
+        host = 'docker.io'
+        if '/' not in path:
+            path = 'library/' + path
+    return host, path
+
+def rewrite_image(ref):
+    """Points a reference at the regional mirror configured for its registry; tags and digests carry over."""
+    try:
+        with open(IMAGE_MIRRORS_PATH, 'r') as f:
+            prefix = json.load(f).get(split_image_ref(ref)[0])
+    except Exception:
+        return ref
+    return prefix.rstrip('/') + '/' + split_image_ref(ref)[1] if prefix else ref
+
+def pull_config(auth_cfg, image):
+    """Adds the ECR credential helper for the image's registry to the pod's pull secrets."""
+    try:
+        cfg = json.loads(auth_cfg) if isinstance(auth_cfg, str) else dict(auth_cfg)
+    except Exception:
+        cfg = {}
+    host = image.split('/')[0]
+    if '.dkr.ecr.' in host:
+        cfg.setdefault('credHelpers', {})[host] = 'ecr-login'
+    return cfg
 
 def get_pod_lock(uid):
     with pod_locks_guard:
@@ -67,6 +108,12 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def reply(self, code, body):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(body if isinstance(body, bytes) else body.encode('utf-8'))
+
     def check_auth(self):
         global AUTH_TOKEN
         if not AUTH_TOKEN:
@@ -76,20 +123,14 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
         if not AUTH_TOKEN:
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"error":"auth_token_not_configured"}')
+            self.reply(500, b'{"error":"auth_token_not_configured"}')
             return False
         auth_header = self.headers.get('Authorization', '')
         expected = f"Bearer {AUTH_TOKEN}"
         if hmac.compare_digest(auth_header, expected):
             record_heartbeat()
             return True
-        self.send_response(401)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(b'{"error":"unauthorized"}')
+        self.reply(401, b'{"error":"unauthorized"}')
         return False
 
     def do_GET(self):
@@ -98,10 +139,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             if self.headers.get('Authorization', ''):
                 if not self.check_auth():
                     return
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            self.reply(200, b'{"status":"ok"}')
             return
 
         if not self.check_auth():
@@ -114,24 +152,21 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 "networkRxBytes": rx_bytes,
                 "networkTxBytes": tx_bytes,
             }
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(resp).encode('utf-8'))
+            self.reply(200, json.dumps(resp))
             return
 
         if parsed.path == '/containers/list':
             results = []
             try:
-                res = subprocess.run(['docker', 'ps', '--filter', 'name=cloudvm-', '--filter', 'status=running', '--format', '{{.ID}}	{{.Names}}	{{.State}}	{{.Status}}'], capture_output=True, text=True)
+                res = subprocess.run([CONTAINER_CLI, 'ps', '--filter', 'name=cloudvm-', '--filter', 'status=running', '--format', '{{.ID}}\t{{.Names}}\t{{.Status}}'], capture_output=True, text=True)
                 if res.returncode == 0:
                     for line in res.stdout.strip().splitlines():
                         if not line:
                             continue
-                        parts = line.split('	')
-                        if len(parts) >= 3:
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
                             name = parts[1]
-                            state = parts[2]
+                            state = 'running'
                             uid = name.removeprefix('cloudvm-')
                             results.append({
                                 "podUID": uid,
@@ -140,10 +175,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                             })
             except Exception:
                 pass
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(results).encode('utf-8'))
+            self.reply(200, json.dumps(results))
             return
 
         if parsed.path == '/containers/status':
@@ -151,7 +183,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             pod_uid = params.get('podUID', [''])[0]
             container_name = f"cloudvm-{pod_uid}"
             rx_bytes, tx_bytes = get_network_bytes()
-            # A recorded start failure wins over docker inspect: a failed docker run can leave the container in "created".
+            # A recorded start failure wins over inspect: a failed run can leave the container in "created".
             with get_pod_lock(pod_uid):
                 failure = start_failures.get(pod_uid)
             if failure is not None:
@@ -167,13 +199,10 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     "networkRxBytes": rx_bytes,
                     "networkTxBytes": tx_bytes,
                 }
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(resp).encode('utf-8'))
+                self.reply(200, json.dumps(resp))
                 return
             try:
-                res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
+                res = subprocess.run([CONTAINER_CLI, 'inspect', container_name], capture_output=True, text=True)
                 if res.returncode == 0:
                     data = json.loads(res.stdout)[0]
                     state = data.get('State', {})
@@ -185,7 +214,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     start_error = state.get('Error', '')
                     message = ''
                     if not running and start_error:
-                        # Docker records why it could not start the container, such as a missing GPU device driver.
+                        # The engine may record why it could not start the container, such as a missing GPU device driver.
                         status_str = 'dead'
                         exit_code = exit_code or 1
                         reason = "StartError"
@@ -193,7 +222,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         reason = "Running" if running else (
                             "ContainerCreating" if status_str in ("created", "starting") else (
-                                ("Completed" if exit_code == 0 else "Error") if status_str in ("exited", "dead") else status_str.capitalize()
+                                ("Completed" if exit_code == 0 else "Error") if status_str in ("exited", "stopped", "dead") else status_str.capitalize()
                             )
                         )
                     resp = {
@@ -208,10 +237,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "networkRxBytes": rx_bytes,
                         "networkTxBytes": tx_bytes,
                     }
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(resp).encode('utf-8'))
+                    self.reply(200, json.dumps(resp))
                     return
             except Exception:
                 pass
@@ -229,10 +255,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "networkRxBytes": rx_bytes,
                         "networkTxBytes": tx_bytes,
                     }
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(resp).encode('utf-8'))
+                    self.reply(200, json.dumps(resp))
                     return
 
             self.send_response(404)
@@ -256,7 +279,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
                 try:
-                    subprocess.run(['docker', 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
+                    subprocess.run([CONTAINER_CLI, 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
                 except Exception:
                     pass
             self.send_response(200)
@@ -265,10 +288,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == '/containers/start':
             if os.path.exists('/tmp/cloudvm-shutting-down'):
-                self.send_response(503)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"error": "node is shutting down"}')
+                self.reply(503, b'{"error": "node is shutting down"}')
                 return
 
             length = int(self.headers.get('Content-Length', 0))
@@ -283,60 +303,31 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             pod_uid = str(req.get('podUID', 'unknown'))
             container_name = f"cloudvm-{pod_uid}"
 
-            run_as_user = req.get('runAsUser')
-            run_as_group = req.get('runAsGroup')
-
-            user_val = None
-            group_val = None
-
-            if run_as_user is not None:
+            ids = {}
+            for field in ('runAsUser', 'runAsGroup'):
+                if req.get(field) is None:
+                    continue
                 try:
-                    user_val = int(run_as_user)
+                    ids[field] = int(req[field])
                 except (ValueError, TypeError):
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"invalid runAsUser"}')
+                    self.reply(400, json.dumps({"error": f"invalid {field}"}))
                     return
-                if user_val == 0:
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"runAsUser 0 is forbidden on host network"}')
+                if ids[field] == 0:
+                    self.reply(400, json.dumps({"error": f"{field} 0 is forbidden on host network"}))
                     return
-
-            if run_as_group is not None:
-                try:
-                    group_val = int(run_as_group)
-                except (ValueError, TypeError):
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"invalid runAsGroup"}')
-                    return
-                if group_val == 0:
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"error":"runAsGroup 0 is forbidden on host network"}')
-                    return
+            user_val = ids.get('runAsUser')
+            group_val = ids.get('runAsGroup')
 
             plock = get_pod_lock(pod_uid)
             with plock:
                 if pod_uid in starting_pods:
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"already_starting"}')
+                    self.reply(200, b'{"status":"already_starting"}')
                     return
 
                 try:
-                    inspect_res = subprocess.run(['docker', 'inspect', container_name], capture_output=True, text=True)
+                    inspect_res = subprocess.run([CONTAINER_CLI, 'inspect', container_name], capture_output=True, text=True)
                     if inspect_res.returncode == 0:
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'application/json')
-                        self.end_headers()
-                        self.wfile.write(b'{"status":"already_exists"}')
+                        self.reply(200, b'{"status":"already_exists"}')
                         return
                 except Exception:
                     pass
@@ -344,7 +335,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 starting_pods.add(pod_uid)
                 start_failures.pop(pod_uid, None)
 
-            image = str(req.get('image', ''))
+            image = rewrite_image(str(req.get('image', '')))
             gpus = req.get('assignedGPUs', [])
             env = req.get('env', {})
             cmd = req.get('command', [])
@@ -374,8 +365,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             else:
                 user_flag = "--user=65532:65532"
 
-            docker_cmd = [
-                'docker', 'run', '-d',
+            run_cmd = [
+                CONTAINER_CLI, *snapshotter_args(), 'run', '-d',
                 '--name', container_name,
                 '--net=host',
                 '--cap-drop=SETUID',
@@ -385,20 +376,20 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 shm_flag,
             ]
             if cpu_milli and cpu_milli > 0:
-                docker_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
+                run_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
             if mem_bytes and mem_bytes > 0:
-                docker_cmd.extend(['--memory', str(mem_bytes)])
+                run_cmd.extend(['--memory', str(mem_bytes)])
             if gpus:
                 gpu_devs = ','.join(str(g) for g in gpus)
-                gpu_spec = f'"device={gpu_devs}"' if len(gpus) > 1 else f"device={gpu_devs}"
-                docker_cmd.extend(['--gpus', gpu_spec])
+                gpu_spec = f'"device={gpu_devs}"'
+                run_cmd.extend(['--gpus', gpu_spec])
             for k, v in env.items():
-                docker_cmd.extend(['-e', f"{k}={v}"])
-            docker_cmd.append(image)
+                run_cmd.extend(['-e', f"{k}={v}"])
+            run_cmd.append(image)
             if isinstance(cmd, list):
-                docker_cmd.extend(cmd)
+                run_cmd.extend(cmd)
             if isinstance(args, list):
-                docker_cmd.extend(args)
+                run_cmd.extend(args)
 
             docker_cfg = req.get('dockerConfigJSON')
 
@@ -410,19 +401,19 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         cfg_dir = tempfile.mkdtemp(prefix=f"docker-cfg-{uid}-")
                         cfg_path = os.path.join(cfg_dir, 'config.json')
                         with open(cfg_path, 'w', encoding='utf-8') as cf:
-                            cf.write(auth_cfg if isinstance(auth_cfg, str) else json.dumps(auth_cfg))
+                            json.dump(pull_config(auth_cfg, img), cf)
                         os.chmod(cfg_path, 0o600)
                     except Exception:
                         cfg_dir = None
 
-                # 1. Pull container image using isolated ephemeral docker config
+                # 1. Pull container image using the isolated ephemeral credential config
                 pull_res = None
                 try:
-                    pull_cmd = ['docker']
+                    pull_env = dict(os.environ)
                     if cfg_dir:
-                        pull_cmd.extend(['--config', cfg_dir])
-                    pull_cmd.extend(['pull', img])
-                    pull_res = subprocess.run(pull_cmd, capture_output=True, text=True)
+                        pull_env['DOCKER_CONFIG'] = cfg_dir
+                    pull_cmd = [CONTAINER_CLI, *snapshotter_args(), 'pull', img]
+                    pull_res = subprocess.run(pull_cmd, capture_output=True, text=True, env=pull_env)
                 except Exception as e:
                     with get_pod_lock(uid):
                         starting_pods.discard(uid)
@@ -449,7 +440,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
                 # 2. Run container
                 try:
-                    with DOCKER_SEMAPHORE:
+                    with CONTAINER_SEMAPHORE:
                         res = subprocess.run(c, capture_output=True, text=True)
                     with get_pod_lock(uid):
                         starting_pods.discard(uid)
@@ -461,12 +452,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         starting_pods.discard(uid)
                         start_failures[uid] = ("StartError", str(e))
 
-            threading.Thread(target=run_async, args=(pod_uid, image, docker_cmd, docker_cfg), daemon=True).start()
+            threading.Thread(target=run_async, args=(pod_uid, image, run_cmd, docker_cfg), daemon=True).start()
 
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"status":"starting"}')
+            self.reply(200, b'{"status":"starting"}')
             return
 
         self.send_response(404)

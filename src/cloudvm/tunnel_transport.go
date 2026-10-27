@@ -107,6 +107,35 @@ func DirectCIDRsFromClusterFacts(raw string) (map[string][]string, error) {
 	return cidrs, nil
 }
 
+// ImageMirrorsFromClusterFacts reads regions.<region>.imageMirrors from the CLUSTER_FACTS JSON, rejecting a registry
+// host that is not a bare host and a mirror prefix that is empty, carries a scheme, or contains whitespace.
+func ImageMirrorsFromClusterFacts(raw string) (map[string]map[string]string, error) {
+	mirrors := map[string]map[string]string{}
+	if strings.TrimSpace(raw) == "" {
+		return mirrors, nil
+	}
+	var facts ClusterFacts
+	if err := json.Unmarshal([]byte(raw), &facts); err != nil {
+		return nil, fmt.Errorf("invalid CLUSTER_FACTS: %w", err)
+	}
+	for region, fact := range facts.Regions {
+		for host, prefix := range fact.ImageMirrors {
+			if host == "" || strings.ContainsAny(host, "/@ \t\r\n") || strings.Contains(host, "://") {
+				return nil, fmt.Errorf("CLUSTER_FACTS region %s: imageMirrors: %q is not a registry host", region, host)
+			}
+			prefix = strings.TrimRight(prefix, "/")
+			if prefix == "" || strings.ContainsAny(prefix, "@ \t\r\n") || strings.Contains(prefix, "://") || strings.HasPrefix(prefix, "/") {
+				return nil, fmt.Errorf("CLUSTER_FACTS region %s: imageMirrors[%s]: %q is not a reference prefix like registry.example.com/mirror", region, host, prefix)
+			}
+			if mirrors[region] == nil {
+				mirrors[region] = map[string]string{}
+			}
+			mirrors[region][host] = prefix
+		}
+	}
+	return mirrors, nil
+}
+
 // validateTransports fails when a transport some region uses lacks the settings it needs.
 func (s *TunnelSettings) validateTransports() error {
 	if s.Transports.privateEndpointRequired() {

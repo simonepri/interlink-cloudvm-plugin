@@ -68,6 +68,30 @@ func TestDirectCIDRsFromClusterFacts(t *testing.T) {
 	}
 }
 
+func TestImageMirrorsFromClusterFacts(t *testing.T) {
+	mirrors, err := ImageMirrorsFromClusterFacts(`{"regions":{
+		"eu-west-1":{"imageMirrors":{"docker.io":"123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub/"}},
+		"us-west-2":{"tunnelTransport":"public"}}}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := map[string]map[string]string{"eu-west-1": {"docker.io": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}}
+	if !reflect.DeepEqual(mirrors, want) {
+		t.Fatalf("got %v, want %v", mirrors, want)
+	}
+	for name, facts := range map[string]string{
+		"scheme in prefix": `{"imageMirrors":{"docker.io":"https://mirror.example.com/hub"}}`,
+		"empty prefix":     `{"imageMirrors":{"docker.io":"/"}}`,
+		"path in host":     `{"imageMirrors":{"docker.io/library":"mirror.example.com/hub"}}`,
+		"scheme in host":   `{"imageMirrors":{"https://docker.io":"mirror.example.com/hub"}}`,
+	} {
+		_, err := ImageMirrorsFromClusterFacts(`{"regions":{"eu-west-1":` + facts + `}}`)
+		if err == nil || !strings.Contains(err.Error(), "eu-west-1") {
+			t.Errorf("%s must fail naming the region, got %v", name, err)
+		}
+	}
+}
+
 const privateTunnelEndpoint = "tunnel.example.internal:443"
 
 func TestTunnelSettings_ValidateTransportsFailsFastOnMissingEnv(t *testing.T) {
@@ -550,6 +574,7 @@ func TestApplyTunnelSpec_ResolvesEveryCandidateRegion(t *testing.T) {
 		Endpoint:       "tunnel.example.internal:443",
 		Transports:     TunnelTransports{"us-west-2": TunnelTransportRouter, "eu-west-1": TunnelTransportPublic},
 		DirectCIDRs:    map[string][]string{"eu-west-1": {"10.137.0.0/16"}},
+		ImageMirrors:   map[string]map[string]string{"eu-west-1": {"docker.io": "mirror.example.com/hub"}},
 		GatewayIP:      "192.0.2.10",
 		PublicEndpoint: "tunnel.example.com:443",
 		MeshAuthKey:    "tskey-auth-test",
@@ -560,7 +585,7 @@ func TestApplyTunnelSpec_ResolvesEveryCandidateRegion(t *testing.T) {
 	}
 	want := map[string]TunnelRoute{
 		"us-west-2": {Transport: "router", Endpoint: "tunnel.example.internal:443", GatewayIP: "192.0.2.10"},
-		"eu-west-1": {Transport: "public", Endpoint: "tunnel.example.com:443", DirectCIDRs: []string{"10.137.0.0/16"}},
+		"eu-west-1": {Transport: "public", Endpoint: "tunnel.example.com:443", DirectCIDRs: []string{"10.137.0.0/16"}, ImageMirrors: map[string]string{"docker.io": "mirror.example.com/hub"}},
 		"us-east-1": {Transport: "tailnet", Endpoint: "tunnel.example.internal:443"},
 	}
 	for region, route := range want {
@@ -578,6 +603,9 @@ func TestApplyTunnelSpec_ResolvesEveryCandidateRegion(t *testing.T) {
 	public := spec.forLaunchRegion("eu-west-1")
 	if public.TunnelTransport != "public" || public.TunnelEndpoint != "tunnel.example.com:443" || public.TunnelGatewayIP != "" {
 		t.Errorf("forLaunchRegion(eu-west-1) = %+v, want the public route", public)
+	}
+	if public.ImageMirrors["docker.io"] != "mirror.example.com/hub" || spec.ImageMirrors != nil {
+		t.Errorf("image mirrors must follow the launch region: public %v, pinned %v", public.ImageMirrors, spec.ImageMirrors)
 	}
 	if spec.TunnelTransport != "router" {
 		t.Errorf("forLaunchRegion must not modify the original spec")

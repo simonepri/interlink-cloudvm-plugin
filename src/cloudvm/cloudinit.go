@@ -57,6 +57,7 @@ type CloudInitConfig struct {
 	RunAsGroup             *int64
 	DockerConfigJSON       string
 	RegistryMirrors        []string
+	ImageMirrors           map[string]string
 	OtelEndpoint           string
 	NodeProblemDetector    bool
 	CustomBootstrapScript  string
@@ -111,14 +112,34 @@ func (c *CloudInitConfig) TunnelHost() string {
 	return tunnelHost(c.TunnelEndpoint)
 }
 
-// RunnerScript returns the embedded in-VM container runner source.
+// RunnerScript returns the embedded in-VM container runner source with blank and comment-only lines stripped.
 func (c *CloudInitConfig) RunnerScript() string {
-	return runnerScript
+	return stripPythonComments(runnerScript)
 }
 
-// TunnelAgentScript returns the embedded in-VM reverse tunnel agent source.
+// TunnelAgentScript returns the embedded in-VM reverse tunnel agent source with blank and comment-only lines stripped.
 func (c *CloudInitConfig) TunnelAgentScript() string {
-	return tunnelAgentScript
+	return stripPythonComments(tunnelAgentScript)
+}
+
+// stripPythonComments drops blank and comment-only lines to keep the user data under the EC2 size limit. It keeps the
+// shebang and encoding lines and every line inside a triple-quoted string.
+func stripPythonComments(src string) string {
+	var kept []string
+	inString := false
+	for i, line := range strings.Split(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		header := i < 2 && (strings.HasPrefix(trimmed, "#!") || strings.Contains(trimmed, "coding"))
+		keep := inString || header || (trimmed != "" && !strings.HasPrefix(trimmed, "#"))
+		if strings.Count(line, `"""`)%2 == 1 || strings.Count(line, "'''")%2 == 1 {
+			inString = !inString
+			keep = true
+		}
+		if keep {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 // RunnerBindAddress returns the interface the in-VM runner listens on: loopback when only the tunnel agent may reach it.
@@ -141,7 +162,7 @@ func (c *CloudInitConfig) EffectivePodUID() string {
 	return c.PodName
 }
 
-// CPULimit formats CPUMillicores into decimal cores for docker --cpus flag.
+// CPULimit formats CPUMillicores into decimal cores for the nerdctl --cpus flag.
 func (c *CloudInitConfig) CPULimit() string {
 	if c.CPUMillicores <= 0 {
 		return ""
@@ -149,7 +170,7 @@ func (c *CloudInitConfig) CPULimit() string {
 	return fmt.Sprintf("%.2f", float64(c.CPUMillicores)/1000.0)
 }
 
-// GPUFlag returns the exact docker --gpus flag based on discrete device allocations.
+// GPUFlag returns the exact nerdctl --gpus flag based on discrete device allocations.
 func (c *CloudInitConfig) GPUFlag() string {
 	if len(c.AssignedGPUs) > 1 {
 		var parts []string
@@ -190,7 +211,16 @@ func (c *CloudInitConfig) RegistryMirrorsJSON() string {
 	return string(b)
 }
 
-// RenderContainerCommand formats Command and Args for docker run.
+// ImageMirrorsJSON returns the JSON object mapping upstream registry hosts to mirror prefixes for the in-VM runner.
+func (c *CloudInitConfig) ImageMirrorsJSON() string {
+	b, err := json.Marshal(c.ImageMirrors)
+	if err != nil || len(c.ImageMirrors) == 0 {
+		return "{}"
+	}
+	return string(b)
+}
+
+// RenderContainerCommand formats Command and Args for nerdctl run.
 func (c *CloudInitConfig) RenderContainerCommand() string {
 	if c.RayHeadAddress != "" && len(c.Command) == 0 {
 		return fmt.Sprintf("ray start --address=%q --num-gpus=%d --block", c.RayHeadAddress, c.NumGPUs)
@@ -248,7 +278,7 @@ fi
 # Prevent non-root container workloads from accessing cloud metadata services (IMDS)
 iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
 
-# Configure ECR credential helper if available in AMI
+# Configure ECR credential helper if available in AMI (nerdctl and the stargz snapshotter read the same file)
 if command -v docker-credential-ecr-login >/dev/null 2>&1; then
   mkdir -p /root/.docker
   if [ ! -f /root/.docker/config.json ]; then
@@ -278,7 +308,7 @@ fi
 echo "[cloudvm-bootstrap] Router transport: resolving {{.TunnelHost}} to {{.TunnelGatewayIP}}"
 CLOUDVM_HOSTS=$(grep -vE '[[:space:]]{{.TunnelHost}}([[:space:]]|$)' /etc/hosts || true)
 printf '%s\n%s %s\n' "$CLOUDVM_HOSTS" "{{.TunnelGatewayIP}}" "{{.TunnelHost}}" > /etc/hosts
-# The gateway address sits inside Docker's default bridge (172.17.0.0/16); a host route keeps it on the VPC uplink.
+# The gateway address can sit inside a container bridge range (172.17.0.0/16); a host route keeps it on the VPC uplink.
 CLOUDVM_UPLINK_GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
 CLOUDVM_UPLINK_DEV=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
 if [ -n "$CLOUDVM_UPLINK_GW" ] && [ -n "$CLOUDVM_UPLINK_DEV" ]; then
@@ -401,7 +431,7 @@ nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
       break
     fi
     {{else}}
-    if docker ps -q --filter "name=cloudvm" 2>/dev/null | grep -q .; then
+    if nerdctl ps -q --filter "name=cloudvm" 2>/dev/null | grep -q .; then
       touch /tmp/workload-ready
       echo "[cloudvm-bootstrap] Container workload running and ready!"
       echo "CLOUDVM_STATUS: {\"status\": \"RUNNING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\"}" > /dev/console 2>/dev/null || true
@@ -412,39 +442,79 @@ nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
   done
 ) &
 
+{{if or .NodeProblemDetector (not .UseNativeDLAMI)}}
+# Container runtime: containerd, pinned nerdctl, and the stargz snapshotter for lazy pulls
+CLOUDVM_NERDCTL_VERSION="2.4.1"
+CLOUDVM_NERDCTL_SHA256="f6bbf02fd8a299cbcbc71a0bad113c1b63b3f33689bbb7d51b0fa98c6d361d5e"
+CLOUDVM_STARGZ_VERSION="0.18.2"
+CLOUDVM_STARGZ_SHA256="515a3c3af0012f192ace31fb79e910597977c77227e976680aeaaef6e9ae50a9"
+# cloudvm_fetch URL SHA256 MEMBER downloads a tarball, verifies its checksum, and extracts MEMBER into /usr/local/bin.
+cloudvm_fetch() {
+  curl -fsSL --retry 5 "$1" -o /tmp/cloudvm-fetch.tgz && echo "$2  /tmp/cloudvm-fetch.tgz" | sha256sum -c - >/dev/null && tar -xzf /tmp/cloudvm-fetch.tgz -C /usr/local/bin "$3"
+}
+if [ "$(uname -m)" != "x86_64" ]; then
+  echo "[cloudvm-bootstrap] Error: the pinned nerdctl and stargz builds are linux-amd64 only" >&2
+  exit 1
+fi
+if ! command -v containerd >/dev/null 2>&1; then
+  dnf install -y containerd || yum install -y containerd || { apt-get update -y && apt-get install -y containerd; } || true
+fi
+if ! command -v containerd >/dev/null 2>&1; then
+  echo "[cloudvm-bootstrap] Error: containerd installation failed" >&2
+  exit 1
+fi
+if ! nerdctl --version 2>/dev/null | grep -q "version ${CLOUDVM_NERDCTL_VERSION}$"; then
+  cloudvm_fetch "https://github.com/containerd/nerdctl/releases/download/v${CLOUDVM_NERDCTL_VERSION}/nerdctl-${CLOUDVM_NERDCTL_VERSION}-linux-amd64.tar.gz" "$CLOUDVM_NERDCTL_SHA256" nerdctl || { echo "[cloudvm-bootstrap] Error: nerdctl install failed" >&2; exit 1; }
+fi
+# The snapshotter pulls eStargz layers lazily (other images pull in full) with the docker keychain the runner also uses.
+if [ ! -x /usr/local/bin/containerd-stargz-grpc ]; then
+  cloudvm_fetch "https://github.com/containerd/stargz-snapshotter/releases/download/v${CLOUDVM_STARGZ_VERSION}/stargz-snapshotter-v${CLOUDVM_STARGZ_VERSION}-linux-amd64.tar.gz" "$CLOUDVM_STARGZ_SHA256" containerd-stargz-grpc || echo "[cloudvm-bootstrap] Warning: stargz snapshotter install failed; images pull in full" >&2
+fi
+if [ -x /usr/local/bin/containerd-stargz-grpc ]; then
+  mkdir -p /etc/containerd /etc/containerd-stargz-grpc
+  touch /etc/containerd-stargz-grpc/config.toml
+  [ -f /etc/containerd/config.toml ] || echo 'version = 2' > /etc/containerd/config.toml
+  grep -q 'proxy_plugins.stargz' /etc/containerd/config.toml || cat << 'CONTAINERD_EOF' >> /etc/containerd/config.toml
+
+[proxy_plugins.stargz]
+  type = "snapshot"
+  address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+CONTAINERD_EOF
+  cat << 'STARGZ_EOF' > /etc/systemd/system/stargz-snapshotter.service
+[Unit]
+Description=stargz snapshotter
+Before=containerd.service
+
+[Service]
+Environment=HOME=/root DOCKER_CONFIG=/root/.docker PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock --config=/etc/containerd-stargz-grpc/config.toml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+STARGZ_EOF
+  systemctl daemon-reload
+  systemctl enable --now stargz-snapshotter.service || true
+fi
+
 {{if .RegistryMirrors}}
-# Configure Docker registry mirrors
-echo "[cloudvm-bootstrap] Configuring container registry mirrors..."
-mkdir -p /etc/docker
-if command -v python3 >/dev/null 2>&1; then
-  python3 -c '
-import json, os
-path = "/etc/docker/daemon.json"
-mirrors = {{.RegistryMirrorsJSON}}
-data = {}
-if os.path.exists(path):
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-data["registry-mirrors"] = mirrors
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-'
-else
-  if [ -f /etc/docker/daemon.json ]; then
-    grep -v '"registry-mirrors"' /etc/docker/daemon.json | grep -v '^}' > /tmp/daemon.json.tmp || true
-    echo '  "registry-mirrors": {{.RegistryMirrorsJSON}}' >> /tmp/daemon.json.tmp
-    echo '}' >> /tmp/daemon.json.tmp
-    mv /tmp/daemon.json.tmp /etc/docker/daemon.json
-  else
-    echo '{"registry-mirrors": {{.RegistryMirrorsJSON}}}' > /etc/docker/daemon.json
-  fi
-fi
-if systemctl is-active --quiet docker 2>/dev/null; then
-  systemctl restart docker 2>/dev/null || true
-fi
+# Docker Hub pulls try these mirrors first
+mkdir -p /etc/containerd/certs.d/docker.io
+cat << 'MIRRORS_EOF' > /etc/containerd/certs.d/docker.io/hosts.toml
+server = "https://registry-1.docker.io"
+{{range .RegistryMirrors}}
+[host.{{printf "%q" .}}]
+  capabilities = ["pull", "resolve"]
+{{end}}
+MIRRORS_EOF
+{{end}}
+
+systemctl enable containerd
+systemctl restart containerd || true
+for i in $(seq 1 30); do
+  [ -S /run/containerd/containerd.sock ] && break
+  sleep 1
+done
 {{end}}
 
 {{if .OtelEndpoint}}
@@ -574,13 +644,7 @@ cat << 'NPD_GPU_EOF' > /etc/node-problem-detector/gpu-monitor.json
 }
 NPD_GPU_EOF
 
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl start docker 2>/dev/null || true
-elif command -v service >/dev/null 2>&1; then
-  service docker start 2>/dev/null || true
-fi
-
-docker run -d   --name node-problem-detector   --restart always   --net=host   --privileged   -v /dev:/dev   -v /dev/kmsg:/dev/kmsg   -v /var/log:/var/log:ro   -v /etc/node-problem-detector:/config/custom:ro   registry.k8s.io/node-problem-detector/node-problem-detector:v0.8.20   --enable-k8s-exporter=false   --address=0.0.0.0   --port=20256   --config.system-log-monitor=/config/kernel-monitor.json,/config/custom/gpu-monitor.json || true
+nerdctl run -d   --name node-problem-detector   --restart always   --net=host   --privileged   -v /dev:/dev   -v /dev/kmsg:/dev/kmsg   -v /var/log:/var/log:ro   -v /etc/node-problem-detector:/config/custom:ro   registry.k8s.io/node-problem-detector/node-problem-detector:v0.8.20   --enable-k8s-exporter=false   --address=0.0.0.0   --port=20256   --config.system-log-monitor=/config/kernel-monitor.json,/config/custom/gpu-monitor.json || true
 {{end}}
 
 {{if .UseNativeDLAMI}}
@@ -603,22 +667,16 @@ PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/n
 {{end}}
 
 {{else}}
-# Ensure Docker and Python 3 are installed on base Linux distributions
-if ! command -v docker >/dev/null 2>&1; then
-  echo "[cloudvm-bootstrap] Installing Docker and Python 3..."
+# Ensure Python 3 is installed on base Linux distributions
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[cloudvm-bootstrap] Installing Python 3..."
   if command -v dnf >/dev/null 2>&1; then
-    dnf install -y docker python3 || true
+    dnf install -y python3 || true
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y docker python3 || true
+    yum install -y python3 || true
   elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y docker.io python3 || true
+    apt-get update -y && apt-get install -y python3 || true
   fi
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl enable --now docker 2>/dev/null || systemctl start docker 2>/dev/null || true
-elif command -v service >/dev/null 2>&1; then
-  service docker start 2>/dev/null || true
 fi
 
 # 5. Container Execution Mode with In-VM Micro-Runner Daemon (:9090)
@@ -634,6 +692,11 @@ chmod 600 /etc/cloudvm/runner-token
 echo -n "{{.RunnerAuthToken}}" > /etc/cloudvm/runner-token
 chmod 600 /etc/cloudvm/runner-token
 {{end}}
+
+cat << 'IMAGE_MIRRORS_EOF' > /etc/cloudvm/image-mirrors.json
+{{.ImageMirrorsJSON}}
+IMAGE_MIRRORS_EOF
+chmod 600 /etc/cloudvm/image-mirrors.json
 
 cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
 {{.RunnerScript}}
@@ -660,7 +723,7 @@ cat << 'TUNNEL_AGENT_EOF' > /usr/local/bin/cloudvm-tunnel-agent.py
 {{.TunnelAgentScript}}
 TUNNEL_AGENT_EOF
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
-CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
+CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
   CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" \
   nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
 {{end}}
@@ -671,8 +734,8 @@ CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTA
 (
   while true; do
     ACTIVE=0
-    if command -v docker >/dev/null 2>&1; then
-      ACTIVE=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+    if command -v nerdctl >/dev/null 2>&1; then
+      ACTIVE=$(nerdctl ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
     fi
     if [ "$ACTIVE" -eq 0 ]; then
       NOW=$(date +%s)
@@ -687,8 +750,8 @@ CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTA
       if [ "$HB_AGE" -gt {{if .IdleGracePeriodSeconds}}{{.IdleGracePeriodSeconds}}{{else}}600{{end}} ]; then
         sleep 60
         ACTIVE_AFTER=0
-        if command -v docker >/dev/null 2>&1; then
-          ACTIVE_AFTER=$(docker ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
+        if command -v nerdctl >/dev/null 2>&1; then
+          ACTIVE_AFTER=$(nerdctl ps -q --filter "name=cloudvm-" 2>/dev/null | wc -l || echo 0)
         fi
         if [ -f /tmp/cloudvm-heartbeat ]; then
           HB_TIME=$(cat /tmp/cloudvm-heartbeat 2>/dev/null | tr -dc '0-9.' || echo "")
