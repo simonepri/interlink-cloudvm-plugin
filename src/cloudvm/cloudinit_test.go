@@ -811,7 +811,9 @@ func TestRenderCloudInit_TunnelWorker(t *testing.T) {
 			`CLOUDVM_DIRECT_CIDRS="10.137.0.0/16,10.138.0.0/16"`,
 			"instance-identity/pkcs7",
 			`CLOUDVM_RUNNER_BIND="127.0.0.1"`,
-			"class Session(object):",
+			"cloudvm_fetch_script " + scriptSHA256(tunnelAgentScript) + " /usr/local/bin/cloudvm-tunnel-agent.py",
+			"cloudvm_fetch_script " + scriptSHA256(runnerScript) + " /usr/local/bin/cloudvm-runner.py",
+			`"https://tunnel.example.internal:443/bootstrap/$1"`,
 		} {
 			if !strings.Contains(script, want) {
 				t.Errorf("rendered script missing %q", want)
@@ -902,12 +904,15 @@ func TestRenderCloudInit_ImageMirrorsAndContainerCLI(t *testing.T) {
 		`{"docker.io":"123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}`,
 		"/etc/cloudvm/image-mirrors.json",
 		`CLOUDVM_CONTAINER_CLI="nerdctl"`,
-		"CONTAINER_CLI = 'nerdctl'",
-		"--snapshotter=stargz",
-		"def rewrite_image(ref):",
+		"cloudvm_fetch_script " + scriptSHA256(runnerScript),
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("rendered script missing %q", want)
+		}
+	}
+	for _, want := range []string{"CONTAINER_CLI = 'nerdctl'", "--snapshotter=stargz", "def rewrite_image(ref):"} {
+		if !strings.Contains(runnerScript, want) {
+			t.Errorf("runner missing %q", want)
 		}
 	}
 	assertBashSyntax(t, script)
@@ -927,8 +932,8 @@ func TestRenderCloudInit_NodeProblemDetectorUsesNerdctl(t *testing.T) {
 
 func TestStrippedPythonScriptsStillCompile(t *testing.T) {
 	cfg := &CloudInitConfig{}
-	for name, src := range map[string]string{"runner.py": cfg.RunnerScript(), "tunnel_agent.py": cfg.TunnelAgentScript()} {
-		if len(src) >= len(map[string]string{"runner.py": runnerScript, "tunnel_agent.py": tunnelAgentScript}[name]) {
+	for name, src := range map[string]string{"runner.py": cfg.RunnerScript()} {
+		if len(src) >= len(runnerScript) {
 			t.Errorf("%s was not stripped", name)
 		}
 		path := filepath.Join(t.TempDir(), name)

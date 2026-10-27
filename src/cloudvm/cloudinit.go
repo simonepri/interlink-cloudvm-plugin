@@ -112,14 +112,20 @@ func (c *CloudInitConfig) TunnelHost() string {
 	return tunnelHost(c.TunnelEndpoint)
 }
 
-// RunnerScript returns the embedded in-VM container runner source with blank and comment-only lines stripped.
+// RunnerScript returns the in-VM container runner source with blank and comment-only lines stripped, which workers
+// without a tunnel endpoint receive in their user data.
 func (c *CloudInitConfig) RunnerScript() string {
 	return stripPythonComments(runnerScript)
 }
 
-// TunnelAgentScript returns the embedded in-VM reverse tunnel agent source with blank and comment-only lines stripped.
-func (c *CloudInitConfig) TunnelAgentScript() string {
-	return stripPythonComments(tunnelAgentScript)
+// RunnerScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the runner by.
+func (c *CloudInitConfig) RunnerScriptSHA256() string {
+	return scriptSHA256(runnerScript)
+}
+
+// TunnelAgentScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the tunnel agent by.
+func (c *CloudInitConfig) TunnelAgentScriptSHA256() string {
+	return scriptSHA256(tunnelAgentScript)
 }
 
 // stripPythonComments drops blank and comment-only lines to keep the user data under the EC2 size limit. It keeps the
@@ -698,9 +704,25 @@ cat << 'IMAGE_MIRRORS_EOF' > /etc/cloudvm/image-mirrors.json
 IMAGE_MIRRORS_EOF
 chmod 600 /etc/cloudvm/image-mirrors.json
 
+{{if .TunnelEndpoint}}
+# cloudvm_fetch_script downloads the script with sha256 $1 from the tunnel gateway to $2, reaching the gateway host the way the
+# tunnel agent does, and fails the bootstrap when the download fails or its hash differs.
+cloudvm_fetch_script() {
+  if curl -fsS --retry 10 --retry-delay 3 --retry-all-errors --connect-timeout 10 --max-time 60 -o "$2" \
+      "https://{{.TunnelEndpoint}}/bootstrap/$1" && echo "$1  $2" | sha256sum -c --status -; then
+    return 0
+  fi
+  rm -f "$2"
+  echo "[cloudvm-bootstrap] FATAL: cannot fetch $2 with sha256 $1 from {{.TunnelEndpoint}}"
+  echo "CLOUDVM_STATUS: {\"status\": \"BOOTSTRAP_FAILED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+  exit 1
+}
+cloudvm_fetch_script {{.RunnerScriptSHA256}} /usr/local/bin/cloudvm-runner.py
+{{else}}
 cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
 {{.RunnerScript}}
 RUNNER_EOF
+{{end}}
 chmod 700 /usr/local/bin/cloudvm-runner.py
 if command -v python3 >/dev/null 2>&1; then
   CLOUDVM_RUNNER_BIND="{{.RunnerBindAddress}}" CLOUDVM_RUNNER_CONCURRENCY="{{if .RunnerConcurrency}}{{.RunnerConcurrency}}{{end}}" \
@@ -719,9 +741,7 @@ else
   TUNNEL_PLATFORM="gcp"
   TUNNEL_INSTANCE_ID=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2>/dev/null || hostname)
 fi
-cat << 'TUNNEL_AGENT_EOF' > /usr/local/bin/cloudvm-tunnel-agent.py
-{{.TunnelAgentScript}}
-TUNNEL_AGENT_EOF
+cloudvm_fetch_script {{.TunnelAgentScriptSHA256}} /usr/local/bin/cloudvm-tunnel-agent.py
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
 CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
   CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" \

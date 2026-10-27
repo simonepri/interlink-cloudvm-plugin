@@ -159,6 +159,7 @@ type TunnelGateway struct {
 	yamuxConfig         *yamux.Config
 	handshakeTimeout    time.Duration
 	onReject            func(reason string)
+	onBootstrap         func(result string)
 	logSink             WorkerLogSink
 	resolver            InstanceAddressResolver
 	directTCPNetworks   []*net.IPNet
@@ -176,6 +177,8 @@ type TunnelGatewayConfig struct {
 	HandshakeTimeout    time.Duration
 	// OnReject is called with a short machine-readable reason for every refused handshake.
 	OnReject func(reason string)
+	// OnBootstrapRequest is called with "served", "not_found", or "bad_request" for every bootstrap script request.
+	OnBootstrapRequest func(result string)
 	// LogSink receives the log stream each worker opens on its session; workers' log streams are closed when nil.
 	LogSink WorkerLogSink
 	// IdentityValidator, when set, runs after the token check and may demand proof of the worker's cloud identity.
@@ -230,6 +233,7 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		yamuxConfig:         cfg.YamuxConfig,
 		handshakeTimeout:    cfg.HandshakeTimeout,
 		onReject:            cfg.OnReject,
+		onBootstrap:         cfg.OnBootstrapRequest,
 		logSink:             cfg.LogSink,
 		resolver:            cfg.Resolver,
 		directTCPNetworks:   cfg.DirectTCPNetworks,
@@ -273,6 +277,10 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 
 	reader := bufio.NewReader(io.LimitReader(conn, maxHandshakeBytes))
+	if isBootstrapRequest(reader) {
+		g.serveBootstrapScript(conn, reader)
+		return
+	}
 	reqLine, err := reader.ReadBytes('\n')
 	if err != nil {
 		_ = conn.Close()

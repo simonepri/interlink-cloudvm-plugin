@@ -47,12 +47,13 @@ func newTunnelFixtureWith(t *testing.T, settings TunnelSettings) *tunnelFixture 
 		t.Fatalf("listen: %v", err)
 	}
 	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
-		Listener:          listener,
-		Registry:          registry,
-		TokenValidator:    server.ValidateTunnelToken,
-		IdentityValidator: server.ValidateTunnelIdentity,
-		OnReject:          metrics.RecordRejection,
-		LogSink:           server,
+		Listener:           listener,
+		Registry:           registry,
+		TokenValidator:     server.ValidateTunnelToken,
+		IdentityValidator:  server.ValidateTunnelIdentity,
+		OnReject:           metrics.RecordRejection,
+		OnBootstrapRequest: metrics.RecordBootstrapRequest,
+		LogSink:            server,
 	})
 	if err != nil {
 		t.Fatalf("gateway: %v", err)

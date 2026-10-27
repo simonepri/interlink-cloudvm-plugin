@@ -624,7 +624,9 @@ The plugin refuses to start when a transport in use lacks its variable or `CLUST
 
 `regions.<region>.imageMirrors` maps an upstream registry host to the mirror reference prefix that region's workers pull from, for example `{"docker.io": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}`. The in-VM runner rewrites an image whose registry host matches before pulling: `rayproject/ray:2.9` becomes `<prefix>/rayproject/ray:2.9`, Docker Hub images without a namespace gain `library/`, and a digest stays attached. ECR mirrors authenticate through the ECR credential helper with the VM's instance role. The plugin refuses to start when a host is not a bare registry host or a prefix is empty or carries a scheme. Mirrors apply only when the tunnel is enabled, because the region facts reach workers through the tunnel route.
 
-`/metrics` exports `cloudvm_tunnel_sessions{region}` and `cloudvm_tunnel_handshake_rejections_total{reason}`. Sessions live in one plugin process, so run a single replica while the tunnel is enabled.
+Tunnel workers download the runner and the tunnel agent at boot instead of carrying them in their user data, which keeps it far below the 16 KiB EC2 limit. The bootstrap requests `https://<tunnel endpoint>/bootstrap/<sha256>` with `curl`, after the step that makes the tunnel host reachable, and stops with a `BOOTSTRAP_FAILED` console status when the download fails or the file's sha256 differs from the one the user data pins. The gateway answers a connection that opens with an HTTP `GET` instead of a handshake with the embedded script of that hash (`runner.py`, `tunnel_agent.py`, or `spot_watcher.py`) and `404` for any other path; the scripts are public, so the request carries no credential. Workers without a tunnel endpoint still receive the runner inline.
+
+`/metrics` exports `cloudvm_tunnel_sessions{region}`, `cloudvm_tunnel_handshake_rejections_total{reason}`, and `cloudvm_tunnel_bootstrap_requests_total{result}`, where `result` is `served`, `not_found`, or `bad_request`. Sessions live in one plugin process, so run a single replica while the tunnel is enabled.
 
 ### AWS KMS Runner Token Encryption
 
