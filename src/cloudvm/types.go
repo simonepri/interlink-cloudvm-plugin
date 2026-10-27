@@ -256,12 +256,13 @@ type ContainerSpec struct {
 }
 
 type PodSpecWrapper struct {
-	NodeName         string                        `json:"nodeName,omitempty"`
-	NodeSelector     map[string]string             `json:"nodeSelector,omitempty"`
-	Affinity         *corev1.Affinity              `json:"affinity,omitempty"`
-	Containers       []ContainerSpec               `json:"containers"`
-	SecurityContext  *PodSecurityContext           `json:"securityContext,omitempty"`
-	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	NodeName           string                        `json:"nodeName,omitempty"`
+	ServiceAccountName string                        `json:"serviceAccountName,omitempty"`
+	NodeSelector       map[string]string             `json:"nodeSelector,omitempty"`
+	Affinity           *corev1.Affinity              `json:"affinity,omitempty"`
+	Containers         []ContainerSpec               `json:"containers"`
+	SecurityContext    *PodSecurityContext           `json:"securityContext,omitempty"`
+	ImagePullSecrets   []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
 // Pod represents the incoming pod definition from InterLink.

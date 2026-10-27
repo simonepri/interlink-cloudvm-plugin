@@ -41,6 +41,8 @@ type StartContainerRequest struct {
 	RunAsUser        *int64            `json:"runAsUser,omitempty"`
 	RunAsGroup       *int64            `json:"runAsGroup,omitempty"`
 	DockerConfigJSON string            `json:"dockerConfigJSON,omitempty"`
+	// AWSCredentials is set when the pod's service account has an IAM role; the runner then serves its credentials.
+	AWSCredentials *PodAWSCredentials `json:"awsCredentials,omitempty"`
 }
 
 // ContainerStatusResult encapsulates container execution telemetry from the in-VM runner.
@@ -249,6 +251,8 @@ type MockContainerRunner struct {
 	containers map[string]*ContainerStatusResult
 	requests   map[string]*StartContainerRequest
 	hostStats  *HostStatsResult
+
+	pushedCredentials map[string][]PodAWSCredentials
 }
 
 // NewMockContainerRunner initializes an in-memory mock container runner.

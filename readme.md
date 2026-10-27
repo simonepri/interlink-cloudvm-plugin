@@ -582,6 +582,7 @@ The provider's AWS role needs these actions:
 | `ec2:DescribeRegions`, `ec2:DescribeSpotPriceHistory`, `ec2:GetSpotPlacementScores` | Spot price ticker and placement scores |
 | `pricing:GetProducts`, `servicequotas:GetServiceQuota`, `cloudwatch:GetMetricData` | On-demand baselines, quota limits, and quota usage |
 | `kms:Encrypt` | Runner token encryption when `KMS_KEY_ID` is set |
+| `eks-auth:AssumeRoleForPodIdentity` on the cluster named by `EKS_CLUSTER_NAME` | Pod role credentials for EKS Pod Identity |
 
 ### EC2 Launch Pacing
 
@@ -658,3 +659,12 @@ For high-compliance environments, set `KMS_KEY_ID` (or `provider.kmsKeyId` in He
 - The in-VM micro-runner creates an ephemeral, pod-isolated credentials directory (`mode 0600`) during `docker --config <dir> pull <image>`, and deletes the directory immediately after the pull completes.
 - Credentials never touch EC2/GCE user-data and are never shared across co-tenant containers on the same VM.
 - In addition to standard Kubernetes secrets, AWS ECR private image repositories remain supported natively via the instance profile EC2 credential helper (`docker-credential-ecr-login`).
+
+### AWS Credentials for Pod Service Accounts
+
+A container on a worker gets the credentials of its pod's own service account role, so AWS SDKs work without code changes, as they do on a cluster node. The plugin decides from the env the EKS webhook adds to the pod: `AWS_CONTAINER_CREDENTIALS_FULL_URI` pointing at the Pod Identity Agent (`169.254.170.23` or `fd00:ec2::23`) means EKS Pod Identity, and `AWS_ROLE_ARN` with `AWS_WEB_IDENTITY_TOKEN_FILE` means IRSA, which wins when both appear, as in the SDK credential chain. A pod with neither gets no credentials and no extra env.
+
+- **Exchange in the plugin.** For a pod with a role, the plugin mints a 10-minute projected token for the pod's service account through the TokenRequest API, bound to the pod so it dies with it, with audience `pods.eks.amazonaws.com` or `sts.amazonaws.com`. It exchanges the token with its own AWS credentials: `eks-auth:AssumeRoleForPodIdentity` against `EKS_CLUSTER_NAME` in `EKS_CLUSTER_REGION` (default `AWS_REGION`), or the unsigned `sts:AssumeRoleWithWebIdentity`. Workers never call AWS for pod credentials, so they may run in another account than the cluster.
+- **Delivery and refresh.** The first credentials ride in `/containers/start`. Every minute the plugin replaces any pod's credentials that are past half their lifetime or have less than 20 minutes left, and pushes them over the runner channel to `POST /containers/credentials?podUID=`, retrying until the runner accepts them. Refreshing stops when the pod finishes or is deleted; after a plugin restart the next status poll resumes it. The plugin never logs credentials.
+- **Serving on the worker.** The plugin drops the webhook's credential variables, and the runner sets `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:170/v1/credentials` and `AWS_CONTAINER_AUTHORIZATION_TOKEN=<random per-pod secret>` in the container. Its loopback endpoint answers a request carrying that secret with the pod's latest credentials in the container credentials format, `401` for an unknown secret, and `503` until current credentials arrive. Containers share the host network, so the secret is what keeps one pod from reading another's credentials; port 170 is privileged, so no non-root container can bind it while the runner is down. Stopping the pod revokes its secret. The instance role stays unreachable from containers through the IMDS block.
+- **Requirements.** The plugin's service account needs `create` on `serviceaccounts/token` (the chart grants it), and its AWS role needs `eks-auth:AssumeRoleForPodIdentity` on the cluster ARN for Pod Identity. Set `provider.eksClusterName` in the chart.

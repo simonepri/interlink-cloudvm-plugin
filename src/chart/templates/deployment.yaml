@@ -39,6 +39,14 @@ spec:
               value: "{{ .Values.provider.awsRegion }}"
             - name: AWS_REGIONS
               value: "{{ join "," .Values.provider.awsRegions | default .Values.provider.awsRegion }}"
+            {{- with .Values.provider.eksClusterName }}
+            - name: EKS_CLUSTER_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.provider.eksClusterRegion }}
+            - name: EKS_CLUSTER_REGION
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.provider.nodeRegions }}
             - name: NODE_REGIONS
               value: {{ toJson . | quote }}
