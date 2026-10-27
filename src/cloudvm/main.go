@@ -321,7 +321,7 @@ func run() error {
 					if err != nil {
 						log.Printf("[reconciler] Error during reconciliation: %v", err)
 					} else if len(res.TerminatedZombies) > 0 || len(res.EvictedPods) > 0 {
-						log.Printf("[reconciler] Cleaned %d zombies, evicted %d vanished pods",
+						log.Printf("[reconciler] Cleaned %d zombies, evicted %d vanished pods", //nolint:gosec // counts only
 							len(res.TerminatedZombies), len(res.EvictedPods))
 					}
 				}
