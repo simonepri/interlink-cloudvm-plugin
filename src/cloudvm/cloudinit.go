@@ -295,14 +295,6 @@ fi
 # Prevent non-root container workloads from accessing cloud metadata services (IMDS)
 iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
 
-# Configure ECR credential helper if available in AMI (nerdctl and the stargz snapshotter read the same file)
-if command -v docker-credential-ecr-login >/dev/null 2>&1; then
-  mkdir -p /root/.docker
-  if [ ! -f /root/.docker/config.json ]; then
-    echo '{"credsStore":"ecr-login"}' > /root/.docker/config.json
-  fi
-fi
-
 # Runner port 9090 dedicated firewall chain inserted at head of INPUT
 iptables -N CLOUDVM_RUNNER 2>/dev/null || true
 iptables -F CLOUDVM_RUNNER 2>/dev/null || true
@@ -468,6 +460,8 @@ CLOUDVM_NERDCTL_VERSION="2.4.1"
 CLOUDVM_NERDCTL_SHA256="f6bbf02fd8a299cbcbc71a0bad113c1b63b3f33689bbb7d51b0fa98c6d361d5e"
 CLOUDVM_STARGZ_VERSION="0.18.2"
 CLOUDVM_STARGZ_SHA256="515a3c3af0012f192ace31fb79e910597977c77227e976680aeaaef6e9ae50a9"
+CLOUDVM_ECR_HELPER_VERSION="0.12.0"
+CLOUDVM_ECR_HELPER_SHA256="a22ab6d59dbac777b8fb31984709461da00a4c778b6ae14c8d3729e8d5ded1a6"
 # cloudvm_fetch URL SHA256 MEMBER downloads a tarball, verifies its checksum, and extracts MEMBER into /usr/local/bin.
 cloudvm_fetch() {
   curl -fsSL --retry 5 "$1" -o /tmp/cloudvm-fetch.tgz && echo "$2  /tmp/cloudvm-fetch.tgz" | sha256sum -c - >/dev/null && tar -xzf /tmp/cloudvm-fetch.tgz -C /usr/local/bin "$3"
@@ -486,19 +480,46 @@ fi
 if ! nerdctl --version 2>/dev/null | grep -q "version ${CLOUDVM_NERDCTL_VERSION}$"; then
   cloudvm_fetch "https://github.com/containerd/nerdctl/releases/download/v${CLOUDVM_NERDCTL_VERSION}/nerdctl-${CLOUDVM_NERDCTL_VERSION}-linux-amd64.tar.gz" "$CLOUDVM_NERDCTL_SHA256" nerdctl || { echo "[cloudvm-bootstrap] Error: nerdctl install failed" >&2; exit 1; }
 fi
+# nerdctl and the stargz snapshotter authenticate ECR pulls with the instance role through this helper; the runner maps
+# each ECR registry host to it in /root/.docker/config.json.
+mkdir -p /root/.docker
+[ -f /root/.docker/config.json ] || echo '{}' > /root/.docker/config.json
+if [ -n "$INSTANCE_ID" ] && ! command -v docker-credential-ecr-login >/dev/null 2>&1; then
+  if curl -fsSL --retry 5 "https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/${CLOUDVM_ECR_HELPER_VERSION}/linux-amd64/docker-credential-ecr-login" -o /tmp/docker-credential-ecr-login && echo "$CLOUDVM_ECR_HELPER_SHA256  /tmp/docker-credential-ecr-login" | sha256sum -c - >/dev/null; then
+    install -m 0755 /tmp/docker-credential-ecr-login /usr/local/bin/docker-credential-ecr-login
+  else
+    echo "[cloudvm-bootstrap] Warning: ECR credential helper install failed; ECR pulls will be unauthenticated" >&2
+  fi
+fi
+mkdir -p /etc/containerd
+[ -f /etc/containerd/config.toml ] || echo 'version = 2' > /etc/containerd/config.toml
+grep -q '# cloudvm-unpack-overlayfs' /etc/containerd/config.toml || cat << 'CONTAINERD_EOF' >> /etc/containerd/config.toml
+
+# cloudvm-unpack-overlayfs
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux/amd64"
+  snapshotter = "overlayfs"
+CONTAINERD_EOF
 # The snapshotter pulls eStargz layers lazily (other images pull in full) with the docker keychain the runner also uses.
 if [ ! -x /usr/local/bin/containerd-stargz-grpc ]; then
   cloudvm_fetch "https://github.com/containerd/stargz-snapshotter/releases/download/v${CLOUDVM_STARGZ_VERSION}/stargz-snapshotter-v${CLOUDVM_STARGZ_VERSION}-linux-amd64.tar.gz" "$CLOUDVM_STARGZ_SHA256" containerd-stargz-grpc || echo "[cloudvm-bootstrap] Warning: stargz snapshotter install failed; images pull in full" >&2
 fi
 if [ -x /usr/local/bin/containerd-stargz-grpc ]; then
-  mkdir -p /etc/containerd /etc/containerd-stargz-grpc
+  mkdir -p /etc/containerd-stargz-grpc
   touch /etc/containerd-stargz-grpc/config.toml
-  [ -f /etc/containerd/config.toml ] || echo 'version = 2' > /etc/containerd/config.toml
   grep -q 'proxy_plugins.stargz' /etc/containerd/config.toml || cat << 'CONTAINERD_EOF' >> /etc/containerd/config.toml
 
 [proxy_plugins.stargz]
   type = "snapshot"
   address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+CONTAINERD_EOF
+  # containerd 2.x pulls through the transfer service, which needs unpack platforms for each snapshotter it unpacks into.
+  grep -q '# cloudvm-unpack-stargz' /etc/containerd/config.toml || cat << 'CONTAINERD_EOF' >> /etc/containerd/config.toml
+
+# cloudvm-unpack-stargz
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux/amd64"
+  snapshotter = "stargz"
 CONTAINERD_EOF
   cat << 'STARGZ_EOF' > /etc/systemd/system/stargz-snapshotter.service
 [Unit]

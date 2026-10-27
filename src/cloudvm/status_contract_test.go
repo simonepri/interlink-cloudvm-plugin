@@ -246,3 +246,25 @@ func TestStatusContract_PodWithoutSpecFallsBackToDefaultContainerName(t *testing
 		t.Fatalf("expected no init container statuses, got %+v", st.InitContainers)
 	}
 }
+
+func TestStatusContract_ImagePullFailureWaits(t *testing.T) {
+	for _, reason := range []string{"ErrImagePull", "ImagePullBackOff"} {
+		t.Run(reason, func(t *testing.T) {
+			const uid = "uid-contract-pull"
+			ts := newStatusContractServer(t, uid, &ContainerStatusResult{Status: "created", Reason: reason, Message: "pull access denied"})
+			pod := contractPod(uid)
+
+			st := queryInterLinkStatus(t, ts, pod)
+			assertStatusNames(t, "containers", st.Containers, pod.Spec.Containers)
+			for _, c := range st.Containers {
+				w := c.State.Waiting
+				if w == nil || w.Reason != reason || w.Message != "pull access denied" {
+					t.Fatalf("container %s: want waiting %s, got %+v", c.Name, reason, c.State)
+				}
+				if c.Ready || c.State.Terminated != nil || c.State.Running != nil {
+					t.Errorf("container %s: a failing pull must neither run nor terminate: %+v", c.Name, c)
+				}
+			}
+		})
+	}
+}

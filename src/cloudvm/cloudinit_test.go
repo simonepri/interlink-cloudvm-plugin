@@ -950,3 +950,32 @@ func TestStrippedPythonScriptsStillCompile(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderCloudInit_InstallsECRCredentialHelper(t *testing.T) {
+	cfg := CloudInitConfig{PodName: "ecr", Region: "eu-west-1", TargetContainerImage: "alpine"}
+	script, err := RenderCloudInit(&cfg)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		`CLOUDVM_ECR_HELPER_SHA256="a22ab6d59dbac777b8fb31984709461da00a4c778b6ae14c8d3729e8d5ded1a6"`,
+		"amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/${CLOUDVM_ECR_HELPER_VERSION}/linux-amd64/docker-credential-ecr-login",
+		"/usr/local/bin/docker-credential-ecr-login",
+		"echo '{}' > /root/.docker/config.json",
+		`[[plugins."io.containerd.transfer.v1.local".unpack_config]]`,
+		`  platform = "linux/amd64"
+  snapshotter = "overlayfs"`,
+		`  platform = "linux/amd64"
+  snapshotter = "stargz"`,
+		"# cloudvm-unpack-overlayfs",
+		"# cloudvm-unpack-stargz",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("rendered script missing %q", want)
+		}
+	}
+	if strings.Contains(script, `"credsStore":"ecr-login"`) {
+		t.Error("the helper must be mapped per ECR host, not as the default credential store")
+	}
+	assertBashSyntax(t, script)
+}
