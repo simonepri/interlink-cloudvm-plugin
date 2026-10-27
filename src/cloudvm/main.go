@@ -468,14 +468,15 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		return nil, err
 	}
 	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
-		Listener:          listener,
-		Registry:          registry,
-		TokenValidator:    server.ValidateTunnelToken,
-		IdentityValidator: server.ValidateTunnelIdentity,
-		OnReject:          metrics.RecordRejection,
-		LogSink:           server,
-		Resolver:          server.ResolveInstanceAddress,
-		DirectTCPNetworks: directTCPNetworks,
+		Listener:           listener,
+		Registry:           registry,
+		TokenValidator:     server.ValidateTunnelToken,
+		IdentityValidator:  server.ValidateTunnelIdentity,
+		OnReject:           metrics.RecordRejection,
+		OnBootstrapRequest: metrics.RecordBootstrapRequest,
+		LogSink:            server,
+		Resolver:           server.ResolveInstanceAddress,
+		DirectTCPNetworks:  directTCPNetworks,
 	})
 	if err != nil {
 		_ = listener.Close()
