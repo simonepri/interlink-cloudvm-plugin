@@ -163,6 +163,8 @@ type TunnelGateway struct {
 	logSink             WorkerLogSink
 	resolver            InstanceAddressResolver
 	directTCPNetworks   []*net.IPNet
+	clusterDomain       string
+	clusterDNSServers   []string
 	closeOnce           sync.Once
 	closed              chan struct{}
 }
@@ -188,6 +190,11 @@ type TunnelGatewayConfig struct {
 	// DirectTCPNetworks lists the networks workers' tcp streams may reach directly, besides other workers, on ports
 	// from 1024 up; direct forwarding is off when empty.
 	DirectTCPNetworks []*net.IPNet
+	// ClusterDomain is the DNS domain whose names workers' dns streams may resolve; DefaultClusterDomain when empty.
+	ClusterDomain string
+	// ClusterDNSServers are the host:port resolvers that answer workers' dns streams; the nameservers of the plugin
+	// pod's /etc/resolv.conf when empty.
+	ClusterDNSServers []string
 }
 
 // WorkerLogSink consumes the newline-delimited WorkerLogRecord stream a worker opens on its tunnel session.
@@ -223,6 +230,12 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 10 * time.Second
 	}
+	if cfg.ClusterDomain == "" {
+		cfg.ClusterDomain = DefaultClusterDomain
+	}
+	if len(cfg.ClusterDNSServers) == 0 {
+		cfg.ClusterDNSServers = ResolvConfNameservers(podResolvConf)
+	}
 
 	gw := &TunnelGateway{
 		listener:            cfg.Listener,
@@ -237,6 +250,8 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		logSink:             cfg.LogSink,
 		resolver:            cfg.Resolver,
 		directTCPNetworks:   cfg.DirectTCPNetworks,
+		clusterDomain:       cfg.ClusterDomain,
+		clusterDNSServers:   cfg.ClusterDNSServers,
 		closed:              make(chan struct{}),
 	}
 	return gw, nil
@@ -355,8 +370,8 @@ func (g *TunnelGateway) acceptWorkerStreams(instanceID string, session *yamux.Se
 	}
 }
 
-// serveWorkerStream reads the stream header and hands a log stream to the log sink and a tcp stream to its target; it
-// closes any other stream.
+// serveWorkerStream reads the stream header and hands a log stream to the log sink, a tcp stream to its target, and a
+// dns stream to the cluster resolver; it closes any other stream.
 func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Stream) {
 	defer stream.Close()
 	if err := stream.SetReadDeadline(time.Now().Add(g.handshakeTimeout)); err != nil {
@@ -379,6 +394,8 @@ func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Strea
 		g.logSink.ConsumeWorkerLogs(instanceID, reader)
 	case header.Stream == WorkerTCPStreamKind:
 		g.serveWorkerTCP(instanceID, reader, stream, header.Target)
+	case header.Stream == WorkerDNSStreamKind:
+		g.serveWorkerDNS(instanceID, reader, stream)
 	}
 }
 

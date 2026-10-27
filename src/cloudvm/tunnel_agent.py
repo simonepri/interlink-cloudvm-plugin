@@ -1,4 +1,4 @@
-"""In-VM reverse tunnel agent: dials the plugin's tunnel gateway over TLS, bridges Yamux streams to the local runner and local ports, and streams worker logs.
+"""In-VM reverse tunnel agent: dials the plugin's tunnel gateway over TLS, bridges Yamux streams to the local runner and local ports, streams worker logs, and serves DNS.
 
 Implements the client half of the github.com/hashicorp/yamux framing on one asyncio loop (stdlib only, Python 3.7+).
 """
@@ -10,6 +10,7 @@ import json
 import os
 import random
 import shutil
+import socket
 import ssl
 import struct
 import sys
@@ -31,6 +32,9 @@ LOG_STREAM_HEADER = b'{"stream":"logs","version":1}\n'
 TCP_STREAM_KIND = "tcp"
 MAX_STREAM_HEADER = 4096
 DEFAULT_TCP_PROXY_PORT = "13128"
+# A dns stream carries one DNS query, ended by the agent's FIN, and its reply.
+DNS_STREAM_HEADER = b'{"stream":"dns","version":1}\n'
+DNS_TIMEOUT = 5
 MAX_LOG_MESSAGE = 16 * 1024
 LOG_READ_CHUNK = 64 * 1024
 LOG_POLL_SECONDS = 1
@@ -201,6 +205,21 @@ class LogStream(object):
             data = data[n:]
 
 
+class DNSStream(object):
+
+    def __init__(self, sid):
+        self.sid, self.task, self.received, self.done = sid, None, b"", asyncio.Event()
+
+    def grow_window(self, delta):
+        pass
+
+    def on_data(self, payload):
+        self.received += payload
+
+    def on_fin(self):
+        self.done.set()
+
+
 class Session(object):
     def __init__(self, reader, writer, runner_addr):
         self.reader = reader
@@ -231,6 +250,14 @@ class Session(object):
         header = (json.dumps({"stream": TCP_STREAM_KIND, "version": 1, "target": target}) + "\n").encode()
         stream.send_window -= len(header)
         self.send(T_DATA, 0, stream.sid, len(header), header)
+        return stream
+
+    def open_dns_stream(self, query):
+        stream = DNSStream(self.next_sid)
+        self.next_sid += 2
+        self.streams[stream.sid] = stream
+        self.send(T_WINDOW, F_SYN, stream.sid, 0)
+        self.send(T_DATA, F_FIN, stream.sid, len(DNS_STREAM_HEADER + query), DNS_STREAM_HEADER + query)
         return stream
 
     def open_log_stream(self, collector):
@@ -308,9 +335,9 @@ class LogCollector(object):
     The files and Docker's own log store are the buffer; the in-memory queue stays small and producers wait when it is full.
     """
 
-    def __init__(self, files, containers):
+    def __init__(self, files, container_cli):
         self.files = files
-        self.containers = containers
+        self.container_cli = container_cli
         self.offsets = {}
         self.container_since = {}
         self.finished = set()
@@ -318,7 +345,7 @@ class LogCollector(object):
     async def ship(self, stream):
         queue = asyncio.Queue(maxsize=256)
         tasks = [asyncio.ensure_future(self.follow_file(source, path, queue)) for source, path in self.files]
-        if self.containers:
+        if self.container_cli:
             tasks.append(asyncio.ensure_future(self.watch_containers(queue)))
         try:
             await stream.write(LOG_STREAM_HEADER)
@@ -369,7 +396,7 @@ class LogCollector(object):
         followers = {}
         try:
             while True:
-                for name in await list_containers():
+                for name in await list_containers(self.container_cli):
                     if name not in followers and name not in self.finished:
                         followers[name] = asyncio.ensure_future(self.follow_container(name, queue))
                 for name in [n for n, t in followers.items() if t.done()]:
@@ -386,7 +413,7 @@ class LogCollector(object):
 
     async def follow_container(self, name, queue):
         since = self.container_since.get(name)
-        cmd = ["docker", "logs", "--follow", "--timestamps"]
+        cmd = [self.container_cli, "logs", "--follow", "--timestamps"]
         if since:
             cmd += ["--since", since]
         cmd.append(name)
@@ -405,6 +432,7 @@ class LogCollector(object):
                 proc.kill()
 
     async def pipe_container(self, reader, name, pod, fd, since, queue):
+        since_key = since and log_time_key(since)
         while True:
             try:
                 line = await reader.readline()
@@ -413,15 +441,20 @@ class LogCollector(object):
             if not line:
                 return
             ts, _, text = line.decode("utf-8", "replace").rstrip("\r\n").partition(" ")
-            if ts == since:
-                continue  # --since includes the last record the previous session already sent
+            if since_key and log_time_key(ts) <= since_key:
+                continue  # --since repeats sent records: Docker the last one, nerdctl its whole second
             await queue.put((log_record("container", text, ts, pod, fd), self.commit_since(name, ts)))
 
 
-async def list_containers():
+def log_time_key(ts):
+    head, _, frac = ts.partition(".")
+    return head[:19] + frac.rstrip("Zz").ljust(9, "0")
+
+
+async def list_containers(cli):
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker", "ps", "--all", "--filter", "name=" + CONTAINER_PREFIX, "--format", "{{.Names}}",
+            cli, "ps", "--all", "--filter", "name=" + CONTAINER_PREFIX, "--format", "{{.Names}}",
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         out, _ = await proc.communicate()
     except OSError:
@@ -447,20 +480,27 @@ def read_file(path):
 
 
 class TCPProxy(object):
-    """Local HTTP CONNECT proxy: connects targets on the direct networks itself and carries every other connection to
-    its target over the current tunnel session."""
+    """Local HTTP CONNECT proxy: tunnels targets in the tunnel networks (without any, those outside the direct
+    networks) and connects the rest itself."""
 
-    def __init__(self, direct_networks=()):
+    def __init__(self, direct_networks=(), tunnel_networks=()):
         self.session = None
         self.direct_networks = list(direct_networks)
+        self.tunnel_networks = list(tunnel_networks)
 
-    def is_direct(self, target):
-        host, _, _ = target.rpartition(":")
+    async def route(self, target):
+        host, _, port = target.rpartition(":")
         try:
             ip = ipaddress.ip_address(host.strip("[]"))
         except ValueError:
-            return False
-        return any(ip in network for network in self.direct_networks)
+            if not self.tunnel_networks:
+                return True, target
+            info = await asyncio.get_event_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            ip = ipaddress.ip_address(info[0][4][0])
+            target = "[%s]:%s" % (ip, port)
+        if any(ip in network for network in self.direct_networks):
+            return False, target
+        return not self.tunnel_networks or any(ip in network for network in self.tunnel_networks), target
 
     async def connect_direct(self, target, reader, writer):
         host, _, port = target.rpartition(":")
@@ -481,18 +521,95 @@ class TCPProxy(object):
             writer.close()
             return
         parts = head.split(b"\r\n", 1)[0].split()
-        if len(parts) >= 2 and parts[0] == b"CONNECT" and self.is_direct(parts[1].decode()):
-            await self.connect_direct(parts[1].decode(), reader, writer)
+        route = None
+        if len(parts) >= 2 and parts[0] == b"CONNECT":
+            try:
+                route = await self.route(parts[1].decode())
+            except (OSError, ValueError) as e:
+                log("CONNECT %s: %s" % (parts[1], e))
+        if route is not None and not route[0]:
+            await self.connect_direct(route[1], reader, writer)
             return
         session = self.session
-        if len(parts) < 2 or parts[0] != b"CONNECT" or session is None:
+        if route is None or session is None:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             writer.close()
             return
-        stream = session.open_tcp_stream(parts[1].decode(), reader, writer)
+        stream = session.open_tcp_stream(route[1], reader, writer)
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         stream.task = asyncio.ensure_future(stream.run())
+
+
+def dns_exchange(upstream, query):
+    with socket.socket(socket.AF_INET6 if ":" in upstream[0] else socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(DNS_TIMEOUT)
+        s.connect(upstream)
+        s.send(query)
+        return s.recv(65535)
+
+
+class DNSForwarder(asyncio.DatagramProtocol):
+    """UDP DNS forwarder: asks the gateway for cluster names and the VM's resolvers for the rest."""
+
+    def __init__(self, domain, upstreams, proxy):
+        self.domain = b"".join(bytes([len(l)]) + l.encode() for l in domain.split(".")) + b"\0"
+        self.upstreams, self.proxy, self.transport = upstreams, proxy, None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        if len(data) > 12:
+            asyncio.ensure_future(self.answer(data, addr))
+
+    async def answer(self, query, addr):
+        end = query.find(b"\0", 12) + 5
+        reply, session = b"", self.proxy.session
+        if not query[12:end - 4].lower().endswith(self.domain):
+            for upstream in self.upstreams:
+                try:
+                    reply = await asyncio.get_event_loop().run_in_executor(None, dns_exchange, upstream, query)
+                    break
+                except OSError as e:
+                    log("DNS %s: %s" % (upstream, e))
+        elif session is not None:
+            stream = session.open_dns_stream(query)
+            try:
+                await asyncio.wait_for(stream.done.wait(), DNS_TIMEOUT)
+                reply = stream.received
+            except asyncio.TimeoutError:
+                pass
+            session.streams.pop(stream.sid, None)
+        if len(reply) < 12:  # SERVFAIL
+            reply = query[:2] + bytes([0x80 | query[2] & 0x79, 0x82]) + b"\0\1\0\0\0\0\0\0" + query[12:end]
+        self.transport.sendto(reply, addr)
+
+
+async def start_dns_forwarder(listen, proxy):
+    """Serves DNS on host:port listen; CLOUDVM_DNS_TAKEOVER=1 puts it before two fallbacks in resolv.conf."""
+    host, _, port = listen.rpartition(":")
+    path = os.environ.get("CLOUDVM_DNS_RESOLV_CONF", "/etc/resolv.conf")
+    with open(path) as f:
+        lines = f.read().splitlines()
+    servers = [l.split()[1] for l in lines if l.startswith("nameserver ") and l.split()[1] != host]
+    upstreams = [(s, 53) for s in servers]
+    if os.environ.get("CLOUDVM_DNS_UPSTREAM"):
+        h, _, p = os.environ["CLOUDVM_DNS_UPSTREAM"].rpartition(":")
+        upstreams = [(h, int(p))]
+    domain = os.environ.get("CLOUDVM_CLUSTER_DOMAIN", "cluster.local").strip(".").lower()
+    forwarder = DNSForwarder(domain, upstreams, proxy)
+    await asyncio.get_event_loop().create_datagram_endpoint(lambda: forwarder, local_addr=(host, int(port)))
+    if os.environ.get("CLOUDVM_DNS_TAKEOVER") == "1":
+        search = ["svc." + domain, domain]
+        search += [d for l in lines if l.startswith(("search ", "domain ")) for d in l.split()[1:] if d not in search]
+        lines = ["nameserver " + s for s in [host] + servers[:2]] + ["search " + " ".join(search)] + [
+            l for l in lines if l.startswith("options")]
+        with open(path + ".tmp", "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(path + ".tmp", 0o644)
+        os.replace(path + ".tmp", path)  # replaces a symlink, such as one into systemd-resolved, not its target
+    return forwarder
 
 
 async def copy(reader, writer):
@@ -520,7 +637,7 @@ def parse_networks(raw):
         try:
             networks.append(ipaddress.ip_network(item, strict=False))
         except ValueError:
-            log("ignoring direct network %r: not a CIDR" % item)
+            log("ignoring network %r: not a CIDR" % item)
     return networks
 
 
@@ -555,6 +672,7 @@ async def connect_once(cfg):
 
 
 def main():
+    container_cli = os.environ.get("CLOUDVM_CONTAINER_CLI", "docker")
     runner_host, _, runner_port = os.environ.get("CLOUDVM_RUNNER_ADDR", "127.0.0.1:9090").rpartition(":")
     cfg = {
         "endpoint": os.environ["CLOUDVM_TUNNEL_ENDPOINT"],
@@ -566,9 +684,11 @@ def main():
         "ca_file": os.environ.get("CLOUDVM_TUNNEL_CA_FILE") or None,
         "collector": LogCollector(
             parse_log_files(os.environ.get("CLOUDVM_LOG_FILES", DEFAULT_LOG_FILES)),
-            os.environ.get("CLOUDVM_CONTAINER_LOGS", "1") != "0" and shutil.which("docker") is not None),
+            os.environ.get("CLOUDVM_CONTAINER_LOGS", "1") != "0" and shutil.which(container_cli) and container_cli),
     }
-    cfg["proxy"] = TCPProxy(parse_networks(os.environ.get("CLOUDVM_DIRECT_CIDRS", "")))
+    cfg["proxy"] = TCPProxy(
+        parse_networks(os.environ.get("CLOUDVM_DIRECT_CIDRS", "")),
+        parse_networks(os.environ.get("CLOUDVM_TUNNEL_CIDRS", "")))
     max_backoff = float(os.environ.get("CLOUDVM_TUNNEL_MAX_BACKOFF", "30"))
     backoff = 0.5
     loop = asyncio.new_event_loop()
@@ -576,6 +696,11 @@ def main():
     proxy_port = int(os.environ.get("CLOUDVM_TCP_PROXY_PORT", DEFAULT_TCP_PROXY_PORT))
     if proxy_port > 0:
         loop.run_until_complete(asyncio.start_server(cfg["proxy"].handle, "127.0.0.1", proxy_port))
+    if os.environ.get("CLOUDVM_DNS_LISTEN"):
+        try:
+            loop.run_until_complete(start_dns_forwarder(os.environ["CLOUDVM_DNS_LISTEN"], cfg["proxy"]))
+        except (OSError, ValueError) as e:
+            log("cannot serve DNS: %s" % e)
     while True:
         started = time.time()
         try:
@@ -584,7 +709,7 @@ def main():
             log("disconnected: %s" % e)
         if time.time() - started > 60:
             backoff = 0.5
-        time.sleep(backoff * random.uniform(0.8, 1.2))
+        loop.run_until_complete(asyncio.sleep(backoff * random.uniform(0.8, 1.2)))
         backoff = min(backoff * 2, max_backoff)
 
 

@@ -108,21 +108,14 @@ func connectAndEcho(t *testing.T, proxyAddr, target string) {
 	}
 }
 
-func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
+// startPythonAgent runs the embedded agent as worker instanceID against the fixture's gateway, with env added to its
+// environment, and waits until its session registers; it stops the agent when the test ends.
+func startPythonAgent(t *testing.T, f *tunnelFixture, instanceID, token string, env ...string) {
+	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skip("python3 not available")
 	}
-	f := newTunnelFixture(t, time.Minute)
-	const instanceID, token, workerIP = "i-python-tcp", "agent-token", "10.9.9.9"
-	f.addNode(instanceID, "eu-west-1", token)
-	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP }
-	f.gateway.directTCPNetworks, _ = ParseDirectTCPNetworks("127.0.0.0/8")
-
-	echoAddr := startEchoServer(t)
-	_, echoPort, _ := net.SplitHostPort(echoAddr)
-	agentProxyPort := freePort(t)
-
 	endpoint, caFile := startTLSTerminator(t, f.gateway.Addr().String())
 	dir := t.TempDir()
 	tokenFile := filepath.Join(dir, "runner-token")
@@ -134,10 +127,9 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 		t.Fatalf("write agent: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var agentLog syncBuffer
 	cmd := exec.CommandContext(ctx, python, "-I", agentFile) //nolint:gosec // test-controlled script path
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(append(os.Environ(),
 		"CLOUDVM_TUNNEL_CA_FILE="+caFile,
 		"CLOUDVM_TUNNEL_ENDPOINT="+endpoint,
 		"CLOUDVM_INSTANCE_ID="+instanceID,
@@ -145,12 +137,10 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 		"CLOUDVM_RUNNER_TOKEN_FILE="+tokenFile,
 		"CLOUDVM_ATTESTATION_FILE="+filepath.Join(dir, "absent"),
 		"CLOUDVM_CONTAINER_LOGS=0",
-		fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort),
-		// The gateway forwards only to 127.0.0.0/8, so a target on ::1 succeeds only when the agent connects it directly.
-		"CLOUDVM_DIRECT_CIDRS=::1/128",
-	)
+	), env...)
 	cmd.Stderr = &agentLog
 	if err := cmd.Start(); err != nil {
+		cancel()
 		t.Fatalf("start agent: %v", err)
 	}
 	t.Cleanup(func() {
@@ -161,6 +151,25 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 		}
 	})
 	waitForWithin(t, 60*time.Second, "python agent session", func() bool { return f.registry.Has(instanceID) })
+}
+
+func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
+	f := newTunnelFixture(t, time.Minute)
+	const instanceID, token, workerIP = "i-python-tcp", "agent-token", "10.9.9.9"
+	f.addNode(instanceID, "eu-west-1", token)
+	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP }
+	f.gateway.directTCPNetworks, _ = ParseDirectTCPNetworks("127.0.0.0/8")
+
+	echoAddr := startEchoServer(t)
+	_, echoPort, _ := net.SplitHostPort(echoAddr)
+	agentProxyPort := freePort(t)
+	startPythonAgent(t, f, instanceID, token,
+		fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort),
+		// The gateway forwards only to 127.0.0.0/8, so a target on ::1 succeeds only when the agent connects it directly.
+		"CLOUDVM_DIRECT_CIDRS=::1/128",
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	clusterProxy, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -239,5 +248,39 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("want 502, got %d", resp.StatusCode)
 		}
+	})
+}
+
+func TestTunnelTCP_PythonAgentTunnelsOnlyTunnelNetworks(t *testing.T) {
+	f := newTunnelFixture(t, time.Minute)
+	const instanceID, token, workerIP = "i-python-egress", "agent-token", "10.9.9.9"
+	f.addNode(instanceID, "eu-west-1", token)
+	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP }
+	// The gateway forwards nothing directly, so a target outside the workers succeeds only when the agent dials it.
+	f.gateway.directTCPNetworks = nil
+
+	echoAddr := startEchoServer(t)
+	_, echoPort, _ := net.SplitHostPort(echoAddr)
+	agentProxyPort := freePort(t)
+	startPythonAgent(t, f, instanceID, token,
+		fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort),
+		"CLOUDVM_DIRECT_CIDRS=::1/128",
+		"CLOUDVM_TUNNEL_CIDRS=10.0.0.0/8",
+	)
+	agentProxy := fmt.Sprintf("127.0.0.1:%d", agentProxyPort)
+
+	t.Run("a target inside the tunnel networks goes through the tunnel", func(t *testing.T) {
+		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, echoPort))
+	})
+	t.Run("a target inside the direct networks is dialed from the worker", func(t *testing.T) {
+		connectAndEcho(t, agentProxy, startEchoServerOn(t, "[::1]:0"))
+	})
+	t.Run("a target outside both is dialed from the worker", func(t *testing.T) {
+		connectAndEcho(t, agentProxy, echoAddr)
+	})
+	t.Run("a host name is routed by its address", func(t *testing.T) {
+		// localhost may resolve to either loopback address first, so both serve the echo on one port.
+		startEchoServerOn(t, net.JoinHostPort("::1", echoPort))
+		connectAndEcho(t, agentProxy, net.JoinHostPort("localhost", echoPort))
 	})
 }
