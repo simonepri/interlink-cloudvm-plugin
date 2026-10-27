@@ -63,7 +63,7 @@ func TestSpotInterruption_LogStreamAsksKubeRayToDrainWorkers(t *testing.T) {
 		t.Fatalf("listed %d ConfigMaps (err %v), want one for the Ray worker", len(cms.Items), err)
 	}
 	cm := cms.Items[0]
-	if cm.Name != "spot-interrupted-uid-worker" || cm.Labels[kubeRaySpotEventLabel] != kubeRaySpotEventValue || cm.Labels[kubeRayTargetClusterLabel] != "rc" {
+	if cm.Name != "spot-interrupted-uid-worker" || cm.Labels[managedByLabel] != managedByValue || cm.Labels[kubeRaySpotEventLabel] != kubeRaySpotEventValue || cm.Labels[kubeRayTargetClusterLabel] != "rc" {
 		t.Fatalf("unexpected ConfigMap metadata %+v", cm.ObjectMeta)
 	}
 	wantData := map[string]string{kubeRayWorkerGroupKey: "gpu", kubeRayInterruptedPodKey: "rc-worker-a", kubeRayReplicasKey: "1"}

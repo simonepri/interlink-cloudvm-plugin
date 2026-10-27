@@ -23,6 +23,12 @@ const (
 	rayGroupLabel   = "ray.io/group"
 )
 
+// The cluster admits the plugin's ConfigMap writes only on objects that carry this label.
+const (
+	managedByLabel = "app.kubernetes.io/managed-by"
+	managedByValue = "interlink-cloudvm-plugin"
+)
+
 // Labels and data keys of the ConfigMap that the KubeRay operator's spot interruption controller consumes.
 const (
 	kubeRaySpotEventLabel     = "test.k8s.io/event"
@@ -81,6 +87,7 @@ func (r *KubePodEventRecorder) RequestRayWorkerDrain(ctx context.Context, namesp
 			Name:      spotInterruptionConfigMapName(uid),
 			Namespace: namespace,
 			Labels: map[string]string{
+				managedByLabel:            managedByValue,
 				kubeRaySpotEventLabel:     kubeRaySpotEventValue,
 				kubeRayTargetClusterLabel: cluster,
 			},
