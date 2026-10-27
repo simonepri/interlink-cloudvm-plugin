@@ -112,6 +112,7 @@ type Reconciler struct {
 	pingJitter        time.Duration
 	configuredRegions []string
 	regionsMu         sync.RWMutex
+	podWatch          PodExistence
 }
 
 // SetOnTerminated registers a callback invoked when a zombie instance is terminated.
@@ -574,6 +575,14 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	}
 	result.EvictedPods = append(result.EvictedPods, r.markPodsFailed(ctx, deadPods)...)
 
+	// 1b. Terminate VMs whose pod no longer exists in Kubernetes, as if the virtual kubelet had deleted it.
+	orphaned := r.reapOrphanedVMs(ctx, activeInstances)
+	result.TerminatedZombies = append(result.TerminatedZombies, orphaned...)
+	reapedIDs := make(map[string]bool, len(orphaned))
+	for _, id := range orphaned {
+		reapedIDs[id] = true
+	}
+
 	// 2. Reverse check: detect zombie VMs whose pods vanished from tracker
 	activeInstanceIDs := make(map[string]bool, len(activePods))
 	for _, id := range activePods {
@@ -584,7 +593,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 
 	now := time.Now()
 	for _, inst := range activeInstances {
-		if activeInstanceIDs[inst.ID] {
+		if activeInstanceIDs[inst.ID] || reapedIDs[inst.ID] {
 			continue
 		}
 

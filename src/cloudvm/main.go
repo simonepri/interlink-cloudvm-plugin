@@ -302,6 +302,10 @@ func run() error {
 			}
 		}
 		reconciler.SetLaunchGracePeriod(launchGrace)
+		if pw, err := NewInClusterPodWatch(); err == nil {
+			pw.Start(ctx)
+			reconciler.SetPodWatch(pw)
+		}
 		server.SetReconciler(reconciler)
 		go reconciler.Start(ctx)
 
@@ -317,7 +321,7 @@ func run() error {
 					if err != nil {
 						log.Printf("[reconciler] Error during reconciliation: %v", err)
 					} else if len(res.TerminatedZombies) > 0 || len(res.EvictedPods) > 0 {
-						log.Printf("[reconciler] Cleaned %d zombies, evicted %d vanished pods",
+						log.Printf("[reconciler] Cleaned %d zombies, evicted %d vanished pods", //nolint:gosec // counts only
 							len(res.TerminatedZombies), len(res.EvictedPods))
 					}
 				}
