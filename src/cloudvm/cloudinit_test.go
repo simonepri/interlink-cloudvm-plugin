@@ -244,7 +244,7 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 
 	// Verify runner concurrency throttle and shutdown check
 	if !strings.Contains(script, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") ||
-		!strings.Contains(script, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") ||
+		!strings.Contains(script, `CLOUDVM_RUNNER_CONCURRENCY=""`) ||
 		!strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
 		t.Fatalf("cloud-init runner missing DOCKER_SEMAPHORE definition")
 	}
@@ -683,7 +683,7 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	if !strings.Contains(script, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") {
 		t.Errorf("cloud-init runner missing DEFAULT_RUNNER_CONCURRENCY definition")
 	}
-	if !strings.Contains(script, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") {
+	if !strings.Contains(script, `CLOUDVM_RUNNER_CONCURRENCY=""`) {
 		t.Errorf("cloud-init runner missing default RUNNER_CONCURRENCY assignment")
 	}
 	if !strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
@@ -703,7 +703,7 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateCloudInit explicit concurrency failed: %v", err)
 	}
-	if !strings.Contains(scriptExplicit, "RUNNER_CONCURRENCY = 16") {
+	if !strings.Contains(scriptExplicit, `CLOUDVM_RUNNER_CONCURRENCY="16"`) {
 		t.Errorf("cloud-init runner missing explicit RUNNER_CONCURRENCY = 16")
 	}
 	if !strings.Contains(scriptExplicit, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
@@ -723,7 +723,7 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	if cfgNegative.RunnerConcurrency != 0 {
 		t.Errorf("expected negative RunnerConcurrency to be reset to 0, got %d", cfgNegative.RunnerConcurrency)
 	}
-	if !strings.Contains(scriptNegative, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") {
+	if !strings.Contains(scriptNegative, `CLOUDVM_RUNNER_CONCURRENCY=""`) {
 		t.Errorf("cloud-init runner missing default RUNNER_CONCURRENCY assignment for negative value")
 	}
 
@@ -793,7 +793,7 @@ func TestRenderCloudInit_TunnelWorker(t *testing.T) {
 			`CLOUDVM_TUNNEL_ENDPOINT="tunnel.example.internal:443"`,
 			`CLOUDVM_DIRECT_CIDRS="10.137.0.0/16,10.138.0.0/16"`,
 			"instance-identity/pkcs7",
-			"ThreadingHTTPServer(('127.0.0.1', PORT)",
+			`CLOUDVM_RUNNER_BIND="127.0.0.1"`,
 			"class Session(object):",
 		} {
 			if !strings.Contains(script, want) {
@@ -835,7 +835,7 @@ func TestRenderCloudInit_TunnelWorker(t *testing.T) {
 		if err != nil {
 			t.Fatalf("render: %v", err)
 		}
-		if !strings.Contains(script, "ThreadingHTTPServer(('0.0.0.0', PORT)") {
+		if !strings.Contains(script, `CLOUDVM_RUNNER_BIND="0.0.0.0"`) {
 			t.Error("direct fallback must keep the runner reachable on the VPC address")
 		}
 	})
