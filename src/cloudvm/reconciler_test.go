@@ -48,6 +48,49 @@ func TestReconcilerZombieDetection(t *testing.T) {
 	}
 }
 
+func TestReconciler_TerminatesStoppedVM(t *testing.T) {
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+
+	mock := NewMockProvider()
+	srv := NewServer(mock, "cluster-stop")
+	body, _ := json.Marshal(&Pod{
+		Metadata: PodMeta{Name: "exited-worker", Namespace: "default", UID: "uid-stop-1"},
+		Spec:     PodSpecWrapper{Containers: []ContainerSpec{{Name: "main", Image: "alpine"}}},
+	})
+	w := httptest.NewRecorder()
+	srv.handleCreate(w, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from create, got %d: %s", w.Code, w.Body.String())
+	}
+	var res CreateStruct
+	_ = json.NewDecoder(w.Body).Decode(&res)
+	instID := strings.Split(res.PodJID, ":")[0]
+
+	// The guest shuts down: the provider reports the VM stopped, but it still exists.
+	mock.mu.Lock()
+	mock.instances[instID].State = StateTerminated
+	mock.mu.Unlock()
+	var terminated []string
+	mock.SetTerminateFn(func(_ context.Context, id string) error {
+		terminated = append(terminated, id)
+		return nil
+	})
+
+	reconciler := NewReconciler(mock, srv, mock, "cluster-stop", 10*time.Minute)
+	reconciler.SetLaunchGracePeriod(0)
+	result, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reconciler failed: %v", err)
+	}
+	if len(result.EvictedPods) != 1 {
+		t.Fatalf("expected the pod on the stopped VM to be evicted, got %v", result.EvictedPods)
+	}
+	if len(terminated) != 1 || terminated[0] != instID {
+		t.Fatalf("expected stopped VM %s to be terminated, got %v", instID, terminated)
+	}
+}
+
 func TestReconciler_SpotInterruptionMarksPodFailed(t *testing.T) {
 	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
 	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))

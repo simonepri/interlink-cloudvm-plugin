@@ -564,6 +564,12 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 				GlobalFleetTracker.RecordInterruption(prov, reg, itype, capType)
 			}
 			deadPods = append(deadPods, deadPod{key: podKey, reason: reason})
+			// A VM that shut itself down stays stopped and keeps billing its disks until it is terminated.
+			if r.terminator != nil {
+				if err := r.terminator.Terminate(ctx, instID); err != nil {
+					log.Printf("[reconciler] Error terminating vanished VM %s: %v", cleanID, err) //nolint:gosec // sanitized
+				}
+			}
 		}
 	}
 	result.EvictedPods = append(result.EvictedPods, r.markPodsFailed(ctx, deadPods)...)
