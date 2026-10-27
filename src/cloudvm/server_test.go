@@ -1309,7 +1309,7 @@ func TestServer_RunnerConcurrency_EnvAndAnnotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate cloud-init: %v", err)
 	}
-	if !strings.Contains(script1, "RUNNER_CONCURRENCY = 8") {
+	if !strings.Contains(script1, `CLOUDVM_RUNNER_CONCURRENCY="8"`) {
 		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = 8")
 	}
 	if !strings.Contains(script1, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
@@ -1353,7 +1353,7 @@ func TestServer_RunnerConcurrency_EnvAndAnnotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate cloud-init: %v", err)
 	}
-	if !strings.Contains(script2, "RUNNER_CONCURRENCY = 24") {
+	if !strings.Contains(script2, `CLOUDVM_RUNNER_CONCURRENCY="24"`) {
 		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = 24")
 	}
 	if !strings.Contains(script2, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
@@ -1390,7 +1390,7 @@ func TestServer_RunnerConcurrency_EnvAndAnnotation(t *testing.T) {
 	if !strings.Contains(script3, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") {
 		t.Errorf("expected cloud-init to contain DEFAULT_RUNNER_CONCURRENCY definition")
 	}
-	if !strings.Contains(script3, "RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY") {
+	if !strings.Contains(script3, `CLOUDVM_RUNNER_CONCURRENCY=""`) {
 		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY")
 	}
 	if !strings.Contains(script3, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
