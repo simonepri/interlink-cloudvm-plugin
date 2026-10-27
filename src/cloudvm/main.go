@@ -455,12 +455,22 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		IdentityValidator: server.ValidateTunnelIdentity,
 		OnReject:          metrics.RecordRejection,
 		LogSink:           server,
+		Resolver:          server.ResolveInstanceAddress,
+		DirectTCP:         os.Getenv("TUNNEL_TCP_DIRECT") == "true",
 	})
 	if err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
 	gateway.Start(ctx)
+	if proxyAddr := strings.TrimSpace(os.Getenv("TUNNEL_PROXY_LISTEN")); proxyAddr != "" {
+		proxyListener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", proxyAddr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to listen for tunnel CONNECT requests on %s: %w", proxyAddr, err)
+		}
+		go gateway.ServeConnectProxy(ctx, proxyListener)
+		log.Printf("[cloudvm-tunnel] Serving CONNECT to worker addresses on %s", proxyAddr) //nolint:gosec // configuration value
+	}
 	log.Printf("[cloudvm-tunnel] Gateway listening on %s; workers dial %s (connect timeout %v)", listenAddr, endpoint, connectTimeout) //nolint:gosec // configuration values
 	return gateway, nil
 }

@@ -160,6 +160,8 @@ type TunnelGateway struct {
 	handshakeTimeout    time.Duration
 	onReject            func(reason string)
 	logSink             WorkerLogSink
+	resolver            InstanceAddressResolver
+	directTCP           bool
 	closeOnce           sync.Once
 	closed              chan struct{}
 }
@@ -178,6 +180,10 @@ type TunnelGatewayConfig struct {
 	LogSink WorkerLogSink
 	// IdentityValidator, when set, runs after the token check and may demand proof of the worker's cloud identity.
 	IdentityValidator func(ctx context.Context, req *TunnelHandshakeRequest) error
+	// Resolver maps a worker VM address to its instance, so tcp streams and CONNECT requests reach that worker.
+	Resolver InstanceAddressResolver
+	// DirectTCP lets workers' tcp streams connect to any address the gateway can reach, not only other workers.
+	DirectTCP bool
 }
 
 // WorkerLogSink consumes the newline-delimited WorkerLogRecord stream a worker opens on its tunnel session.
@@ -192,6 +198,8 @@ const WorkerLogStreamKind = "logs"
 type WorkerStreamHeader struct {
 	Stream  string `json:"stream"`
 	Version int    `json:"version"`
+	// Target is the host:port a tcp stream connects to.
+	Target string `json:"target,omitempty"`
 }
 
 // NewTunnelGateway creates a new TunnelGateway.
@@ -222,6 +230,8 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		handshakeTimeout:    cfg.HandshakeTimeout,
 		onReject:            cfg.OnReject,
 		logSink:             cfg.LogSink,
+		resolver:            cfg.Resolver,
+		directTCP:           cfg.DirectTCP,
 		closed:              make(chan struct{}),
 	}
 	return gw, nil
@@ -336,7 +346,8 @@ func (g *TunnelGateway) acceptWorkerStreams(instanceID string, session *yamux.Se
 	}
 }
 
-// serveWorkerStream reads the stream header and hands a log stream to the log sink; it closes any other stream.
+// serveWorkerStream reads the stream header and hands a log stream to the log sink and a tcp stream to its target; it
+// closes any other stream.
 func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Stream) {
 	defer stream.Close()
 	if err := stream.SetReadDeadline(time.Now().Add(g.handshakeTimeout)); err != nil {
@@ -348,13 +359,18 @@ func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Strea
 		return
 	}
 	var header WorkerStreamHeader
-	if err := json.Unmarshal(line, &header); err != nil || header.Stream != WorkerLogStreamKind || g.logSink == nil {
+	if err := json.Unmarshal(line, &header); err != nil {
 		return
 	}
 	if err := stream.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
-	g.logSink.ConsumeWorkerLogs(instanceID, reader)
+	switch {
+	case header.Stream == WorkerLogStreamKind && g.logSink != nil:
+		g.logSink.ConsumeWorkerLogs(instanceID, reader)
+	case header.Stream == WorkerTCPStreamKind:
+		g.serveWorkerTCP(instanceID, reader, stream, header.Target)
+	}
 }
 
 // verifyAttestation checks the platform identity document when a verifier is configured and the worker sent one.
