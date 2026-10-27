@@ -545,3 +545,18 @@ func TestNodePool_ServerMaxPodsPerNodeEnv(t *testing.T) {
 		}
 	})
 }
+
+func TestNodePool_InstanceByIPMatchesLaunchAddress(t *testing.T) {
+	pool := NewNodePool(60 * time.Second)
+	pool.RegisterNode(NewCloudVMNode("i-launch", ProviderAWS, "eu-west-1", "10.0.0.5", ResourceVector{}))
+
+	if id, ok := pool.InstanceByIP("10.0.0.5"); !ok || id != "i-launch" {
+		t.Fatalf("InstanceByIP(10.0.0.5) = %q, %v; want i-launch, true", id, ok)
+	}
+	if _, ok := pool.InstanceByIP(""); ok {
+		t.Fatal("InstanceByIP matched an empty address")
+	}
+	if _, ok := pool.InstanceByIP("10.0.0.6"); ok {
+		t.Fatal("InstanceByIP matched an unknown address")
+	}
+}
