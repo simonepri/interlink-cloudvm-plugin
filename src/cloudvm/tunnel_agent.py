@@ -109,7 +109,7 @@ class Stream(object):
         self.session.streams.pop(self.sid, None)
 
     async def read_target(self):
-        """Returns where to bridge this gateway-opened stream: the local port its tcp header names, or the runner.
+        """Returns where to bridge this gateway-opened stream: the address of this VM its tcp header names, or the runner.
 
         Also returns the bytes read past the header and how many received bytes to credit back to the gateway.
         """
@@ -128,11 +128,11 @@ class Stream(object):
         try:
             header = json.loads(line.decode())
             host, _, port = header["target"].rpartition(":")
-            port = int(port)
+            host, port = host.strip("[]"), int(port)
         except (ValueError, KeyError, AttributeError) as e:
             log("stream %d: invalid stream header: %s" % (self.sid, e))
             return None, b"", 0
-        if header.get("stream") != TCP_STREAM_KIND or host not in ("127.0.0.1", "localhost"):
+        if header.get("stream") != TCP_STREAM_KIND or not is_own_address(host):
             log("stream %d: refused stream to %s" % (self.sid, header.get("target")))
             return None, b"", 0
         return (host, port), rest, len(buf)
@@ -313,6 +313,24 @@ class Session(object):
                 stream.task.cancel()
         elif flags & F_FIN:
             stream.on_fin()
+
+
+def is_own_address(host):
+    """Reports whether host is localhost or an IP address of this VM, which only a local address can bind to."""
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.is_unspecified or ip.is_multicast:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6 if ip.version == 6 else socket.AF_INET) as s:
+            s.bind((host, 0))
+    except OSError:
+        return False
+    return True
 
 
 def now_rfc3339():

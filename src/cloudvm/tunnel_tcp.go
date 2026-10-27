@@ -39,7 +39,7 @@ func (g *TunnelGateway) serveWorkerTCP(instanceID string, reader *bufio.Reader, 
 	}
 	var upstream net.Conn
 	if peer, ok := g.resolveInstance(host); ok {
-		upstream, err = g.openWorkerTCP(peer, port)
+		upstream, err = g.openWorkerTCP(peer, target)
 	} else if err = g.allowDirect(host, port); err == nil {
 		upstream, err = (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
 	}
@@ -78,7 +78,7 @@ func (g *TunnelGateway) serveConnect(conn net.Conn) {
 		_, _ = io.WriteString(conn, "HTTP/1.1 405 Method Not Allowed\r\n\r\n")
 		return
 	}
-	host, port, err := net.SplitHostPort(req.Host)
+	host, _, err := net.SplitHostPort(req.Host)
 	if err != nil {
 		_, _ = io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\n\r\n")
 		return
@@ -89,7 +89,7 @@ func (g *TunnelGateway) serveConnect(conn net.Conn) {
 		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		return
 	}
-	upstream, err := g.openWorkerTCP(peer, port)
+	upstream, err := g.openWorkerTCP(peer, req.Host)
 	if err != nil {
 		log.Printf("[tunnel] CONNECT %s: %v", req.Host, err)
 		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -103,8 +103,9 @@ func (g *TunnelGateway) serveConnect(conn net.Conn) {
 	bridge(reader, conn, upstream)
 }
 
-// openWorkerTCP opens a stream on the worker's session that its agent connects to the given local port.
-func (g *TunnelGateway) openWorkerTCP(instanceID, port string) (net.Conn, error) {
+// openWorkerTCP opens a stream on the worker's session that its agent connects to target, an address of the worker
+// itself, so a process listening only on the worker's private IP is reachable too.
+func (g *TunnelGateway) openWorkerTCP(instanceID, target string) (net.Conn, error) {
 	session, ok := g.registry.Get(instanceID)
 	if !ok {
 		return nil, fmt.Errorf("no active tunnel session for instance %s", instanceID)
@@ -117,7 +118,7 @@ func (g *TunnelGateway) openWorkerTCP(instanceID, port string) (net.Conn, error)
 		Stream  string `json:"stream"`
 		Version int    `json:"version"`
 		Target  string `json:"target"`
-	}{WorkerTCPStreamKind, 1, net.JoinHostPort("127.0.0.1", port)})
+	}{WorkerTCPStreamKind, 1, target})
 	if err != nil {
 		_ = stream.Close()
 		return nil, err

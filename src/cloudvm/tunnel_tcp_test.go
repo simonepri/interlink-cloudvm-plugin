@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -44,10 +45,10 @@ func startEchoServerOn(t *testing.T, addr string) string {
 	return l.Addr().String()
 }
 
-// startResetServer accepts connections, reads one chunk, and closes each with a TCP reset.
-func startResetServer(t *testing.T) string {
+// startResetServerOn accepts connections on addr, reads one chunk, and closes each with a TCP reset.
+func startResetServerOn(t *testing.T, addr string) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		t.Fatalf("reset listen: %v", err)
 	}
@@ -64,6 +65,22 @@ func startResetServer(t *testing.T) string {
 		}
 	}()
 	return l.Addr().String()
+}
+
+// localWorkerIP returns an IPv4 address of this host other than loopback, which stands in for a worker's private IP.
+func localWorkerIP(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatalf("interface addresses: %v", err)
+	}
+	for _, addr := range addrs {
+		if n, ok := addr.(*net.IPNet); ok && n.IP.To4() != nil && n.IP.IsGlobalUnicast() {
+			return n.IP.String()
+		}
+	}
+	t.Skip("no non-loopback IPv4 address")
+	return ""
 }
 
 func freePort(t *testing.T) int {
@@ -155,13 +172,15 @@ func startPythonAgent(t *testing.T, f *tunnelFixture, instanceID, token string, 
 
 func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 	f := newTunnelFixture(t, time.Minute)
-	const instanceID, token, workerIP = "i-python-tcp", "agent-token", "10.9.9.9"
+	const instanceID, token = "i-python-tcp", "agent-token"
+	// The worker's servers listen only on its private address, as Ray's agents do; 192.0.2.1 is another host's.
+	workerIP := localWorkerIP(t)
 	f.addNode(instanceID, "eu-west-1", token)
-	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP }
+	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP || ip == "192.0.2.1" }
 	f.gateway.directTCPNetworks, _ = ParseDirectTCPNetworks("127.0.0.0/8")
 
 	echoAddr := startEchoServer(t)
-	_, echoPort, _ := net.SplitHostPort(echoAddr)
+	_, workerEchoPort, _ := net.SplitHostPort(startEchoServerOn(t, net.JoinHostPort(workerIP, "0")))
 	agentProxyPort := freePort(t)
 	startPythonAgent(t, f, instanceID, token,
 		fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort),
@@ -182,16 +201,40 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 		connectAndEcho(t, agentProxy, echoAddr)
 	})
 	t.Run("cluster to worker", func(t *testing.T) {
-		connectAndEcho(t, clusterProxy.Addr().String(), net.JoinHostPort(workerIP, echoPort))
+		connectAndEcho(t, clusterProxy.Addr().String(), net.JoinHostPort(workerIP, workerEchoPort))
 	})
 	t.Run("worker to worker", func(t *testing.T) {
-		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, echoPort))
+		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, workerEchoPort))
+	})
+	t.Run("the worker refuses a stream to an address it does not own", func(t *testing.T) {
+		target := net.JoinHostPort("192.0.2.1", workerEchoPort)
+		conn, err := net.DialTimeout("tcp", clusterProxy.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+		if err != nil {
+			t.Fatalf("CONNECT %s: %v", target, err)
+		}
+		_ = resp.Body.Close()
+		_, _ = conn.Write([]byte("x"))
+		if _, err := reader.ReadByte(); err == nil {
+			t.Fatal("the worker forwarded a stream to another host's address")
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("the cluster connection stayed open after the worker refused the stream")
+		}
 	})
 	t.Run("worker connects its direct networks without the tunnel", func(t *testing.T) {
 		connectAndEcho(t, agentProxy, startEchoServerOn(t, "[::1]:0"))
 	})
 	t.Run("a reset on the worker closes the cluster connection", func(t *testing.T) {
-		_, resetPort, _ := net.SplitHostPort(startResetServer(t))
+		_, resetPort, _ := net.SplitHostPort(startResetServerOn(t, net.JoinHostPort(workerIP, "0")))
 		target := net.JoinHostPort(workerIP, resetPort)
 		conn, err := net.DialTimeout("tcp", clusterProxy.Addr().String(), 5*time.Second)
 		if err != nil {
@@ -253,24 +296,36 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 
 func TestTunnelTCP_PythonAgentTunnelsOnlyTunnelNetworks(t *testing.T) {
 	f := newTunnelFixture(t, time.Minute)
-	const instanceID, token, workerIP = "i-python-egress", "agent-token", "10.9.9.9"
+	const instanceID, token = "i-python-egress", "agent-token"
+	workerIP := localWorkerIP(t)
 	f.addNode(instanceID, "eu-west-1", token)
-	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP }
+	// The resolver records the addresses the gateway forwards to, which shows whether a connection used the tunnel.
+	var tunneled atomic.Bool
+	f.gateway.resolver = func(ip string) (string, bool) {
+		if ip == workerIP {
+			tunneled.Store(true)
+		}
+		return instanceID, ip == workerIP
+	}
 	// The gateway forwards nothing directly, so a target outside the workers succeeds only when the agent dials it.
 	f.gateway.directTCPNetworks = nil
 
 	echoAddr := startEchoServer(t)
 	_, echoPort, _ := net.SplitHostPort(echoAddr)
+	_, workerEchoPort, _ := net.SplitHostPort(startEchoServerOn(t, net.JoinHostPort(workerIP, "0")))
 	agentProxyPort := freePort(t)
 	startPythonAgent(t, f, instanceID, token,
 		fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort),
 		"CLOUDVM_DIRECT_CIDRS=::1/128",
-		"CLOUDVM_TUNNEL_CIDRS=10.0.0.0/8",
+		"CLOUDVM_TUNNEL_CIDRS="+workerIP+"/32",
 	)
 	agentProxy := fmt.Sprintf("127.0.0.1:%d", agentProxyPort)
 
 	t.Run("a target inside the tunnel networks goes through the tunnel", func(t *testing.T) {
-		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, echoPort))
+		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, workerEchoPort))
+		if !tunneled.Load() {
+			t.Fatal("the connection did not go through the gateway")
+		}
 	})
 	t.Run("a target inside the direct networks is dialed from the worker", func(t *testing.T) {
 		connectAndEcho(t, agentProxy, startEchoServerOn(t, "[::1]:0"))
