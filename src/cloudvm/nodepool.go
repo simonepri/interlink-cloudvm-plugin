@@ -191,6 +191,21 @@ func (node *CloudVMNode) FitsAndScores(req ResourceVector) (bool, []int, []int, 
 	return true, assignedGPUs, assignedTPUs, score
 }
 
+// ownerNamespace returns the namespace of the node and its pod allocations, empty when it has neither; false when they
+// disagree.
+func (node *CloudVMNode) ownerNamespace() (string, bool) {
+	namespace := node.Namespace
+	for _, alloc := range node.ActivePods {
+		if namespace == "" {
+			namespace = alloc.PodNamespace
+		}
+		if alloc.PodNamespace != namespace {
+			return "", false
+		}
+	}
+	return namespace, true
+}
+
 // AssignPod commits resource and discrete device reservations for a pod.
 func (node *CloudVMNode) AssignPod(alloc *PodAllocation) {
 	node.ActivePods[alloc.PodUID] = alloc
@@ -374,7 +389,8 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 		if region != "" && node.Region != region {
 			continue
 		}
-		if node.Namespace != "" && namespace != "" && node.Namespace != namespace {
+		// A node never mixes namespaces, so the tunnel gateway can attribute its traffic to one.
+		if owner, ok := node.ownerNamespace(); !ok || (owner != "" && owner != namespace) {
 			continue
 		}
 		if np.maxPodsPerNode > 0 && node.ActivePodCount() >= np.maxPodsPerNode {
@@ -403,6 +419,7 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 		AssignedTPUs: bestTPUs,
 		StartedAt:    time.Now(),
 	}
+	bestNode.Namespace = namespace
 	bestNode.AssignPod(alloc)
 	return bestNode, bestGPUs, bestTPUs, nil
 }
@@ -555,6 +572,19 @@ func (np *NodePool) InstanceByIP(ip string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// InstanceNamespace returns the one namespace of the node and the pods allocated to it; false when the node is unknown,
+// has no namespace, or its pods disagree.
+func (np *NodePool) InstanceNamespace(instanceID string) (string, bool) {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	node, found := np.nodes[instanceID]
+	if !found || node == nil {
+		return "", false
+	}
+	namespace, ok := node.ownerNamespace()
+	return namespace, ok && namespace != ""
 }
 
 // ActiveNodes returns a slice of all active nodes currently tracked in the pool.

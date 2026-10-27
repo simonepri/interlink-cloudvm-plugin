@@ -241,8 +241,16 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	podWatch, err := NewInClusterPodWatch()
+	if err != nil {
+		log.Printf("[cloudvm] Pod watch unavailable, so the reconciler keeps VMs of deleted pods and the tunnel refuses tcp streams: %v", err)
+		podWatch = nil
+	} else {
+		podWatch.Start(ctx)
+	}
+
 	if providerType == "aws" || providerType == "gcp" {
-		gateway, err := startTunnelGateway(ctx, server)
+		gateway, err := startTunnelGateway(ctx, server, podWatch)
 		if err != nil {
 			return err
 		}
@@ -302,9 +310,8 @@ func run() error {
 			}
 		}
 		reconciler.SetLaunchGracePeriod(launchGrace)
-		if pw, err := NewInClusterPodWatch(); err == nil {
-			pw.Start(ctx)
-			reconciler.SetPodWatch(pw)
+		if podWatch != nil {
+			reconciler.SetPodWatch(podWatch)
 		}
 		server.SetReconciler(reconciler)
 		go reconciler.Start(ctx)
@@ -391,8 +398,9 @@ func run() error {
 	}
 }
 
-// startTunnelGateway listens for worker reverse tunnels and routes every runner call through them.
-func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, error) {
+// startTunnelGateway listens for worker reverse tunnels and routes every runner call through them; podWatch, when set,
+// attributes cluster ends of tcp streams to namespaces.
+func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch) (*TunnelGateway, error) {
 	endpoint := strings.TrimSpace(os.Getenv("TUNNEL_ENDPOINT"))
 	transports, err := TunnelTransportsFromClusterFacts(os.Getenv("CLUSTER_FACTS"))
 	if err != nil {
@@ -468,7 +476,7 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		_ = listener.Close()
 		return nil, err
 	}
-	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
+	config := TunnelGatewayConfig{
 		Listener:           listener,
 		Registry:           registry,
 		TokenValidator:     server.ValidateTunnelToken,
@@ -478,7 +486,13 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		LogSink:            server,
 		Resolver:           server.ResolveInstanceAddress,
 		DirectTCPNetworks:  directTCPNetworks,
-	})
+		WorkerNamespace:    server.WorkerNamespace,
+		OnTCPRefusal:       metrics.RecordTCPRefusal,
+	}
+	if podWatch != nil {
+		config.PodNamespaces = podWatch
+	}
+	gateway, err := NewTunnelGateway(config)
 	if err != nil {
 		_ = listener.Close()
 		return nil, err

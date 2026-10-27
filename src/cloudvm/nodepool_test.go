@@ -560,3 +560,28 @@ func TestNodePool_InstanceByIPMatchesLaunchAddress(t *testing.T) {
 		t.Fatal("InstanceByIP matched an unknown address")
 	}
 }
+
+func TestNodePool_NodeKeepsOneNamespace(t *testing.T) {
+	pool := NewNodePool(time.Minute)
+	capacity, _ := NewResourceVector("8", "32Gi", 0, 0)
+	req, _ := NewResourceVector("1", "1Gi", 0, 0)
+	pool.RegisterNode(NewCloudVMNode("i-shared", ProviderAWS, "eu-west-1", "10.0.0.5", capacity))
+	if _, ok := pool.InstanceNamespace("i-shared"); ok {
+		t.Fatal("a node without pods has a namespace")
+	}
+	if _, _, _, err := pool.Allocate(req, "eu-west-1", "uid-a", "team-a", "a"); err != nil {
+		t.Fatalf("first pod: %v", err)
+	}
+	if _, _, _, err := pool.Allocate(req, "eu-west-1", "uid-b", "team-b", "b"); err == nil {
+		t.Fatal("a pod of another namespace joined the node")
+	}
+	if _, _, _, err := pool.Allocate(req, "eu-west-1", "uid-a2", "team-a", "a2"); err != nil {
+		t.Fatalf("pod of the same namespace: %v", err)
+	}
+	if ns, ok := pool.InstanceNamespace("i-shared"); !ok || ns != "team-a" {
+		t.Fatalf("InstanceNamespace = %q, %v; want team-a, true", ns, ok)
+	}
+	if _, ok := pool.InstanceNamespace("i-missing"); ok {
+		t.Fatal("an unknown node has a namespace")
+	}
+}

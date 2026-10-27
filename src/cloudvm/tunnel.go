@@ -163,6 +163,10 @@ type TunnelGateway struct {
 	logSink             WorkerLogSink
 	resolver            InstanceAddressResolver
 	directTCPNetworks   []*net.IPNet
+	podNamespaces       PodNamespaces
+	workerNamespace     WorkerNamespaceResolver
+	onTCPRefusal        func(reason string)
+	tcpRefusalLog       refusalLog
 	clusterDomain       string
 	clusterDNSServers   []string
 	closeOnce           sync.Once
@@ -190,6 +194,12 @@ type TunnelGatewayConfig struct {
 	// DirectTCPNetworks lists the networks workers' tcp streams may reach directly, besides other workers, on ports
 	// from 1024 up; direct forwarding is off when empty.
 	DirectTCPNetworks []*net.IPNet
+	// PodNamespaces maps cluster pod IPs to their namespaces; every tcp stream with a cluster end is refused when nil.
+	PodNamespaces PodNamespaces
+	// WorkerNamespace maps a worker to the namespace of its pods; every tcp stream is refused when nil.
+	WorkerNamespace WorkerNamespaceResolver
+	// OnTCPRefusal is called with a short machine-readable reason for every refused tcp stream and CONNECT request.
+	OnTCPRefusal func(reason string)
 	// ClusterDomain is the DNS domain whose names workers' dns streams may resolve; DefaultClusterDomain when empty.
 	ClusterDomain string
 	// ClusterDNSServers are the host:port resolvers that answer workers' dns streams; the nameservers of the plugin
@@ -250,6 +260,9 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		logSink:             cfg.LogSink,
 		resolver:            cfg.Resolver,
 		directTCPNetworks:   cfg.DirectTCPNetworks,
+		podNamespaces:       cfg.PodNamespaces,
+		workerNamespace:     cfg.WorkerNamespace,
+		onTCPRefusal:        cfg.OnTCPRefusal,
 		clusterDomain:       cfg.ClusterDomain,
 		clusterDNSServers:   cfg.ClusterDNSServers,
 		closed:              make(chan struct{}),

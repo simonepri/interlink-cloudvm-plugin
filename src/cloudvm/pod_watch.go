@@ -1,5 +1,5 @@
-// Kubernetes pod watch: a shared informer that tells the reconciler which pods still exist, so it can terminate VMs
-// whose pod was deleted while the plugin never received the delete call.
+// Kubernetes pod watch: a shared informer that tells the reconciler which pods still exist and tells the tunnel gateway
+// which namespace owns a pod IP.
 package main
 
 import (
@@ -20,7 +20,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-const podUIDIndex = "pod-uid"
+const (
+	podUIDIndex = "pod-uid"
+	podIPIndex  = "pod-ip"
+)
 
 // PodExistence answers whether the pod with a given UID still exists in Kubernetes.
 type PodExistence interface {
@@ -35,19 +38,24 @@ type OrphanedPodDeleter interface {
 	DeleteOrphanedPod(ctx context.Context, namespace, name, uid string)
 }
 
-// PodWatch caches the UIDs of all pods in the cluster through a shared informer.
+// PodWatch caches the UIDs and IPs of all pods in the cluster through a shared informer.
 type PodWatch struct {
 	informer cache.SharedIndexInformer
 	factory  informers.SharedInformerFactory
 }
 
-// NewPodWatch creates a watch backed by client. Only pod metadata stays in the cache.
+// NewPodWatch creates a watch backed by client. Only pod metadata and the fields that decide who owns a pod IP stay in
+// the cache.
 func NewPodWatch(client kubernetes.Interface) *PodWatch {
 	factory := informers.NewSharedInformerFactory(client, 0)
 	inf := factory.Core().V1().Pods().Informer()
 	_ = inf.SetTransform(func(obj any) (any, error) {
 		if pod, ok := obj.(*corev1.Pod); ok {
-			return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID}}, nil
+			return &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+				Spec:       corev1.PodSpec{HostNetwork: pod.Spec.HostNetwork},
+				Status:     corev1.PodStatus{Phase: pod.Status.Phase, PodIP: pod.Status.PodIP, PodIPs: pod.Status.PodIPs},
+			}, nil
 		}
 		return obj, nil
 	})
@@ -57,7 +65,7 @@ func NewPodWatch(client kubernetes.Interface) *PodWatch {
 			return []string{sanitizeGCPLabel(string(pod.UID))}, nil
 		}
 		return nil, nil
-	}})
+	}, podIPIndex: podIPs})
 	return &PodWatch{informer: inf, factory: factory}
 }
 
@@ -89,6 +97,41 @@ func (w *PodWatch) HasSynced() bool {
 func (w *PodWatch) PodExists(uid string) bool {
 	objs, err := w.informer.GetIndexer().ByIndex(podUIDIndex, sanitizeGCPLabel(uid))
 	return err != nil || len(objs) > 0
+}
+
+// PodNamespace returns the namespace of the pods that hold ip; false when no pod holds it or pods of several namespaces
+// do.
+func (w *PodWatch) PodNamespace(ip string) (string, bool) {
+	objs, err := w.informer.GetIndexer().ByIndex(podIPIndex, ip)
+	if err != nil {
+		return "", false
+	}
+	namespace := ""
+	for _, obj := range objs {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok || (namespace != "" && pod.Namespace != namespace) {
+			return "", false
+		}
+		namespace = pod.Namespace
+	}
+	return namespace, namespace != ""
+}
+
+// podIPs indexes the IPs a pod owns. A host-network pod shares its node's IP and a finished pod may have handed its IP
+// to a new pod, so neither owns one.
+func podIPs(obj any) ([]string, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || pod.Spec.HostNetwork || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return nil, nil
+	}
+	ips := make([]string, 0, len(pod.Status.PodIPs)+1)
+	for _, podIP := range pod.Status.PodIPs {
+		ips = append(ips, podIP.IP)
+	}
+	if len(ips) == 0 && pod.Status.PodIP != "" {
+		ips = append(ips, pod.Status.PodIP)
+	}
+	return ips, nil
 }
 
 // SetPodWatch enables termination of VMs whose pod no longer exists.
