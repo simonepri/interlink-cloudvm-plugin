@@ -170,13 +170,22 @@ func run() error {
 		}
 	}
 
+	namespaceFirewalls, err := NamespaceFirewallsFromClusterFacts(os.Getenv("CLUSTER_FACTS"))
+	if err != nil {
+		return err
+	}
+	gcpProv := NewGCPProvider("", "us-central1-a")
+	gcpProv.SetNamespaceFirewalls(namespaceFirewalls)
+
 	switch providerType {
 	case "aws":
 		defaultProvider = awsProv
 	case "gcp":
 		gcpProject := os.Getenv("GCP_PROJECT")
 		gcpZone := os.Getenv("GCP_ZONE")
-		defaultProvider = NewGCPProvider(gcpProject, gcpZone)
+		gcpDefault := NewGCPProvider(gcpProject, gcpZone)
+		gcpDefault.SetNamespaceFirewalls(namespaceFirewalls)
+		defaultProvider = gcpDefault
 	default:
 		defaultProvider = mockProv
 	}
@@ -241,7 +250,7 @@ func run() error {
 	}
 	log.Printf("[cloudvm] Node pool warm idle grace period configured to %v", idleGrace) //nolint:gosec // duration is safe
 	server.RegisterProvider(ProviderAWS, awsProv)
-	server.RegisterProvider(ProviderGCP, NewGCPProvider("", "us-central1-a"))
+	server.RegisterProvider(ProviderGCP, gcpProv)
 	server.RegisterProvider(ProviderMock, mockProv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -76,6 +76,7 @@ type mockEC2FleetClient struct {
 	describeInstanceTypesFn func(ctx context.Context, params *ec2.DescribeInstanceTypesInput) (*ec2.DescribeInstanceTypesOutput, error)
 	describeOfferingsFn     func(ctx context.Context, params *ec2.DescribeInstanceTypeOfferingsInput) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
 	describeSubnetsFn       func(ctx context.Context, params *ec2.DescribeSubnetsInput) (*ec2.DescribeSubnetsOutput, error)
+	modifyInstanceFn        func(ctx context.Context, params *ec2.ModifyInstanceAttributeInput) (*ec2.ModifyInstanceAttributeOutput, error)
 	// templateImages maps a launch template ID or name to its image's architecture, x86_64 or arm64.
 	templateImages map[string]ec2types.ArchitectureValues
 }
@@ -133,6 +134,13 @@ func (m *mockEC2FleetClient) DescribeInstanceTypeOfferings(ctx context.Context, 
 		return m.describeOfferingsFn(ctx, params)
 	}
 	return &ec2.DescribeInstanceTypeOfferingsOutput{}, nil
+}
+
+func (m *mockEC2FleetClient) ModifyInstanceAttribute(ctx context.Context, params *ec2.ModifyInstanceAttributeInput, _ ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error) {
+	if m.modifyInstanceFn != nil {
+		return m.modifyInstanceFn(ctx, params)
+	}
+	return &ec2.ModifyInstanceAttributeOutput{}, nil
 }
 
 // DescribeSubnets returns no subnets by default, which leaves subnet AZs unknown and fleet overrides unfiltered.

@@ -966,6 +966,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	inst, err := prov.Launch(launchCtx, spec)
 	if err != nil {
 		log.Printf("[cloudvm] Failed to launch VM for %s: %v", spec.PodName, err)
+		s.recordNamespaceFirewallEvent(launchCtx, spec, err)
 		finalErr = fmt.Errorf("launch failed: %w", err)
 		http.Error(w, finalErr.Error(), http.StatusInternalServerError)
 		return

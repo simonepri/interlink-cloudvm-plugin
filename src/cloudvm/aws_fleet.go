@@ -170,6 +170,9 @@ type RegionalClusterFact struct {
 	DirectCIDRs []string `json:"directCidrs,omitempty"`
 	// ImageMirrors maps an upstream registry host to the mirror reference prefix the region's workers pull from instead.
 	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
+	// NamespaceFirewalls maps a pod namespace to the firewall its workers join so they reach only workers of the same
+	// namespace: a security group ID on AWS, a network tag on GCP. When set, pods of unlisted namespaces do not launch.
+	NamespaceFirewalls map[string]string `json:"namespaceFirewalls,omitempty"`
 }
 
 // ClusterFacts holds the regional deployment facts for dynamic Launch Template and subnet selection.
@@ -188,6 +191,7 @@ type EC2FleetClient interface {
 	DescribeSubnets(ctx context.Context, params *ec2.DescribeSubnetsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error)
 	DescribeLaunchTemplateVersions(ctx context.Context, params *ec2.DescribeLaunchTemplateVersionsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplateVersionsOutput, error)
 	DescribeImages(ctx context.Context, params *ec2.DescribeImagesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error)
+	ModifyInstanceAttribute(ctx context.Context, params *ec2.ModifyInstanceAttributeInput, optFns ...func(*ec2.Options)) (*ec2.ModifyInstanceAttributeOutput, error)
 }
 
 var (
@@ -654,6 +658,46 @@ func (p *AWSProvider) ResolveRegionalSubnets(region string) []string {
 }
 
 // SetEC2Client registers a concrete *ec2.Client into the multi-region client pool.
+// namespaceFirewall returns the security group a pod of namespace joins in region: "" when the region's cluster facts
+// list no namespace firewalls, and errNamespaceFirewallMissing when they list some but none for namespace.
+func (p *AWSProvider) namespaceFirewall(region, namespace string) (string, error) {
+	p.mu.RLock()
+	var firewalls map[string]string
+	if p.clusterFacts != nil {
+		firewalls = p.clusterFacts.Regions[region].NamespaceFirewalls
+	}
+	p.mu.RUnlock()
+	sg, err := namespaceFirewall(firewalls, region, namespace)
+	if err != nil {
+		return "", err
+	}
+	if sg != "" && !securityGroupIDPattern.MatchString(sg) {
+		return "", fmt.Errorf("region %s: namespace firewall %q of namespace %q is not a security group ID", region, sg, namespace)
+	}
+	return sg, nil
+}
+
+// attachNamespaceFirewall adds sg to the security groups the instance booted with from its launch template; EC2 Fleet
+// overrides cannot name security groups, so the group joins after launch.
+func attachNamespaceFirewall(ctx context.Context, client EC2FleetClient, instanceID string, booted []ec2types.GroupIdentifier, sg string) error {
+	groups := []string{sg}
+	for _, g := range booted {
+		if id := aws.ToString(g.GroupId); id != "" && id != sg {
+			groups = append(groups, id)
+		}
+	}
+	if len(groups) == 1 {
+		return fmt.Errorf("instance %s reports no launch template security groups to keep beside %s", instanceID, sg)
+	}
+	if _, err := client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+		InstanceId: aws.String(instanceID),
+		Groups:     groups,
+	}); err != nil {
+		return fmt.Errorf("ec2:ModifyInstanceAttribute adding %s to %s: %w", sg, instanceID, err)
+	}
+	return nil
+}
+
 func (p *AWSProvider) SetEC2Client(region string, c *ec2.Client) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -807,6 +851,9 @@ func (p *AWSProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		derived.InstanceType = instanceTypes[0]
 		spec = &derived
 	}
+	if _, err := p.namespaceFirewall(spec.Region, spec.PodNamespace); err != nil {
+		return nil, err
+	}
 	regions := p.launchRegions(spec, instanceTypes)
 
 	var failures []string
@@ -840,6 +887,11 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 	capType := "spot"
 	if spec.MarketType == "on-demand" {
 		capType = "on-demand"
+	}
+
+	namespaceSG, err := p.namespaceFirewall(region, spec.PodNamespace)
+	if err != nil {
+		return nil, err
 	}
 
 	ltID, ltName := "", ""
@@ -936,11 +988,24 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 	descOut, descErr := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 		InstanceIds: []string{inst.ID},
 	})
+	var bootedGroups []ec2types.GroupIdentifier
 	if descErr == nil && len(descOut.Reservations) > 0 && len(descOut.Reservations[0].Instances) > 0 {
 		ec2Inst := descOut.Reservations[0].Instances[0]
 		if ec2Inst.PrivateIpAddress != nil && *ec2Inst.PrivateIpAddress != "" {
 			inst.IP = *ec2Inst.PrivateIpAddress
 		}
+		bootedGroups = ec2Inst.SecurityGroups
+	}
+	if namespaceSG != "" {
+		if err := attachNamespaceFirewall(ctx, client, inst.ID, bootedGroups, namespaceSG); err != nil {
+			// A worker outside its namespace firewall cannot reach its peers, so it does not run the pod.
+			if _, termErr := client.TerminateInstances(context.WithoutCancel(ctx), &ec2.TerminateInstancesInput{InstanceIds: []string{inst.ID}}); termErr != nil {
+				log.Printf("[aws] Failed to terminate %s after its namespace firewall did not attach: %v", sanitizeLog(inst.ID), termErr) //nolint:gosec // sanitized
+			}
+			GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "namespace_firewall")
+			return nil, fmt.Errorf("attach namespace firewall: %w", err)
+		}
+		inst.Metadata["namespaceFirewall"] = namespaceSG
 	}
 
 	p.AddConfiguredRegions(region)
