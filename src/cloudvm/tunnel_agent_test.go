@@ -233,3 +233,15 @@ func TestTunnelAgent_PythonAgentRejectedWithWrongToken(t *testing.T) {
 		t.Fatal("agent with a forged token must not get a session")
 	}
 }
+
+func TestTunnelAgent_OrdersContainerLogTimestamps(t *testing.T) {
+	// Docker pads nanoseconds and nerdctl trims them; --since on nerdctl repeats the whole second, which the agent skips.
+	out := runAgentPython(t, `
+k = agent.log_time_key
+print(k("2024-01-01T00:00:00.5Z") == k("2024-01-01T00:00:00.500000000Z"))
+print(k("2024-01-01T00:00:00.123456789Z") < k("2024-01-01T00:00:00.5Z") < k("2024-01-01T00:00:01Z"))
+`)
+	if want := "True\nTrue\n"; out != want {
+		t.Fatalf("log_time_key results = %q, want %q", out, want)
+	}
+}

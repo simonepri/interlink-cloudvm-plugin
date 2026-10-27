@@ -338,7 +338,7 @@ Standard Kubernetes DaemonSets do not run on InterLink virtual nodes. Instead, h
 | **Torch Compile Cache** | Pre-populated kernel cache in AMI | Local disk / S3 | Avoids 5-15 minute Triton/Inductor compilation on cold boot. |
 | **Node Problem Detector** (`ENABLE_NPD=true`) | Embedded standalone NPD agent | Host systemd service | Checks GPU Xid/ECC errors, kernel deadlocks, and driver faults; terminates unhealthy VMs cleanly. |
 | **DCGM Exporter / OTEL** (`OTEL_ENDPOINT`) | Host OTEL Collector / Vector | Systemd service | Ships GPU telemetry, container logs, and system metrics directly to central SigNoz/Honeycomb. |
-| **Log collector** (`CLOUDVM_OTLP_LOGS_ENDPOINT`) | Tunnel agent log stream | Reverse tunnel session | The tunnel agent streams the bootstrap log, runner log, and `docker logs` of each pod container over its tunnel; the plugin forwards them as OTLP/HTTP logs tagged `cloudvm.instance_id`, `cloudvm.region`, `k8s.pod.name`, and `k8s.namespace.name`, and keeps the last 128 KiB of each pod's container output for `kubectl logs`. |
+| **Log collector** (`CLOUDVM_OTLP_LOGS_ENDPOINT`) | Tunnel agent log stream | Reverse tunnel session | The tunnel agent streams the bootstrap log, runner log, and `docker logs` (or `CLOUDVM_CONTAINER_CLI logs`) of each pod container over its tunnel; the plugin forwards them as OTLP/HTTP logs tagged `cloudvm.instance_id`, `cloudvm.region`, `k8s.pod.name`, and `k8s.namespace.name`, and keeps the last 128 KiB of each pod's container output for `kubectl logs`. |
 | **Pull-Through Cache** (`REGISTRY_MIRRORS`) | Docker / containerd registry mirrors | Host daemon config | Pulls container images via local cluster caches (Harbor, Spegel) avoiding Docker Hub limits. |
 | **Custom Bootstrap** (`CUSTOM_BOOTSTRAP_SCRIPT`) | Shell script execution hook | `cloud-init` execution | Allows mounting NFS/EFS/FSx shares, enrolling security agents, or injecting custom CA certs. |
 
@@ -623,6 +623,21 @@ The plugin refuses to start when a transport in use lacks its variable or `CLUST
 `regions.<region>.directCidrs` lists the private networks that region's workers share, such as the region's worker VPC. A worker's local CONNECT proxy on `127.0.0.1:13128` connects targets inside those networks directly and carries every other target through the tunnel, so traffic between workers of one region stays inside its network. The plugin refuses to start when an entry is not a CIDR.
 
 `regions.<region>.imageMirrors` maps an upstream registry host to the mirror reference prefix that region's workers pull from, for example `{"docker.io": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}`. The in-VM runner rewrites an image whose registry host matches before pulling: `rayproject/ray:2.9` becomes `<prefix>/rayproject/ray:2.9`, Docker Hub images without a namespace gain `library/`, and a digest stays attached. ECR mirrors authenticate through the ECR credential helper with the VM's instance role. The plugin refuses to start when a host is not a bare registry host or a prefix is empty or carries a scheme. Mirrors apply only when the tunnel is enabled, because the region facts reach workers through the tunnel route.
+
+The tunnel agent on each worker reads these variables, which the bootstrap script sets:
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `CLOUDVM_DIRECT_CIDRS` | (empty) | Comma-separated CIDRs the CONNECT proxy dials directly from the worker |
+| `CLOUDVM_TUNNEL_CIDRS` | (empty) | Comma-separated CIDRs the CONNECT proxy carries through the tunnel, such as the cluster's pod and service networks; when set, the proxy resolves host names itself and dials every target outside these networks directly, so internet traffic leaves from the worker; when empty, it tunnels every target outside `CLOUDVM_DIRECT_CIDRS` |
+| `CLOUDVM_CONTAINER_CLI` | `docker` | CLI whose `logs --follow --timestamps` and `ps --all` the agent runs to stream container output, such as `nerdctl` |
+| `CLOUDVM_DNS_LISTEN` | (empty: no forwarder) | UDP `host:port` of the agent's DNS forwarder, such as `127.0.0.153:53`; it sends queries for names in the cluster domain through the tunnel and every other query to the nameservers in `CLOUDVM_DNS_RESOLV_CONF` |
+| `CLOUDVM_CLUSTER_DOMAIN` | `cluster.local` | Domain whose names the forwarder resolves through the tunnel |
+| `CLOUDVM_DNS_RESOLV_CONF` | `/etc/resolv.conf` | Resolver configuration the forwarder reads its upstream nameservers from |
+| `CLOUDVM_DNS_TAKEOVER` | `0` | `1` rewrites `CLOUDVM_DNS_RESOLV_CONF` once the forwarder listens: the forwarder comes first, up to two original nameservers follow as fallbacks while the agent is down, and `svc.<domain>` and `<domain>` lead the search list, so `my-svc.my-ns` resolves as in a pod; the forwarder must listen on port 53 |
+| `CLOUDVM_DNS_UPSTREAM` | (nameservers of `CLOUDVM_DNS_RESOLV_CONF`) | One `host:port` resolver that replaces those nameservers |
+
+The gateway answers a worker's cluster DNS query by sending it to the nameservers in the plugin pod's `/etc/resolv.conf`, over UDP and then TCP when the reply is truncated, and refuses names outside `cluster.local`. The forwarder answers SERVFAIL when no tunnel session is up or the gateway does not reply within 5 seconds.
 
 Tunnel workers download the runner and the tunnel agent at boot instead of carrying them in their user data, which keeps it far below the 16 KiB EC2 limit. The bootstrap requests `https://<tunnel endpoint>/bootstrap/<sha256>` with `curl`, after the step that makes the tunnel host reachable, and stops with a `BOOTSTRAP_FAILED` console status when the download fails or the file's sha256 differs from the one the user data pins. The gateway answers a connection that opens with an HTTP `GET` instead of a handshake with the embedded script of that hash (`runner.py`, `tunnel_agent.py`, or `spot_watcher.py`) and `404` for any other path; the scripts are public, so the request carries no credential. Workers without a tunnel endpoint still receive the runner inline.
 
