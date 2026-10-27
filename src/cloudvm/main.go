@@ -302,6 +302,10 @@ func run() error {
 			}
 		}
 		reconciler.SetLaunchGracePeriod(launchGrace)
+		if pw, err := NewInClusterPodWatch(); err == nil {
+			pw.Start(ctx)
+			reconciler.SetPodWatch(pw)
+		}
 		server.SetReconciler(reconciler)
 		go reconciler.Start(ctx)
 
