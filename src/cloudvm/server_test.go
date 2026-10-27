@@ -1821,3 +1821,78 @@ func TestServer_HandleStatus_RunnerStartFailureIsTerminal(t *testing.T) {
 		t.Fatalf("unexpected terminated state: %+v", term)
 	}
 }
+
+func TestInjectRayProxyEnv(t *testing.T) {
+	ray := &Pod{
+		Metadata: PodMeta{Labels: map[string]string{"ray.io/node-type": "worker"}},
+		Spec: PodSpecWrapper{Containers: []ContainerSpec{
+			{Name: "a"},
+			{Name: "b", Env: []EnvVar{{Name: "grpc_proxy", Value: "http://custom:1"}}},
+		}},
+	}
+	injectRayProxyEnv(ray)
+	for _, c := range ray.Spec.Containers {
+		got := map[string]string{}
+		for _, e := range c.Env {
+			got[e.Name] = e.Value
+		}
+		wantProxy := "http://127.0.0.1:13128"
+		if c.Name == "b" {
+			wantProxy = "http://custom:1"
+		}
+		if got["grpc_proxy"] != wantProxy || got["RAY_grpc_enable_http_proxy"] != "1" || got["no_grpc_proxy"] != "127.0.0.1,localhost" {
+			t.Errorf("container %s env = %v", c.Name, got)
+		}
+		if len(c.Env) != 3 {
+			t.Errorf("container %s: expected 3 env vars, got %v", c.Name, c.Env)
+		}
+	}
+
+	plain := &Pod{Spec: PodSpecWrapper{Containers: []ContainerSpec{{Name: "a"}}}}
+	injectRayProxyEnv(plain)
+	if len(plain.Spec.Containers[0].Env) != 0 {
+		t.Errorf("non-Ray pod must not get proxy env, got %v", plain.Spec.Containers[0].Env)
+	}
+}
+
+func TestServer_HandleStatus_ReportsVMPodIP(t *testing.T) {
+	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
+	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	server := NewServer(NewMockProvider(), "test-cluster")
+	runner := NewMockContainerRunner()
+	runner.SetStatus("uid-ip-1", &ContainerStatusResult{Running: true})
+	server.SetContainerRunner(runner)
+	ts := httptest.NewServer(server.Routes())
+	defer ts.Close()
+
+	query := func() PodStatusResponse {
+		resp, err := http.Post(ts.URL+"/status", "application/json",
+			strings.NewReader(`[{"pod": {"metadata": {"name": "ip-pod", "namespace": "default", "uid": "uid-ip-1"}}}]`))
+		if err != nil {
+			t.Fatalf("POST /status failed: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var sts []PodStatusResponse
+		if err := json.NewDecoder(resp.Body).Decode(&sts); err != nil || len(sts) != 1 {
+			t.Fatalf("decode: %v (%d statuses)", err, len(sts))
+		}
+		return sts[0]
+	}
+
+	if st := query(); st.PodIP != "" || len(st.PodIPs) != 0 {
+		t.Fatalf("expected no pod IP before the VM is known, got %q %v", st.PodIP, st.PodIPs)
+	}
+
+	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
+	node := NewCloudVMNode("i-ip-node", ProviderMock, "us-east-1", "10.1.2.3", capVec)
+	reqVec, _ := NewResourceVector("1", "4Gi", 1, 0)
+	server.NodePool().RegisterAndAllocate(node, reqVec, "uid-ip-1", "default", "ip-pod")
+	server.mu.Lock()
+	server.instances["uid-ip-1"] = &Instance{ID: "i-ip-node", Provider: ProviderMock, Region: "us-east-1", State: StateRunning, CreatedAt: time.Now()}
+	server.mu.Unlock()
+
+	st := query()
+	if st.PodIP != "10.1.2.3" || len(st.PodIPs) != 1 || st.PodIPs[0] != "10.1.2.3" {
+		t.Fatalf("expected pod IP 10.1.2.3, got %q %v", st.PodIP, st.PodIPs)
+	}
+}
