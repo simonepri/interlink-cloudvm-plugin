@@ -534,6 +534,25 @@ Set `cloudvm.vk.io/region-selection: scored` next to `cloudvm.vk.io/candidate-re
 
 Every launch posts a `CloudVMRegionSelected` event on the pod naming the region used and, after a fallback, the error that each earlier region returned. The chart's RBAC grants `create` on `events` for this.
 
+### Spot Interruption Draining for KubeRay
+
+Each tunneled worker runs a spot watcher (`spot_watcher.py`) next to the tunnel agent. It polls AWS IMDSv2 `/latest/meta-data/spot/instance-action` every 5s, or waits on GCP `computeMetadata/v1/instance/preempted` with `wait_for_change`, and prints each new notice as one JSON line, such as `{"event": "spot-interruption", "action": "terminate", "time": "2026-10-27T10:02:00Z"}`, to `/var/log/cloudvm-spot-watcher.log`. The tunnel agent ships that file under the `spot` log source.
+
+When the plugin reads a notice from a worker's log stream, it cordons the VM so no new pod lands on it and posts a `CloudVMSpotInterruption` warning event on every pod running there. For each pod labeled `ray.io/cluster` and `ray.io/group`, except Ray heads, it creates a ConfigMap named `spot-interrupted-<pod UID>` in the pod's namespace for the KubeRay operator's spot interruption controller:
+
+```yaml
+metadata:
+  labels:
+    test.k8s.io/event: spot-interrupted
+    target-cluster: <ray.io/cluster>
+data:
+  workerGroup: <ray.io/group>
+  interruptedPod: <pod name>
+  interruptedReplicas: "1"
+```
+
+The ConfigMap name is fixed per pod, so a notice that arrives again creates nothing new. The pod owns the ConfigMap, so Kubernetes deletes it with the pod. The chart's RBAC grants `get` on `pods` and `create` on `configmaps` for this.
+
 ### Launch Templates
 
 Each region boots workers from launch templates that `CLUSTER_FACTS` names. `regions.<region>.launchTemplates` lists them in the order launches try them, each with an `id` or `name` and optional `requirements` in the [Karpenter well-known label](https://karpenter.sh/docs/concepts/scheduling/#well-known-labels) format. Every candidate instance type boots from the first template whose requirements it satisfies, so one fleet request can mix templates, and a type no template accepts is not launched in that region. The plugin adds each template's image architecture to its requirements by reading its `$Latest` version and image (`ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeImages`); when EC2 cannot tell, as for an image resolved from an SSM parameter, the template counts as `amd64` unless its requirements name `kubernetes.io/arch`. Besides the Karpenter labels, requirements can use `cloudvm.vk.io/gpu-slice`, which is `true` for a GPU slice and `false` for every other type. For example, GPU slices need NVIDIA's GRID driver:

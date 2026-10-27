@@ -1,9 +1,10 @@
 // Package main implements the interlink-cloudvm-plugin daemon.
-// This file consumes the log stream workers send over their tunnel session, keeps recent container output for kubectl logs, and feeds the OTLP forwarder.
+// This file consumes the log stream workers send over their tunnel session, keeps recent container output for kubectl logs, feeds the OTLP forwarder, and acts on spot notices.
 package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -27,13 +28,14 @@ const (
 	WorkerLogSourceBootstrap = "bootstrap"
 	WorkerLogSourceRunner    = "runner"
 	WorkerLogSourceContainer = "container"
+	WorkerLogSourceSpot      = "spot"
 )
 
 // WorkerLogRecord is one line on a worker log stream.
 type WorkerLogRecord struct {
 	// Time is an RFC 3339 timestamp; the plugin uses its receive time when it is missing or invalid.
 	Time string `json:"time,omitempty"`
-	// Source is bootstrap, runner, or container.
+	// Source is bootstrap, runner, container, or spot.
 	Source string `json:"src"`
 	// PodUID identifies the pod whose container wrote a container record.
 	PodUID string `json:"pod,omitempty"`
@@ -59,12 +61,17 @@ func (s *Server) ConsumeWorkerLogs(instanceID string, r io.Reader) {
 		reader = bufio.NewReaderSize(r, maxWorkerLogLine)
 	}
 	pods := make(map[string]PodAllocation)
+	var lastNotice SpotInterruptionNotice
 	for {
 		line, err := readWorkerLogLine(reader)
 		if len(line) > 0 {
 			var rec WorkerLogRecord
 			if json.Unmarshal(line, &rec) == nil {
 				s.recordWorkerLog(forwarder, instanceID, &rec, pods)
+				if notice, ok := parseSpotInterruptionNotice(&rec); ok && notice != lastNotice {
+					lastNotice = notice
+					s.handleSpotInterruption(context.Background(), instanceID, notice)
+				}
 			}
 		}
 		if err != nil {
