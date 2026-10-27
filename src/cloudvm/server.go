@@ -620,6 +620,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	injectRayProxyEnv(pod)
+
 	var flight *inFlightCreate
 	var finalResp *CreateStruct
 	var finalErr error
@@ -1593,7 +1595,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					}
 
 					containers, initContainers := specContainerStatuses(tgt.spec, status)
+					var podIP string
+					var podIPs []string
+					if ip := node.GetInternalIP(); ip != "" {
+						podIP, podIPs = ip, []string{ip}
+					}
 					responses[idx] = PodStatusResponse{
+						PodIP:          podIP,
+						PodIPs:         podIPs,
 						PodUID:         tgt.uid,
 						Name:           tgt.name,
 						Namespace:      tgt.ns,

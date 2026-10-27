@@ -316,4 +316,7 @@ type PodStatusResponse struct {
 	JID            string            `json:"JID"`
 	Containers     []ContainerStatus `json:"containers"`
 	InitContainers []ContainerStatus `json:"initContainers"`
+	// PodIP is the private IP of the VM running the pod; empty until the VM's IP is known.
+	PodIP  string   `json:"podIP,omitempty"`
+	PodIPs []string `json:"podIPs,omitempty"`
 }
