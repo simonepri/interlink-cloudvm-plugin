@@ -112,22 +112,34 @@ func (c *CloudInitConfig) TunnelHost() string {
 	return tunnelHost(c.TunnelEndpoint)
 }
 
-// RunnerScript returns the embedded in-VM container runner source without blank and comment-only lines, which keeps
-// the user data under the EC2 limit.
+// RunnerScript returns the embedded in-VM container runner source with blank and comment-only lines stripped.
 func (c *CloudInitConfig) RunnerScript() string {
-	lines := strings.Split(runnerScript, "\n")
-	kept := lines[:0]
-	for _, line := range lines {
-		if trimmed := strings.TrimSpace(line); trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+	return stripPythonComments(runnerScript)
+}
+
+// TunnelAgentScript returns the embedded in-VM reverse tunnel agent source with blank and comment-only lines stripped.
+func (c *CloudInitConfig) TunnelAgentScript() string {
+	return stripPythonComments(tunnelAgentScript)
+}
+
+// stripPythonComments drops blank and comment-only lines to keep the user data under the EC2 size limit. It keeps the
+// shebang and encoding lines and every line inside a triple-quoted string.
+func stripPythonComments(src string) string {
+	var kept []string
+	inString := false
+	for i, line := range strings.Split(src, "\n") {
+		trimmed := strings.TrimSpace(line)
+		header := i < 2 && (strings.HasPrefix(trimmed, "#!") || strings.Contains(trimmed, "coding"))
+		keep := inString || header || (trimmed != "" && !strings.HasPrefix(trimmed, "#"))
+		if strings.Count(line, `"""`)%2 == 1 || strings.Count(line, "'''")%2 == 1 {
+			inString = !inString
+			keep = true
+		}
+		if keep {
 			kept = append(kept, line)
 		}
 	}
 	return strings.Join(kept, "\n")
-}
-
-// TunnelAgentScript returns the embedded in-VM reverse tunnel agent source.
-func (c *CloudInitConfig) TunnelAgentScript() string {
-	return tunnelAgentScript
 }
 
 // RunnerBindAddress returns the interface the in-VM runner listens on: loopback when only the tunnel agent may reach it.

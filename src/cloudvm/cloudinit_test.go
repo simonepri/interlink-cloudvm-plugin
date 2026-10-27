@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -921,4 +923,20 @@ func TestRenderCloudInit_NodeProblemDetectorUsesNerdctl(t *testing.T) {
 		t.Errorf("node-problem-detector must start through nerdctl")
 	}
 	assertBashSyntax(t, script)
+}
+
+func TestStrippedPythonScriptsStillCompile(t *testing.T) {
+	cfg := &CloudInitConfig{}
+	for name, src := range map[string]string{"runner.py": cfg.RunnerScript(), "tunnel_agent.py": cfg.TunnelAgentScript()} {
+		if len(src) >= len(map[string]string{"runner.py": runnerScript, "tunnel_agent.py": tunnelAgentScript}[name]) {
+			t.Errorf("%s was not stripped", name)
+		}
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("python3", "-I", "-c", "import ast,sys; ast.parse(open(sys.argv[1]).read())", path).CombinedOutput(); err != nil { //nolint:gosec // test-controlled path
+			t.Errorf("stripped %s does not parse: %v\n%s", name, err, out)
+		}
+	}
 }
