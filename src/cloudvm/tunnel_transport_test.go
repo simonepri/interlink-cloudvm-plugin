@@ -92,6 +92,16 @@ func TestImageMirrorsFromClusterFacts(t *testing.T) {
 	}
 }
 
+func TestTunnelCIDRs_ClusterAndOtherRegionsOnly(t *testing.T) {
+	state := &tunnelState{TunnelSettings: TunnelSettings{
+		ClusterCIDRs: []string{"10.112.0.0/12"},
+		DirectCIDRs:  map[string][]string{"eu-west-1": {"10.137.0.0/17"}, "us-west-2": {"10.133.128.0/17", "10.112.0.0/12"}},
+	}}
+	if got, want := state.tunnelCIDRs("eu-west-1"), []string{"10.112.0.0/12", "10.133.128.0/17"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("eu-west-1 tunnel CIDRs = %v, want %v", got, want)
+	}
+}
+
 const privateTunnelEndpoint = "tunnel.example.internal:443"
 
 func TestTunnelSettings_ValidateTransportsFailsFastOnMissingEnv(t *testing.T) {
@@ -584,9 +594,9 @@ func TestApplyTunnelSpec_ResolvesEveryCandidateRegion(t *testing.T) {
 		t.Fatalf("applyTunnelSpec: %v", err)
 	}
 	want := map[string]TunnelRoute{
-		"us-west-2": {Transport: "router", Endpoint: "tunnel.example.internal:443", GatewayIP: "192.0.2.10"},
+		"us-west-2": {Transport: "router", Endpoint: "tunnel.example.internal:443", GatewayIP: "192.0.2.10", TunnelCIDRs: []string{"10.137.0.0/16"}},
 		"eu-west-1": {Transport: "public", Endpoint: "tunnel.example.com:443", DirectCIDRs: []string{"10.137.0.0/16"}, ImageMirrors: map[string]string{"docker.io": "mirror.example.com/hub"}},
-		"us-east-1": {Transport: "tailnet", Endpoint: "tunnel.example.internal:443"},
+		"us-east-1": {Transport: "tailnet", Endpoint: "tunnel.example.internal:443", TunnelCIDRs: []string{"10.137.0.0/16"}},
 	}
 	for region, route := range want {
 		if got := spec.TunnelRoutes[region]; !reflect.DeepEqual(got, route) {

@@ -48,6 +48,7 @@ type CloudInitConfig struct {
 	TunnelTransport        string
 	TunnelGatewayIP        string
 	TunnelDirectCIDRs      []string
+	TunnelCIDRs            []string
 	RunnerDirectHTTP       bool
 	Region                 string
 	InstanceType           string
@@ -121,6 +122,16 @@ func (c *CloudInitConfig) RunnerScript() string {
 // RunnerScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the runner by.
 func (c *CloudInitConfig) RunnerScriptSHA256() string {
 	return scriptSHA256(runnerScript)
+}
+
+// SpotWatcherScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the spot watcher by.
+func (c *CloudInitConfig) SpotWatcherScriptSHA256() string {
+	return scriptSHA256(spotWatcherScript)
+}
+
+// TunnelCIDRList returns the comma-separated networks the worker's agent sends through the tunnel.
+func (c *CloudInitConfig) TunnelCIDRList() string {
+	return strings.Join(c.TunnelCIDRs, ",")
 }
 
 // TunnelAgentScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the tunnel agent by.
@@ -397,7 +408,9 @@ if [ -n "$DEV" ] && command -v tc >/dev/null 2>&1; then
 fi
 {{end}}
 
-# 3. Configure Multi-Cloud Spot Interruption Watcher (AWS IMDSv2 & GCP Metadata)
+# 3. Configure Multi-Cloud Spot Interruption Watcher (AWS IMDSv2 & GCP Metadata). Tunnel workers instead report notices to
+# the plugin through the spot watcher, so Ray drains the worker before the VM goes away.
+{{if not .TunnelEndpoint}}
 cat << 'EOF' > /usr/local/bin/spot-monitor.sh
 #!/usr/bin/env bash
 while true; do
@@ -425,6 +438,7 @@ done
 EOF
 chmod +x /usr/local/bin/spot-monitor.sh
 nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
+{{end}}
 
 # 4. Asynchronous Readiness Watcher
 (
@@ -741,10 +755,14 @@ else
   TUNNEL_PLATFORM="gcp"
   TUNNEL_INSTANCE_ID=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2>/dev/null || hostname)
 fi
+cloudvm_fetch_script {{.SpotWatcherScriptSHA256}} /usr/local/bin/cloudvm-spot-watcher.py
+CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" nohup python3 /usr/local/bin/cloudvm-spot-watcher.py >> {{.SpotWatcherLogPath}} 2>&1 < /dev/null &
 cloudvm_fetch_script {{.TunnelAgentScriptSHA256}} /usr/local/bin/cloudvm-tunnel-agent.py
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
 CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
-  CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" \
+  CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" CLOUDVM_TUNNEL_CIDRS="{{.TunnelCIDRList}}" \
+  CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1" \
+  CLOUDVM_LOG_FILES="bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log,{{.SpotWatcherLogFile}}" \
   nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
 {{end}}
 

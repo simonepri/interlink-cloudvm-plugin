@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,6 +32,8 @@ type TunnelSettings struct {
 	Transports TunnelTransports
 	// DirectCIDRs maps each region to the private networks its workers reach each other on without the tunnel.
 	DirectCIDRs map[string][]string
+	// ClusterCIDRs are the cluster networks workers reach through the tunnel, such as the pod network.
+	ClusterCIDRs []string
 	// ImageMirrors maps each region to the registry mirrors its workers pull images from.
 	ImageMirrors map[string]map[string]string
 	// GatewayIP is the gateway ClusterIP router workers pin the Endpoint host to.
@@ -115,14 +118,40 @@ type TunnelRoute struct {
 	Endpoint    string   `json:"endpoint,omitempty"`
 	GatewayIP   string   `json:"gatewayIP,omitempty"`
 	DirectCIDRs []string `json:"directCidrs,omitempty"`
+	// TunnelCIDRs are the networks a worker of the region sends through the tunnel: the cluster networks and the other
+	// regions' worker networks. The worker dials every other destination itself.
+	TunnelCIDRs []string `json:"tunnelCidrs,omitempty"`
 	// ImageMirrors maps an upstream registry host to the mirror reference prefix workers of the region pull from.
 	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
+}
+
+// tunnelCIDRs returns the networks workers of region reach through the tunnel: the cluster networks and every other
+// region's worker networks, sorted and without duplicates.
+func (t *tunnelState) tunnelCIDRs(region string) []string {
+	seen := make(map[string]bool)
+	var cidrs []string
+	add := func(list []string) {
+		for _, c := range list {
+			if !seen[c] {
+				seen[c] = true
+				cidrs = append(cidrs, c)
+			}
+		}
+	}
+	add(t.ClusterCIDRs)
+	for r, list := range t.DirectCIDRs {
+		if r != region {
+			add(list)
+		}
+	}
+	sort.Strings(cidrs)
+	return cidrs
 }
 
 // route resolves the tunnel route of workers launched in region, failing when a setting its transport needs is unset.
 func (t *tunnelState) route(region, meshKey string) (TunnelRoute, error) {
 	transport := t.Transports.For(region)
-	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region], ImageMirrors: t.ImageMirrors[region]}
+	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region], TunnelCIDRs: t.tunnelCIDRs(region), ImageMirrors: t.ImageMirrors[region]}
 	if transport == TunnelTransportPublic {
 		route.Endpoint = t.PublicEndpoint
 		return route, nil
@@ -188,6 +217,7 @@ func (spec *InstanceSpec) applyTunnelRoute(route TunnelRoute) {
 	spec.TunnelEndpoint = route.Endpoint
 	spec.TunnelGatewayIP = route.GatewayIP
 	spec.TunnelDirectCIDRs = route.DirectCIDRs
+	spec.TunnelCIDRs = route.TunnelCIDRs
 	spec.ImageMirrors = route.ImageMirrors
 }
 
