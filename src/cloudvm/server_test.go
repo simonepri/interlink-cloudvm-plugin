@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1894,5 +1896,23 @@ func TestServer_HandleStatus_ReportsVMPodIP(t *testing.T) {
 	st := query()
 	if st.PodIP != "10.1.2.3" || len(st.PodIPs) != 1 || st.PodIPs[0] != "10.1.2.3" {
 		t.Fatalf("expected pod IP 10.1.2.3, got %q %v", st.PodIP, st.PodIPs)
+	}
+}
+
+func TestServer_LogStatusErrorOncePerPod(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	server := NewServer(NewMockProvider(), "test-cluster")
+	boom := errors.New("parsing time \"\"")
+	for i := 0; i < 3; i++ {
+		server.logStatusError("uid-a", "i-1", boom)
+	}
+	server.logStatusError("uid-b", "i-1", boom)
+	if n := strings.Count(buf.String(), "Runner status call"); n != 2 {
+		t.Fatalf("want one log line per pod, got %d:\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "uid-a") || !strings.Contains(buf.String(), `parsing time`) {
+		t.Errorf("log must name the pod and the error: %s", buf.String())
 	}
 }
