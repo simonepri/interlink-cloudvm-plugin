@@ -543,6 +543,18 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 }
 
 // ActiveNodes returns a slice of all active nodes currently tracked in the pool.
+// InstanceByIP returns the instance ID of the registered node with the given private IP.
+func (np *NodePool) InstanceByIP(ip string) (string, bool) {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	for _, node := range np.nodes {
+		if node.IP == ip && ip != "" {
+			return node.InstanceID, true
+		}
+	}
+	return "", false
+}
+
 func (np *NodePool) ActiveNodes() []*CloudVMNode {
 	if np == nil {
 		return nil

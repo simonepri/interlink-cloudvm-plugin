@@ -1,4 +1,4 @@
-"""In-VM reverse tunnel agent: dials the plugin's tunnel gateway over TLS, bridges Yamux streams to the local runner, and streams worker logs.
+"""In-VM reverse tunnel agent: dials the plugin's tunnel gateway over TLS, bridges Yamux streams to the local runner and local ports, and streams worker logs.
 
 Implements the client half of the github.com/hashicorp/yamux framing on one asyncio loop (stdlib only, Python 3.7+).
 """
@@ -24,6 +24,10 @@ MAX_FRAME = 16 * 1024
 READ_IDLE_TIMEOUT = 90
 # The first line of the agent-opened log stream; newline-delimited JSON log records follow it.
 LOG_STREAM_HEADER = b'{"stream":"logs","version":1}\n'
+# A stream whose first line is a tcp header carries one plain TCP connection to the header's target.
+TCP_STREAM_KIND = "tcp"
+MAX_STREAM_HEADER = 4096
+DEFAULT_TCP_PROXY_PORT = "13128"
 MAX_LOG_MESSAGE = 16 * 1024
 LOG_READ_CHUNK = 64 * 1024
 LOG_POLL_SECONDS = 1
@@ -38,9 +42,10 @@ def log(msg):
 
 
 class Stream(object):
-    """One gateway-opened Yamux stream bridged to a fresh TCP connection to the local runner."""
+    """One Yamux stream bridged to a TCP connection: a gateway-opened stream dials the runner or the target its tcp
+    header names on this host, and an agent-opened stream carries a connection accepted by the local CONNECT proxy."""
 
-    def __init__(self, session, sid):
+    def __init__(self, session, sid, local=None):
         self.session = session
         self.sid = sid
         self.inbound = asyncio.Queue()
@@ -48,6 +53,7 @@ class Stream(object):
         self.window_open = asyncio.Event()
         self.window_open.set()
         self.task = None
+        self.local = local
 
     def grow_window(self, delta):
         self.send_window += delta
@@ -61,14 +67,23 @@ class Stream(object):
         self.inbound.put_nowait(None)
 
     async def run(self):
-        try:
-            host, port = self.session.runner_addr
-            local_reader, local_writer = await asyncio.wait_for(asyncio.open_connection(host, port), 10)
-        except (OSError, asyncio.TimeoutError) as e:
-            log("stream %d: cannot reach local runner: %s" % (self.sid, e))
-            self.session.send(T_WINDOW, F_RST, self.sid, 0)
-            self.session.streams.pop(self.sid, None)
-            return
+        if self.local is not None:
+            local_reader, local_writer = self.local
+        else:
+            target, rest, consumed = await self.read_target()
+            if target is None:
+                self.reset()
+                return
+            try:
+                local_reader, local_writer = await asyncio.wait_for(asyncio.open_connection(*target), 10)
+            except (OSError, asyncio.TimeoutError) as e:
+                log("stream %d: cannot reach %s:%d: %s" % (self.sid, target[0], target[1], e))
+                self.reset()
+                return
+            if rest:
+                local_writer.write(rest)
+            if consumed:
+                self.session.send(T_WINDOW, 0, self.sid, consumed)
         pump_in = asyncio.ensure_future(self.pump_in(local_writer))
         try:
             await self.pump_out(local_reader)
@@ -77,6 +92,39 @@ class Stream(object):
             pump_in.cancel()
             local_writer.close()
             self.session.streams.pop(self.sid, None)
+
+    def reset(self):
+        self.session.send(T_WINDOW, F_RST, self.sid, 0)
+        self.session.streams.pop(self.sid, None)
+
+    async def read_target(self):
+        """Returns where to bridge this gateway-opened stream: the local port its tcp header names, or the runner.
+
+        Also returns the bytes read past the header and how many received bytes to credit back to the gateway.
+        """
+        first = await self.inbound.get()
+        if first is None:
+            return None, b"", 0
+        if not first.startswith(b"{"):
+            return self.session.runner_addr, first, len(first)
+        buf = first
+        while b"\n" not in buf and len(buf) < MAX_STREAM_HEADER:
+            chunk = await self.inbound.get()
+            if chunk is None:
+                return None, b"", 0
+            buf += chunk
+        line, _, rest = buf.partition(b"\n")
+        try:
+            header = json.loads(line.decode())
+            host, _, port = header["target"].rpartition(":")
+            port = int(port)
+        except (ValueError, KeyError, AttributeError) as e:
+            log("stream %d: invalid stream header: %s" % (self.sid, e))
+            return None, b"", 0
+        if header.get("stream") != TCP_STREAM_KIND or host not in ("127.0.0.1", "localhost"):
+            log("stream %d: refused stream to %s" % (self.sid, header.get("target")))
+            return None, b"", 0
+        return (host, port), rest, len(buf)
 
     async def pump_in(self, local_writer):
         """Copies tunnel data into the local runner and returns receive window credit to the gateway."""
@@ -153,6 +201,20 @@ class Session(object):
 
     def send(self, ftype, flags, sid, length, payload=b""):
         self.writer.write(HEADER.pack(VERSION, ftype, flags, sid, length) + payload)
+
+    def open_tcp_stream(self, target, local_reader, local_writer):
+        """Opens a stream asking the gateway to connect to target, bridged to an accepted local connection.
+
+        The caller starts the stream once it has answered its client.
+        """
+        stream = Stream(self, self.next_sid, local=(local_reader, local_writer))
+        self.next_sid += 2
+        self.streams[stream.sid] = stream
+        self.send(T_WINDOW, F_SYN, stream.sid, 0)
+        header = (json.dumps({"stream": TCP_STREAM_KIND, "version": 1, "target": target}) + "\n").encode()
+        stream.send_window -= len(header)
+        self.send(T_DATA, 0, stream.sid, len(header), header)
+        return stream
 
     def open_log_stream(self, collector):
         """Opens the session's log stream and starts shipping the collector's records over it."""
@@ -367,6 +429,30 @@ def read_file(path):
         return b""
 
 
+class TCPProxy(object):
+    """Local HTTP CONNECT proxy that carries each accepted connection to its target over the current tunnel session."""
+
+    def __init__(self):
+        self.session = None
+
+    async def handle(self, reader, writer):
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
+            writer.close()
+            return
+        parts = head.split(b"\r\n", 1)[0].split()
+        session = self.session
+        if len(parts) < 2 or parts[0] != b"CONNECT" or session is None:
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            writer.close()
+            return
+        stream = session.open_tcp_stream(parts[1].decode(), reader, writer)
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+        stream.task = asyncio.ensure_future(stream.run())
+
+
 async def connect_once(cfg):
     host, _, port = cfg["endpoint"].rpartition(":")
     # The gateway presents a publicly trusted certificate; CLOUDVM_TUNNEL_CA_FILE only narrows trust to a private bundle.
@@ -390,8 +476,10 @@ async def connect_once(cfg):
         log("connected to %s" % cfg["endpoint"])
         session = Session(reader, writer, cfg["runner_addr"])
         session.open_log_stream(cfg["collector"])
+        cfg["proxy"].session = session
         await session.serve()
     finally:
+        cfg["proxy"].session = None
         writer.close()
 
 
@@ -409,10 +497,14 @@ def main():
             parse_log_files(os.environ.get("CLOUDVM_LOG_FILES", DEFAULT_LOG_FILES)),
             os.environ.get("CLOUDVM_CONTAINER_LOGS", "1") != "0" and shutil.which("docker") is not None),
     }
+    cfg["proxy"] = TCPProxy()
     max_backoff = float(os.environ.get("CLOUDVM_TUNNEL_MAX_BACKOFF", "30"))
     backoff = 0.5
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    proxy_port = int(os.environ.get("CLOUDVM_TCP_PROXY_PORT", DEFAULT_TCP_PROXY_PORT))
+    if proxy_port > 0:
+        loop.run_until_complete(asyncio.start_server(cfg["proxy"].handle, "127.0.0.1", proxy_port))
     while True:
         started = time.time()
         try:
