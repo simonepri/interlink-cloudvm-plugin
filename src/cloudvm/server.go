@@ -555,11 +555,7 @@ func (s *Server) SetReconciler(r *Reconciler) {
 	s.reconciler = r
 	if r != nil {
 		r.SetNodePool(s.nodePool)
-		r.SetOnTerminated(func(id string) {
-			if s.tokenStore != nil {
-				_ = s.tokenStore.Delete(id)
-			}
-		})
+		r.SetOnTerminated(s.forgetTerminatedInstance)
 	}
 }
 
@@ -576,32 +572,7 @@ func (s *Server) ProviderForType(pt ProviderType) Provider {
 // TerminateIdleNode cleanly terminates an idle VM using its specific cloud provider
 // and prunes associated runner tokens and in-memory instance records.
 func (s *Server) TerminateIdleNode(ctx context.Context, node *CloudVMNode) {
-	if node == nil {
-		return
-	}
-	prov := s.ProviderForType(node.Provider)
-	cleanID := sanitizeLog(node.InstanceID)
-	log.Printf("[cloudvm] Terminating expired idle node %s", cleanID) //nolint:gosec
-	if prov != nil {
-		if err := prov.Terminate(ctx, node.InstanceID); err != nil {
-			log.Printf("[cloudvm] Error terminating idle instance %s: %v", cleanID, err) //nolint:gosec // sanitized
-			return
-		}
-	}
-	if s.tokenStore != nil {
-		_ = s.tokenStore.Delete(node.InstanceID)
-	}
-	s.mu.Lock()
-	for k, inst := range s.instances {
-		if inst != nil && inst.ID == node.InstanceID {
-			delete(s.instances, k)
-		}
-	}
-	s.tombstones[node.InstanceID] = time.Now()
-	if s.tombstoneStore != nil {
-		_ = s.tombstoneStore.Set(node.InstanceID)
-	}
-	s.mu.Unlock()
+	s.TerminateIdleNodes(ctx, []*CloudVMNode{node})
 }
 
 // Routes returns the standard InterLink HTTP routing handler.

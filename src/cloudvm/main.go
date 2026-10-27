@@ -343,27 +343,7 @@ func run() error {
 	}
 
 	// Background idle node collector (terminates warm VMs after idle grace period)
-	go func() {
-		idleInterval := 10 * time.Second
-		if ig := server.NodePool().IdleGracePeriod(); ig > 0 && ig < 10*time.Second {
-			idleInterval = ig / 2
-			if idleInterval < time.Second {
-				idleInterval = time.Second
-			}
-		}
-		idleTicker := time.NewTicker(idleInterval)
-		defer idleTicker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-idleTicker.C:
-				for _, node := range server.NodePool().CollectExpiredIdleNodes() {
-					server.TerminateIdleNode(ctx, node)
-				}
-			}
-		}
-	}()
+	go server.RunIdleCollector(ctx)
 
 	httpServer := &http.Server{
 		Addr:        ":" + port,

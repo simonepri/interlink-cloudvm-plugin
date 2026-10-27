@@ -504,6 +504,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 
 	// 1. Forward check: detect pods whose cloud VM vanished or terminated
 	var deadPods []deadPod
+	var vanishedVMs []string
 	for podKey, instID := range activePods {
 		if instID == "" {
 			continue
@@ -566,12 +567,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 			}
 			deadPods = append(deadPods, deadPod{key: podKey, reason: reason})
 			// A VM that shut itself down stays stopped and keeps billing its disks until it is terminated.
-			if r.terminator != nil {
-				if err := r.terminator.Terminate(ctx, instID); err != nil {
-					log.Printf("[reconciler] Error terminating vanished VM %s: %v", cleanID, err) //nolint:gosec // sanitized
-				}
-			}
+			vanishedVMs = append(vanishedVMs, instID)
 		}
+	}
+	for id, err := range r.terminate(ctx, vanishedVMs) {
+		log.Printf("[reconciler] Error terminating vanished VM %s: %v", sanitizeLog(id), err) //nolint:gosec // sanitized
 	}
 	result.EvictedPods = append(result.EvictedPods, r.markPodsFailed(ctx, deadPods)...)
 
@@ -592,6 +592,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	}
 
 	now := time.Now()
+	var zombies []string
 	for _, inst := range activeInstances {
 		if activeInstanceIDs[inst.ID] || reapedIDs[inst.ID] {
 			continue
@@ -645,16 +646,27 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 				cleanKey := sanitizeLog(fullKey)
 				log.Printf("[reconciler] Detected zombie instance %s for vanished pod %s. Terminating...", cleanID, cleanKey) //nolint:gosec // sanitized
 				result.TerminatedZombies = append(result.TerminatedZombies, inst.ID)
-				if r.terminator != nil {
-					if err := r.terminator.Terminate(ctx, inst.ID); err != nil {
-						log.Printf("[reconciler] Error terminating zombie instance %s: %v", cleanID, err) //nolint:gosec // sanitized
-					} else if r.onTerminate != nil {
-						r.onTerminate(inst.ID)
-					}
-				}
+				zombies = append(zombies, inst.ID)
 			}
+		}
+	}
+	termErrs := r.terminate(ctx, zombies)
+	for _, id := range zombies {
+		if err := termErrs[id]; err != nil {
+			log.Printf("[reconciler] Error terminating zombie instance %s: %v", sanitizeLog(id), err) //nolint:gosec // sanitized
+		} else if r.terminator != nil && r.onTerminate != nil {
+			r.onTerminate(id)
 		}
 	}
 
 	return result, nil
+}
+
+// terminate terminates instances in batched or bounded parallel calls and returns the error of each failed
+// termination. Without a terminator it terminates nothing.
+func (r *Reconciler) terminate(ctx context.Context, instanceIDs []string) map[string]error {
+	if r.terminator == nil || len(instanceIDs) == 0 {
+		return nil
+	}
+	return terminateInstances(ctx, r.terminator, instanceIDs)
 }

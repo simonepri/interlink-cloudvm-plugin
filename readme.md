@@ -519,6 +519,8 @@ Runner authorization tokens are generated securely per instance and passed throu
 4. Co-tenant Discovery Timeout:
 When the provider restarts while an in-VM runner is unreachable, the node is flagged with unverified co-tenants and protected from idle collection and zombie cleanup. Background reconciliation retries container discovery on each reconcile pass for up to 30 minutes before releasing the node for garbage collection.
 
+The idle collector terminates a VM once its last pod has been gone for `IDLE_GRACE_PERIOD`, checking every 10 seconds, and retries a failed termination on its next pass. The collector and the reconciler terminate VMs together: on AWS in one `TerminateInstances` call per region and 1000 instances, elsewhere in up to 32 parallel calls, each with a 30 second timeout. `/metrics` exports `cloudvm_idle_nodes`, `cloudvm_idle_terminations_total`, and `cloudvm_idle_termination_errors_total`.
+
 
 ### Regional Virtual Nodes
 
