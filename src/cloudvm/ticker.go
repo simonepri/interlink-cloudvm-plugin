@@ -83,6 +83,8 @@ type SpotPriceTicker struct {
 	quotasFactory func(region string) AWSServiceQuotasAPI
 	usageFactory  func(region string) AWSUsageAPI
 	probeCaps     map[probeCapKey]probeCap
+
+	probeMaxInstances int
 }
 
 // NewSpotPriceTicker initializes a spot price ticker with full market observability.

@@ -62,6 +62,11 @@ func newConfiguredTicker(ctx context.Context, awsProv *AWSProvider) *SpotPriceTi
 	tickerTypes := parseCommaList(os.Getenv("TICKER_INSTANCE_TYPES"))
 	spotTicker := NewSpotPriceTicker(tickerRegions, tickerTypes, interval, awsProv.ConfiguredRegions()...)
 	spotTicker.GCPMarket().SetRegions(parseCommaList(os.Getenv("TICKER_GCP_REGIONS")))
+	if raw := os.Getenv("TICKER_PROBE_MAX_INSTANCES"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			spotTicker.SetProbeMaxInstances(n)
+		}
+	}
 	configureAWSMarketAPIs(ctx, spotTicker)
 	return spotTicker
 }

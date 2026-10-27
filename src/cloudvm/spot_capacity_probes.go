@@ -16,6 +16,10 @@ import (
 // ProbeGPUCounts are the GPU counts at which the ticker asks AWS how likely it is to get spot capacity.
 var ProbeGPUCounts = []int{8, 64, 256, 1024}
 
+// DefaultProbeMaxInstances is the largest target capacity, in instances, a probe asks about.
+// AWS rejects larger targets with TargetCapacityLimitExceeded once they pass the account's exploration limit, about 50 instances.
+const DefaultProbeMaxInstances = 50
+
 // probeCapRetry is how long the ticker skips probe targets at or above one AWS rejected as too large.
 // AWS sets that limit from the account's recent spot usage, so it can grow; a day later the ticker tries again.
 const probeCapRetry = 24 * time.Hour
@@ -72,7 +76,10 @@ func (t *SpotPriceTicker) probeGroups(ctx context.Context) []probeGroup {
 }
 
 // ProbeSpotCapacity asks AWS for regional spot placement scores per probe group and probed GPU count, keyed like FillLimits.SpotScores.
-// A request AWS rejects, for example a target above the account's spot capacity limit, leaves that GPU count unscored.
+// A probe asks about at most probeMaxInstances instances. A larger ProbeGPUCounts entry is probed at that cap and its score is stored under
+// the GPU count actually probed, so a score always means "AWS rates getting this many GPUs at this likelihood"; the planner then takes no
+// spot GPUs beyond the largest probed count that scores well.
+// A request AWS rejects anyway, because the account's limit is lower than the cap, leaves that GPU count unscored and is logged once.
 func (t *SpotPriceTicker) ProbeSpotCapacity(ctx context.Context) map[string]map[int]float64 {
 	scores := make(map[string]map[int]float64)
 	regions := t.Regions()
@@ -87,8 +94,14 @@ func (t *SpotPriceTicker) ProbeSpotCapacity(ctx context.Context) map[string]map[
 
 	for _, group := range t.probeGroups(ctx) {
 		capKey := probeCapKey{group.minGPUMemoryGB, group.gpusPerInstance}
-		for _, gpus := range ProbeGPUCounts {
-			instances := ceilDiv(gpus, group.gpusPerInstance)
+		probed := make(map[int]bool)
+		for _, wanted := range ProbeGPUCounts {
+			instances := min(ceilDiv(wanted, group.gpusPerInstance), t.maxProbeInstances())
+			if probed[instances] {
+				continue
+			}
+			probed[instances] = true
+			gpus := instances * group.gpusPerInstance
 			if t.probeTooLarge(capKey, instances) {
 				continue
 			}
@@ -108,7 +121,7 @@ func (t *SpotPriceTicker) ProbeSpotCapacity(ctx context.Context) map[string]map[
 					break
 				}
 				if err != nil {
-					log.Printf("[cloudvm-ticker] Spot capacity probe for %d GPUs of %d-GPU shapes at %d GB failed: %v", gpus, group.gpusPerInstance, group.minGPUMemoryGB, err)
+					log.Printf("[cloudvm-ticker] Spot capacity probe for %d GPUs of %d-GPU shapes at %d GB failed: %v", gpus, group.gpusPerInstance, group.minGPUMemoryGB, err) //nolint:gosec // integers and an AWS error
 					continue
 				}
 				for _, item := range out.SpotPlacementScores {
@@ -140,8 +153,27 @@ func (t *SpotPriceTicker) rememberProbeLimit(key probeCapKey, instances int) {
 		t.probeCaps = make(map[probeCapKey]probeCap)
 	}
 	c, ok := t.probeCaps[key]
+	if !ok || instances < c.instances {
+		log.Printf("[cloudvm-ticker] AWS rejected spot capacity probes of %d instances for %d-GPU shapes at %d GB as above the account limit; skipping targets at or above that size for %s", instances, key.gpusPerInstance, key.minGPUMemoryGB, probeCapRetry) //nolint:gosec // integers and a constant
+	}
 	if !ok || time.Now().After(c.until) || instances < c.instances {
 		c = probeCap{instances: instances, until: time.Now().Add(probeCapRetry)}
 	}
 	t.probeCaps[key] = c
+}
+
+// SetProbeMaxInstances overrides the largest target capacity, in instances, a spot capacity probe asks about; values below 1 restore the default.
+func (t *SpotPriceTicker) SetProbeMaxInstances(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.probeMaxInstances = n
+}
+
+func (t *SpotPriceTicker) maxProbeInstances() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.probeMaxInstances < 1 {
+		return DefaultProbeMaxInstances
+	}
+	return t.probeMaxInstances
 }
