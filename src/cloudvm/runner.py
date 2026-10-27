@@ -7,6 +7,7 @@ import hmac
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,8 +17,11 @@ import urllib.parse
 
 PORT = 9090
 CONTAINER_CLI = 'nerdctl'
-STARGZ_SOCKET = '/run/containerd-stargz-grpc/containerd-stargz-grpc.sock'
-IMAGE_MIRRORS_PATH = '/etc/cloudvm/image-mirrors.json'
+STARGZ_SOCKET = os.environ.get("CLOUDVM_STARGZ_SOCKET", '/run/containerd-stargz-grpc/containerd-stargz-grpc.sock')
+IMAGE_MIRRORS_PATH = os.environ.get("CLOUDVM_IMAGE_MIRRORS", '/etc/cloudvm/image-mirrors.json')
+HOST_DOCKER_CONFIG_DIR = os.environ.get("CLOUDVM_DOCKER_CONFIG", '/root/.docker')
+PULL_BACKOFF_START = float(os.environ.get("CLOUDVM_PULL_BACKOFF_START") or 10)
+PULL_BACKOFF_MAX = float(os.environ.get("CLOUDVM_PULL_BACKOFF_MAX") or 300)
 DOCKER_HUB_HOSTS = ('docker.io', 'index.docker.io', 'registry-1.docker.io')
 AUTH_TOKEN = ""
 try:
@@ -30,6 +34,8 @@ pod_locks = {}
 pod_locks_guard = threading.Lock()
 starting_pods = set()
 start_failures = {}
+pull_failures = {}
+host_config_lock = threading.Lock()
 DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)
 RUNNER_CONCURRENCY = int(os.environ.get("CLOUDVM_RUNNER_CONCURRENCY") or DEFAULT_RUNNER_CONCURRENCY)
 CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)
@@ -60,6 +66,28 @@ def rewrite_image(ref):
         return ref
     return prefix.rstrip('/') + '/' + split_image_ref(ref)[1] if prefix else ref
 
+def is_ecr_host(host):
+    return '.dkr.ecr.' in host
+
+def ensure_ecr_helper(host):
+    """Maps an ECR registry host to the credential helper in the host config nerdctl and the stargz snapshotter read."""
+    if not is_ecr_host(host):
+        return
+    path = os.path.join(HOST_DOCKER_CONFIG_DIR, 'config.json')
+    with host_config_lock:
+        try:
+            with open(path, 'r') as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        if cfg.get('credHelpers', {}).get(host) == 'ecr-login':
+            return
+        cfg.setdefault('credHelpers', {})[host] = 'ecr-login'
+        os.makedirs(HOST_DOCKER_CONFIG_DIR, exist_ok=True)
+        with open(path + '.tmp', 'w') as f:
+            json.dump(cfg, f)
+        os.replace(path + '.tmp', path)
+
 def pull_config(auth_cfg, image):
     """Adds the ECR credential helper for the image's registry to the pod's pull secrets."""
     try:
@@ -67,9 +95,32 @@ def pull_config(auth_cfg, image):
     except Exception:
         cfg = {}
     host = image.split('/')[0]
-    if '.dkr.ecr.' in host:
+    if is_ecr_host(host):
         cfg.setdefault('credHelpers', {})[host] = 'ecr-login'
     return cfg
+
+def pull_image(img, auth_cfg, lazy):
+    """Pulls img and returns None, or the error text. Pod pull secrets live in a per-pod directory removed afterwards."""
+    cfg_dir = None
+    try:
+        ensure_ecr_helper(img.split('/')[0])
+        env = dict(os.environ, DOCKER_CONFIG=HOST_DOCKER_CONFIG_DIR)
+        if auth_cfg:
+            cfg_dir = tempfile.mkdtemp(prefix="docker-cfg-")
+            cfg_path = os.path.join(cfg_dir, 'config.json')
+            with open(cfg_path, 'w', encoding='utf-8') as cf:
+                json.dump(pull_config(auth_cfg, img), cf)
+            os.chmod(cfg_path, 0o600)
+            env['DOCKER_CONFIG'] = cfg_dir
+        res = subprocess.run([CONTAINER_CLI, *(snapshotter_args() if lazy else []), 'pull', img], capture_output=True, text=True, env=env)
+        if res.returncode != 0:
+            return res.stderr.strip() or res.stdout.strip() or "image pull failed"
+        return None
+    except Exception as e:
+        return str(e)
+    finally:
+        if cfg_dir:
+            shutil.rmtree(cfg_dir, ignore_errors=True)
 
 def get_pod_lock(uid):
     with pod_locks_guard:
@@ -245,13 +296,14 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             plock = get_pod_lock(pod_uid)
             with plock:
                 if pod_uid in starting_pods:
+                    pull_reason, pull_error = pull_failures.get(pod_uid, ("ContainerCreating", "Pulling container image or initializing..."))
                     resp = {
                         "podUID": pod_uid,
                         "running": False,
                         "status": "created",
                         "exitCode": 0,
-                        "reason": "ContainerCreating",
-                        "message": "Pulling container image or initializing...",
+                        "reason": pull_reason,
+                        "message": pull_error,
                         "networkRxBytes": rx_bytes,
                         "networkTxBytes": tx_bytes,
                     }
@@ -278,6 +330,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 with plock:
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
+                    pull_failures.pop(pod_uid, None)
                 try:
                     subprocess.run([CONTAINER_CLI, 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
                 except Exception:
@@ -334,8 +387,10 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
                 starting_pods.add(pod_uid)
                 start_failures.pop(pod_uid, None)
+                pull_failures.pop(pod_uid, None)
 
-            image = rewrite_image(str(req.get('image', '')))
+            original_image = str(req.get('image', ''))
+            image = rewrite_image(original_image)
             gpus = req.get('assignedGPUs', [])
             env = req.get('env', {})
             cmd = req.get('command', [])
@@ -385,6 +440,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 run_cmd.extend(['--gpus', gpu_spec])
             for k, v in env.items():
                 run_cmd.extend(['-e', f"{k}={v}"])
+            image_index = len(run_cmd)
             run_cmd.append(image)
             if isinstance(cmd, list):
                 run_cmd.extend(cmd)
@@ -393,50 +449,45 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
             docker_cfg = req.get('dockerConfigJSON')
 
-            def run_async(uid, img, c, auth_cfg):
-                # 0. Isolate credentials in an ephemeral per-pod directory (never shared with co-tenants)
-                cfg_dir = None
-                if auth_cfg:
-                    try:
-                        cfg_dir = tempfile.mkdtemp(prefix=f"docker-cfg-{uid}-")
-                        cfg_path = os.path.join(cfg_dir, 'config.json')
-                        with open(cfg_path, 'w', encoding='utf-8') as cf:
-                            json.dump(pull_config(auth_cfg, img), cf)
-                        os.chmod(cfg_path, 0o600)
-                    except Exception:
-                        cfg_dir = None
-
-                # 1. Pull container image using the isolated ephemeral credential config
-                pull_res = None
-                try:
-                    pull_env = dict(os.environ)
-                    if cfg_dir:
-                        pull_env['DOCKER_CONFIG'] = cfg_dir
-                    pull_cmd = [CONTAINER_CLI, *snapshotter_args(), 'pull', img]
-                    pull_res = subprocess.run(pull_cmd, capture_output=True, text=True, env=pull_env)
-                except Exception as e:
-                    with get_pod_lock(uid):
-                        starting_pods.discard(uid)
-                        start_failures[uid] = ("ErrImagePull", str(e))
-                    if cfg_dir:
-                        try:
-                            shutil.rmtree(cfg_dir)
-                        except Exception:
-                            pass
-                    return
-
-                # Clean up isolated credentials directory immediately
-                if cfg_dir:
-                    try:
-                        shutil.rmtree(cfg_dir)
-                    except Exception:
-                        pass
-                if pull_res.returncode != 0:
-                    err_msg = pull_res.stderr.strip() or pull_res.stdout.strip() or "image pull failed"
-                    with get_pod_lock(uid):
-                        starting_pods.discard(uid)
-                        start_failures[uid] = ("ErrImagePull", err_msg)
-                    return
+            def run_async(uid, imgs, c, idx, auth_cfg):
+                # 1. Pull: try the mirrored reference, then the original, and back off exponentially while the pod stays Pending
+                delay = PULL_BACKOFF_START
+                lazy = True
+                while True:
+                    err_msg = "image pull failed"
+                    for img in imgs:
+                        err = pull_image(img, auth_cfg, lazy)
+                        if err and lazy and re.search(r'unpack|snapshotter', err, re.I):
+                            print(f"[cloudvm-runner] lazy pull of {img} for {uid} failed, retrying with the default snapshotter: {err}", flush=True)
+                            lazy = False
+                            err = pull_image(img, auth_cfg, lazy)
+                        if err is None:
+                            print(f"[cloudvm-runner] pulled {img} for {uid}" + (" (mirror failed, used upstream)" if img != imgs[0] else ""), flush=True)
+                            c[idx] = img
+                            if not lazy and c[1] == '--snapshotter=stargz':
+                                del c[1]
+                            break
+                        print(f"[cloudvm-runner] pull of {img} for {uid} failed: {err}", flush=True)
+                        err_msg = err
+                    else:
+                        with get_pod_lock(uid):
+                            if uid not in starting_pods:
+                                return
+                            pull_failures[uid] = ("ErrImagePull", err_msg)
+                        deadline = time.time() + delay
+                        while time.time() < deadline:
+                            time.sleep(min(1, PULL_BACKOFF_START))
+                            with get_pod_lock(uid):
+                                if uid not in starting_pods:
+                                    pull_failures.pop(uid, None)
+                                    return
+                        with get_pod_lock(uid):
+                            pull_failures[uid] = ("ImagePullBackOff", err_msg)
+                        delay = min(delay * 2, PULL_BACKOFF_MAX)
+                        continue
+                    break
+                with get_pod_lock(uid):
+                    pull_failures.pop(uid, None)
 
                 # 2. Run container
                 try:
@@ -452,7 +503,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         starting_pods.discard(uid)
                         start_failures[uid] = ("StartError", str(e))
 
-            threading.Thread(target=run_async, args=(pod_uid, image, run_cmd, docker_cfg), daemon=True).start()
+            threading.Thread(target=run_async, args=(pod_uid, [image] + ([original_image] if original_image != image else []), run_cmd, image_index, docker_cfg), daemon=True).start()
 
             self.reply(200, b'{"status":"starting"}')
             return

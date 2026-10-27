@@ -190,3 +190,159 @@ func TestRunnerScript_ReportsStartFailure(t *testing.T) {
 		t.Fatalf("expected the nerdctl state error in the message, got %q", res.Message)
 	}
 }
+
+// fakePullingNerdctl logs each pull with the credential directory it saw and fails pulls of refs listed in $state/fail.
+const fakePullingNerdctl = `#!/usr/bin/env bash
+state="$FAKE_NERDCTL_STATE"
+case "$1" in
+  --snapshotter=stargz)
+    if [ "$2" = pull ]; then
+      echo "stargz $3" >> "$state/pulls"
+      echo 'level=fatal msg="unable to initialize unpacker: no unpack platforms defined: invalid argument"' >&2; exit 1
+    fi
+    echo "$@" > "$state/run"; touch "$state/created"; exit 0 ;;
+  pull)
+    echo "$2 $DOCKER_CONFIG" >> "$state/pulls"
+    cat "$DOCKER_CONFIG/config.json" > "$state/config-at-pull" 2>/dev/null
+    if grep -qxF "$2" "$state/fail" 2>/dev/null; then echo "pull access denied for $2: no basic auth credentials" >&2; exit 1; fi
+    exit 0 ;;
+  run) echo "$@" > "$state/run"; touch "$state/created"; exit 0 ;;
+  inspect)
+    if [ -f "$state/created" ]; then
+      printf '[{"State":{"Status":"running","Running":true,"ExitCode":0,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}}]'
+      exit 0
+    fi
+    exit 1 ;;
+  *) exit 0 ;;
+esac
+`
+
+func newPullingRunnerHarness(t *testing.T, failRefs ...string) (*runnerHarness, string) {
+	t.Helper()
+	h := newRunnerHarness(t)
+	dir := filepath.Dir(h.script)
+	if err := os.WriteFile(filepath.Join(dir, "bin", "nerdctl"), []byte(fakePullingNerdctl), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	state := filepath.Join(dir, "state")
+	if err := os.WriteFile(filepath.Join(state, "fail"), []byte(strings.Join(failRefs, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mirrors := filepath.Join(dir, "mirrors.json")
+	if err := os.WriteFile(mirrors, []byte(`{"docker.io":"123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.env = append(h.env, "CLOUDVM_IMAGE_MIRRORS="+mirrors, "CLOUDVM_DOCKER_CONFIG="+filepath.Join(dir, "docker"),
+		"CLOUDVM_PULL_BACKOFF_START=0.2", "CLOUDVM_PULL_BACKOFF_MAX=0.4")
+	return h, state
+}
+
+func waitStatus(t *testing.T, h *runnerHarness, uid string, ok func(ContainerStatusResult) bool) {
+	t.Helper()
+	var res ContainerStatusResult
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if res = h.status(uid); ok(res) {
+			return
+		}
+	}
+	t.Fatalf("status never matched, last %+v", res)
+}
+
+const mirroredRay = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub/rayproject/ray:2.9"
+
+func TestRunnerScript_PullFailureBacksOffThenRecovers(t *testing.T) {
+	h, state := newPullingRunnerHarness(t, mirroredRay, "rayproject/ray:2.9")
+	defer h.start()()
+
+	resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"pull","image":"rayproject/ray:2.9"}`)
+	_ = resp.Body.Close()
+
+	seen := map[string]bool{}
+	waitStatus(t, h, "pull", func(r ContainerStatusResult) bool {
+		if r.Running || r.Status == "dead" || r.ExitCode != 0 {
+			t.Fatalf("a failing pull must not terminate the container: %+v", r)
+		}
+		seen[r.Reason] = true
+		return seen["ErrImagePull"] && seen["ImagePullBackOff"]
+	})
+	if r := h.status("pull"); !strings.Contains(r.Message, "no basic auth credentials") {
+		t.Errorf("status should carry the pull error, got %+v", r)
+	}
+
+	if err := os.WriteFile(filepath.Join(state, "fail"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, h, "pull", func(r ContainerStatusResult) bool { return r.Running })
+	pulls, _ := os.ReadFile(filepath.Join(state, "pulls"))
+	if n := strings.Count(string(pulls), "\n"); n < 3 {
+		t.Errorf("want the mirror and upstream tried, then the mirror again, got %q", pulls)
+	}
+}
+
+func TestRunnerScript_PullFallsBackToUpstreamWhenMirrorFails(t *testing.T) {
+	h, state := newPullingRunnerHarness(t, mirroredRay)
+	defer h.start()()
+
+	resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"fallback","image":"rayproject/ray:2.9"}`)
+	_ = resp.Body.Close()
+	waitStatus(t, h, "fallback", func(r ContainerStatusResult) bool { return r.Running })
+
+	run, _ := os.ReadFile(filepath.Join(state, "run"))
+	if !strings.Contains(string(run), " rayproject/ray:2.9") || strings.Contains(string(run), "ecr") {
+		t.Errorf("container must run the upstream reference after the mirror failed, got %q", run)
+	}
+}
+
+func TestRunnerScript_ECRPullUsesCredentialHelper(t *testing.T) {
+	h, state := newPullingRunnerHarness(t)
+	defer h.start()()
+
+	for _, body := range []string{
+		`{"podUID":"plain","image":"rayproject/ray:2.9"}`,
+		`{"podUID":"secret","image":"rayproject/ray:2.9","dockerConfigJSON":"{\"auths\":{\"ghcr.io\":{\"auth\":\"eDp5\"}}}"}`,
+	} {
+		resp := h.do(http.MethodPost, "/containers/start", body)
+		_ = resp.Body.Close()
+	}
+	waitStatus(t, h, "plain", func(r ContainerStatusResult) bool { return r.Running })
+	waitStatus(t, h, "secret", func(r ContainerStatusResult) bool { return r.Running })
+
+	hostCfg, _ := os.ReadFile(filepath.Join(filepath.Dir(h.script), "docker", "config.json"))
+	if !strings.Contains(string(hostCfg), `"123456789012.dkr.ecr.eu-west-1.amazonaws.com": "ecr-login"`) && !strings.Contains(string(hostCfg), `"123456789012.dkr.ecr.eu-west-1.amazonaws.com":"ecr-login"`) {
+		t.Errorf("host config must map the ECR host to the helper for nerdctl and the snapshotter, got %s", hostCfg)
+	}
+	pulls, _ := os.ReadFile(filepath.Join(state, "pulls"))
+	lines := strings.Split(strings.TrimSpace(string(pulls)), "\n")
+	perPod := 0
+	for _, l := range lines {
+		if strings.Contains(l, "docker-cfg-") {
+			perPod++
+		}
+	}
+	if len(lines) != 2 || perPod != 1 {
+		t.Errorf("one pull must use the host config and one a per-pod directory, got %q", pulls)
+	}
+}
+
+func TestRunnerScript_StargzUnpackErrorFallsBackToDefaultSnapshotter(t *testing.T) {
+	h, state := newPullingRunnerHarness(t)
+	sock := filepath.Join(filepath.Dir(h.script), "stargz.sock")
+	if err := os.WriteFile(sock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.env = append(h.env, "CLOUDVM_STARGZ_SOCKET="+sock)
+	defer h.start()()
+
+	resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"lazy","image":"ghcr.io/example/app:1"}`)
+	_ = resp.Body.Close()
+	waitStatus(t, h, "lazy", func(r ContainerStatusResult) bool { return r.Running })
+
+	pulls, _ := os.ReadFile(filepath.Join(state, "pulls"))
+	if !strings.HasPrefix(string(pulls), "stargz ghcr.io/example/app:1\nghcr.io/example/app:1 ") {
+		t.Errorf("want a stargz pull then a default-snapshotter pull, got %q", pulls)
+	}
+	run, _ := os.ReadFile(filepath.Join(state, "run"))
+	if strings.Contains(string(run), "--snapshotter") || !strings.Contains(string(run), "ghcr.io/example/app:1") {
+		t.Errorf("run must use the default snapshotter the image was pulled into, got %q", run)
+	}
+}

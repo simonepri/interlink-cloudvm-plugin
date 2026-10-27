@@ -1535,7 +1535,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 										status.State.Running = &ContainerRunningState{
 											StartedAt: cResult.StartedAt,
 										}
-									case cResult.Reason == "StartError" || cResult.Reason == "ErrImagePull":
+									case cResult.Reason == "ErrImagePull" || cResult.Reason == "ImagePullBackOff":
+										// The runner keeps retrying the pull, so the container waits like a kubelet's and the pod stays Pending.
+										status.Ready = false
+										status.State.Waiting = &ContainerWaitingState{
+											Reason:  cResult.Reason,
+											Message: cResult.Message,
+										}
+									case cResult.Reason == "StartError":
 										s.recordRunnerTermination(tgt.uid, tgt.jid, cResult, &status)
 									case cResult.Status == "created" || cResult.Status == "starting":
 										status.Ready = false
@@ -1662,7 +1669,7 @@ func (s *Server) recordRunnerTermination(uid, jid string, cResult *ContainerStat
 		finAt = time.Now()
 	}
 	exitCode := cResult.ExitCode
-	if exitCode == 0 && (cResult.Reason == "StartError" || cResult.Reason == "ErrImagePull") {
+	if exitCode == 0 && cResult.Reason == "StartError" {
 		exitCode = 1
 	}
 	term := &ContainerTerminatedState{
