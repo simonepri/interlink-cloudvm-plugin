@@ -118,6 +118,8 @@ type InstanceSpec struct {
 	TunnelGatewayIP string `json:"tunnelGatewayIP,omitempty"`
 	// TunnelDirectCIDRs are the private networks the worker's agent dials directly instead of through the tunnel.
 	TunnelDirectCIDRs []string `json:"tunnelDirectCidrs,omitempty"`
+	// TunnelCIDRs are the networks the worker's agent sends through the tunnel; it dials every other destination itself.
+	TunnelCIDRs []string `json:"tunnelCidrs,omitempty"`
 	// ImageMirrors maps an upstream registry host to the mirror reference prefix the worker's runner pulls from instead.
 	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
 	// TunnelRoutes holds the tunnel route of every region this launch may use; the Tunnel* fields hold the pinned region's.

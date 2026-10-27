@@ -427,6 +427,7 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		Endpoint:       endpoint,
 		Transports:     transports,
 		DirectCIDRs:    directCIDRs,
+		ClusterCIDRs:   splitCIDRList(os.Getenv("TUNNEL_TCP_DIRECT_CIDRS")),
 		ImageMirrors:   imageMirrors,
 		GatewayIP:      strings.TrimSpace(os.Getenv("TUNNEL_GATEWAY_IP")),
 		PublicEndpoint: strings.TrimSpace(os.Getenv("TUNNEL_PUBLIC_ENDPOINT")),

@@ -84,6 +84,17 @@ func TunnelTransportsFromClusterFacts(raw string) (TunnelTransports, error) {
 	return transports, nil
 }
 
+// splitCIDRList splits a comma-separated CIDR list, dropping blanks; callers validate the entries.
+func splitCIDRList(raw string) []string {
+	var cidrs []string
+	for _, c := range strings.Split(raw, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			cidrs = append(cidrs, c)
+		}
+	}
+	return cidrs
+}
+
 // DirectCIDRsFromClusterFacts reads regions.<region>.directCidrs from the CLUSTER_FACTS JSON, rejecting entries that are not CIDRs.
 func DirectCIDRsFromClusterFacts(raw string) (map[string][]string, error) {
 	cidrs := map[string][]string{}

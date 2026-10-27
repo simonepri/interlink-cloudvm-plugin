@@ -17,6 +17,11 @@ func (c *CloudInitConfig) SpotWatcherScript() string {
 	return spotWatcherScript
 }
 
+// SpotWatcherLogPath returns the file the bootstrap writes the watcher's output to.
+func (c *CloudInitConfig) SpotWatcherLogPath() string {
+	return spotWatcherLogPath
+}
+
 // SpotWatcherLogFile returns the CLOUDVM_LOG_FILES entry that ships the watcher's output under the spot log source.
 func (c *CloudInitConfig) SpotWatcherLogFile() string {
 	return WorkerLogSourceSpot + "=" + spotWatcherLogPath
