@@ -85,11 +85,13 @@ func (g *TunnelGateway) serveConnect(conn net.Conn) {
 	}
 	peer, ok := g.resolveInstance(host)
 	if !ok {
+		log.Printf("[tunnel] CONNECT %s: no registered instance has this address", req.Host)
 		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		return
 	}
 	upstream, err := g.openWorkerTCP(peer, port)
 	if err != nil {
+		log.Printf("[tunnel] CONNECT %s: %v", req.Host, err)
 		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		return
 	}
