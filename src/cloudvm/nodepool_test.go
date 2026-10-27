@@ -263,9 +263,9 @@ func TestEndToEnd_Two4GPUPodsBinPackIntoOne8GPUVM(t *testing.T) {
 		t.Fatalf("reconciler erroneously killed shared VM while Pod 2 was still running: %v", res.TerminatedZombies)
 	}
 
-	// 4. Delete Pod 2 -> Last pod on VM finishes -> VM is terminated
+	// 4. Delete Pod 2 the way the virtual kubelet does -> Last pod on VM finishes -> VM is terminated
 	recDel2 := httptest.NewRecorder()
-	handler.ServeHTTP(recDel2, httptest.NewRequest(http.MethodPost, "/delete", bytes.NewReader(pod2Body)))
+	handler.ServeHTTP(recDel2, httptest.NewRequest(http.MethodDelete, "/delete", bytes.NewReader(pod2Body)))
 	if recDel2.Code != http.StatusOK {
 		t.Fatalf("pod 2 delete failed: %d", recDel2.Code)
 	}
