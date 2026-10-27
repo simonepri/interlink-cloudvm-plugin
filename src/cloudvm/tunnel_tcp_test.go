@@ -1,4 +1,5 @@
-// Tests TCP forwarding over worker tunnel sessions between the real Python agent and the gateway, in all three directions.
+// Tests TCP forwarding over worker tunnel sessions between the real Python agent and the gateway, in all three directions,
+// and the gateway's refusal of streams between namespaces.
 package main
 
 import (
@@ -13,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -170,6 +173,86 @@ func startPythonAgent(t *testing.T, f *tunnelFixture, instanceID, token string, 
 	waitForWithin(t, 60*time.Second, "python agent session", func() bool { return f.registry.Has(instanceID) })
 }
 
+// fakePodNamespaces maps pod IPs to namespaces once synced.
+type fakePodNamespaces struct {
+	mu     sync.Mutex
+	synced bool
+	byIP   map[string]string
+}
+
+func (p *fakePodNamespaces) HasSynced() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.synced
+}
+
+func (p *fakePodNamespaces) PodNamespace(ip string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	namespace, ok := p.byIP[ip]
+	return namespace, ok
+}
+
+func (p *fakePodNamespaces) set(synced bool, byIP map[string]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.synced, p.byIP = synced, byIP
+}
+
+// isolateNamespaces puts worker instanceID and the cluster pods on loopback, which stand in for every cluster client
+// and target, in namespace, and returns the pod mapping and the refusal reasons the gateway records.
+func isolateNamespaces(f *tunnelFixture, instanceID, namespace string) (*fakePodNamespaces, chan string) {
+	if node, ok := f.server.NodePool().Node(instanceID); ok {
+		node.Namespace = namespace
+	}
+	pods := &fakePodNamespaces{synced: true, byIP: map[string]string{"127.0.0.1": namespace}}
+	refusals := make(chan string, 64)
+	f.gateway.podNamespaces = pods
+	f.gateway.workerNamespace = f.server.WorkerNamespace
+	f.gateway.onTCPRefusal = func(reason string) {
+		f.metrics.RecordTCPRefusal(reason)
+		refusals <- reason
+	}
+	return pods, refusals
+}
+
+// expectRefused checks that a CONNECT through proxyAddr to target carries no data, and that the gateway refused it
+// with reason.
+func expectRefused(t *testing.T, proxyAddr, target string, refusals <-chan string, reason string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy %s: %v", proxyAddr, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err == nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			_, _ = conn.Write([]byte("x"))
+			_, err = reader.ReadByte()
+			if err == nil {
+				t.Fatalf("CONNECT %s via %s carried data", target, proxyAddr)
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				t.Fatalf("CONNECT %s via %s stayed open after the refusal", target, proxyAddr)
+			}
+		}
+	}
+	select {
+	case got := <-refusals:
+		if got != reason {
+			t.Fatalf("CONNECT %s via %s refused with %q, want %q", target, proxyAddr, got, reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("CONNECT %s via %s recorded no refusal", target, proxyAddr)
+	}
+}
+
 func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 	f := newTunnelFixture(t, time.Minute)
 	const instanceID, token = "i-python-tcp", "agent-token"
@@ -178,6 +261,7 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 	f.addNode(instanceID, "eu-west-1", token)
 	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP || ip == "192.0.2.1" }
 	f.gateway.directTCPNetworks, _ = ParseDirectTCPNetworks("127.0.0.0/8")
+	isolateNamespaces(f, instanceID, "team-a")
 
 	echoAddr := startEchoServer(t)
 	_, workerEchoPort, _ := net.SplitHostPort(startEchoServerOn(t, net.JoinHostPort(workerIP, "0")))
@@ -309,6 +393,7 @@ func TestTunnelTCP_PythonAgentTunnelsOnlyTunnelNetworks(t *testing.T) {
 	}
 	// The gateway forwards nothing directly, so a target outside the workers succeeds only when the agent dials it.
 	f.gateway.directTCPNetworks = nil
+	isolateNamespaces(f, instanceID, "team-a")
 
 	echoAddr := startEchoServer(t)
 	_, echoPort, _ := net.SplitHostPort(echoAddr)
@@ -338,4 +423,114 @@ func TestTunnelTCP_PythonAgentTunnelsOnlyTunnelNetworks(t *testing.T) {
 		startEchoServerOn(t, net.JoinHostPort("::1", echoPort))
 		connectAndEcho(t, agentProxy, net.JoinHostPort("localhost", echoPort))
 	})
+}
+
+func TestTunnelTCP_PythonAgentRefusesStreamsAcrossNamespaces(t *testing.T) {
+	f := newTunnelFixture(t, time.Minute)
+	const instanceID, otherID, token = "i-python-team-a", "i-python-team-b", "team-a-token"
+	// 192.0.2.1 stands in for a worker of another namespace, which the gateway refuses before opening its session.
+	workerIP := localWorkerIP(t)
+	f.addNode(instanceID, "eu-west-1", token)
+	f.addNode(otherID, "eu-west-1", "other-token").Namespace = "team-b"
+	f.gateway.resolver = func(ip string) (string, bool) {
+		switch ip {
+		case workerIP:
+			return instanceID, true
+		case "192.0.2.1":
+			return otherID, true
+		}
+		return "", false
+	}
+	f.gateway.directTCPNetworks, _ = ParseDirectTCPNetworks("127.0.0.0/8")
+	pods, refusals := isolateNamespaces(f, instanceID, "team-a")
+
+	echoAddr := startEchoServer(t)
+	_, workerEchoPort, _ := net.SplitHostPort(startEchoServerOn(t, net.JoinHostPort(workerIP, "0")))
+	workerEcho := net.JoinHostPort(workerIP, workerEchoPort)
+	agentProxyPort := freePort(t)
+	startPythonAgent(t, f, instanceID, token, fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clusterProxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("cluster proxy listen: %v", err)
+	}
+	go f.gateway.ServeConnectProxy(ctx, clusterProxy)
+	agentProxy := fmt.Sprintf("127.0.0.1:%d", agentProxyPort)
+
+	t.Run("worker to worker of another namespace", func(t *testing.T) {
+		expectRefused(t, agentProxy, net.JoinHostPort("192.0.2.1", workerEchoPort), refusals, "namespace_mismatch")
+	})
+	pods.set(true, map[string]string{"127.0.0.1": "team-b"})
+	t.Run("cluster pod of another namespace to worker", func(t *testing.T) {
+		expectRefused(t, clusterProxy.Addr().String(), workerEcho, refusals, "namespace_mismatch")
+	})
+	t.Run("worker to cluster pod of another namespace", func(t *testing.T) {
+		expectRefused(t, agentProxy, echoAddr, refusals, "namespace_mismatch")
+	})
+	pods.set(false, map[string]string{"127.0.0.1": "team-a"})
+	t.Run("cluster to worker before the pod watch syncs", func(t *testing.T) {
+		expectRefused(t, clusterProxy.Addr().String(), workerEcho, refusals, "unsynced")
+	})
+	t.Run("worker to cluster before the pod watch syncs", func(t *testing.T) {
+		expectRefused(t, agentProxy, echoAddr, refusals, "unsynced")
+	})
+	pods.set(true, map[string]string{})
+	t.Run("a cluster client that is no pod", func(t *testing.T) {
+		expectRefused(t, clusterProxy.Addr().String(), workerEcho, refusals, "unknown_source")
+	})
+	t.Run("a cluster target that is no pod", func(t *testing.T) {
+		expectRefused(t, agentProxy, echoAddr, refusals, "unknown_target")
+	})
+	pods.set(true, map[string]string{"127.0.0.1": "team-a"})
+	t.Run("the same namespace is still allowed", func(t *testing.T) {
+		connectAndEcho(t, clusterProxy.Addr().String(), workerEcho)
+		connectAndEcho(t, agentProxy, echoAddr)
+	})
+	t.Run("refusals are counted by reason", func(t *testing.T) {
+		body := scrapeMetrics(t, f.server)
+		for _, want := range []string{
+			`cloudvm_tunnel_tcp_refused_total{reason="namespace_mismatch"} 3`,
+			`cloudvm_tunnel_tcp_refused_total{reason="unsynced"} 2`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("metrics lack %s:\n%s", want, body)
+			}
+		}
+	})
+}
+
+func TestTunnelTCP_GatewayRefusesWorkersWithoutOneNamespace(t *testing.T) {
+	np := NewNodePool(time.Minute)
+	capacity, _ := NewResourceVector("4", "16Gi", 0, 0)
+	np.RegisterNode(NewCloudVMNode("i-empty", ProviderMock, "eu-west-1", "10.0.0.1", capacity))
+	g := &TunnelGateway{workerNamespace: np.InstanceNamespace}
+	if _, err := g.dialFromWorker("i-empty", "10.0.0.2", "6379", "10.0.0.2:6379"); !isRefusal(err, "unknown_source") {
+		t.Fatalf("stream from a worker without pods: %v, want unknown_source", err)
+	}
+	if _, err := (&TunnelGateway{}).dialFromWorker("i-empty", "10.0.0.2", "6379", "10.0.0.2:6379"); !isRefusal(err, "unknown_source") {
+		t.Fatalf("stream without a worker namespace resolver: %v, want unknown_source", err)
+	}
+}
+
+func isRefusal(err error, reason string) bool {
+	var refusal *tcpRefusal
+	return errors.As(err, &refusal) && refusal.reason == reason
+}
+
+func TestTunnelTCP_RefusalLogHoldsBackRepeatsPerReason(t *testing.T) {
+	var l refusalLog
+	now := time.Now()
+	if _, ok := l.allow("namespace_mismatch", now); !ok {
+		t.Fatal("first refusal not logged")
+	}
+	if _, ok := l.allow("namespace_mismatch", now.Add(time.Second)); ok {
+		t.Fatal("repeat within the interval logged")
+	}
+	if _, ok := l.allow("unsynced", now.Add(time.Second)); !ok {
+		t.Fatal("refusal with another reason held back")
+	}
+	if suppressed, ok := l.allow("namespace_mismatch", now.Add(tcpRefusalLogInterval)); !ok || suppressed != 1 {
+		t.Fatalf("refusal after the interval: logged %v with %d held back, want true with 1", ok, suppressed)
+	}
 }

@@ -1,4 +1,5 @@
-// Bridges plain TCP connections over worker tunnel sessions, so processes on worker VMs and in the cluster can reach each other.
+// Bridges plain TCP connections over worker tunnel sessions, so processes on worker VMs and in the cluster can reach each
+// other, and refuses every connection whose two ends belong to different Kubernetes namespaces.
 package main
 
 import (
@@ -30,24 +31,146 @@ const minDirectTCPPort = 1024
 // InstanceAddressResolver maps a worker VM's private IP to the instance ID of its tunnel session.
 type InstanceAddressResolver func(ip string) (string, bool)
 
+// PodNamespaces maps a cluster pod IP to the namespace of the pods that hold it.
+type PodNamespaces interface {
+	// HasSynced reports whether the mapping covers every pod. The gateway refuses lookups before it does.
+	HasSynced() bool
+	// PodNamespace returns the namespace of the pods holding ip; false when none or several namespaces hold it.
+	PodNamespace(ip string) (string, bool)
+}
+
+// WorkerNamespaceResolver maps a worker's instance ID to the one namespace whose pods it runs.
+type WorkerNamespaceResolver func(instanceID string) (string, bool)
+
+// tcpRefusalLogInterval bounds how often the gateway logs refusals that share a reason.
+const tcpRefusalLogInterval = 10 * time.Second
+
+// tcpRefusal is why the gateway refuses a stream; reason is the metric label.
+type tcpRefusal struct {
+	reason string
+	detail string
+}
+
+func (r *tcpRefusal) Error() string { return r.detail }
+
+func refuse(reason, format string, args ...any) error {
+	return &tcpRefusal{reason: reason, detail: fmt.Sprintf(format, args...)}
+}
+
 // serveWorkerTCP bridges a worker-opened tcp stream to its target: another worker VM when the target is one of their
-// addresses, otherwise a direct connection from the gateway when allowDirect permits it.
+// addresses, otherwise a direct connection from the gateway when allowDirect permits it. Both ends must share a
+// namespace.
 func (g *TunnelGateway) serveWorkerTCP(instanceID string, reader *bufio.Reader, stream *yamux.Stream, target string) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return
 	}
-	var upstream net.Conn
-	if peer, ok := g.resolveInstance(host); ok {
-		upstream, err = g.openWorkerTCP(peer, target)
-	} else if err = g.allowDirect(host, port); err == nil {
-		upstream, err = (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
-	}
+	upstream, err := g.dialFromWorker(instanceID, host, port, target)
 	if err != nil {
-		log.Printf("[cloudvm-tunnel] Refused tcp stream from %s to %s: %v", sanitizeLog(instanceID), sanitizeLog(target), err) //nolint:gosec // sanitized
+		g.logTCPError(instanceID, target, err)
 		return
 	}
 	bridge(reader, stream, upstream)
+}
+
+func (g *TunnelGateway) dialFromWorker(instanceID, host, port, target string) (net.Conn, error) {
+	source, err := g.workerNamespaceOf(instanceID, "unknown_source")
+	if err != nil {
+		return nil, err
+	}
+	if peer, ok := g.resolveInstance(host); ok {
+		dest, err := g.workerNamespaceOf(peer, "unknown_target")
+		if err != nil {
+			return nil, err
+		}
+		if err := sameNamespace(source, dest); err != nil {
+			return nil, err
+		}
+		return g.openWorkerTCP(peer, target)
+	}
+	if err := g.allowDirect(host, port); err != nil {
+		return nil, refuse("direct_forbidden", "%v", err)
+	}
+	dest, err := g.podNamespaceOf(host, "unknown_target")
+	if err != nil {
+		return nil, err
+	}
+	if err := sameNamespace(source, dest); err != nil {
+		return nil, err
+	}
+	return (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
+}
+
+// workerNamespaceOf returns the namespace of a worker's pods, or a refusal with unknownReason when it has none.
+func (g *TunnelGateway) workerNamespaceOf(instanceID, unknownReason string) (string, error) {
+	if g.workerNamespace != nil {
+		if namespace, ok := g.workerNamespace(instanceID); ok {
+			return namespace, nil
+		}
+	}
+	return "", refuse(unknownReason, "worker %s runs no pods of a single namespace", instanceID)
+}
+
+// podNamespaceOf returns the namespace of the cluster pod holding ip, or a refusal with unknownReason when no pod of a
+// single namespace does; before the pod mapping syncs, every lookup is refused.
+func (g *TunnelGateway) podNamespaceOf(ip, unknownReason string) (string, error) {
+	if g.podNamespaces == nil || !g.podNamespaces.HasSynced() {
+		return "", refuse("unsynced", "the pod watch has not synced")
+	}
+	if parsed := net.ParseIP(ip); parsed != nil {
+		if namespace, ok := g.podNamespaces.PodNamespace(parsed.String()); ok {
+			return namespace, nil
+		}
+	}
+	return "", refuse(unknownReason, "no pod of a single namespace holds %s", ip)
+}
+
+func sameNamespace(source, dest string) error {
+	if source != dest {
+		return refuse("namespace_mismatch", "namespace %s may not reach namespace %s", source, dest)
+	}
+	return nil
+}
+
+// logTCPError records a refusal in the metric and the rate-limited log, and logs any other failure as it happens.
+func (g *TunnelGateway) logTCPError(source, target string, err error) {
+	var refusal *tcpRefusal
+	if !errors.As(err, &refusal) {
+		log.Printf("[cloudvm-tunnel] tcp stream from %s to %s failed: %v", sanitizeLog(source), sanitizeLog(target), err) //nolint:gosec // sanitized
+		return
+	}
+	if g.onTCPRefusal != nil {
+		g.onTCPRefusal(refusal.reason)
+	}
+	if suppressed, ok := g.tcpRefusalLog.allow(refusal.reason, time.Now()); ok {
+		log.Printf("[cloudvm-tunnel] Refused tcp stream from %s to %s (%s): %s; %d more refusals with this reason were not logged", //nolint:gosec // sanitized
+			sanitizeLog(source), sanitizeLog(target), refusal.reason, sanitizeLog(refusal.detail), suppressed)
+	}
+}
+
+// refusalLog lets one log line per reason through every tcpRefusalLogInterval and counts the refusals it holds back.
+type refusalLog struct {
+	mu         sync.Mutex
+	next       map[string]time.Time
+	suppressed map[string]int
+}
+
+// allow reports whether a refusal with reason may be logged at now, and how many were held back since the last one.
+func (l *refusalLog) allow(reason string, now time.Time) (int, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.next == nil {
+		l.next = make(map[string]time.Time)
+		l.suppressed = make(map[string]int)
+	}
+	if now.Before(l.next[reason]) {
+		l.suppressed[reason]++
+		return 0, false
+	}
+	suppressed := l.suppressed[reason]
+	l.suppressed[reason] = 0
+	l.next[reason] = now.Add(tcpRefusalLogInterval)
+	return suppressed, true
 }
 
 // ServeConnectProxy accepts HTTP CONNECT requests from the cluster and bridges each to the worker VM that owns the
@@ -83,16 +206,16 @@ func (g *TunnelGateway) serveConnect(conn net.Conn) {
 		_, _ = io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\n\r\n")
 		return
 	}
-	peer, ok := g.resolveInstance(host)
-	if !ok {
-		log.Printf("[tunnel] CONNECT %s: no registered instance has this address", req.Host)
-		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		return
-	}
-	upstream, err := g.openWorkerTCP(peer, req.Host)
+	client, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	upstream, err := g.dialFromCluster(client, host, req.Host)
 	if err != nil {
-		log.Printf("[tunnel] CONNECT %s: %v", req.Host, err)
-		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		g.logTCPError(client, req.Host, err)
+		var refusal *tcpRefusal
+		if errors.As(err, &refusal) && refusal.reason != "unknown_target" {
+			_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\n\r\n")
+		} else {
+			_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		}
 		return
 	}
 	_ = conn.SetReadDeadline(time.Time{})
@@ -101,6 +224,27 @@ func (g *TunnelGateway) serveConnect(conn net.Conn) {
 		return
 	}
 	bridge(reader, conn, upstream)
+}
+
+// dialFromCluster opens a stream to the worker that owns host for the cluster pod at client, when both share a
+// namespace.
+func (g *TunnelGateway) dialFromCluster(client, host, target string) (net.Conn, error) {
+	peer, ok := g.resolveInstance(host)
+	if !ok {
+		return nil, refuse("unknown_target", "no registered instance has address %s", host)
+	}
+	source, err := g.podNamespaceOf(client, "unknown_source")
+	if err != nil {
+		return nil, err
+	}
+	dest, err := g.workerNamespaceOf(peer, "unknown_target")
+	if err != nil {
+		return nil, err
+	}
+	if err := sameNamespace(source, dest); err != nil {
+		return nil, err
+	}
+	return g.openWorkerTCP(peer, target)
 }
 
 // openWorkerTCP opens a stream on the worker's session that its agent connects to target, an address of the worker
@@ -195,6 +339,15 @@ func bridge(reader io.Reader, conn io.WriteCloser, upstream io.ReadWriteCloser) 
 		closeBoth()
 	}()
 	<-done
+}
+
+// WorkerNamespace returns the namespace of the pods a worker VM runs.
+func (s *Server) WorkerNamespace(instanceID string) (string, bool) {
+	np := s.NodePool()
+	if np == nil {
+		return "", false
+	}
+	return np.InstanceNamespace(instanceID)
 }
 
 // ResolveInstanceAddress maps a worker VM's private IP to its instance ID.

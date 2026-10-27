@@ -1,6 +1,6 @@
 // Package main implements the interlink-cloudvm-plugin daemon.
-// This file exports Prometheus metrics for reverse tunnel sessions: connected workers per region, refused handshakes, and
-// bootstrap script requests.
+// This file exports Prometheus metrics for reverse tunnel sessions: connected workers per region, refused handshakes,
+// bootstrap script requests, and refused tcp streams.
 package main
 
 import (
@@ -12,10 +12,11 @@ type TunnelMetrics struct {
 	Registry   *prometheus.Registry
 	rejections *prometheus.CounterVec
 	bootstraps *prometheus.CounterVec
+	tcpRefused *prometheus.CounterVec
 }
 
 // NewTunnelMetrics registers a per-region session gauge, computed at scrape time from the session registry, and
-// rejection and bootstrap request counters.
+// rejection, bootstrap request, and tcp stream refusal counters.
 func NewTunnelMetrics(sessions *SessionRegistry, regionOf func(instanceID string) string) *TunnelMetrics {
 	reg := prometheus.NewRegistry()
 	m := &TunnelMetrics{
@@ -28,8 +29,12 @@ func NewTunnelMetrics(sessions *SessionRegistry, regionOf func(instanceID string
 			Name: "cloudvm_tunnel_bootstrap_requests_total",
 			Help: "Bootstrap script requests the gateway answered, by result.",
 		}, []string{"result"}),
+		tcpRefused: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_tunnel_tcp_refused_total",
+			Help: "Tunnel tcp streams and CONNECT requests the gateway refused, by reason.",
+		}, []string{"reason"}),
 	}
-	reg.MustRegister(m.rejections, m.bootstraps, &tunnelSessionCollector{sessions: sessions, regionOf: regionOf})
+	reg.MustRegister(m.rejections, m.bootstraps, m.tcpRefused, &tunnelSessionCollector{sessions: sessions, regionOf: regionOf})
 	return m
 }
 
@@ -41,6 +46,11 @@ func (m *TunnelMetrics) RecordRejection(reason string) {
 // RecordBootstrapRequest increments the bootstrap request counter for result.
 func (m *TunnelMetrics) RecordBootstrapRequest(result string) {
 	m.bootstraps.WithLabelValues(result).Inc()
+}
+
+// RecordTCPRefusal increments the tcp stream refusal counter for reason.
+func (m *TunnelMetrics) RecordTCPRefusal(reason string) {
+	m.tcpRefused.WithLabelValues(reason).Inc()
 }
 
 var tunnelSessionsDesc = prometheus.NewDesc(

@@ -158,3 +158,41 @@ func TestReconciler_LaunchGraceProtectsOrphanCandidate(t *testing.T) {
 		t.Fatal("recently launched VM was terminated")
 	}
 }
+
+func podWithIP(ns, name, ip string, phase corev1.PodPhase, hostNetwork bool) *corev1.Pod {
+	pod := kubePod(ns, name, ns+"-"+name)
+	pod.Spec.HostNetwork = hostNetwork
+	pod.Status = corev1.PodStatus{Phase: phase, PodIP: ip, PodIPs: []corev1.PodIP{{IP: ip}}}
+	return pod
+}
+
+func TestPodWatch_PodNamespaceByIP(t *testing.T) {
+	pw := startPodWatch(t,
+		podWithIP("team-a", "head", "10.112.0.5", corev1.PodRunning, false),
+		// A finished pod gave its IP to the running pod of another namespace.
+		podWithIP("team-b", "done", "10.112.0.6", corev1.PodSucceeded, false),
+		podWithIP("team-a", "reused", "10.112.0.6", corev1.PodRunning, false),
+		// Host-network pods share their node's IP.
+		podWithIP("kube-system", "agent", "10.0.0.1", corev1.PodRunning, true),
+		// Pods on one worker VM share its IP.
+		podWithIP("team-c", "w1", "10.0.1.1", corev1.PodRunning, false),
+		podWithIP("team-c", "w2", "10.0.1.1", corev1.PodRunning, false),
+		podWithIP("team-c", "x1", "10.0.1.2", corev1.PodRunning, false),
+		podWithIP("team-d", "x2", "10.0.1.2", corev1.PodRunning, false),
+	)
+	for _, tc := range []struct {
+		ip, want string
+		ok       bool
+	}{
+		{"10.112.0.5", "team-a", true},
+		{"10.112.0.6", "team-a", true},
+		{"10.0.0.1", "", false},
+		{"10.0.1.1", "team-c", true},
+		{"10.0.1.2", "", false},
+		{"10.9.9.9", "", false},
+	} {
+		if got, ok := pw.PodNamespace(tc.ip); got != tc.want || ok != tc.ok {
+			t.Errorf("PodNamespace(%s) = %q, %v; want %q, %v", tc.ip, got, ok, tc.want, tc.ok)
+		}
+	}
+}
