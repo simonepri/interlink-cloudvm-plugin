@@ -78,6 +78,7 @@ type Server struct {
 	inFlightCreates       map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
 	podLogs               *PodLogBuffer                        // recent container output served to kubectl logs
 	logForwarder          *OTLPLogForwarder                    // optional OTLP export of worker logs
+	podCredentials        *PodCredentials                      // optional AWS credentials for pods whose service account has a role
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -426,6 +427,49 @@ func (s *Server) SetSecretResolver(sr SecretResolver) {
 	s.secretResolver = sr
 }
 
+// SetPodCredentials configures how pods whose service account has an IAM role receive AWS credentials.
+func (s *Server) SetPodCredentials(pc *PodCredentials) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.podCredentials = pc
+}
+
+// podCredentialRefreshInterval is how often the plugin refreshes and redelivers pod role credentials.
+const podCredentialRefreshInterval = time.Minute
+
+// RunPodCredentials refreshes the role credentials of running pods until ctx ends.
+func (s *Server) RunPodCredentials(ctx context.Context) {
+	s.mu.RLock()
+	pc := s.podCredentials
+	s.mu.RUnlock()
+	if pc != nil {
+		pc.Run(ctx, podCredentialRefreshInterval, s.deliverPodCredentials)
+	}
+}
+
+// deliverPodCredentials pushes the pod's role credentials to the runner of its node, and reports
+// errPodCredentialsGone once the pod finished or was deleted.
+func (s *Server) deliverPodCredentials(ctx context.Context, podUID string, creds *PodAWSCredentials) error {
+	s.mu.RLock()
+	gone := s.isTombstonedLocked(podUID) || s.completedPods[podUID] != nil
+	runner := s.runner
+	s.mu.RUnlock()
+	node, alloc, found := s.nodePool.FindPodNode(podUID)
+	if gone || (found && alloc.Completed) {
+		return errPodCredentialsGone
+	}
+	if !found {
+		return fmt.Errorf("pod %s is not placed on a node", podUID)
+	}
+	pusher, ok := runner.(PodCredentialsPusher)
+	if !ok {
+		return fmt.Errorf("container runner %T cannot deliver credentials", runner)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return pusher.PushPodCredentials(ctx, node, podUID, creds)
+}
+
 func (s *Server) SetContainerRunner(r ContainerRunner) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -635,6 +679,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// The EKS webhook points the pod's SDKs at in-cluster credential sources a VM lacks; the runner serves its own.
+	podEnv := spec.Env
+	if DetectPodAWSRole(podEnv) != nil {
+		spec.Env = stripWebhookCredentialEnv(podEnv)
+	}
 
 	if len(pod.Spec.ImagePullSecrets) > 0 {
 		s.mu.RLock()
@@ -744,6 +793,19 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
+	var awsCreds *PodAWSCredentials
+	s.mu.RLock()
+	podCredentials := s.podCredentials
+	s.mu.RUnlock()
+	if podCredentials != nil {
+		awsCreds = podCredentials.Track(r.Context(), PodRef{
+			Namespace:      spec.PodNamespace,
+			Name:           spec.PodName,
+			UID:            spec.PodUID,
+			ServiceAccount: pod.Spec.ServiceAccountName,
+		}, podEnv, true)
+	}
+
 	prov := s.selectProvider(spec)
 	reqVec := ResourceVectorFromPod(pod)
 
@@ -791,6 +853,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			RunAsUser:        spec.RunAsUser,
 			RunAsGroup:       spec.RunAsGroup,
 			DockerConfigJSON: spec.DockerConfigJSON,
+			AWSCredentials:   awsCreds,
 		}
 		startErr := s.runner.StartContainer(r.Context(), warmNode, startReq)
 		if startErr != nil {
@@ -990,6 +1053,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		RunAsUser:        spec.RunAsUser,
 		RunAsGroup:       spec.RunAsGroup,
 		DockerConfigJSON: spec.DockerConfigJSON,
+		AWSCredentials:   awsCreds,
 	}
 	startErr := s.runner.StartContainer(r.Context(), newNode, startReq)
 	if startErr != nil {
@@ -1102,7 +1166,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	delete(s.instances, podName)
 	delete(s.completedPods, key)
 	delete(s.completedPods, podName)
+	podCredentials := s.podCredentials
 	s.mu.Unlock()
+	if podCredentials != nil {
+		podCredentials.Forget(uid)
+		podCredentials.Forget(pod.Metadata.UID)
+	}
 
 	// Release resources from NodePool
 	remainingPods := 0
@@ -1175,13 +1244,15 @@ type statusPodMetadata struct {
 }
 
 type statusContainerSpec struct {
-	Name  string `json:"name"`
-	Image string `json:"image"`
+	Name  string   `json:"name"`
+	Image string   `json:"image"`
+	Env   []EnvVar `json:"env,omitempty"`
 }
 
 type statusPodSpec struct {
-	Containers     []statusContainerSpec `json:"containers"`
-	InitContainers []statusContainerSpec `json:"initContainers"`
+	Containers         []statusContainerSpec `json:"containers"`
+	InitContainers     []statusContainerSpec `json:"initContainers"`
+	ServiceAccountName string                `json:"serviceAccountName,omitempty"`
 }
 
 type statusPodItem struct {
@@ -1270,6 +1341,34 @@ func decodeStatusPods(r io.Reader) []*statusPodRef {
 	return pods
 }
 
+// resumePodCredentials tracks the running pods whose service account has a role but whose credentials nobody refreshes,
+// such as after a plugin restart; the refresher obtains and delivers them on its next round.
+func (s *Server) resumePodCredentials(ctx context.Context, pods []*statusPodRef) {
+	s.mu.RLock()
+	pc := s.podCredentials
+	s.mu.RUnlock()
+	if pc == nil {
+		return
+	}
+	for _, p := range pods {
+		if p.UID == "" || pc.Tracked(p.UID) {
+			continue
+		}
+		if _, alloc, found := s.nodePool.FindPodNode(p.UID); !found || alloc.Completed {
+			continue
+		}
+		envs := make([][]EnvVar, 0, len(p.Spec.Containers))
+		for _, c := range p.Spec.Containers {
+			envs = append(envs, c.Env)
+		}
+		ns := p.Namespace
+		if ns == "" {
+			ns = "default"
+		}
+		pc.Track(ctx, PodRef{Namespace: ns, Name: p.Name, UID: p.UID, ServiceAccount: p.Spec.ServiceAccountName}, envFromContainers(envs...), false)
+	}
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1304,6 +1403,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.Unlock()
+	s.resumePodCredentials(r.Context(), pods)
 
 	type statusTarget struct {
 		name          string

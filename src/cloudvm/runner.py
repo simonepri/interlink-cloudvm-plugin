@@ -1,6 +1,7 @@
 """In-VM container runner: serves the plugin's create, status, logs, and delete calls by driving the VM's containerd through nerdctl.
 
 The bootstrap sets CLOUDVM_RUNNER_BIND and CLOUDVM_RUNNER_CONCURRENCY; the plugin reaches it through the tunnel agent.
+It also serves each pod whose service account has an IAM role the credentials the plugin sends for it on a loopback endpoint.
 """
 import datetime
 import hmac
@@ -8,6 +9,7 @@ import http.server
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -39,6 +41,12 @@ host_config_lock = threading.Lock()
 DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)
 RUNNER_CONCURRENCY = int(os.environ.get("CLOUDVM_RUNNER_CONCURRENCY") or DEFAULT_RUNNER_CONCURRENCY)
 CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)
+
+# Containers share the host network, so they reach the credential endpoint on loopback. A privileged port keeps a
+# non-root container from binding it while the runner is down.
+CREDENTIALS_ADDR = os.environ.get("CLOUDVM_CREDENTIALS_ADDR", "127.0.0.1:170")
+pod_credentials = {}
+pod_credentials_guard = threading.Lock()
 
 def snapshotter_args():
     # Lazy pulls need the stargz snapshotter; without it containerd's default snapshotter pulls in full.
@@ -160,6 +168,81 @@ def get_network_bytes():
     except Exception:
         pass
     return rx_bytes, tx_bytes
+
+def set_pod_credentials(pod_uid, creds):
+    """Records the role credentials the plugin sent for the pod, keeping those that expire last, and returns the
+    secret that authorizes the pod's container at the credential endpoint."""
+    with pod_credentials_guard:
+        entry = pod_credentials.get(pod_uid)
+        if entry is None:
+            entry = {'secret': secrets.token_urlsafe(32), 'creds': {}}
+            pod_credentials[pod_uid] = entry
+        if creds.get('accessKeyId') and int(creds.get('expiration') or 0) >= int(entry['creds'].get('expiration') or 0):
+            entry['creds'] = dict(creds)
+        return entry['secret']
+
+def forget_pod_credentials(pod_uid):
+    with pod_credentials_guard:
+        pod_credentials.pop(pod_uid, None)
+
+def credentials_env(secret):
+    """Returns the env that points every AWS SDK in a container at the pod's credential endpoint."""
+    return {
+        'AWS_CONTAINER_CREDENTIALS_FULL_URI': 'http://%s/v1/credentials' % CREDENTIALS_ADDR,
+        'AWS_CONTAINER_AUTHORIZATION_TOKEN': secret,
+    }
+
+def credentials_for_secret(secret):
+    """Returns the pod UID and credentials whose endpoint secret matches, comparing every secret in constant time."""
+    match = None
+    with pod_credentials_guard:
+        for uid, entry in pod_credentials.items():
+            if hmac.compare_digest(entry['secret'].encode(), secret.encode()):
+                match = (uid, entry['creds'])
+    return match
+
+class CredentialsHandler(http.server.BaseHTTPRequestHandler):
+    """Serves a pod's role credentials in the AWS container credentials format to the holder of its endpoint secret."""
+    def log_message(self, format, *args):
+        pass
+
+    def reply(self, code, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if urllib.parse.urlparse(self.path).path != '/v1/credentials':
+            self.reply(404, {'code': 'NotFound', 'message': 'unknown path'})
+            return
+        match = credentials_for_secret(self.headers.get('Authorization', ''))
+        if match is None:
+            self.reply(401, {'code': 'AccessDenied', 'message': 'unknown authorization token'})
+            return
+        uid, creds = match
+        expiration = int(creds.get('expiration') or 0)
+        if not creds.get('accessKeyId') or expiration <= time.time():
+            print(f"[cloudvm-runner] no current AWS credentials for {uid}", flush=True)
+            self.reply(503, {'code': 'CredentialsUnavailable', 'message': 'the plugin has not delivered current credentials'})
+            return
+        self.reply(200, {
+            'AccessKeyId': creds['accessKeyId'],
+            'SecretAccessKey': creds['secretAccessKey'],
+            'Token': creds['sessionToken'],
+            'Expiration': datetime.datetime.fromtimestamp(expiration, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        })
+
+def serve_credentials():
+    host, _, port = CREDENTIALS_ADDR.rpartition(':')
+    while True:
+        try:
+            http.server.ThreadingHTTPServer((host, int(port)), CredentialsHandler).serve_forever()
+        except Exception as e:
+            print(f"[cloudvm-runner] credential endpoint on {CREDENTIALS_ADDR} failed: {e}", flush=True)
+        time.sleep(5)
 
 class RunnerHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -328,10 +411,24 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
+        if parsed.path == '/containers/credentials':
+            pod_uid = urllib.parse.parse_qs(parsed.query).get('podUID', [''])[0]
+            try:
+                creds = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8'))
+            except Exception:
+                creds = None
+            if not pod_uid or not isinstance(creds, dict):
+                self.reply(400, b'{"error":"invalid credentials request"}')
+                return
+            set_pod_credentials(pod_uid, creds)
+            self.reply(200, b'{"status":"ok"}')
+            return
+
         if parsed.path == '/containers/stop':
             params = urllib.parse.parse_qs(parsed.query)
             pod_uid = params.get('podUID', [''])[0]
             if pod_uid:
+                forget_pod_credentials(pod_uid)
                 plock = get_pod_lock(pod_uid)
                 with plock:
                     starting_pods.discard(pod_uid)
@@ -398,7 +495,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             original_image = str(req.get('image', ''))
             image = rewrite_image(original_image)
             gpus = req.get('assignedGPUs', [])
-            env = req.get('env', {})
+            env = dict(req.get('env') or {})
+            if isinstance(req.get('awsCredentials'), dict):
+                env.update(credentials_env(set_pod_credentials(pod_uid, req['awsCredentials'])))
             cmd = req.get('command', [])
             args = req.get('args', [])
             cpu_milli = req.get('cpuMillicores', 0)
@@ -518,5 +617,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 if __name__ == '__main__':
+    if CREDENTIALS_ADDR:
+        threading.Thread(target=serve_credentials, daemon=True).start()
     server = http.server.ThreadingHTTPServer((os.environ.get("CLOUDVM_RUNNER_BIND", "127.0.0.1"), PORT), RunnerHandler)
     server.serve_forever()

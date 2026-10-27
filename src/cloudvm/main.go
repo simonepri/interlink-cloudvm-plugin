@@ -240,6 +240,12 @@ func run() error {
 	server.RegisterProvider(ProviderMock, mockProv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if pc, err := NewPodCredentialsFromEnv(ctx, awsRegion); err == nil {
+		server.SetPodCredentials(pc)
+		go server.RunPodCredentials(ctx)
+	} else {
+		log.Printf("[cloudvm] Pods get no AWS credentials for their service account roles: %v", err)
+	}
 
 	podWatch, err := NewInClusterPodWatch()
 	if err != nil {

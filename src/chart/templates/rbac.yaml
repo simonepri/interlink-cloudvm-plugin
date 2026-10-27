@@ -20,6 +20,10 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+  # Mints the projected tokens of the pods it runs, which it exchanges for their service account's IAM role credentials.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -61,6 +65,10 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["configmaps"]
+    verbs: ["create"]
+  # Mints the projected tokens of the pods it runs, which it exchanges for their service account's IAM role credentials.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
     verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

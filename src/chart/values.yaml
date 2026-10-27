@@ -18,6 +18,10 @@ provider:
   awsRegions: []
   # Region each virtual node's pods launch in, keyed by node name; a cloudvm.vk.io/region annotation overrides it.
   nodeRegions: {}
+  # EKS cluster whose Pod Identity associations give pods their IAM role credentials,
+  # and its region (default awsRegion).
+  eksClusterName: ""
+  eksClusterRegion: ""
   awsLaunchTemplateId: ""
   awsLaunchTemplateName: ""
   awsSubnetId: ""
