@@ -5,6 +5,7 @@ Implements the client half of the github.com/hashicorp/yamux framing on one asyn
 import asyncio
 import base64
 import datetime
+import ipaddress
 import json
 import os
 import random
@@ -19,6 +20,8 @@ T_DATA, T_WINDOW, T_PING, T_GOAWAY = 0, 1, 2, 3
 F_SYN, F_ACK, F_FIN, F_RST = 1, 2, 4, 8
 HEADER = struct.Struct(">BBHII")
 INITIAL_WINDOW = 256 * 1024
+# Each stream grants its peer this much room when it opens; at about 130ms between continents it allows roughly 15 MB/s.
+STREAM_WINDOW = 2 * 1024 * 1024
 MAX_FRAME = 16 * 1024
 # The gateway pings every 30s; a link that stays silent for this long is treated as dead.
 READ_IDLE_TIMEOUT = 90
@@ -224,7 +227,7 @@ class Session(object):
         stream = Stream(self, self.next_sid, local=(local_reader, local_writer))
         self.next_sid += 2
         self.streams[stream.sid] = stream
-        self.send(T_WINDOW, F_SYN, stream.sid, 0)
+        self.send(T_WINDOW, F_SYN, stream.sid, STREAM_WINDOW - INITIAL_WINDOW)
         header = (json.dumps({"stream": TCP_STREAM_KIND, "version": 1, "target": target}) + "\n").encode()
         stream.send_window -= len(header)
         self.send(T_DATA, 0, stream.sid, len(header), header)
@@ -269,7 +272,7 @@ class Session(object):
         if stream is None and flags & F_SYN:
             stream = Stream(self, sid)
             self.streams[sid] = stream
-            self.send(T_WINDOW, F_ACK, sid, 0)
+            self.send(T_WINDOW, F_ACK, sid, STREAM_WINDOW - INITIAL_WINDOW)
             stream.task = asyncio.ensure_future(stream.run())
         if stream is None:
             return
@@ -444,10 +447,32 @@ def read_file(path):
 
 
 class TCPProxy(object):
-    """Local HTTP CONNECT proxy that carries each accepted connection to its target over the current tunnel session."""
+    """Local HTTP CONNECT proxy: connects targets on the direct networks itself and carries every other connection to
+    its target over the current tunnel session."""
 
-    def __init__(self):
+    def __init__(self, direct_networks=()):
         self.session = None
+        self.direct_networks = list(direct_networks)
+
+    def is_direct(self, target):
+        host, _, _ = target.rpartition(":")
+        try:
+            ip = ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            return False
+        return any(ip in network for network in self.direct_networks)
+
+    async def connect_direct(self, target, reader, writer):
+        host, _, port = target.rpartition(":")
+        try:
+            peer_reader, peer_writer = await asyncio.wait_for(asyncio.open_connection(host.strip("[]"), int(port)), 10)
+        except (OSError, ValueError, asyncio.TimeoutError) as e:
+            log("direct connection to %s failed: %s" % (target, e))
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            writer.close()
+            return
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await asyncio.gather(copy(reader, peer_writer), copy(peer_reader, writer))
 
     async def handle(self, reader, writer):
         try:
@@ -456,6 +481,9 @@ class TCPProxy(object):
             writer.close()
             return
         parts = head.split(b"\r\n", 1)[0].split()
+        if len(parts) >= 2 and parts[0] == b"CONNECT" and self.is_direct(parts[1].decode()):
+            await self.connect_direct(parts[1].decode(), reader, writer)
+            return
         session = self.session
         if len(parts) < 2 or parts[0] != b"CONNECT" or session is None:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -465,6 +493,35 @@ class TCPProxy(object):
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         stream.task = asyncio.ensure_future(stream.run())
+
+
+async def copy(reader, writer):
+    """Copies reader into writer until either side ends, then closes writer."""
+    try:
+        while True:
+            data = await reader.read(64 * 1024)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except OSError:
+        pass
+    finally:
+        writer.close()
+
+
+def parse_networks(raw):
+    """Parses a comma-separated list of CIDRs, skipping entries that are not CIDRs."""
+    networks = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            log("ignoring direct network %r: not a CIDR" % item)
+    return networks
 
 
 async def connect_once(cfg):
@@ -511,7 +568,7 @@ def main():
             parse_log_files(os.environ.get("CLOUDVM_LOG_FILES", DEFAULT_LOG_FILES)),
             os.environ.get("CLOUDVM_CONTAINER_LOGS", "1") != "0" and shutil.which("docker") is not None),
     }
-    cfg["proxy"] = TCPProxy()
+    cfg["proxy"] = TCPProxy(parse_networks(os.environ.get("CLOUDVM_DIRECT_CIDRS", "")))
     max_backoff = float(os.environ.get("CLOUDVM_TUNNEL_MAX_BACKOFF", "30"))
     backoff = 0.5
     loop = asyncio.new_event_loop()

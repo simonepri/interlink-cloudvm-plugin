@@ -5,3 +5,5 @@ dist/
 .DS_Store
 *.log
 *.out
+# Binary from building the cloudvm package in place
+src/cloudvm/cloudvm

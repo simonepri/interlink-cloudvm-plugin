@@ -20,12 +20,12 @@ import (
 )
 
 // DefaultYamuxConfig returns a tuned Yamux configuration for reverse tunnel gateway and workers.
-// Configures keepalive ping interval of 30 seconds and receive stream window of 64 KiB.
+// Configures keepalive ping interval of 30 seconds and a 2 MiB receive window per stream, matching the agent's STREAM_WINDOW.
 func DefaultYamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = true
 	cfg.KeepAliveInterval = 30 * time.Second
-	cfg.MaxStreamWindowSize = 256 * 1024 // 64 KiB receive stream window
+	cfg.MaxStreamWindowSize = 2 * 1024 * 1024
 	cfg.LogOutput = io.Discard
 	return cfg
 }

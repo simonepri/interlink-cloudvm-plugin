@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +50,21 @@ func TestTunnelTransportsFromClusterFacts(t *testing.T) {
 	}
 	if _, err := TunnelTransportsFromClusterFacts(`{not json`); err == nil {
 		t.Fatal("malformed CLUSTER_FACTS must fail")
+	}
+}
+
+func TestDirectCIDRsFromClusterFacts(t *testing.T) {
+	cidrs, err := DirectCIDRsFromClusterFacts(`{"regions":{
+		"us-west-2":{"directCidrs":["10.133.0.0/16"]},
+		"eu-west-1":{"tunnelTransport":"public"}}}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if want := map[string][]string{"us-west-2": {"10.133.0.0/16"}}; !reflect.DeepEqual(cidrs, want) {
+		t.Fatalf("got %v, want %v", cidrs, want)
+	}
+	if _, err := DirectCIDRsFromClusterFacts(`{"regions":{"us-west-2":{"directCidrs":["10.133.0.0"]}}}`); err == nil || !strings.Contains(err.Error(), "us-west-2") {
+		t.Fatalf("a non-CIDR entry must fail naming the region, got %v", err)
 	}
 }
 
@@ -533,6 +549,7 @@ func TestApplyTunnelSpec_ResolvesEveryCandidateRegion(t *testing.T) {
 	server.EnableTunnel(TunnelSettings{
 		Endpoint:       "tunnel.example.internal:443",
 		Transports:     TunnelTransports{"us-west-2": TunnelTransportRouter, "eu-west-1": TunnelTransportPublic},
+		DirectCIDRs:    map[string][]string{"eu-west-1": {"10.137.0.0/16"}},
 		GatewayIP:      "192.0.2.10",
 		PublicEndpoint: "tunnel.example.com:443",
 		MeshAuthKey:    "tskey-auth-test",
@@ -543,11 +560,11 @@ func TestApplyTunnelSpec_ResolvesEveryCandidateRegion(t *testing.T) {
 	}
 	want := map[string]TunnelRoute{
 		"us-west-2": {Transport: "router", Endpoint: "tunnel.example.internal:443", GatewayIP: "192.0.2.10"},
-		"eu-west-1": {Transport: "public", Endpoint: "tunnel.example.com:443"},
+		"eu-west-1": {Transport: "public", Endpoint: "tunnel.example.com:443", DirectCIDRs: []string{"10.137.0.0/16"}},
 		"us-east-1": {Transport: "tailnet", Endpoint: "tunnel.example.internal:443"},
 	}
 	for region, route := range want {
-		if got := spec.TunnelRoutes[region]; got != route {
+		if got := spec.TunnelRoutes[region]; !reflect.DeepEqual(got, route) {
 			t.Errorf("route of %s = %+v, want %+v", region, got, route)
 		}
 	}

@@ -166,6 +166,8 @@ type RegionalClusterFact struct {
 	SecurityGroupIDs   []string             `json:"securityGroupIds,omitempty"`
 	// TunnelTransport is the path the region's workers take to the tunnel gateway; empty means tailnet.
 	TunnelTransport string `json:"tunnelTransport,omitempty"`
+	// DirectCIDRs are the private networks the region's workers reach each other on without the tunnel.
+	DirectCIDRs []string `json:"directCidrs,omitempty"`
 }
 
 // ClusterFacts holds the regional deployment facts for dynamic Launch Template and subnet selection.
@@ -985,6 +987,7 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		TunnelEndpoint:        spec.TunnelEndpoint,
 		TunnelTransport:       spec.TunnelTransport,
 		TunnelGatewayIP:       spec.TunnelGatewayIP,
+		TunnelDirectCIDRs:     spec.TunnelDirectCIDRs,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		TargetContainerImage:  spec.TargetContainerImage,
 		Command:               spec.Command,

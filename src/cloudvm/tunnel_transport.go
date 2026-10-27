@@ -84,6 +84,29 @@ func TunnelTransportsFromClusterFacts(raw string) (TunnelTransports, error) {
 	return transports, nil
 }
 
+// DirectCIDRsFromClusterFacts reads regions.<region>.directCidrs from the CLUSTER_FACTS JSON, rejecting entries that are not CIDRs.
+func DirectCIDRsFromClusterFacts(raw string) (map[string][]string, error) {
+	cidrs := map[string][]string{}
+	if strings.TrimSpace(raw) == "" {
+		return cidrs, nil
+	}
+	var facts ClusterFacts
+	if err := json.Unmarshal([]byte(raw), &facts); err != nil {
+		return nil, fmt.Errorf("invalid CLUSTER_FACTS: %w", err)
+	}
+	for region, fact := range facts.Regions {
+		for _, cidr := range fact.DirectCIDRs {
+			if _, _, err := net.ParseCIDR(cidr); err != nil {
+				return nil, fmt.Errorf("CLUSTER_FACTS region %s: directCidrs: %w", region, err)
+			}
+		}
+		if len(fact.DirectCIDRs) > 0 {
+			cidrs[region] = fact.DirectCIDRs
+		}
+	}
+	return cidrs, nil
+}
+
 // validateTransports fails when a transport some region uses lacks the settings it needs.
 func (s *TunnelSettings) validateTransports() error {
 	if s.Transports.privateEndpointRequired() {

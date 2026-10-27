@@ -116,6 +116,8 @@ type InstanceSpec struct {
 	TunnelTransport string `json:"tunnelTransport,omitempty"`
 	// TunnelGatewayIP is the gateway address a router-transport worker pins the TunnelEndpoint host to.
 	TunnelGatewayIP string `json:"tunnelGatewayIP,omitempty"`
+	// TunnelDirectCIDRs are the private networks the worker's agent dials directly instead of through the tunnel.
+	TunnelDirectCIDRs []string `json:"tunnelDirectCidrs,omitempty"`
 	// TunnelRoutes holds the tunnel route of every region this launch may use; the Tunnel* fields hold the pinned region's.
 	TunnelRoutes map[string]TunnelRoute `json:"tunnelRoutes,omitempty"`
 	// RunnerDirectHTTP keeps the in-VM runner listening on all interfaces for same-VPC direct HTTP access.
