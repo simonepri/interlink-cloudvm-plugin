@@ -31,6 +31,8 @@ type TunnelSettings struct {
 	Transports TunnelTransports
 	// DirectCIDRs maps each region to the private networks its workers reach each other on without the tunnel.
 	DirectCIDRs map[string][]string
+	// ImageMirrors maps each region to the registry mirrors its workers pull images from.
+	ImageMirrors map[string]map[string]string
 	// GatewayIP is the gateway ClusterIP router workers pin the Endpoint host to.
 	GatewayIP string
 	// PublicEndpoint is the host:port of the public listener public workers dial.
@@ -113,12 +115,14 @@ type TunnelRoute struct {
 	Endpoint    string   `json:"endpoint,omitempty"`
 	GatewayIP   string   `json:"gatewayIP,omitempty"`
 	DirectCIDRs []string `json:"directCidrs,omitempty"`
+	// ImageMirrors maps an upstream registry host to the mirror reference prefix workers of the region pull from.
+	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
 }
 
 // route resolves the tunnel route of workers launched in region, failing when a setting its transport needs is unset.
 func (t *tunnelState) route(region, meshKey string) (TunnelRoute, error) {
 	transport := t.Transports.For(region)
-	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region]}
+	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region], ImageMirrors: t.ImageMirrors[region]}
 	if transport == TunnelTransportPublic {
 		route.Endpoint = t.PublicEndpoint
 		return route, nil
@@ -184,6 +188,7 @@ func (spec *InstanceSpec) applyTunnelRoute(route TunnelRoute) {
 	spec.TunnelEndpoint = route.Endpoint
 	spec.TunnelGatewayIP = route.GatewayIP
 	spec.TunnelDirectCIDRs = route.DirectCIDRs
+	spec.ImageMirrors = route.ImageMirrors
 }
 
 // hasTunnelRoute reports whether a launch may use region: every region may when the spec carries no routes.

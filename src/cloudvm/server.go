@@ -300,6 +300,7 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		TunnelTransport:       spec.TunnelTransport,
 		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		TunnelDirectCIDRs:     spec.TunnelDirectCIDRs,
+		ImageMirrors:          spec.ImageMirrors,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                spec.Region,
 		InstanceType:          spec.InstanceType,

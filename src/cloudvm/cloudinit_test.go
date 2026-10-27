@@ -89,7 +89,7 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	if bytes.Contains([]byte(script), []byte("initial-pod.json")) {
 		t.Errorf("cloud-init must not launch initial-pod.json via user-data")
 	}
-	if !bytes.Contains([]byte(script), []byte(`docker ps -q --filter "name=cloudvm"`)) {
+	if !bytes.Contains([]byte(script), []byte(`nerdctl ps -q --filter "name=cloudvm"`)) {
 		t.Errorf("cloud-init missing multi-pod idle watchdog container check")
 	}
 }
@@ -245,8 +245,8 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	// Verify runner concurrency throttle and shutdown check
 	if !strings.Contains(script, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") ||
 		!strings.Contains(script, `CLOUDVM_RUNNER_CONCURRENCY=""`) ||
-		!strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
-		t.Fatalf("cloud-init runner missing DOCKER_SEMAPHORE definition")
+		!strings.Contains(script, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Fatalf("cloud-init runner missing CONTAINER_SEMAPHORE definition")
 	}
 	if !strings.Contains(script, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
 		t.Fatalf("cloud-init runner missing shutting-down check")
@@ -333,17 +333,20 @@ func TestCloudInit_RegistryMirrors(t *testing.T) {
 			t.Fatalf("GenerateCloudInit failed: %v", err)
 		}
 
-		if !strings.Contains(script, "/etc/docker/daemon.json") {
-			t.Errorf("cloud-init missing /etc/docker/daemon.json configuration")
+		if !strings.Contains(script, "/etc/containerd/certs.d/docker.io/hosts.toml") {
+			t.Errorf("cloud-init missing containerd hosts.toml configuration")
 		}
-		if !strings.Contains(script, "registry-mirrors") {
-			t.Errorf("cloud-init missing registry-mirrors key")
+		if !strings.Contains(script, `[host."https://mirror.gcr.io"]`) {
+			t.Errorf("cloud-init missing hosts.toml host table for the mirror")
+		}
+		if strings.Contains(script, "daemon.json") {
+			t.Errorf("cloud-init must not configure the Docker daemon")
 		}
 		if !strings.Contains(script, "https://mirror.gcr.io") || !strings.Contains(script, "https://dockerhub.mirror.local") {
 			t.Errorf("cloud-init missing configured mirror URLs in script")
 		}
-		if !strings.Contains(script, "systemctl restart docker") {
-			t.Errorf("cloud-init missing docker restart command after updating daemon.json")
+		if !strings.Contains(script, "systemctl restart containerd") {
+			t.Errorf("cloud-init missing containerd restart command")
 		}
 	})
 
@@ -537,8 +540,8 @@ func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
 	}
 
 	// Verify all features are present
-	if !strings.Contains(script, "registry-mirrors") {
-		t.Errorf("combined cloud-init missing registry-mirrors")
+	if !strings.Contains(script, "certs.d/docker.io/hosts.toml") {
+		t.Errorf("combined cloud-init missing hosts.toml mirrors")
 	}
 	if !strings.Contains(script, "https://dockerhub.internal.mirror") {
 		t.Errorf("combined cloud-init missing dockerhub.internal.mirror")
@@ -572,7 +575,7 @@ func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
 	}
 }
 
-func TestCloudInit_DockerInstallAndHeartbeatBootstrap(t *testing.T) {
+func TestCloudInit_ContainerRuntimeAndHeartbeatBootstrap(t *testing.T) {
 	cfg := &CloudInitConfig{
 		PodName:         "boot-test-pod",
 		PodNamespace:    "default",
@@ -587,11 +590,23 @@ func TestCloudInit_DockerInstallAndHeartbeatBootstrap(t *testing.T) {
 	if !strings.Contains(script, "touch /tmp/cloudvm-heartbeat") {
 		t.Errorf("cloud-init missing boot heartbeat initialization touch")
 	}
-	if !strings.Contains(script, "Installing Docker and Python 3") {
-		t.Errorf("cloud-init missing Docker and Python 3 automated installation block")
+	for _, want := range []string{
+		"Installing Python 3",
+		`CLOUDVM_NERDCTL_SHA256="f6bbf02fd8a299cbcbc71a0bad113c1b63b3f33689bbb7d51b0fa98c6d361d5e"`,
+		"nerdctl-${CLOUDVM_NERDCTL_VERSION}-linux-amd64.tar.gz",
+		"sha256sum -c -",
+		`CLOUDVM_STARGZ_SHA256="515a3c3af0012f192ace31fb79e910597977c77227e976680aeaaef6e9ae50a9"`,
+		"[proxy_plugins.stargz]",
+		"Before=containerd.service",
+		"DOCKER_CONFIG=/root/.docker",
+		"systemctl restart containerd",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("cloud-init missing %q", want)
+		}
 	}
-	if !strings.Contains(script, "systemctl enable --now docker") {
-		t.Errorf("cloud-init missing docker enable/start command")
+	if strings.Contains(script, "docker run") || strings.Contains(script, "install -y docker") || strings.Contains(script, "enable --now docker") {
+		t.Errorf("cloud-init must not depend on the Docker daemon")
 	}
 	if !strings.Contains(script, "HB_AGE=0") {
 		t.Errorf("cloud-init watchdog missing safe HB_AGE default 0")
@@ -686,11 +701,11 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	if !strings.Contains(script, `CLOUDVM_RUNNER_CONCURRENCY=""`) {
 		t.Errorf("cloud-init runner missing default RUNNER_CONCURRENCY assignment")
 	}
-	if !strings.Contains(script, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
-		t.Errorf("cloud-init runner missing DOCKER_SEMAPHORE definition with RUNNER_CONCURRENCY")
+	if !strings.Contains(script, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("cloud-init runner missing CONTAINER_SEMAPHORE definition with RUNNER_CONCURRENCY")
 	}
-	if !strings.Contains(script, "with DOCKER_SEMAPHORE:") {
-		t.Errorf("cloud-init runner missing with DOCKER_SEMAPHORE acquisition around container launch")
+	if !strings.Contains(script, "with CONTAINER_SEMAPHORE:") {
+		t.Errorf("cloud-init runner missing with CONTAINER_SEMAPHORE acquisition around container launch")
 	}
 
 	// 2. Explicit positive RunnerConcurrency renders the exact integer in RUNNER_CONCURRENCY = <val>
@@ -706,8 +721,8 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	if !strings.Contains(scriptExplicit, `CLOUDVM_RUNNER_CONCURRENCY="16"`) {
 		t.Errorf("cloud-init runner missing explicit RUNNER_CONCURRENCY = 16")
 	}
-	if !strings.Contains(scriptExplicit, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
-		t.Errorf("cloud-init runner missing DOCKER_SEMAPHORE definition with RUNNER_CONCURRENCY")
+	if !strings.Contains(scriptExplicit, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("cloud-init runner missing CONTAINER_SEMAPHORE definition with RUNNER_CONCURRENCY")
 	}
 
 	// 3. Negative RunnerConcurrency resets to 0 in Validate() and renders default
@@ -731,7 +746,7 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	if !strings.Contains(script, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
 		t.Errorf("cloud-init runner missing /tmp/cloudvm-shutting-down check")
 	}
-	if !strings.Contains(script, "self.send_response(503)") {
+	if !strings.Contains(script, "self.reply(503, ") {
 		t.Errorf("cloud-init runner missing 503 response on shutting-down check")
 	}
 	if !strings.Contains(script, `{"error": "node is shutting down"}`) {
@@ -865,4 +880,45 @@ func assertUserDataFits(t *testing.T, script string) {
 		t.Fatalf("compressed user data is %d bytes, above the 16 KiB EC2 limit", buf.Len())
 	}
 	t.Logf("compressed user data: %d bytes", buf.Len())
+}
+
+func TestRenderCloudInit_ImageMirrorsAndContainerCLI(t *testing.T) {
+	cfg := CloudInitConfig{
+		PodName:              "mirror-worker",
+		Region:               "eu-west-1",
+		RunnerAuthToken:      "runner-secret",
+		TunnelEndpoint:       "tunnel.example.internal:443",
+		MeshAuthKey:          "tskey-auth-plaintext",
+		ImageMirrors:         map[string]string{"docker.io": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"},
+		TargetContainerImage: "alpine",
+	}
+	script, err := RenderCloudInit(&cfg)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		`{"docker.io":"123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}`,
+		"/etc/cloudvm/image-mirrors.json",
+		`CLOUDVM_CONTAINER_CLI="nerdctl"`,
+		"CONTAINER_CLI = 'nerdctl'",
+		"--snapshotter=stargz",
+		"def rewrite_image(ref):",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("rendered script missing %q", want)
+		}
+	}
+	assertBashSyntax(t, script)
+}
+
+func TestRenderCloudInit_NodeProblemDetectorUsesNerdctl(t *testing.T) {
+	cfg := CloudInitConfig{PodName: "npd", Region: "eu-west-1", UseNativeDLAMI: true, NodeProblemDetector: true}
+	script, err := RenderCloudInit(&cfg)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(script, "nerdctl run -d   --name node-problem-detector   --restart always") || strings.Contains(script, "docker run") {
+		t.Errorf("node-problem-detector must start through nerdctl")
+	}
+	assertBashSyntax(t, script)
 }

@@ -402,6 +402,10 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 	if err != nil {
 		return nil, err
 	}
+	imageMirrors, err := ImageMirrorsFromClusterFacts(os.Getenv("CLUSTER_FACTS"))
+	if err != nil {
+		return nil, err
+	}
 	meshKey := os.Getenv("TAILSCALE_AUTHKEY")
 	if meshKey == "" && transports.meshKeyRequired() {
 		return nil, fmt.Errorf("TAILSCALE_AUTHKEY is required so tailnet-transport workers can join the tailnet")
@@ -423,6 +427,7 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		Endpoint:       endpoint,
 		Transports:     transports,
 		DirectCIDRs:    directCIDRs,
+		ImageMirrors:   imageMirrors,
 		GatewayIP:      strings.TrimSpace(os.Getenv("TUNNEL_GATEWAY_IP")),
 		PublicEndpoint: strings.TrimSpace(os.Getenv("TUNNEL_PUBLIC_ENDPOINT")),
 		MeshAuthKey:    meshKey,

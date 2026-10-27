@@ -1312,8 +1312,8 @@ func TestServer_RunnerConcurrency_EnvAndAnnotation(t *testing.T) {
 	if !strings.Contains(script1, `CLOUDVM_RUNNER_CONCURRENCY="8"`) {
 		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = 8")
 	}
-	if !strings.Contains(script1, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
-		t.Errorf("expected cloud-init to contain DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
+	if !strings.Contains(script1, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("expected cloud-init to contain CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
 	}
 
 	// 2. Pod with annotation "cloudvm.vk.io/runner-concurrency" overrides environment default
@@ -1356,8 +1356,8 @@ func TestServer_RunnerConcurrency_EnvAndAnnotation(t *testing.T) {
 	if !strings.Contains(script2, `CLOUDVM_RUNNER_CONCURRENCY="24"`) {
 		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = 24")
 	}
-	if !strings.Contains(script2, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
-		t.Errorf("expected cloud-init to contain DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
+	if !strings.Contains(script2, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("expected cloud-init to contain CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
 	}
 
 	// 3. When neither env var nor annotation is set, defaults to auto/cpu_count
@@ -1393,8 +1393,8 @@ func TestServer_RunnerConcurrency_EnvAndAnnotation(t *testing.T) {
 	if !strings.Contains(script3, `CLOUDVM_RUNNER_CONCURRENCY=""`) {
 		t.Errorf("expected cloud-init to contain RUNNER_CONCURRENCY = DEFAULT_RUNNER_CONCURRENCY")
 	}
-	if !strings.Contains(script3, "DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
-		t.Errorf("expected cloud-init to contain DOCKER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
+	if !strings.Contains(script3, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		t.Errorf("expected cloud-init to contain CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)")
 	}
 }
 
@@ -1776,7 +1776,7 @@ func TestServer_HandleStatus_RunnerStartFailureIsTerminal(t *testing.T) {
 
 	const startErr = `could not select device driver "" with capabilities: [[gpu]]`
 	runner := NewMockContainerRunner()
-	// A failed docker run leaves the container in "created"; the start failure must still end the pod.
+	// A failed nerdctl run leaves the container in "created"; the start failure must still end the pod.
 	runner.SetStatus("uid-gpu-pod", &ContainerStatusResult{
 		Status:  "created",
 		Reason:  "StartError",

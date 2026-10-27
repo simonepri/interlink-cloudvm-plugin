@@ -1,4 +1,4 @@
-// Runs the embedded in-VM runner script against a fake docker CLI to verify how it reports container start failures.
+// Runs the embedded in-VM runner script against a fake nerdctl CLI to verify how it reports container start failures.
 package main
 
 import (
@@ -14,14 +14,14 @@ import (
 	"time"
 )
 
-const fakeDockerStartError = `docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]]`
+const fakeNerdctlStartError = `nerdctl: could not select device driver "" with capabilities: [[gpu]]`
 
-// fakeDocker mimics a docker CLI whose `run` creates the container but fails to start it, as a missing GPU runtime does.
-const fakeDocker = `#!/usr/bin/env bash
-state="$FAKE_DOCKER_STATE"
+// fakeNerdctl mimics a nerdctl CLI whose `run` creates the container but fails to start it, as a missing GPU runtime does.
+const fakeNerdctl = `#!/usr/bin/env bash
+state="$FAKE_NERDCTL_STATE"
 case "$1" in
   pull) exit 0 ;;
-  run) touch "$state/created"; echo '` + fakeDockerStartError + `' >&2; exit 125 ;;
+  run) touch "$state/created"; echo '` + fakeNerdctlStartError + `' >&2; exit 125 ;;
   inspect)
     if [ -f "$state/created" ]; then
       printf '[{"State":{"Status":"created","Running":false,"ExitCode":128,"Error":"could not select device driver \\"\\" with capabilities: [[gpu]]","StartedAt":"0001-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}}]'
@@ -73,7 +73,7 @@ func newRunnerHarness(t *testing.T) *runnerHarness {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte(fakeDocker), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+	if err := os.WriteFile(filepath.Join(binDir, "nerdctl"), []byte(fakeNerdctl), 0o755); err != nil { //nolint:gosec // test fixture must be executable
 		t.Fatal(err)
 	}
 	tokenPath := filepath.Join(dir, "runner-token")
@@ -101,7 +101,7 @@ func newRunnerHarness(t *testing.T) *runnerHarness {
 		url:    fmt.Sprintf("http://127.0.0.1:%d", port),
 		token:  "tok",
 		script: scriptPath,
-		env:    append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_DOCKER_STATE="+stateDir),
+		env:    append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_NERDCTL_STATE="+stateDir),
 	}
 }
 
@@ -152,7 +152,7 @@ func (h *runnerHarness) status(podUID string) ContainerStatusResult {
 	return res
 }
 
-func TestRunnerScript_ReportsDockerStartFailure(t *testing.T) {
+func TestRunnerScript_ReportsStartFailure(t *testing.T) {
 	h := newRunnerHarness(t)
 	stop := h.start()
 
@@ -175,18 +175,18 @@ func TestRunnerScript_ReportsDockerStartFailure(t *testing.T) {
 		t.Fatalf("expected a terminal StartError, got %+v", res)
 	}
 	if !strings.Contains(res.Message, "could not select device driver") {
-		t.Fatalf("expected the docker error in the message, got %q", res.Message)
+		t.Fatalf("expected the nerdctl error in the message, got %q", res.Message)
 	}
 	stop()
 
-	// A restarted runner has lost its in-memory failure record and must read the failure from docker inspect.
+	// A restarted runner has lost its in-memory failure record and must read the failure from nerdctl inspect.
 	stop = h.start()
 	defer stop()
 	res = h.status("gpu")
 	if res.Reason != "StartError" || res.Status != "dead" || res.ExitCode == 0 {
-		t.Fatalf("expected StartError from docker inspect after restart, got %+v", res)
+		t.Fatalf("expected StartError from nerdctl inspect after restart, got %+v", res)
 	}
 	if !strings.Contains(res.Message, "could not select device driver") {
-		t.Fatalf("expected the docker state error in the message, got %q", res.Message)
+		t.Fatalf("expected the nerdctl state error in the message, got %q", res.Message)
 	}
 }
