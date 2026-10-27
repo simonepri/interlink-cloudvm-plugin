@@ -88,6 +88,10 @@ class Stream(object):
         try:
             await self.pump_out(local_reader)
             await pump_in
+        except (OSError, AssertionError) as e:
+            # The gateway end only learns that this connection ended from a reset.
+            log("stream %d: %s" % (self.sid, e))
+            self.reset()
         finally:
             pump_in.cancel()
             local_writer.close()
@@ -132,7 +136,10 @@ class Stream(object):
             chunk = await self.inbound.get()
             if chunk is None:
                 if local_writer.can_write_eof():
-                    local_writer.write_eof()
+                    try:
+                        local_writer.write_eof()
+                    except OSError:
+                        pass  # the local end already closed
                 return
             local_writer.write(chunk)
             await local_writer.drain()
@@ -150,7 +157,7 @@ class Stream(object):
             if self.send_window <= 0:
                 self.window_open.clear()
             self.session.send(T_DATA, 0, self.sid, len(data), data)
-            await self.session.writer.drain()
+            await self.session.drain()
 
 
 class LogStream(object):
@@ -187,7 +194,7 @@ class LogStream(object):
             if self.send_window <= 0:
                 self.window_open.clear()
             self.session.send(T_DATA, 0, self.sid, n, data[:n])
-            await self.session.writer.drain()
+            await self.session.drain()
             data = data[n:]
 
 
@@ -198,9 +205,16 @@ class Session(object):
         self.runner_addr = runner_addr
         self.streams = {}
         self.next_sid = 1  # Yamux clients open odd stream IDs
+        # On Python 3.9, the system Python of Amazon Linux 2023, a second concurrent drain() fails an assertion.
+        self.drain_lock = asyncio.Lock()
 
     def send(self, ftype, flags, sid, length, payload=b""):
         self.writer.write(HEADER.pack(VERSION, ftype, flags, sid, length) + payload)
+
+    async def drain(self):
+        """Waits until the session socket accepts more frames, letting one stream wait at a time."""
+        async with self.drain_lock:
+            await self.writer.drain()
 
     def open_tcp_stream(self, target, local_reader, local_writer):
         """Opens a stream asking the gateway to connect to target, bridged to an accepted local connection.

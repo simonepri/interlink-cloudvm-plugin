@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,6 +34,28 @@ func startEchoServer(t *testing.T) string {
 				defer conn.Close()
 				_, _ = io.Copy(conn, conn)
 			}()
+		}
+	}()
+	return l.Addr().String()
+}
+
+// startResetServer accepts connections, reads one chunk, and closes each with a TCP reset.
+func startResetServer(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reset listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Read(make([]byte, 1))
+			_ = conn.(*net.TCPConn).SetLinger(0)
+			_ = conn.Close()
 		}
 	}()
 	return l.Addr().String()
@@ -147,6 +170,29 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 	})
 	t.Run("worker to worker", func(t *testing.T) {
 		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, echoPort))
+	})
+	t.Run("a reset on the worker closes the cluster connection", func(t *testing.T) {
+		_, resetPort, _ := net.SplitHostPort(startResetServer(t))
+		target := net.JoinHostPort(workerIP, resetPort)
+		conn, err := net.DialTimeout("tcp", clusterProxy.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("CONNECT %s: %v %v", target, resp, err)
+		}
+		_ = resp.Body.Close()
+		_, _ = conn.Write([]byte("x"))
+		_, err = reader.ReadByte()
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("cluster connection stayed open after the worker side reset")
+		}
 	})
 	t.Run("direct forwarding refuses well-known ports and other networks", func(t *testing.T) {
 		g := &TunnelGateway{}
