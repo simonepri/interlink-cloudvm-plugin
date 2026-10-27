@@ -292,22 +292,18 @@ func (s *Server) failTunnelDeadline(ctx context.Context, node *CloudVMNode, req 
 	s.TerminateIdleNode(ctx, node)
 }
 
-// handleMetrics serves tunnel metrics together with the embedded spot ticker's metrics when either is enabled.
+// handleMetrics serves the idle collector metrics, plus the tunnel and embedded spot ticker metrics when enabled.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	ticker := s.spotTicker
 	tunnel := s.tunnel
 	s.mu.RUnlock()
-	var gatherers prometheus.Gatherers
+	gatherers := prometheus.Gatherers{idleMetrics.Registry}
 	if ticker != nil && ticker.Metrics() != nil {
 		gatherers = append(gatherers, ticker.Metrics().Gatherer())
 	}
 	if tunnel != nil {
 		gatherers = append(gatherers, tunnel.metrics.Registry)
-	}
-	if len(gatherers) == 0 {
-		http.Error(w, "no metrics enabled", http.StatusNotFound)
-		return
 	}
 	promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}).ServeHTTP(w, r)
 }

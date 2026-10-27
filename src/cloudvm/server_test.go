@@ -499,6 +499,7 @@ func TestServer_CreateIdempotency(t *testing.T) {
 func TestRegression_CompletedPodPreservesStatusAfterIdleVMTermination(t *testing.T) {
 	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
 	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
+	t.Setenv("TOMBSTONE_STORE_PATH", filepath.Join(t.TempDir(), "tombstones.json"))
 	mock := NewMockProvider()
 	server := NewServer(mock, "test-cluster")
 	runner := NewMockContainerRunner()

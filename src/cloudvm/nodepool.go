@@ -3,6 +3,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -46,6 +47,9 @@ type CloudVMNode struct {
 	UnknownCoTenantsRetries int            `json:"unknownCoTenantsRetries,omitempty"`
 	UnknownSince            time.Time      `json:"unknownSince,omitempty"`
 	RunnerAuthToken         string         `json:"runnerAuthToken,omitempty"`
+
+	// idleHoldLogged records that the idle collector logged why it keeps this expired idle node.
+	idleHoldLogged bool
 
 	// Discrete device maps: Slot Index -> PodUID
 	GPUSlots map[int]string `json:"gpuSlots"`
@@ -529,17 +533,34 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	now := time.Now()
 
 	for id, node := range np.nodes {
-		if node.UnknownCoTenants {
+		if node.ActivePodCount() != 0 || node.IdleSince == nil || now.Sub(*node.IdleSince) <= np.idleGracePeriod {
+			node.idleHoldLogged = false
 			continue
 		}
-		if node.ActivePodCount() == 0 && node.IdleSince != nil {
-			if now.Sub(*node.IdleSince) > np.idleGracePeriod {
-				expired = append(expired, node)
-				delete(np.nodes, id)
+		if node.UnknownCoTenants {
+			if !node.idleHoldLogged {
+				node.idleHoldLogged = true
+				log.Printf("[cloudvm] Keeping idle node %s past its %v grace period until its co-tenants are verified", sanitizeLog(id), np.idleGracePeriod) //nolint:gosec // sanitized
 			}
+			continue
 		}
+		expired = append(expired, node)
+		delete(np.nodes, id)
 	}
 	return expired
+}
+
+// IdleNodeCount returns how many tracked nodes have no active pods.
+func (np *NodePool) IdleNodeCount() int {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	count := 0
+	for _, node := range np.nodes {
+		if node.ActivePodCount() == 0 {
+			count++
+		}
+	}
+	return count
 }
 
 // InstanceByIP returns the instance ID of the registered node with the given private IP.
