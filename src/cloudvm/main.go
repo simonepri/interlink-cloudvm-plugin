@@ -448,6 +448,11 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		go forwarder.Run(ctx)
 		log.Printf("[cloudvm-logs] Forwarding worker logs to %s", endpoint) //nolint:gosec // configuration value
 	}
+	directTCPNetworks, err := ParseDirectTCPNetworks(os.Getenv("TUNNEL_TCP_DIRECT_CIDRS"))
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
 	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
 		Listener:          listener,
 		Registry:          registry,
@@ -456,7 +461,7 @@ func startTunnelGateway(ctx context.Context, server *Server) (*TunnelGateway, er
 		OnReject:          metrics.RecordRejection,
 		LogSink:           server,
 		Resolver:          server.ResolveInstanceAddress,
-		DirectTCP:         os.Getenv("TUNNEL_TCP_DIRECT") == "true",
+		DirectTCPNetworks: directTCPNetworks,
 	})
 	if err != nil {
 		_ = listener.Close()

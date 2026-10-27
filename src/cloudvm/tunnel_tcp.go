@@ -11,6 +11,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,11 +24,14 @@ const WorkerTCPStreamKind = "tcp"
 
 const tcpDialTimeout = 10 * time.Second
 
+// minDirectTCPPort keeps direct forwarding off well-known ports, such as the API servers the gateway itself reaches.
+const minDirectTCPPort = 1024
+
 // InstanceAddressResolver maps a worker VM's private IP to the instance ID of its tunnel session.
 type InstanceAddressResolver func(ip string) (string, bool)
 
 // serveWorkerTCP bridges a worker-opened tcp stream to its target: another worker VM when the target is one of their
-// addresses, otherwise a direct connection from the gateway when direct forwarding is enabled.
+// addresses, otherwise a direct connection from the gateway when allowDirect permits it.
 func (g *TunnelGateway) serveWorkerTCP(instanceID string, reader *bufio.Reader, stream *yamux.Stream, target string) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
@@ -35,10 +40,8 @@ func (g *TunnelGateway) serveWorkerTCP(instanceID string, reader *bufio.Reader, 
 	var upstream net.Conn
 	if peer, ok := g.resolveInstance(host); ok {
 		upstream, err = g.openWorkerTCP(peer, port)
-	} else if g.directTCP {
+	} else if err = g.allowDirect(host, port); err == nil {
 		upstream, err = (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
-	} else {
-		err = errors.New("direct forwarding is disabled")
 	}
 	if err != nil {
 		log.Printf("[cloudvm-tunnel] Refused tcp stream from %s to %s: %v", sanitizeLog(instanceID), sanitizeLog(target), err) //nolint:gosec // sanitized
@@ -122,6 +125,44 @@ func (g *TunnelGateway) openWorkerTCP(instanceID, port string) (net.Conn, error)
 		return nil, err
 	}
 	return stream, nil
+}
+
+// allowDirect reports why the gateway may not dial target itself: direct forwarding reaches only addresses inside the
+// configured networks, on ports from minDirectTCPPort up.
+func (g *TunnelGateway) allowDirect(host, port string) error {
+	if len(g.directTCPNetworks) == 0 {
+		return errors.New("direct forwarding is disabled")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("target %q is not an IP address", host)
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < minDirectTCPPort || p > 65535 {
+		return fmt.Errorf("port %q is outside %d-65535", port, minDirectTCPPort)
+	}
+	for _, network := range g.directTCPNetworks {
+		if network.Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("target %s is outside the direct forwarding networks", host)
+}
+
+// ParseDirectTCPNetworks parses the comma-separated CIDRs direct forwarding may reach.
+func ParseDirectTCPNetworks(raw string) ([]*net.IPNet, error) {
+	var networks []*net.IPNet
+	for _, cidr := range strings.Split(raw, ",") {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid direct forwarding network %q: %w", cidr, err)
+		}
+		networks = append(networks, network)
+	}
+	return networks, nil
 }
 
 func (g *TunnelGateway) resolveInstance(host string) (string, bool) {

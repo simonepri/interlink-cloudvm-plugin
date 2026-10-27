@@ -89,7 +89,7 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 	const instanceID, token, workerIP = "i-python-tcp", "agent-token", "10.9.9.9"
 	f.addNode(instanceID, "eu-west-1", token)
 	f.gateway.resolver = func(ip string) (string, bool) { return instanceID, ip == workerIP }
-	f.gateway.directTCP = true
+	f.gateway.directTCPNetworks, _ = ParseDirectTCPNetworks("127.0.0.0/8")
 
 	echoAddr := startEchoServer(t)
 	_, echoPort, _ := net.SplitHostPort(echoAddr)
@@ -147,6 +147,26 @@ func TestTunnelTCP_PythonAgentForwardsBetweenWorkersAndCluster(t *testing.T) {
 	})
 	t.Run("worker to worker", func(t *testing.T) {
 		connectAndEcho(t, agentProxy, net.JoinHostPort(workerIP, echoPort))
+	})
+	t.Run("direct forwarding refuses well-known ports and other networks", func(t *testing.T) {
+		g := &TunnelGateway{}
+		g.directTCPNetworks, _ = ParseDirectTCPNetworks("10.112.0.0/12")
+		for _, tc := range []struct{ host, port string }{
+			{"10.112.0.5", "443"},
+			{"10.112.0.5", "22"},
+			{"10.200.0.5", "6379"},
+			{"api.example.com", "6379"},
+		} {
+			if err := g.allowDirect(tc.host, tc.port); err == nil {
+				t.Errorf("allowDirect(%s, %s) = nil, want refusal", tc.host, tc.port)
+			}
+		}
+		if err := g.allowDirect("10.112.0.5", "6379"); err != nil {
+			t.Errorf("allowDirect(10.112.0.5, 6379) = %v, want nil", err)
+		}
+		if err := (&TunnelGateway{}).allowDirect("10.112.0.5", "6379"); err == nil {
+			t.Error("allowDirect without networks = nil, want refusal")
+		}
 	})
 	t.Run("cluster proxy refuses unknown addresses", func(t *testing.T) {
 		conn, err := net.DialTimeout("tcp", clusterProxy.Addr().String(), 5*time.Second)
