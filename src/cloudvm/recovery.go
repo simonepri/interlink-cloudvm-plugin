@@ -44,7 +44,8 @@ func (s *Server) buildRecoveredNode(inst *Instance, podUID, ns, marketType strin
 	recNode.InstanceType = inst.InstanceType
 	recNode.Namespace = ns
 	recNode.Spot = (marketType == "spot")
-	recNode.Cordoned = true
+	// The capacity of an adopted VM is a guess, so it never takes new pods.
+	markSpinDown(recNode, SpinDownRecovered)
 
 	tok := ""
 	if s.tokenStore != nil {

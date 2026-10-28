@@ -186,6 +186,9 @@ func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNo
 		return fmt.Errorf("failed to stop container on VM at %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("in-VM runner error (%d) stopping container %s", resp.StatusCode, podUID)
+	}
 	return nil
 }
 

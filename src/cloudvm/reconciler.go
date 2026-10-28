@@ -570,6 +570,12 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 			vanishedVMs = append(vanishedVMs, instID)
 		}
 	}
+	// A lost VM's pods are about to be marked failed, which would leave it idle; it must not take a new pod.
+	if np := r.getNodePool(); np != nil {
+		for _, id := range vanishedVMs {
+			np.Cordon(id, SpinDownLost)
+		}
+	}
 	for id, err := range r.terminate(ctx, vanishedVMs) {
 		log.Printf("[reconciler] Error terminating vanished VM %s: %v", sanitizeLog(id), err) //nolint:gosec // sanitized
 	}
@@ -592,6 +598,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	}
 
 	now := time.Now()
+	np := r.getNodePool()
 	var zombies []string
 	for _, inst := range activeInstances {
 		if activeInstanceIDs[inst.ID] || reapedIDs[inst.ID] {
@@ -644,6 +651,10 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 			if isTombstoned || now.Sub(inst.CreatedAt) > r.graceTTL {
 				cleanID := sanitizeLog(inst.ID)
 				cleanKey := sanitizeLog(fullKey)
+				// A pooled VM that is busy or held for reuse stays; any other is cordoned so no pod lands on it meanwhile.
+				if np != nil && !np.ClaimForTermination(inst.ID) {
+					continue
+				}
 				log.Printf("[reconciler] Detected zombie instance %s for vanished pod %s. Terminating...", cleanID, cleanKey) //nolint:gosec // sanitized
 				result.TerminatedZombies = append(result.TerminatedZombies, inst.ID)
 				zombies = append(zombies, inst.ID)

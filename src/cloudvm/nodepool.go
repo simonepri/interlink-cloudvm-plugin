@@ -43,6 +43,8 @@ type CloudVMNode struct {
 	CreatedAt               time.Time      `json:"createdAt"`
 	IdleSince               *time.Time     `json:"idleSince,omitempty"`
 	Cordoned                bool           `json:"cordoned,omitempty"`
+	SpinDownReason          SpinDownReason `json:"spinDownReason,omitempty"`
+	GPUType                 string         `json:"gpuType,omitempty"`
 	UnknownCoTenants        bool           `json:"unknownCoTenants,omitempty"`
 	UnknownCoTenantsRetries int            `json:"unknownCoTenantsRetries,omitempty"`
 	UnknownSince            time.Time      `json:"unknownSince,omitempty"`
@@ -269,7 +271,6 @@ func (node *CloudVMNode) MarkPodCompleted(podUID string, exitCode int32, reason,
 	if node.ActivePodCount() == 0 {
 		now := time.Now()
 		node.IdleSince = &now
-		node.Cordoned = true
 	}
 	return true
 }
@@ -300,7 +301,6 @@ func (node *CloudVMNode) ReleasePod(podUID string) bool {
 	if node.ActivePodCount() == 0 {
 		now := time.Now()
 		node.IdleSince = &now
-		node.Cordoned = true
 	}
 	return true
 }
@@ -311,6 +311,7 @@ type NodePool struct {
 	nodes           map[string]*CloudVMNode
 	idleGracePeriod time.Duration
 	maxPodsPerNode  int
+	reuse           ReusePolicy
 }
 
 // NewNodePool initializes a NodePool with a default idle grace period before node termination.
@@ -350,6 +351,13 @@ func (np *NodePool) SetMaxPodsPerNode(n int) {
 	np.maxPodsPerNode = n
 }
 
+// SetReusePolicy sets the rules that decide whether an idle node may take a new pod.
+func (np *NodePool) SetReusePolicy(p ReusePolicy) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	np.reuse = p
+}
+
 // SetIdleGracePeriod updates the idle grace period for the node pool.
 func (np *NodePool) SetIdleGracePeriod(d time.Duration) {
 	np.mu.Lock()
@@ -371,10 +379,32 @@ func (np *NodePool) UnregisterNode(instanceID string) {
 	delete(np.nodes, instanceID)
 }
 
-// Allocate attempts to bin-pack a pod into an existing warm node using MostAllocated scoring.
-// Returns (node, assignedGPUs, assignedTPUs, nil) on a Bin-Pack Hit.
-// Returns (nil, nil, nil, ErrNoWarmCapacity) on a Bin-Pack Miss.
-func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespace, podName string, spot ...bool) (*CloudVMNode, []int, []int, error) {
+// AllocationRequest describes a pod to bin-pack into a warm node.
+type AllocationRequest struct {
+	Resources ResourceVector
+	Region    string
+	PodUID    string
+	Namespace string
+	PodName   string
+	// Spot restricts the allocation to spot (true) or on-demand (false) nodes when set.
+	Spot *bool
+	// Accepts reports whether a node meets the pod's instance constraints; nil accepts every node. AllocatePod calls it
+	// under the pool lock, so it must not block or call back into the pool.
+	Accepts func(*CloudVMNode) bool
+}
+
+// Allocation is the node and devices a pod was bin-packed into.
+type Allocation struct {
+	Node *CloudVMNode
+	GPUs []int
+	TPUs []int
+	// Reused is true when the node was idle, so the pod reuses a VM another pod left behind.
+	Reused bool
+}
+
+// AllocatePod bin-packs a pod into the warm node with the highest MostAllocated score that fits it. Nodes marked for
+// spin-down never take a pod, and an idle node takes one only while ReusePolicy allows it.
+func (np *NodePool) AllocatePod(a AllocationRequest) (*Allocation, error) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 
@@ -382,12 +412,14 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 	var bestGPUs []int
 	var bestTPUs []int
 	var highestScore int64 = -1
+	now := time.Now()
 
+	req, region, namespace := a.Resources, a.Region, a.Namespace
 	for _, node := range np.nodes {
 		if node.Cordoned {
 			continue
 		}
-		if len(spot) > 0 && node.Spot != spot[0] {
+		if a.Spot != nil && node.Spot != *a.Spot {
 			continue
 		}
 		if region != "" && node.Region != region {
@@ -401,6 +433,12 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 		if np.maxPodsPerNode > 0 && node.ActivePodCount() >= np.maxPodsPerNode {
 			continue
 		}
+		if a.Accepts != nil && !a.Accepts(node) {
+			continue
+		}
+		if node.isIdle() && !np.reusableLocked(node, now) {
+			continue
+		}
 
 		fits, gpus, tpus, score := node.FitsAndScores(req)
 		if fits && score > highestScore {
@@ -412,21 +450,21 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 	}
 
 	if bestNode == nil {
-		return nil, nil, nil, fmt.Errorf("no warm node capacity available")
+		return nil, fmt.Errorf("no warm node capacity available")
 	}
 
-	alloc := &PodAllocation{
-		PodUID:       podUID,
+	reused := bestNode.isIdle()
+	bestNode.Namespace = namespace
+	bestNode.AssignPod(&PodAllocation{
+		PodUID:       a.PodUID,
 		PodNamespace: namespace,
-		PodName:      podName,
+		PodName:      a.PodName,
 		Allocated:    req,
 		AssignedGPUs: bestGPUs,
 		AssignedTPUs: bestTPUs,
-		StartedAt:    time.Now(),
-	}
-	bestNode.Namespace = namespace
-	bestNode.AssignPod(alloc)
-	return bestNode, bestGPUs, bestTPUs, nil
+		StartedAt:    now,
+	})
+	return &Allocation{Node: bestNode, GPUs: bestGPUs, TPUs: bestTPUs, Reused: reused}, nil
 }
 
 // MarkPodCompleted records a pod container as finished, frees its compute resources,
@@ -437,6 +475,7 @@ func (np *NodePool) MarkPodCompleted(podUID string, exitCode int32, reason, mess
 
 	for _, node := range np.nodes {
 		if node.MarkPodCompleted(podUID, exitCode, reason, message, finishedAt) {
+			np.checkIdleLocked(node, time.Now())
 			return
 		}
 	}
@@ -449,6 +488,7 @@ func (np *NodePool) Release(podUID string) int {
 
 	for _, node := range np.nodes {
 		if node.ReleasePod(podUID) {
+			np.checkIdleLocked(node, time.Now())
 			return node.ActivePodCount()
 		}
 	}
@@ -542,7 +582,9 @@ func (np *NodePool) FindPodNode(podUID string) (*CloudVMNode, PodAllocation, boo
 	return nil, PodAllocation{}, false
 }
 
-// CollectExpiredIdleNodes returns instance IDs of nodes that have had 0 active pods for > idleGracePeriod.
+// CollectExpiredIdleNodes removes and returns the nodes without active pods that are marked for spin-down or have been
+// idle for > idleGracePeriod. Removing a node under the pool lock moves it to Terminating: no allocation can pick it
+// after this returns. It first marks idle nodes for spin-down when ReusePolicy no longer allows reusing them.
 func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	np.mu.Lock()
 	defer np.mu.Unlock()
@@ -551,7 +593,14 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	now := time.Now()
 
 	for id, node := range np.nodes {
-		if node.ActivePodCount() != 0 || node.IdleSince == nil || now.Sub(*node.IdleSince) <= np.idleGracePeriod {
+		if node.ActivePodCount() != 0 {
+			node.idleHoldLogged = false
+			continue
+		}
+		np.checkIdleLocked(node, now)
+		// A node marked for spin-down can never be reused, so it does not wait out the grace period.
+		graceOver := node.IdleSince != nil && now.Sub(*node.IdleSince) > np.idleGracePeriod
+		if !node.Cordoned && !graceOver {
 			node.idleHoldLogged = false
 			continue
 		}
@@ -566,6 +615,45 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 		delete(np.nodes, id)
 	}
 	return expired
+}
+
+// RejectReuse marks a node for spin-down and releases the pod just placed on it, so the pod launches a new VM instead.
+func (np *NodePool) RejectReuse(instanceID, podUID string, reason SpinDownReason) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	if node, ok := np.nodes[instanceID]; ok && node != nil {
+		markSpinDown(node, reason)
+		node.ReleasePod(podUID)
+	}
+}
+
+// ClaimForTermination reports whether a path outside the idle collector may terminate a VM, and marks a pooled one
+// for spin-down so no pod is allocated to it before it terminates. It refuses a pooled VM with active pods or
+// unverified co-tenants, and an idle one still in the grace period during which it may be reused.
+func (np *NodePool) ClaimForTermination(instanceID string) bool {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	node, ok := np.nodes[instanceID]
+	if !ok || node == nil {
+		return true
+	}
+	if node.ActivePodCount() > 0 || node.UnknownCoTenants {
+		return false
+	}
+	if !node.Cordoned && node.IdleSince != nil && np.idleGracePeriod > 0 && time.Since(*node.IdleSince) <= np.idleGracePeriod {
+		return false
+	}
+	markSpinDown(node, SpinDownOrphaned)
+	return true
+}
+
+// ReturnUnterminated puts back a node the idle collector removed but failed to terminate. The node stays marked for
+// spin-down, so the collector retries its termination on its next pass and no allocation reuses it meanwhile.
+func (np *NodePool) ReturnUnterminated(node *CloudVMNode) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	markSpinDown(node, SpinDownTerminateFailed)
+	np.nodes[node.InstanceID] = node
 }
 
 // IdleNodeCount returns how many tracked nodes have no active pods.
@@ -655,20 +743,22 @@ func (np *NodePool) RegisterAndAllocate(node *CloudVMNode, req ResourceVector, p
 	return gpus, tpus
 }
 
-// Cordon marks an instance as cordoned, excluding it from future bin-pack allocations.
-func (np *NodePool) Cordon(instanceID string) {
+// Cordon marks an instance for spin-down, excluding it from future bin-pack allocations; the idle collector
+// terminates it on its first pass after its last active pod leaves.
+func (np *NodePool) Cordon(instanceID string, reason SpinDownReason) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 	if node, exists := np.nodes[instanceID]; exists && node != nil {
-		node.Cordoned = true
+		markSpinDown(node, reason)
 	}
 }
 
-// Uncordon unmarks an instance as cordoned, allowing future bin-pack allocations.
+// Uncordon clears the spin-down mark of an instance, allowing future bin-pack allocations.
 func (np *NodePool) Uncordon(instanceID string) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 	if node, exists := np.nodes[instanceID]; exists && node != nil {
 		node.Cordoned = false
+		node.SpinDownReason = ""
 	}
 }

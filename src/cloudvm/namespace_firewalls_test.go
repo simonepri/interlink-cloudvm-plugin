@@ -211,13 +211,13 @@ func TestNodePool_NeverPacksAcrossNamespaces(t *testing.T) {
 	launched := NewCloudVMNode("i-team-a", ProviderAWS, "us-west-2", "10.0.0.1", capacity)
 	pool.RegisterAndAllocate(launched, req, "uid-a1", "team-a", "a1")
 
-	if node, _, _, err := pool.Allocate(req, "us-west-2", "uid-b1", "team-b", "b1"); err == nil {
+	if node, _, err := allocate(pool, req, "us-west-2", "uid-b1", "team-b"); err == nil {
 		t.Fatalf("team-b pod packed onto %s, want a bin-pack miss", node.InstanceID)
 	}
-	if node, _, _, err := pool.Allocate(req, "us-west-2", "uid-x", "", "x"); err == nil {
+	if node, _, err := allocate(pool, req, "us-west-2", "uid-x", ""); err == nil {
 		t.Fatalf("pod without a namespace packed onto %s, want a bin-pack miss", node.InstanceID)
 	}
-	node, _, _, err := pool.Allocate(req, "us-west-2", "uid-a2", "team-a", "a2")
+	node, _, err := allocate(pool, req, "us-west-2", "uid-a2", "team-a")
 	if err != nil || node.InstanceID != "i-team-a" {
 		t.Fatalf("team-a pod got %v, %v; want it packed onto i-team-a", node, err)
 	}

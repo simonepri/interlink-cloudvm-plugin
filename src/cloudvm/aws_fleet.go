@@ -994,6 +994,9 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 		if ec2Inst.PrivateIpAddress != nil && *ec2Inst.PrivateIpAddress != "" {
 			inst.IP = *ec2Inst.PrivateIpAddress
 		}
+		if zone := instanceZone(ec2Inst); zone != "" {
+			inst.Metadata["availabilityZone"] = zone
+		}
 		bootedGroups = ec2Inst.SecurityGroups
 	}
 	if namespaceSG != "" {

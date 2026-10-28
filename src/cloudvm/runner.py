@@ -425,6 +425,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/containers/stop':
+            # Removing the container drops its writable layer and logs, so a later pod on this VM finds only the image cache.
             params = urllib.parse.parse_qs(parsed.query)
             pod_uid = params.get('podUID', [''])[0]
             if pod_uid:
@@ -434,10 +435,16 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
                     pull_failures.pop(pod_uid, None)
+                container_name = f"cloudvm-{pod_uid}"
                 try:
-                    subprocess.run([CONTAINER_CLI, 'stop', f"cloudvm-{pod_uid}"], capture_output=True)
+                    subprocess.run([CONTAINER_CLI, 'stop', container_name], capture_output=True)
+                    subprocess.run([CONTAINER_CLI, 'rm', '-f', container_name], capture_output=True)
+                    remains = subprocess.run([CONTAINER_CLI, 'inspect', container_name], capture_output=True).returncode == 0
                 except Exception:
-                    pass
+                    remains = True
+                if remains:
+                    self.reply(500, b'{"error":"container was not removed"}')
+                    return
             self.send_response(200)
             self.end_headers()
             return
