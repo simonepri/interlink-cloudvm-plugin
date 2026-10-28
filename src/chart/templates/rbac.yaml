@@ -20,6 +20,10 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+  # Reads the topology.kubernetes.io/region label of the node each pod is bound to.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
   # Mints the projected tokens of the pods it runs, which it exchanges for their service account's IAM role credentials.
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
@@ -41,6 +45,35 @@ subjects:
     name: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- else }}
+# Nodes are cluster-scoped, so the region label read needs a ClusterRole even when the other rules stay namespaced.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}-nodes
+  labels:
+    app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}-nodes
+  labels:
+    app.kubernetes.io/name: {{ include "interlink-cloudvm-plugin.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}-nodes
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
 {{- $saName := include "interlink-cloudvm-plugin.serviceAccountName" . -}}
 {{- $relName := .Release.Name -}}
 {{- $relNs := .Release.Namespace -}}

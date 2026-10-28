@@ -23,6 +23,8 @@ import (
 
 func TestMain(m *testing.M) {
 	cleanTempStores()
+	// Most tests create pods without a node; this entry gives the empty node name a region.
+	_ = os.Setenv("NODE_REGIONS", `{"":"us-east-1"}`)
 	code := m.Run()
 	cleanTempStores()
 	os.Exit(code)
