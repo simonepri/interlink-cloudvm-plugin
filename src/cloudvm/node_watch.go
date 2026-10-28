@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,14 +60,25 @@ func NewInClusterNodeWatch() (*NodeWatch, error) {
 	return NewNodeWatch(cs), nil
 }
 
-// Start runs the informer until ctx is cancelled and waits for its first full list.
-func (w *NodeWatch) Start(ctx context.Context) {
+// Start runs the informer until ctx is cancelled and waits up to wait for its first full list. On timeout, such as
+// when the service account cannot list nodes, it logs a warning and returns false; the informer keeps retrying, and
+// NodeRegion answers only once the list has succeeded.
+func (w *NodeWatch) Start(ctx context.Context, wait time.Duration) bool {
 	w.factory.Start(ctx.Done())
-	cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced)
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	if cache.WaitForCacheSync(waitCtx.Done(), w.informer.HasSynced) {
+		return true
+	}
+	log.Printf("[cloudvm] Warning: node watch not synced after %s, so node region labels are ignored until it syncs; check that the service account can get, list, and watch nodes", wait)
+	return false
 }
 
 // NodeRegion returns the region label of the cached node, or an empty string.
 func (w *NodeWatch) NodeRegion(nodeName string) string {
+	if !w.informer.HasSynced() {
+		return ""
+	}
 	obj, exists, err := w.informer.GetStore().GetByKey(nodeName)
 	if err != nil || !exists {
 		return ""

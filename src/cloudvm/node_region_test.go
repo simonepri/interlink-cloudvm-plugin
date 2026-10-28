@@ -3,14 +3,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 type stubNodeRegions map[string]string
@@ -98,7 +102,7 @@ func TestNodeWatchReadsRegionLabel(t *testing.T) {
 	watch := NewNodeWatch(client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	watch.Start(ctx)
+	watch.Start(ctx, 5*time.Second)
 	if got := watch.NodeRegion("virtual-node-use1-l4-spot"); got != "us-east-1" {
 		t.Errorf("labeled node region = %q, want us-east-1", got)
 	}
@@ -107,5 +111,25 @@ func TestNodeWatchReadsRegionLabel(t *testing.T) {
 	}
 	if got := watch.NodeRegion("missing"); got != "" {
 		t.Errorf("missing node region = %q, want empty", got)
+	}
+}
+
+func TestNodeWatchStartGivesUpWhenListFails(t *testing.T) {
+	client := fake.NewSimpleClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n", Labels: map[string]string{regionLabel: "us-east-1"}}})
+	client.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("forbidden")
+	})
+	watch := NewNodeWatch(client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	if watch.Start(ctx, 200*time.Millisecond) {
+		t.Fatal("Start reported a sync although every list fails")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("Start blocked for %s", time.Since(start))
+	}
+	if got := watch.NodeRegion("n"); got != "" {
+		t.Errorf("unsynced watch answered %q, want empty", got)
 	}
 }

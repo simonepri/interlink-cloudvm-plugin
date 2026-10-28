@@ -275,7 +275,7 @@ func run() error {
 	if nodeWatch, err := NewInClusterNodeWatch(); err != nil {
 		log.Printf("[cloudvm] Node watch unavailable, so pods launch only in regions set by annotation, node selector, or NODE_REGIONS: %v", err)
 	} else {
-		nodeWatch.Start(ctx)
+		nodeWatch.Start(ctx, nodeWatchSyncTimeout)
 		server.SetNodeRegionLookup(nodeWatch)
 	}
 
@@ -418,6 +418,9 @@ func run() error {
 
 // startTunnelGateway listens for worker reverse tunnels and routes every runner call through them; podWatch, when set,
 // attributes cluster ends of tcp streams to namespaces.
+// nodeWatchSyncTimeout bounds how long startup waits for the first node list.
+const nodeWatchSyncTimeout = 60 * time.Second
+
 func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch) (*TunnelGateway, error) {
 	endpoint := strings.TrimSpace(os.Getenv("TUNNEL_ENDPOINT"))
 	transports, err := TunnelTransportsFromClusterFacts(os.Getenv("CLUSTER_FACTS"))
