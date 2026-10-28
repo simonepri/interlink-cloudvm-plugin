@@ -127,7 +127,11 @@ func TestIdleCollector_TerminatesManyReleasedNodesWithinGraceAndOneInterval(t *t
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go s.RunIdleCollector(ctx)
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		s.RunIdleCollector(ctx)
+	}()
 	releasedAt := time.Now()
 	releaseAll(s, nodes)
 
@@ -141,7 +145,9 @@ func TestIdleCollector_TerminatesManyReleasedNodesWithinGraceAndOneInterval(t *t
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	// The collector records metrics and tombstones after the provider calls of a pass return, so let the pass finish.
 	cancel()
+	<-collectorDone
 
 	prov.assertTerminatedOnce(t, ids)
 	if peak := prov.peak.Load(); peak > terminateConcurrency {
