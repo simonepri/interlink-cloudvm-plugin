@@ -78,6 +78,7 @@ type SpotPriceTicker struct {
 	solver        *FillSolver
 	catalog       *HardwareCatalog
 	onDemand      *OnDemandPriceBook
+	transfer      *TransferPriceBook
 	spotCapacity  map[string]map[int]float64
 	quotasAPI     AWSServiceQuotasAPI
 	quotasFactory func(region string) AWSServiceQuotasAPI
@@ -178,6 +179,7 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		solver:              solver,
 		catalog:             catalog,
 		onDemand:            GlobalOnDemandPrices,
+		transfer:            GlobalTransferPrices,
 		fetcherFactory: func(ctx context.Context, region string) (SpotPriceFetcher, error) {
 			cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 			if err != nil {
@@ -295,11 +297,25 @@ func (t *SpotPriceTicker) GCPMarket() *GCPMarketCollector {
 	return t.gcpMarket
 }
 
-// SetPricingAPI gives this ticker its own on-demand price book backed by api instead of GlobalOnDemandPrices.
+// SetPricingAPI gives this ticker its own on-demand and transfer price books backed by api instead of the global ones.
+// The transfer book keeps the regions of the one it replaces.
 func (t *SpotPriceTicker) SetPricingAPI(api AWSPricingAPI) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.onDemand = NewOnDemandPriceBook(api)
+	t.transfer = NewTransferPriceBook(api, t.transfer.Regions()...)
+}
+
+// TransferPrices returns the transfer price book this ticker exports.
+func (t *SpotPriceTicker) TransferPrices() *TransferPriceBook {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.transfer
+}
+
+// TransferPrice returns the cached USD per GB price of moving data out of src to dst by kind; see TransferPriceBook.TransferPrice.
+func (t *SpotPriceTicker) TransferPrice(src, dst string, kind TransferKind) (float64, bool) {
+	return t.TransferPrices().TransferPrice(src, dst, kind)
 }
 
 // SetServiceQuotasAPI overrides the AWS service quotas client used for every region.
@@ -678,6 +694,13 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 			PricePerHour:    ondemand,
 			PricePerGPUHour: onDemandPerGPU,
 		})
+	}
+
+	// AWS data transfer prices between the launch regions, reloaded on the on-demand price schedule
+	transferPrices := t.TransferPrices()
+	transferPrices.Refresh(ctx)
+	for _, p := range transferPrices.Prices() {
+		t.metrics.SetTransferPrice("aws", p.Source, p.Destination, string(p.Kind), p.USDPerGB)
 	}
 
 	// 2. AWS Scores

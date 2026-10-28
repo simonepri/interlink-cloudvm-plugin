@@ -67,18 +67,22 @@ func newConfiguredTicker(ctx context.Context, awsProv *AWSProvider) *SpotPriceTi
 			spotTicker.SetProbeMaxInstances(n)
 		}
 	}
-	configureAWSMarketAPIs(ctx, spotTicker)
+	configureAWSMarketAPIs(ctx, spotTicker, awsProv.ConfiguredRegions())
 	return spotTicker
 }
 
-// configureAWSMarketAPIs gives the shared on-demand price book a Price List API client and the ticker, when present, per-region Service Quotas and CloudWatch clients.
-func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker) {
+// configureAWSMarketAPIs gives the shared on-demand and transfer price books a Price List API client, prices transfers
+// between launchRegions, and gives the ticker, when present, per-region Service Quotas and CloudWatch clients.
+func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker, launchRegions []string) {
+	GlobalTransferPrices.SetRegions(launchRegions)
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsPricingRegion))
 	if err != nil {
 		log.Printf("[cloudvm] Warning: AWS on-demand prices and quotas unavailable: %v", err)
 		return
 	}
-	GlobalOnDemandPrices.SetClient(pricing.NewFromConfig(cfg))
+	pricingClient := pricing.NewFromConfig(cfg)
+	GlobalOnDemandPrices.SetClient(pricingClient)
+	GlobalTransferPrices.SetClient(pricingClient)
 	if spotTicker != nil {
 		spotTicker.SetServiceQuotasFactory(func(region string) AWSServiceQuotasAPI {
 			return servicequotas.NewFromConfig(cfg, func(o *servicequotas.Options) { o.Region = region })
@@ -286,7 +290,7 @@ func run() error {
 		awsProv.SetRegionScorer(spotTicker)
 		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(spotTicker.Regions())) //nolint:gosec // log length is safe
 	} else if providerType == "aws" {
-		configureAWSMarketAPIs(ctx, nil)
+		configureAWSMarketAPIs(ctx, nil, awsProv.ConfiguredRegions())
 	}
 
 	// Background reconciler

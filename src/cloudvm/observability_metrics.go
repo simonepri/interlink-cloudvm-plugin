@@ -25,6 +25,7 @@ type ObservabilityMetrics struct {
 	gpuPrice      *prometheus.GaugeVec
 	vcpuPrice     *prometheus.GaugeVec
 	instancePrice *prometheus.GaugeVec
+	transferPrice *prometheus.GaugeVec
 
 	// Availability & Signals
 	availScore     *prometheus.GaugeVec
@@ -96,6 +97,11 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 			Name: "cloudvm_instance_price_usd_per_hour",
 			Help: "Current price in USD per instance-hour",
 		}, marketLabels),
+
+		transferPrice: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_transfer_price_usd_per_gb",
+			Help: "List price in USD per GB of data leaving source_region: cross_region to destination_region, cross_zone within source_region in each direction, or internet at the first paid volume tier after any free allowance",
+		}, []string{"provider", "source_region", "destination_region", "transfer_kind"}),
 
 		availScore: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_availability_score",
@@ -250,6 +256,7 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.gpuPrice,
 		m.vcpuPrice,
 		m.instancePrice,
+		m.transferPrice,
 		m.availScore,
 		m.expectedUptime,
 		m.signalAge,
@@ -345,6 +352,11 @@ func (m *ObservabilityMetrics) SetGPUPrice(provider, region, zone, accelerator, 
 // SetVCPUPrice exports price per vCPU-hour for CPU-only shapes.
 func (m *ObservabilityMetrics) SetVCPUPrice(provider, region, zone, capacityType, instanceType string, vcpuPriceUSD float64) {
 	m.market.set(m.vcpuPrice, vcpuPriceUSD, provider, region, zone, "none", capacityType, instanceType)
+}
+
+// SetTransferPrice exports the USD per GB price of moving data out of sourceRegion to destinationRegion by transferKind.
+func (m *ObservabilityMetrics) SetTransferPrice(provider, sourceRegion, destinationRegion, transferKind string, usdPerGB float64) {
+	m.market.set(m.transferPrice, usdPerGB, provider, sourceRegion, destinationRegion, transferKind)
 }
 
 // SetAvailabilityScore exports availability score (0.0 to 1.0).
