@@ -103,3 +103,57 @@ func TestSpotPriceTicker_ProbeSpotCapacityLearnsTheTargetLimit(t *testing.T) {
 		t.Errorf("after the retry window, %d rejected probes in total, want 2", got)
 	}
 }
+
+func TestSpotPriceTicker_ProbeSpotCapacityCapsTargetsAtTheConfiguredLimit(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"p5.48xlarge"}, time.Minute)
+	fetcher := &probeFetcher{}
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
+	ticker.SetProbeMaxInstances(20)
+
+	scores := ticker.ProbeSpotCapacity(context.Background())
+
+	var targets []int32
+	for _, in := range fetcher.inputs {
+		targets = append(targets, aws.ToInt32(in.TargetCapacity))
+	}
+	slices.Sort(targets)
+	// 8 GPUs = 1 instance, 64 GPUs = 8, and 256 and 1024 GPUs both cap at 20 instances, probed once.
+	for _, want := range []int32{1, 8, 20} {
+		if !slices.Contains(targets, want) {
+			t.Errorf("targets %v lack %d", targets, want)
+		}
+	}
+	for _, got := range targets {
+		if got > 20 {
+			t.Errorf("probe asked for %d instances, above the cap of 20", got)
+		}
+	}
+	count := func(want int32) int {
+		n := 0
+		for _, got := range targets {
+			if got == want {
+				n++
+			}
+		}
+		return n
+	}
+	if count(20) != count(8) {
+		t.Errorf("capped target probed %d times, want once per group like the 8-instance probe (%d): %v", count(20), count(8), targets)
+	}
+	got := scores[spotScoreKey("aws", "us-east-1", 80, 8)]
+	for _, gpus := range []int{8, 64, 160} {
+		if got[gpus] != 7 {
+			t.Errorf("scores %v lack 7 at %d GPUs", got, gpus)
+		}
+	}
+	if _, ok := got[1024]; ok {
+		t.Errorf("scores %v hold 1024 GPUs, which was never probed", got)
+	}
+}
+
+func TestSpotPriceTicker_ProbeSpotCapacityDefaultsToFiftyInstances(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"p5.48xlarge"}, time.Minute)
+	if got := ticker.maxProbeInstances(); got != 50 {
+		t.Errorf("default probe cap = %d, want 50", got)
+	}
+}
