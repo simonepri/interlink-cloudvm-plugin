@@ -143,6 +143,7 @@ func TestTunnelAgent_PythonAgentServesRunnerThroughGateway(t *testing.T) {
 		"CLOUDVM_RUNNER_TOKEN_FILE="+tokenFile,
 		"CLOUDVM_ATTESTATION_FILE="+filepath.Join(dir, "absent"),
 		"CLOUDVM_TUNNEL_MAX_BACKOFF=0.2",
+		"CLOUDVM_TCP_PROXY_PORT=0",
 	)
 	cmd.Stderr = &agentLog
 	if err := cmd.Start(); err != nil {
@@ -157,7 +158,9 @@ func TestTunnelAgent_PythonAgentServesRunnerThroughGateway(t *testing.T) {
 	})
 
 	// Interpreter start-up dominates on loaded CI runners.
-	waitForWithin(t, 60*time.Second, "python agent session", func() bool { return f.registry.Has(instanceID) })
+	waitForWithin(t, 60*time.Second, "python agent session", func() bool {
+		return f.registry.Has(instanceID) && strings.Contains(agentLog.String(), "connected to ")
+	})
 	runner := f.gateway.Runner()
 	if err := runner.StartContainer(ctx, node, &StartContainerRequest{PodUID: "pod-py", Image: "alpine"}); err != nil {
 		t.Fatalf("StartContainer: %v", err)
@@ -217,6 +220,7 @@ func TestTunnelAgent_PythonAgentRejectedWithWrongToken(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"CLOUDVM_TUNNEL_CA_FILE="+caFile,
 		"CLOUDVM_TUNNEL_ENDPOINT="+endpoint,
+		"CLOUDVM_TCP_PROXY_PORT=0",
 		"CLOUDVM_INSTANCE_ID=i-imposter",
 		"CLOUDVM_RUNNER_TOKEN_FILE="+tokenFile,
 		"CLOUDVM_TUNNEL_MAX_BACKOFF=0.2",

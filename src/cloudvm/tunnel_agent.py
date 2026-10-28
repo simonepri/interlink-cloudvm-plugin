@@ -257,7 +257,10 @@ class Session(object):
         self.next_sid += 2
         self.streams[stream.sid] = stream
         self.send(T_WINDOW, F_SYN, stream.sid, 0)
-        self.send(T_DATA, F_FIN, stream.sid, len(DNS_STREAM_HEADER + query), DNS_STREAM_HEADER + query)
+        # HACK(simonepri): yamux marks the stream closed before it copies a FIN frame's payload, so the gateway can read EOF
+        # and drop the query; send the FIN in its own frame. https://github.com/hashicorp/yamux/issues/184
+        self.send(T_DATA, 0, stream.sid, len(DNS_STREAM_HEADER + query), DNS_STREAM_HEADER + query)
+        self.send(T_DATA, F_FIN, stream.sid, 0)
         return stream
 
     def open_log_stream(self, collector):

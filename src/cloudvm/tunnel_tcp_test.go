@@ -152,6 +152,7 @@ func startPythonAgent(t *testing.T, f *tunnelFixture, instanceID, token string, 
 	cmd.Env = append(append(os.Environ(),
 		"CLOUDVM_TUNNEL_CA_FILE="+caFile,
 		"CLOUDVM_TUNNEL_ENDPOINT="+endpoint,
+		"CLOUDVM_TCP_PROXY_PORT=0", // a test needing a fixed port passes its own, which comes later in env
 		"CLOUDVM_INSTANCE_ID="+instanceID,
 		"CLOUDVM_RUNNER_ADDR=127.0.0.1:1",
 		"CLOUDVM_RUNNER_TOKEN_FILE="+tokenFile,
@@ -170,7 +171,10 @@ func startPythonAgent(t *testing.T, f *tunnelFixture, instanceID, token string, 
 			t.Logf("agent log:\n%s", agentLog.String())
 		}
 	})
-	waitForWithin(t, 60*time.Second, "python agent session", func() bool { return f.registry.Has(instanceID) })
+	// The gateway registers the session before the agent finishes the handshake and routes queries to it, so the agent's own log marks readiness.
+	waitForWithin(t, 60*time.Second, "python agent session", func() bool {
+		return f.registry.Has(instanceID) && strings.Contains(agentLog.String(), "connected to ")
+	})
 }
 
 // fakePodNamespaces maps pod IPs to namespaces once synced.
