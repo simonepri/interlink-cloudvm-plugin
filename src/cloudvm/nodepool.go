@@ -393,8 +393,9 @@ func (np *NodePool) Allocate(req ResourceVector, region string, podUID, namespac
 		if region != "" && node.Region != region {
 			continue
 		}
-		// A node never mixes namespaces, so the tunnel gateway can attribute its traffic to one.
-		if owner, ok := node.ownerNamespace(); !ok || (owner != "" && owner != namespace) {
+		// A node never mixes namespaces, so the tunnel gateway can attribute its traffic to one and the node carries only
+		// that namespace's firewall; a pod without a namespace never shares a node.
+		if owner, ok := node.ownerNamespace(); !ok || namespace == "" || (owner != "" && owner != namespace) {
 			continue
 		}
 		if np.maxPodsPerNode > 0 && node.ActivePodCount() >= np.maxPodsPerNode {

@@ -102,7 +102,7 @@ The provider consists of five main components:
 
 ### 1. Spot Fleet Bidding & Multi-Pod Bin-Packing (N Pods to 1 VM)
 
-When a pod schedules onto the virtual node, the provider first checks `NodePool` for an active VM in the same namespace and region that has enough free CPU, memory, and discrete GPU/TPU slots (`NodeResourcesMostAllocated` scoring):
+When a pod schedules onto the virtual node, the provider first checks `NodePool` for an active VM in the same namespace and region (a VM never takes pods of a second namespace, and a pod without a namespace never shares a VM) that has enough free CPU, memory, and discrete GPU/TPU slots (`NodeResourcesMostAllocated` scoring):
 
 - **Bin-Pack Hit**: If an active VM has free capacity (for example, an 8-GPU `g5.48xlarge` currently running a single 4-GPU pod on GPUs `[0..3]`), the provider assigns the remaining GPU slots (`[4..7]`) and dispatches the second pod onto that warm VM without calling EC2/GCE.
 - **Bin-Pack Miss**: If no active VM can fit the request, the solver builds a list of candidate instance types and requests a new VM (`price-capacity-optimized` on AWS EC2 Fleet, `bulkInsert` on GCP).
@@ -578,6 +578,7 @@ The provider's AWS role needs these actions:
 | `ec2:CreateFleet`, `ec2:RunInstances`, `ec2:CreateTags` | Launching tagged instant fleets |
 | `iam:PassRole` | Passing the worker instance profile named in the launch template |
 | `ec2:DescribeInstances`, `ec2:TerminateInstances` | Instance status, inventory, and cleanup |
+| `ec2:ModifyInstanceAttribute` | Adding the namespace security group to a new worker when its region sets `namespaceFirewalls` |
 | `ec2:DescribeInstanceTypes` | Hardware catalog discovery |
 | `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeImages` | Launch template image architecture |
 | `ec2:DescribeInstanceTypeOfferings`, `ec2:DescribeSubnets` | Dropping overrides an AZ does not offer |
@@ -626,6 +627,8 @@ The plugin refuses to start when a transport in use lacks its variable or `CLUST
 `regions.<region>.directCidrs` lists the private networks that region's workers share, such as the region's worker VPC. A worker's local CONNECT proxy on `127.0.0.1:13128` connects targets inside those networks directly and carries every other target through the tunnel, so traffic between workers of one region stays inside its network. The plugin refuses to start when an entry is not a CIDR.
 
 `regions.<region>.imageMirrors` maps an upstream registry host to the mirror reference prefix that region's workers pull from, for example `{"docker.io": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/docker-hub"}`. The in-VM runner rewrites an image whose registry host matches before pulling: `rayproject/ray:2.9` becomes `<prefix>/rayproject/ray:2.9`, Docker Hub images without a namespace gain `library/`, and a digest stays attached. ECR mirrors authenticate through the ECR credential helper with the VM's instance role. The plugin refuses to start when a host is not a bare registry host or a prefix is empty or carries a scheme. Mirrors apply only when the tunnel is enabled, because the region facts reach workers through the tunnel route.
+
+`regions.<region>.namespaceFirewalls` maps a pod namespace to the firewall its workers join in that region, so workers reach only workers of their own namespace: a security group ID on AWS, for example `{"team-a": "sg-0123456789abcdef0"}`, and a network tag on GCP. The firewall should admit traffic only between its own members. On AWS the worker boots with its launch template's security groups, and the plugin then adds the namespace group with `ec2:ModifyInstanceAttribute`, because EC2 Fleet overrides cannot name security groups; when the group does not attach, the plugin terminates the worker and fails the launch. On GCP the instance carries the namespace tag. When a region lists namespace firewalls but none for the pod's namespace, the plugin refuses the launch, skips that region as a fallback candidate, and posts a `CloudVMNamespaceFirewallMissing` warning event on the pod. A region without `namespaceFirewalls` launches workers as before. The plugin refuses to start when a key is not a namespace name or a value is neither a security group ID nor a network tag.
 
 The tunnel agent on each worker reads these variables, which the bootstrap script sets:
 

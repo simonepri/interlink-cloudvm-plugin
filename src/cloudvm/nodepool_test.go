@@ -25,6 +25,7 @@ func TestNodePool_GPUSlicing(t *testing.T) {
 		GPUs:   8,
 	}
 	node := NewCloudVMNode("i-8gpu-node-01", ProviderAWS, "us-west-2", "10.42.0.10", capacity)
+	node.Namespace = "default"
 	pool.RegisterNode(node)
 
 	if count := pool.ActiveNodeCount(); count != 1 {
@@ -93,7 +94,9 @@ func TestNodePool_CPUMemoryFittingAndScoring(t *testing.T) {
 		Memory: resource.MustParse("64Gi"),
 	})
 
+	node1.Namespace = "prod"
 	pool.RegisterNode(node1)
+	node2.Namespace = "prod"
 	pool.RegisterNode(node2)
 
 	// Pod requesting 6 CPUs and 12GiB
@@ -120,6 +123,7 @@ func TestNodePool_PodReleaseAndIdleCooldown(t *testing.T) {
 		Memory: resource.MustParse("32Gi"),
 		GPUs:   2,
 	})
+	node.Namespace = "default"
 	pool.RegisterNode(node)
 
 	// Allocate Pod A and Pod B
@@ -410,6 +414,7 @@ func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
 		Memory: resource.MustParse("256Gi"),
 	}
 	node1 := NewCloudVMNode("i-density-node-01", ProviderAWS, "us-east-1", "10.42.0.11", capacity)
+	node1.Namespace = "default"
 	pool.RegisterNode(node1)
 
 	req := ResourceVector{
@@ -443,6 +448,7 @@ func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
 
 	// 4. Register Node 2: Pod 3 should now succeed by fanning out onto Node 2
 	node2 := NewCloudVMNode("i-density-node-02", ProviderAWS, "us-east-1", "10.42.0.12", capacity)
+	node2.Namespace = "default"
 	pool.RegisterNode(node2)
 
 	n3, _, _, err := pool.Allocate(req, "us-east-1", "pod-d-3", "default", "worker-3")
@@ -462,6 +468,7 @@ func TestNodePool_PreTerminationCordonOnZeroActivePods(t *testing.T) {
 		Memory: resource.MustParse("128Gi"),
 	}
 	node := NewCloudVMNode("i-cordon-test-01", ProviderAWS, "us-east-1", "10.42.0.21", capacity)
+	node.Namespace = "default"
 	pool.RegisterNode(node)
 
 	req := ResourceVector{

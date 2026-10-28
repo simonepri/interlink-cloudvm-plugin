@@ -21,8 +21,10 @@ type GCPProvider struct {
 	ServiceAccountEmail string
 	configuredZones     []string
 	instanceZones       map[string]string
-	client              GCPComputeService
-	mu                  sync.RWMutex
+	// namespaceFirewalls maps each region to the network tag a pod namespace's workers carry there.
+	namespaceFirewalls map[string]map[string]string
+	client             GCPComputeService
+	mu                 sync.RWMutex
 }
 
 // NewGCPProvider creates a new GCP Compute Engine provider.
@@ -56,6 +58,14 @@ func (p *GCPProvider) SetClient(c GCPComputeService) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.client = c
+}
+
+// SetNamespaceFirewalls sets, per region, the network tag each pod namespace's workers carry so the region's firewall
+// rules admit only workers of the same namespace; a region without entries launches without one.
+func (p *GCPProvider) SetNamespaceFirewalls(firewalls map[string]map[string]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.namespaceFirewalls = firewalls
 }
 
 // AddConfiguredZones adds additional zones to be queried during multi-zone inventory scans.
@@ -322,6 +332,12 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 	}
 	zone := p.resolveZone(spec)
 	region := zoneToRegion(zone)
+	p.mu.RLock()
+	namespaceTag, err := namespaceFirewall(p.namespaceFirewalls[region], region, spec.PodNamespace)
+	p.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
 	project := p.getProject()
 	p.AddConfiguredZones(zone)
 
@@ -515,6 +531,9 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		GuestAccelerators: guestAccelerators,
 		Disks:             disks,
 		Metadata:          metadata,
+	}
+	if namespaceTag != "" {
+		gcpInstance.Tags = &compute.Tags{Items: []string{namespaceTag}}
 	}
 
 	client, err := p.getClient(ctx)

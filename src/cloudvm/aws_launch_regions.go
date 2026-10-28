@@ -58,6 +58,11 @@ func (p *AWSProvider) launchRegions(spec *InstanceSpec, instanceTypes []string) 
 				sanitizeLog(r), sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName))
 			continue
 		}
+		if _, err := p.namespaceFirewall(r, spec.PodNamespace); err != nil {
+			log.Printf("[aws] Skipping candidate region %s for %s/%s: %v", //nolint:gosec // sanitized
+				sanitizeLog(r), sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(err.Error()))
+			continue
+		}
 		if len(p.configuredTemplates(r)) == 0 {
 			log.Printf("[aws] Skipping candidate region %s for %s/%s: no launch template in cluster facts", //nolint:gosec // sanitized
 				sanitizeLog(r), sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName))
