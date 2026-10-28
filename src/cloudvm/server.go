@@ -680,6 +680,41 @@ func (s *Server) selectProvider(spec *InstanceSpec) Provider {
 	return s.defaultProv
 }
 
+// reuseProbeTimeout bounds the runner health check before a pod reuses an idle VM.
+const reuseProbeTimeout = 5 * time.Second
+
+// allocateWarmNode bin-packs the pod into a warm node that meets its instance constraints. Before the pod reuses an
+// idle VM it checks that the VM's runner answers; a VM whose runner does not is marked for spin-down and the pod gets
+// no warm node.
+func (s *Server) allocateWarmNode(ctx context.Context, spec *InstanceSpec, req ResourceVector) (*CloudVMNode, []int, []int, error) {
+	spot := spec.MarketType != "on-demand"
+	alloc, err := s.nodePool.AllocatePod(AllocationRequest{
+		Resources: req,
+		Region:    spec.Region,
+		PodUID:    spec.PodUID,
+		Namespace: spec.PodNamespace,
+		PodName:   spec.PodName,
+		Spot:      &spot,
+		Accepts:   func(node *CloudVMNode) bool { return nodeMeetsSpec(node, spec) },
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if alloc.Reused {
+		probeCtx, cancel := context.WithTimeout(ctx, reuseProbeTimeout)
+		_, probeErr := s.runner.GetHostStats(probeCtx, alloc.Node)
+		cancel()
+		if probeErr != nil {
+			log.Printf("[cloudvm] Idle node %s failed its runner check before reuse: %v", alloc.Node.InstanceID, probeErr)
+			s.nodePool.RejectReuse(alloc.Node.InstanceID, spec.PodUID, SpinDownUnhealthy)
+			return nil, nil, nil, fmt.Errorf("idle node %s is unhealthy: %w", alloc.Node.InstanceID, probeErr)
+		}
+		idleMetrics.reuses.Inc()
+		log.Printf("[cloudvm] Reusing idle node %s for pod %s/%s", alloc.Node.InstanceID, spec.PodNamespace, spec.PodName)
+	}
+	return alloc.Node, alloc.GPUs, alloc.TPUs, nil
+}
+
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -865,8 +900,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Try to bin-pack into an existing warm node
-	isSpot := spec.MarketType != "on-demand"
-	warmNode, assignedGPUs, assignedTPUs, err := s.nodePool.Allocate(reqVec, spec.Region, spec.PodUID, spec.PodNamespace, spec.PodName, isSpot)
+	warmNode, assignedGPUs, assignedTPUs, err := s.allocateWarmNode(r.Context(), spec, reqVec)
 	if err == nil && warmNode != nil {
 		log.Printf("[cloudvm] Bin-pack hit! Slicing pod %s/%s into warm node %s (GPUs=%v, TPUs=%v)",
 			spec.PodNamespace, spec.PodName, warmNode.InstanceID, assignedGPUs, assignedTPUs)
@@ -1068,8 +1102,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	newNode.Namespace = spec.PodNamespace
 	newNode.RunnerAuthToken = spec.RunnerAuthToken
 	newNode.Spot = spec.MarketType != "on-demand"
+	newNode.Zone = inst.Metadata["availabilityZone"]
+	newNode.GPUType = spec.GPUType
 	if spec.AMIMode == "dlami" {
-		newNode.Cordoned = true // Native DLAMI runs single-tenant workload; exclude from bin-packing
+		markSpinDown(newNode, SpinDownSingleTenant) // Native DLAMI runs single-tenant workload; exclude from bin-packing
 	}
 	gpus, tpus := s.nodePool.RegisterAndAllocate(newNode, reqVec, spec.PodUID, spec.PodNamespace, spec.PodName)
 
@@ -1222,7 +1258,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		foundInPool = true
 		nodeRef = node
 		wasCordoned = node.Cordoned
-		_ = s.runner.StopContainer(r.Context(), node, uid)
+		if err := s.runner.StopContainer(r.Context(), node, uid); err != nil {
+			// The pod's container may still be on the VM, so no later pod may reuse it.
+			log.Printf("[cloudvm] Failed to remove the container of pod %s from node %s: %v", uid, node.InstanceID, err)
+			s.nodePool.Cordon(node.InstanceID, SpinDownCleanupFailed)
+		}
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
 		if s.nodePool.HasUnknownCoTenants(node.InstanceID) {
@@ -1898,7 +1938,7 @@ func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req
 			}
 			if s.nodePool != nil {
 				s.nodePool.MarkPodCompleted(req.PodUID, 1, "StartError", term.Message, term.FinishedAt)
-				s.nodePool.Cordon(node.InstanceID)
+				s.nodePool.Cordon(node.InstanceID, SpinDownStartFailed)
 			}
 			s.mu.Unlock()
 			return

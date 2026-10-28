@@ -15,6 +15,8 @@ type idleCollectorMetrics struct {
 	idleNodes    prometheus.Gauge
 	terminations prometheus.Counter
 	errors       prometheus.Counter
+	reuses       prometheus.Counter
+	spinDowns    *prometheus.CounterVec
 }
 
 func newIdleCollectorMetrics() *idleCollectorMetrics {
@@ -32,8 +34,16 @@ func newIdleCollectorMetrics() *idleCollectorMetrics {
 			Name: "cloudvm_idle_termination_errors_total",
 			Help: "Failed idle VM terminations; the collector retries each on its next pass",
 		}),
+		reuses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "cloudvm_reused_allocations_total",
+			Help: "Pods placed on an idle VM that an earlier pod left behind",
+		}),
+		spinDowns: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_spin_downs_total",
+			Help: "VMs marked to take no new pods and terminate once idle, by reason",
+		}, []string{"reason"}),
 	}
-	m.Registry.MustRegister(m.idleNodes, m.terminations, m.errors)
+	m.Registry.MustRegister(m.idleNodes, m.terminations, m.errors, m.reuses, m.spinDowns)
 	return m
 }
 
@@ -70,7 +80,8 @@ func (s *Server) CollectIdleNodes(ctx context.Context) {
 }
 
 // TerminateIdleNodes terminates idle VMs in batched or parallel provider calls and forgets each one it terminated. A
-// node it fails to terminate goes back into the pool, so the next collector pass retries it.
+// node it fails to terminate goes back into the pool marked for spin-down, so the next collector pass retries it and
+// no pod reuses it meanwhile.
 func (s *Server) TerminateIdleNodes(ctx context.Context, nodes []*CloudVMNode) {
 	byProvider := make(map[ProviderType][]*CloudVMNode)
 	for _, node := range nodes {
@@ -89,7 +100,7 @@ func (s *Server) TerminateIdleNodes(ctx context.Context, nodes []*CloudVMNode) {
 			for _, node := range group {
 				log.Printf("[cloudvm] Keeping idle node %s: no %q provider is registered to terminate it", sanitizeLog(node.InstanceID), pt) //nolint:gosec // sanitized
 				idleMetrics.errors.Inc()
-				s.nodePool.RegisterNode(node)
+				s.nodePool.ReturnUnterminated(node)
 			}
 			continue
 		}
@@ -104,7 +115,7 @@ func (s *Server) TerminateIdleNodes(ctx context.Context, nodes []*CloudVMNode) {
 				log.Printf("[cloudvm] Error terminating idle instance %s, retrying on the next pass: %v", sanitizeLog(node.InstanceID), err) //nolint:gosec // sanitized
 				idleMetrics.errors.Inc()
 				if !s.isInstanceTombstoned(node.InstanceID) {
-					s.nodePool.RegisterNode(node)
+					s.nodePool.ReturnUnterminated(node)
 				}
 				continue
 			}

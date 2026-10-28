@@ -83,6 +83,14 @@ spec:
             - name: IDLE_GRACE_PERIOD
               value: "{{ .Values.provider.idleGracePeriod }}"
             {{- end }}
+            {{- if .Values.provider.reuseMaxVMAge }}
+            - name: REUSE_MAX_VM_AGE
+              value: "{{ .Values.provider.reuseMaxVMAge }}"
+            {{- end }}
+            {{- if .Values.provider.reuseMaxPricePremium }}
+            - name: REUSE_MAX_PRICE_PREMIUM
+              value: "{{ .Values.provider.reuseMaxPricePremium }}"
+            {{- end }}
             {{- if .Values.provider.kmsKeyId }}
             - name: KMS_KEY_ID
               value: "{{ .Values.provider.kmsKeyId }}"

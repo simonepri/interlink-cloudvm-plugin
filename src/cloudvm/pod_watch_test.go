@@ -147,6 +147,31 @@ func TestReconciler_RecreatedPodTerminatesOldVM(t *testing.T) {
 	}
 }
 
+func TestReconciler_ReusedVMKeepsRecordsOfSameNamedPod(t *testing.T) {
+	f := newOrphanFixture(t, "uid-old")
+	f.srv.SetIdleGracePeriod(time.Hour)
+	f.srv.handleDelete(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(`{"metadata":{"name":"worker","namespace":"jobs","uid":"uid-old"}}`)))
+	podJSON := `{"metadata":{"name":"worker","namespace":"jobs","uid":"uid-new"},"spec":{"containers":[{"name":"c1","resources":{"limits":{"cpu":"2","memory":"4Gi"}}}]}}`
+	f.srv.handleCreate(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/create", bytes.NewBufferString(podJSON)))
+	if node, _, ok := f.srv.nodePool.FindPodNode("uid-new"); !ok || node.InstanceID != f.instID {
+		t.Fatalf("expected the recreated pod to reuse VM %s", f.instID)
+	}
+
+	f.rec.SetPodWatch(startPodWatch(t, kubePod("jobs", "worker", "uid-new")))
+	if _, err := f.rec.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !instanceAlive(t, f) {
+		t.Fatal("reused VM was terminated for the pod it was launched for")
+	}
+	f.srv.mu.RLock()
+	_, kept := f.srv.instances["jobs/worker"]
+	f.srv.mu.RUnlock()
+	if !kept {
+		t.Fatal("releasing the launch pod again dropped the records of the pod now on the VM")
+	}
+}
+
 func TestReconciler_LaunchGraceProtectsOrphanCandidate(t *testing.T) {
 	f := newOrphanFixture(t, "uid-fresh")
 	f.rec.SetLaunchGracePeriod(time.Hour)

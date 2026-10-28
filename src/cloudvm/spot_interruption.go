@@ -111,7 +111,7 @@ func (r *KubePodEventRecorder) RequestRayWorkerDrain(ctx context.Context, namesp
 // handleSpotInterruption stops placing pods on the interrupted VM, posts a warning on each of its pods, and asks KubeRay to
 // drain the Ray workers among them.
 func (s *Server) handleSpotInterruption(ctx context.Context, instanceID string, notice SpotInterruptionNotice) {
-	s.nodePool.Cordon(instanceID)
+	s.nodePool.Cordon(instanceID, SpinDownInterruption)
 	pods := s.runningPods(instanceID)
 	log.Printf("[cloudvm] Spot interruption notice for %s (action %q at %s) affects %d pods", instanceID, notice.Action, notice.Time, len(pods))
 	s.mu.RLock()

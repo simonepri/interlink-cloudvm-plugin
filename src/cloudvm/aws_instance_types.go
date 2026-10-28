@@ -112,6 +112,21 @@ func (c *instanceFactsCache) resolve(ctx context.Context, client InstanceTypeDes
 	return out
 }
 
+// cached returns the facts of a type this process already described, or the static catalog facts of a GPU type,
+// without calling EC2.
+func (c *instanceFactsCache) cached(name string) (InstanceTypeFacts, bool) {
+	c.mu.Lock()
+	f, ok := c.facts[name]
+	c.mu.Unlock()
+	if ok {
+		return f, true
+	}
+	if GPUCountForInstanceType(name) > 0 {
+		return staticInstanceFacts(name), true
+	}
+	return InstanceTypeFacts{}, false
+}
+
 func describeInstanceFacts(ctx context.Context, client InstanceTypeDescriber, names []string) (map[string]InstanceTypeFacts, error) {
 	out := make(map[string]InstanceTypeFacts, len(names))
 	input := &ec2.DescribeInstanceTypesInput{Filters: []ec2types.Filter{{Name: aws.String("instance-type"), Values: names}}}

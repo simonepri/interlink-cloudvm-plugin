@@ -15,6 +15,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// allocate bin-packs a pod into pool and returns its node and GPUs.
+func allocate(pool *NodePool, req ResourceVector, region, podUID, namespace string) (*CloudVMNode, []int, error) {
+	alloc, err := pool.AllocatePod(AllocationRequest{Resources: req, Region: region, PodUID: podUID, Namespace: namespace, PodName: podUID})
+	if err != nil {
+		return nil, nil, err
+	}
+	return alloc.Node, alloc.GPUs, nil
+}
+
 func TestNodePool_GPUSlicing(t *testing.T) {
 	pool := NewNodePool(60 * time.Second)
 
@@ -38,7 +47,7 @@ func TestNodePool_GPUSlicing(t *testing.T) {
 		Memory: resource.MustParse("128Gi"),
 		GPUs:   4,
 	}
-	allocatedNode, gpus1, _, err := pool.Allocate(pod1Req, "us-west-2", "pod-uid-1", "default", "worker-1")
+	allocatedNode, gpus1, err := allocate(pool, pod1Req, "us-west-2", "pod-uid-1", "default")
 	if err != nil {
 		t.Fatalf("expected pod 1 to allocate successfully: %v", err)
 	}
@@ -56,7 +65,7 @@ func TestNodePool_GPUSlicing(t *testing.T) {
 		Memory: resource.MustParse("128Gi"),
 		GPUs:   4,
 	}
-	allocatedNode2, gpus2, _, err := pool.Allocate(pod2Req, "us-west-2", "pod-uid-2", "default", "worker-2")
+	allocatedNode2, gpus2, err := allocate(pool, pod2Req, "us-west-2", "pod-uid-2", "default")
 	if err != nil {
 		t.Fatalf("expected pod 2 to bin-pack into warm node: %v", err)
 	}
@@ -74,7 +83,7 @@ func TestNodePool_GPUSlicing(t *testing.T) {
 		Memory: resource.MustParse("16Gi"),
 		GPUs:   1,
 	}
-	_, _, _, err = pool.Allocate(pod3Req, "us-west-2", "pod-uid-3", "default", "worker-3")
+	_, _, err = allocate(pool, pod3Req, "us-west-2", "pod-uid-3", "default")
 	if err == nil {
 		t.Fatalf("expected pod 3 allocation to fail due to GPU exhaustion")
 	}
@@ -106,7 +115,7 @@ func TestNodePool_CPUMemoryFittingAndScoring(t *testing.T) {
 	}
 
 	// NodeResourcesMostAllocated favors node1 (6/8 = 75%) over node2 (6/32 = 18.75%)
-	targetNode, _, _, err := pool.Allocate(req, "us-east-1", "pod-cpu-1", "prod", "task-1")
+	targetNode, _, err := allocate(pool, req, "us-east-1", "pod-cpu-1", "prod")
 	if err != nil {
 		t.Fatalf("unexpected allocation error: %v", err)
 	}
@@ -132,8 +141,8 @@ func TestNodePool_PodReleaseAndIdleCooldown(t *testing.T) {
 		Memory: resource.MustParse("8Gi"),
 		GPUs:   1,
 	}
-	_, _, _, _ = pool.Allocate(req, "us-west-2", "pod-a", "default", "worker-a")
-	_, _, _, _ = pool.Allocate(req, "us-west-2", "pod-b", "default", "worker-b")
+	_, _, _ = allocate(pool, req, "us-west-2", "pod-a", "default")
+	_, _, _ = allocate(pool, req, "us-west-2", "pod-b", "default")
 
 	// Release Pod A: Node still has Pod B running -> not idle
 	pool.Release("pod-a")
@@ -144,13 +153,13 @@ func TestNodePool_PodReleaseAndIdleCooldown(t *testing.T) {
 		t.Errorf("node should not be cordoned while Pod B is still running")
 	}
 
-	// Release Pod B: Node has 0 active pods -> IdleSince recorded and cordoned
+	// Release Pod B: Node has 0 active pods -> IdleSince recorded, and it stays allocatable for reuse
 	pool.Release("pod-b")
 	if node.IdleSince == nil {
 		t.Fatalf("node should record IdleSince timestamp once all pods finish")
 	}
-	if !node.Cordoned {
-		t.Fatalf("node should be cordoned automatically upon reaching 0 active pods")
+	if node.Cordoned {
+		t.Fatalf("idle node should stay allocatable during its grace period")
 	}
 
 	// Immediate collection should return empty because grace period (100ms) has not elapsed
@@ -423,7 +432,7 @@ func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
 	}
 
 	// 1. Allocate Pod 1
-	n1, _, _, err := pool.Allocate(req, "us-east-1", "pod-d-1", "default", "worker-1")
+	n1, _, err := allocate(pool, req, "us-east-1", "pod-d-1", "default")
 	if err != nil || n1.InstanceID != "i-density-node-01" {
 		t.Fatalf("failed to allocate pod 1: %v", err)
 	}
@@ -432,7 +441,7 @@ func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
 	}
 
 	// 2. Allocate Pod 2 (reaches density limit of 2)
-	n2, _, _, err := pool.Allocate(req, "us-east-1", "pod-d-2", "default", "worker-2")
+	n2, _, err := allocate(pool, req, "us-east-1", "pod-d-2", "default")
 	if err != nil || n2.InstanceID != "i-density-node-01" {
 		t.Fatalf("failed to allocate pod 2: %v", err)
 	}
@@ -441,7 +450,7 @@ func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
 	}
 
 	// 3. Allocate Pod 3: must be rejected even though node 1 has plenty of CPU/memory
-	_, _, _, err = pool.Allocate(req, "us-east-1", "pod-d-3", "default", "worker-3")
+	_, _, err = allocate(pool, req, "us-east-1", "pod-d-3", "default")
 	if err == nil {
 		t.Fatalf("expected pod 3 allocation to be rejected due to maxPodsPerNode limit")
 	}
@@ -451,7 +460,7 @@ func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
 	node2.Namespace = "default"
 	pool.RegisterNode(node2)
 
-	n3, _, _, err := pool.Allocate(req, "us-east-1", "pod-d-3", "default", "worker-3")
+	n3, _, err := allocate(pool, req, "us-east-1", "pod-d-3", "default")
 	if err != nil || n3.InstanceID != "i-density-node-02" {
 		t.Fatalf("expected pod 3 to fan out to node 2, got node %v, err: %v", n3, err)
 	}
@@ -460,7 +469,7 @@ func TestNodePool_MaxPodsPerNodeDensity(t *testing.T) {
 	}
 }
 
-func TestNodePool_PreTerminationCordonOnZeroActivePods(t *testing.T) {
+func TestNodePool_IdleNodeStaysAllocatableUntilSpinDown(t *testing.T) {
 	pool := NewNodePool(60 * time.Second)
 
 	capacity := ResourceVector{
@@ -476,48 +485,43 @@ func TestNodePool_PreTerminationCordonOnZeroActivePods(t *testing.T) {
 		Memory: resource.MustParse("4Gi"),
 	}
 
-	// 1. Allocate Pod 1
-	_, _, _, err := pool.Allocate(req, "us-east-1", "uid-cordon-1", "default", "task-1")
-	if err != nil {
+	if _, _, err := allocate(pool, req, "us-east-1", "uid-cordon-1", "default"); err != nil {
 		t.Fatalf("failed to allocate pod 1: %v", err)
 	}
-	if node.Cordoned {
-		t.Fatalf("expected node to not be cordoned with 1 active pod")
-	}
 
-	// 2. Release Pod 1: active count reaches 0 -> node must be automatically cordoned
-	remaining := pool.Release("uid-cordon-1")
-	if remaining != 0 {
+	// Releasing the last pod leaves the node idle but allocatable.
+	if remaining := pool.Release("uid-cordon-1"); remaining != 0 {
 		t.Fatalf("expected remaining active pods 0, got %d", remaining)
 	}
-	if !node.Cordoned {
-		t.Fatalf("expected node to be automatically cordoned upon reaching 0 active pods")
-	}
-
-	// 3. New allocation must reject cordoned idle node counting down to self-destruct
-	_, _, _, err = pool.Allocate(req, "us-east-1", "uid-cordon-2", "default", "task-2")
-	if err == nil {
-		t.Fatalf("expected allocation to fail when only warm node is cordoned")
-	}
-
-	// 4. Uncordon the node and verify allocations are accepted again
-	pool.Uncordon(node.InstanceID)
 	if node.Cordoned {
-		t.Fatalf("expected node to be uncordoned after Uncordon call")
+		t.Fatalf("expected idle node to stay allocatable")
 	}
 
-	nAlloc, _, _, err := pool.Allocate(req, "us-east-1", "uid-cordon-2", "default", "task-2")
-	if err != nil || nAlloc.InstanceID != "i-cordon-test-01" {
-		t.Fatalf("expected allocation to succeed on uncordoned node, got: %v", err)
+	// A completed pod that is not deleted yet keeps its container on the VM, so the node takes no new pod.
+	if _, _, err := allocate(pool, req, "us-east-1", "uid-cordon-2", "default"); err != nil {
+		t.Fatalf("expected the idle node to be reused: %v", err)
 	}
-
-	// 5. Test MarkPodCompleted: when container finishes and active count reaches 0 -> cordoned
 	pool.MarkPodCompleted("uid-cordon-2", 0, "Completed", "Done", time.Now())
-	if node.ActivePodCount() != 0 {
-		t.Fatalf("expected active pod count 0 after MarkPodCompleted, got %d", node.ActivePodCount())
+	if node.ActivePodCount() != 0 || node.Cordoned {
+		t.Fatalf("expected an idle, uncordoned node after MarkPodCompleted (active %d, cordoned %v)", node.ActivePodCount(), node.Cordoned)
 	}
-	if !node.Cordoned {
-		t.Fatalf("expected node to be automatically cordoned after MarkPodCompleted reached 0 active pods")
+	if _, _, err := allocate(pool, req, "us-east-1", "uid-cordon-3", "default"); err == nil {
+		t.Fatalf("expected no reuse while the completed pod's container is still on the VM")
+	}
+	pool.Release("uid-cordon-2")
+
+	// A node marked for spin-down takes no pod.
+	pool.Cordon(node.InstanceID, SpinDownInterruption)
+	if node.SpinDownReason != SpinDownInterruption {
+		t.Fatalf("expected spin-down reason %q, got %q", SpinDownInterruption, node.SpinDownReason)
+	}
+	if _, _, err := allocate(pool, req, "us-east-1", "uid-cordon-3", "default"); err == nil {
+		t.Fatalf("expected allocation to fail when the only warm node is marked for spin-down")
+	}
+
+	pool.Uncordon(node.InstanceID)
+	if nAlloc, _, err := allocate(pool, req, "us-east-1", "uid-cordon-3", "default"); err != nil || nAlloc.InstanceID != "i-cordon-test-01" {
+		t.Fatalf("expected allocation to succeed on uncordoned node, got: %v", err)
 	}
 }
 
@@ -576,13 +580,13 @@ func TestNodePool_NodeKeepsOneNamespace(t *testing.T) {
 	if _, ok := pool.InstanceNamespace("i-shared"); ok {
 		t.Fatal("a node without pods has a namespace")
 	}
-	if _, _, _, err := pool.Allocate(req, "eu-west-1", "uid-a", "team-a", "a"); err != nil {
+	if _, _, err := allocate(pool, req, "eu-west-1", "uid-a", "team-a"); err != nil {
 		t.Fatalf("first pod: %v", err)
 	}
-	if _, _, _, err := pool.Allocate(req, "eu-west-1", "uid-b", "team-b", "b"); err == nil {
+	if _, _, err := allocate(pool, req, "eu-west-1", "uid-b", "team-b"); err == nil {
 		t.Fatal("a pod of another namespace joined the node")
 	}
-	if _, _, _, err := pool.Allocate(req, "eu-west-1", "uid-a2", "team-a", "a2"); err != nil {
+	if _, _, err := allocate(pool, req, "eu-west-1", "uid-a2", "team-a"); err != nil {
 		t.Fatalf("pod of the same namespace: %v", err)
 	}
 	if ns, ok := pool.InstanceNamespace("i-shared"); !ok || ns != "team-a" {

@@ -64,7 +64,7 @@ func TestServer_RecoverActiveInstances(t *testing.T) {
 
 	// Verify that Allocate skips this cordoned recovered node
 	req, _ := NewResourceVector("1", "2Gi", 0, 0)
-	_, _, _, err = server.NodePool().Allocate(req, "us-east-1", "new-pod", "custom-ns", "new-worker")
+	_, _, err = allocate(server.NodePool(), req, "us-east-1", "new-pod", "custom-ns")
 	if err == nil {
 		t.Fatalf("expected Allocate to skip cordoned recovered node")
 	}

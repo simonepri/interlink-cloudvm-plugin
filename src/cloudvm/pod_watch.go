@@ -173,6 +173,13 @@ func (r *Reconciler) reapOrphanedVMs(ctx context.Context, instances []*Instance)
 		if checker, ok := r.tracker.(CoTenantReconciler); ok && checker.HasUnknownCoTenants(inst.ID) {
 			continue
 		}
+		// A pooled VM outlives the pod it was launched for once it is reused; that pod is already released, and
+		// deleting it again by name would drop the records of a newer pod with the same name.
+		if np := r.getNodePool(); np != nil && np.HasNode(inst.ID) {
+			if _, _, found := np.FindPodNode(podUID); !found {
+				continue
+			}
+		}
 		cleanID := sanitizeLog(inst.ID)
 		log.Printf("[reconciler] Pod %s/%s (uid %s) no longer exists. Releasing VM %s...", sanitizeLog(ns), sanitizeLog(podName), sanitizeLog(podUID), cleanID) //nolint:gosec // sanitized
 		if d, ok := r.tracker.(OrphanedPodDeleter); ok {

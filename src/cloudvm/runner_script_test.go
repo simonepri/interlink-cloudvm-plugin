@@ -376,3 +376,65 @@ func TestRunnerScript_RunningContainerStatusDecodesInGoClient(t *testing.T) {
 		t.Errorf("want a running container with its start time, got %+v", res)
 	}
 }
+
+// fakeRemovingNerdctl creates $state/created on run and deletes it on rm unless $state/stuck exists.
+const fakeRemovingNerdctl = `#!/usr/bin/env bash
+state="$FAKE_NERDCTL_STATE"
+case "$1" in
+  run) touch "$state/created"; exit 0 ;;
+  rm) [ -f "$state/stuck" ] || rm -f "$state/created"; exit 0 ;;
+  inspect)
+    if [ -f "$state/created" ]; then
+      printf '[{"State":{"Status":"exited","Running":false,"ExitCode":0}}]'
+      exit 0
+    fi
+    echo "Error: No such object: $2" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+`
+
+func TestRunnerScript_StopRemovesContainer(t *testing.T) {
+	h := newRunnerHarness(t)
+	stateDir := strings.TrimPrefix(h.env[len(h.env)-1], "FAKE_NERDCTL_STATE=")
+	binDir := filepath.Join(filepath.Dir(stateDir), "bin")
+	if err := os.WriteFile(filepath.Join(binDir, "nerdctl"), []byte(fakeRemovingNerdctl), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	defer h.start()()
+
+	created := filepath.Join(stateDir, "created")
+	startAndWait := func() {
+		t.Helper()
+		resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"p","image":"busybox"}`)
+		_ = resp.Body.Close()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(created); err == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatal("container never ran")
+	}
+
+	startAndWait()
+	resp := h.do(http.MethodPost, "/containers/stop?podUID=p", "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stop returned HTTP %d", resp.StatusCode)
+	}
+	if _, err := os.Stat(created); !os.IsNotExist(err) {
+		t.Fatalf("expected stop to remove the container, stat: %v", err)
+	}
+
+	// A container that survives removal fails the stop, so the plugin never reuses the VM.
+	startAndWait()
+	if err := os.WriteFile(filepath.Join(stateDir, "stuck"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp = h.do(http.MethodPost, "/containers/stop?podUID=p", "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when the container remains, got %d", resp.StatusCode)
+	}
+}

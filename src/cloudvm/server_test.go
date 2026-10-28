@@ -396,7 +396,7 @@ func TestRegression_DeleteFinishedPodDoesNotKillCoTenants(t *testing.T) {
 	req2, _ := NewResourceVector("2", "8Gi", 1, 0)
 
 	server.NodePool().RegisterAndAllocate(node, req1, "uid-cotenant-1", "default", "worker-1")
-	_, _, _, err := server.NodePool().Allocate(req2, "us-east-1", "uid-cotenant-2", "default", "worker-2")
+	_, _, err := allocate(server.NodePool(), req2, "us-east-1", "uid-cotenant-2", "default")
 	if err != nil {
 		t.Fatalf("failed to allocate co-tenant 2: %v", err)
 	}
@@ -1118,12 +1118,9 @@ func TestServer_WarmNodeReuseAcrossPodDeletions(t *testing.T) {
 	if node.IdleSince == nil {
 		t.Fatalf("expected IdleSince timestamp recorded on warm node")
 	}
-	if !node.Cordoned {
-		t.Fatalf("expected warm node to be cordoned upon reaching 0 active pods")
+	if node.Cordoned {
+		t.Fatalf("expected warm node to stay allocatable during its grace period")
 	}
-
-	// Explicitly uncordon node to re-enable pod allocation
-	srv.NodePool().Uncordon(originalInstanceID)
 
 	// 3. Launch Pod 2 within idle grace period -> Should reuse the existing warm VM!
 	p2Payload := `{

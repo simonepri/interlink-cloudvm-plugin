@@ -307,6 +307,24 @@ func run() error {
 		configureAWSMarketAPIs(ctx, nil, launchRegionsFromEnv(awsProv))
 	}
 
+	reuseMaxAge := DefaultReuseMaxAge
+	if raw := os.Getenv("REUSE_MAX_VM_AGE"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			return fmt.Errorf("invalid REUSE_MAX_VM_AGE %q", raw)
+		}
+		reuseMaxAge = d
+	}
+	var reusePricePremium float64
+	if raw := os.Getenv("REUSE_MAX_PRICE_PREMIUM"); raw != "" {
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil || f < 0 {
+			return fmt.Errorf("invalid REUSE_MAX_PRICE_PREMIUM %q", raw)
+		}
+		reusePricePremium = f
+	}
+	server.ConfigureNodeReuse(reuseMaxAge, reusePricePremium)
+
 	// Background reconciler
 	reconcileInterval := 60 * time.Second
 	if intervalSec := os.Getenv("RECONCILE_INTERVAL_SECONDS"); intervalSec != "" {
