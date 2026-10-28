@@ -709,20 +709,17 @@ func TestNodePool_UnknownCoTenantsExceededRetriesClearedForGC(t *testing.T) {
 	delReq := httptest.NewRequest(http.MethodPost, "/delete", bytes.NewBufferString(pod1JSON))
 	srv.handleDelete(httptest.NewRecorder(), delReq)
 
-	// Set short timeout for unit test
-	oldTimeout := UnknownCoTenantTimeout
-	UnknownCoTenantTimeout = 250 * time.Millisecond
-	defer func() { UnknownCoTenantTimeout = oldTimeout }()
-
 	reconciler := NewReconciler(mock, srv, mock, "test-cluster", 0)
-	// First reconcile: node remains flagged
+	// First reconcile: the node is flagged for far less than the timeout, so it stays flagged however slow the host is.
 	_, _ = reconciler.ReconcileOnce(ctx)
 	if !srv.nodePool.HasUnknownCoTenants(inst.ID) {
 		t.Fatalf("expected UnknownCoTenants still true before timeout")
 	}
 
-	// Advance past timeout
-	time.Sleep(300 * time.Millisecond)
+	// Move the flagging time past the timeout instead of sleeping, so the test does not depend on the clock rate.
+	srv.nodePool.mu.Lock()
+	srv.nodePool.nodes[inst.ID].UnknownSince = time.Now().Add(-2 * UnknownCoTenantTimeout)
+	srv.nodePool.mu.Unlock()
 
 	// Reconcile after timeout: flag cleared -> VM collected as zombie
 	res, err := reconciler.ReconcileOnce(ctx)

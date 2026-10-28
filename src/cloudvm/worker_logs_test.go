@@ -264,6 +264,7 @@ func TestTunnelAgent_PythonAgentStreamsLogFiles(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"CLOUDVM_TUNNEL_CA_FILE="+caFile,
 		"CLOUDVM_TUNNEL_ENDPOINT="+endpoint,
+		"CLOUDVM_TCP_PROXY_PORT=0",
 		"CLOUDVM_INSTANCE_ID="+instanceID,
 		"CLOUDVM_RUNNER_TOKEN_FILE="+tokenFile,
 		"CLOUDVM_ATTESTATION_FILE="+filepath.Join(dir, "absent"),
