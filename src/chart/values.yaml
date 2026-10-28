@@ -32,6 +32,8 @@ provider:
   idleGracePeriod: "60s"
   # Idle VMs older than this are terminated instead of reused ("0" disables the limit).
   reuseMaxVMAge: "24h"
+  # How long an idle VM's reverse tunnel may stay down before the VM is terminated instead of reused.
+  reuseTunnelDownGrace: "30s"
   # Fraction by which an idle spot VM's zone price may exceed the cheapest zone of its region before it is terminated
   # instead of reused, such as "0.2"; empty disables the check. Needs the embedded spot ticker (ENABLE_TICKER).
   reuseMaxPricePremium: ""

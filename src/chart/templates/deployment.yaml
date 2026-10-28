@@ -87,6 +87,10 @@ spec:
             - name: REUSE_MAX_VM_AGE
               value: "{{ .Values.provider.reuseMaxVMAge }}"
             {{- end }}
+            {{- if .Values.provider.reuseTunnelDownGrace }}
+            - name: REUSE_TUNNEL_DOWN_GRACE
+              value: "{{ .Values.provider.reuseTunnelDownGrace }}"
+            {{- end }}
             {{- if .Values.provider.reuseMaxPricePremium }}
             - name: REUSE_MAX_PRICE_PREMIUM
               value: "{{ .Values.provider.reuseMaxPricePremium }}"

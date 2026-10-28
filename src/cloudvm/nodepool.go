@@ -582,9 +582,9 @@ func (np *NodePool) FindPodNode(podUID string) (*CloudVMNode, PodAllocation, boo
 	return nil, PodAllocation{}, false
 }
 
-// CollectExpiredIdleNodes removes and returns the nodes that have had 0 active pods for > idleGracePeriod. Removing a
-// node under the pool lock moves it to Terminating: no allocation can pick it after this returns. It also marks idle
-// nodes still in their grace period for spin-down when ReusePolicy no longer allows reusing them.
+// CollectExpiredIdleNodes removes and returns the nodes without active pods that are marked for spin-down or have been
+// idle for > idleGracePeriod. Removing a node under the pool lock moves it to Terminating: no allocation can pick it
+// after this returns. It first marks idle nodes for spin-down when ReusePolicy no longer allows reusing them.
 func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	np.mu.Lock()
 	defer np.mu.Unlock()
@@ -593,9 +593,15 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	now := time.Now()
 
 	for id, node := range np.nodes {
-		if node.ActivePodCount() != 0 || node.IdleSince == nil || now.Sub(*node.IdleSince) <= np.idleGracePeriod {
+		if node.ActivePodCount() != 0 {
 			node.idleHoldLogged = false
-			np.checkIdleLocked(node, now)
+			continue
+		}
+		np.checkIdleLocked(node, now)
+		// A node marked for spin-down can never be reused, so it does not wait out the grace period.
+		graceOver := node.IdleSince != nil && now.Sub(*node.IdleSince) > np.idleGracePeriod
+		if !node.Cordoned && !graceOver {
+			node.idleHoldLogged = false
 			continue
 		}
 		if node.UnknownCoTenants {
@@ -642,7 +648,7 @@ func (np *NodePool) ClaimForTermination(instanceID string) bool {
 }
 
 // ReturnUnterminated puts back a node the idle collector removed but failed to terminate. The node stays marked for
-// spin-down, so the collector retries its termination and no allocation reuses a VM whose termination may be underway.
+// spin-down, so the collector retries its termination on its next pass and no allocation reuses it meanwhile.
 func (np *NodePool) ReturnUnterminated(node *CloudVMNode) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
@@ -738,7 +744,7 @@ func (np *NodePool) RegisterAndAllocate(node *CloudVMNode, req ResourceVector, p
 }
 
 // Cordon marks an instance for spin-down, excluding it from future bin-pack allocations; the idle collector
-// terminates it once it has been idle for the grace period.
+// terminates it on its first pass after its last active pod leaves.
 func (np *NodePool) Cordon(instanceID string, reason SpinDownReason) {
 	np.mu.Lock()
 	defer np.mu.Unlock()

@@ -6,6 +6,7 @@ import (
 	"log"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -13,7 +14,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-// SpinDownReason is why a VM takes no new pods and is terminated once it has been idle for the grace period.
+// SpinDownReason is why a VM takes no new pods and is terminated by the idle collector's first pass after its last
+// active pod leaves.
 type SpinDownReason string
 
 const (
@@ -44,14 +46,17 @@ type ReusePolicy struct {
 	PriceTooHigh func(*CloudVMNode) bool
 }
 
+// DefaultReuseTunnelDownGrace is how long an idle VM's reverse tunnel may stay down before the VM is spun down.
+const DefaultReuseTunnelDownGrace = 30 * time.Second
+
 // ConfigureNodeReuse sets the node pool's reuse policy: spin down idle VMs older than maxAge (zero disables), whose
-// reverse tunnel is down, or, with an embedded spot ticker and a positive pricePremium, whose spot price exceeds the
-// cheapest zone of their region by more than that fraction. Call it after the tunnel and ticker are configured.
-func (s *Server) ConfigureNodeReuse(maxAge time.Duration, pricePremium float64) {
+// reverse tunnel has been down for longer than tunnelDownGrace, or, with an embedded spot ticker and a positive
+// pricePremium, whose spot price exceeds the cheapest zone of their region by more than that fraction. Call it after
+// the tunnel and ticker are configured.
+func (s *Server) ConfigureNodeReuse(maxAge, tunnelDownGrace time.Duration, pricePremium float64) {
 	policy := ReusePolicy{MaxAge: maxAge}
 	if t := s.tunnelConfig(); t != nil && !t.DirectFallback {
-		registry := t.Registry
-		policy.Healthy = func(node *CloudVMNode) bool { return registry.Has(node.InstanceID) }
+		policy.Healthy = newTunnelDownTracker(t.Registry.Has, tunnelDownGrace).healthy
 	}
 	s.mu.RLock()
 	ticker := s.spotTicker
@@ -173,4 +178,41 @@ func spotPriceAbove(ticker *SpotPriceTicker, premium float64) func(*CloudVMNode)
 		best, ok := ticker.GetPrice(node.Region, node.InstanceType)
 		return ok && current.SpotPriceUSD > best.SpotPriceUSD*(1+premium)
 	}
+}
+
+// tunnelDownTracker reports a VM unhealthy once its reverse tunnel has been seen down for longer than grace, so a
+// momentary reconnect does not spin down a warm VM. The runner check before each reuse still rejects a VM it cannot
+// reach. Down time counts from the first check that saw the tunnel down; the idle collector checks idle VMs at least
+// every 10 seconds.
+type tunnelDownTracker struct {
+	connected func(instanceID string) bool
+	grace     time.Duration
+	now       func() time.Time
+	mu        sync.Mutex
+	downSince map[string]time.Time
+}
+
+func newTunnelDownTracker(connected func(string) bool, grace time.Duration) *tunnelDownTracker {
+	return &tunnelDownTracker{connected: connected, grace: grace, now: time.Now, downSince: make(map[string]time.Time)}
+}
+
+func (t *tunnelDownTracker) healthy(node *CloudVMNode) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.connected(node.InstanceID) {
+		delete(t.downSince, node.InstanceID)
+		return true
+	}
+	now := t.now()
+	since, seen := t.downSince[node.InstanceID]
+	if !seen {
+		t.downSince[node.InstanceID] = now
+		since = now
+	}
+	if now.Sub(since) <= t.grace {
+		return true
+	}
+	// The VM is about to be spun down and is never checked again.
+	delete(t.downSince, node.InstanceID)
+	return false
 }

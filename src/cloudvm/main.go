@@ -323,7 +323,15 @@ func run() error {
 		}
 		reusePricePremium = f
 	}
-	server.ConfigureNodeReuse(reuseMaxAge, reusePricePremium)
+	reuseTunnelDownGrace := DefaultReuseTunnelDownGrace
+	if raw := os.Getenv("REUSE_TUNNEL_DOWN_GRACE"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 {
+			return fmt.Errorf("invalid REUSE_TUNNEL_DOWN_GRACE %q", raw)
+		}
+		reuseTunnelDownGrace = d
+	}
+	server.ConfigureNodeReuse(reuseMaxAge, reuseTunnelDownGrace, reusePricePremium)
 
 	// Background reconciler
 	reconcileInterval := 60 * time.Second

@@ -120,9 +120,7 @@ func TestNodePool_DoesNotReuseIdleNodeWithSpinDownReason(t *testing.T) {
 			if got := spinDownCount(tc.reason) - before; got != 1 {
 				t.Fatalf("spin-down metric for %q grew by %v, want 1", tc.reason, got)
 			}
-			// The collector still terminates it once the grace period ends.
-			past := time.Now().Add(-2 * time.Minute)
-			node.IdleSince = &past
+			// The collector terminates it on its next pass without waiting out the grace period.
 			if expired := pool.CollectExpiredIdleNodes(); len(expired) != 1 {
 				t.Fatalf("expected the spun-down node to be collected, got %d", len(expired))
 			}
@@ -209,6 +207,15 @@ func TestServer_LaunchesNewVMWhenIdleVMFailsRunnerCheck(t *testing.T) {
 	}
 	if got := counterValue(idleMetrics.reuses) - reusesBefore; got != 0 {
 		t.Fatalf("reuse metric grew by %v for a rejected reuse", got)
+	}
+
+	// The rejected VM never takes another pod, so the next collector pass terminates it despite its fresh IdleSince.
+	s.CollectIdleNodes(context.Background())
+	if s.nodePool.HasNode(first.InstanceID) {
+		t.Fatalf("expected the VM rejected for reuse to be terminated on the next collector pass")
+	}
+	if st, err := prov.Status(context.Background(), first.InstanceID); err != nil || st.State != StateTerminated {
+		t.Fatalf("expected VM %s terminated in the cloud, got %+v, %v", first.InstanceID, st, err)
 	}
 
 	// A healthy idle VM is reused and counted.
@@ -411,5 +418,39 @@ func TestSpotPriceAbove(t *testing.T) {
 	node.Zone = ""
 	if spotPriceAbove(ticker, 0.2)(node) {
 		t.Fatalf("expected no verdict without the node's zone")
+	}
+}
+
+func TestTunnelDownTracker_ToleratesShortDrops(t *testing.T) {
+	connected := true
+	now := time.Now()
+	tracker := newTunnelDownTracker(func(string) bool { return connected }, 30*time.Second)
+	tracker.now = func() time.Time { return now }
+	node := &CloudVMNode{InstanceID: "i-flaky"}
+
+	if !tracker.healthy(node) {
+		t.Fatal("expected a connected VM healthy")
+	}
+	connected = false
+	if !tracker.healthy(node) {
+		t.Fatal("expected a VM whose tunnel just dropped healthy")
+	}
+	now = now.Add(20 * time.Second)
+	if !tracker.healthy(node) {
+		t.Fatal("expected a VM whose tunnel has been down for 20s healthy")
+	}
+	// Reconnecting resets the down time.
+	connected = true
+	if !tracker.healthy(node) {
+		t.Fatal("expected a reconnected VM healthy")
+	}
+	connected = false
+	now = now.Add(20 * time.Second)
+	if !tracker.healthy(node) {
+		t.Fatal("expected the down time to restart after a reconnect")
+	}
+	now = now.Add(31 * time.Second)
+	if tracker.healthy(node) {
+		t.Fatal("expected a VM whose tunnel has been down for 31s unhealthy")
 	}
 }
