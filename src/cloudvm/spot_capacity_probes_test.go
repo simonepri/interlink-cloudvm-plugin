@@ -19,13 +19,18 @@ type probeFetcher struct {
 	mockEC2TickerFetcher
 	mu     sync.Mutex
 	inputs []*ec2.GetSpotPlacementScoresInput
+	limit  int32 // largest accepted target; 0 means 32
 }
 
 func (f *probeFetcher) GetSpotPlacementScores(_ context.Context, in *ec2.GetSpotPlacementScoresInput, _ ...func(*ec2.Options)) (*ec2.GetSpotPlacementScoresOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.inputs = append(f.inputs, in)
-	if aws.ToInt32(in.TargetCapacity) > 32 {
+	limit := f.limit
+	if limit == 0 {
+		limit = 32
+	}
+	if aws.ToInt32(in.TargetCapacity) > limit {
 		return nil, &smithy.GenericAPIError{Code: "TargetCapacityLimitExceeded", Message: "The value for targetCapacity exceeds your limit"}
 	}
 	out := &ec2.GetSpotPlacementScoresOutput{}
@@ -65,6 +70,9 @@ func TestSpotPriceTicker_ProbeSpotCapacity(t *testing.T) {
 	if _, ok := eightGPU[1024]; ok {
 		t.Errorf("1024 GPUs (128 instances) was rejected by AWS but still scored: %v", eightGPU)
 	}
+	if eightGPU[256] != 7 {
+		t.Errorf("rejected 1024-GPU probe did not back off to an accepted size: %v", eightGPU)
+	}
 }
 
 func TestSpotPriceTicker_ProbeSpotCapacityLearnsTheTargetLimit(t *testing.T) {
@@ -81,10 +89,16 @@ func TestSpotPriceTicker_ProbeSpotCapacityLearnsTheTargetLimit(t *testing.T) {
 		return n
 	}
 
-	// 1-GPU shapes: 64 GPUs is 64 instances, which the mock rejects; 256 and 1024 are then skipped.
-	ticker.ProbeSpotCapacity(context.Background())
+	// 1-GPU shapes: 64 GPUs is 64 instances, which the mock rejects; the probe backs off to 32, and 256 and 1024 reuse it.
+	scores := ticker.ProbeSpotCapacity(context.Background())
 	if got := rejected(); got != 1 {
 		t.Fatalf("first pass sent %d rejected probes, want 1", got)
+	}
+	if got := len(fetcher.inputs); got != 3 {
+		t.Errorf("first pass sent %d requests, want 3 (8, 64, 32)", got)
+	}
+	if got := scores[spotScoreKey("aws", "us-east-1", 24, 1)]; got[8] != 7 || got[32] != 7 {
+		t.Errorf("scores %v lack 7 at 8 and 32 GPUs", got)
 	}
 	ticker.ProbeSpotCapacity(context.Background())
 	if got := rejected(); got != 1 {
@@ -101,6 +115,36 @@ func TestSpotPriceTicker_ProbeSpotCapacityLearnsTheTargetLimit(t *testing.T) {
 	ticker.ProbeSpotCapacity(context.Background())
 	if got := rejected(); got != 2 {
 		t.Errorf("after the retry window, %d rejected probes in total, want 2", got)
+	}
+}
+
+func TestSpotPriceTicker_ProbeSpotCapacityHalvesUntilAccepted(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"g6.xlarge"}, time.Minute)
+	fetcher := &probeFetcher{limit: 5}
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
+
+	scores := ticker.ProbeSpotCapacity(context.Background())
+
+	// 8 is rejected, 4 accepted; 64 is rejected, then 32, 16 rejected (3 backoffs) so it stays unscored beyond 4.
+	got := scores[spotScoreKey("aws", "us-east-1", 24, 1)]
+	if got[4] != 7 || len(got) != 1 {
+		t.Errorf("scores %v, want only 4 GPUs scored", got)
+	}
+	if n := len(fetcher.inputs); n > len(ProbeGPUCounts)*(1+maxProbeBackoffs) {
+		t.Errorf("pass sent %d requests, above the backoff budget", n)
+	}
+}
+
+func TestSpotPriceTicker_ProbeSpotCapacityHasNoDefaultCap(t *testing.T) {
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"p5.48xlarge"}, time.Minute)
+	fetcher := &probeFetcher{limit: 1000}
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
+
+	scores := ticker.ProbeSpotCapacity(context.Background())
+
+	got := scores[spotScoreKey("aws", "us-east-1", 80, 8)]
+	if got[1024] != 7 {
+		t.Errorf("scores %v lack 7 at 1024 GPUs (128 instances)", got)
 	}
 }
 
@@ -148,12 +192,5 @@ func TestSpotPriceTicker_ProbeSpotCapacityCapsTargetsAtTheConfiguredLimit(t *tes
 	}
 	if _, ok := got[1024]; ok {
 		t.Errorf("scores %v hold 1024 GPUs, which was never probed", got)
-	}
-}
-
-func TestSpotPriceTicker_ProbeSpotCapacityDefaultsToFiftyInstances(t *testing.T) {
-	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"p5.48xlarge"}, time.Minute)
-	if got := ticker.maxProbeInstances(); got != 50 {
-		t.Errorf("default probe cap = %d, want 50", got)
 	}
 }
