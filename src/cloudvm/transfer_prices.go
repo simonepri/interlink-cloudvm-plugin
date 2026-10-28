@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,7 +80,7 @@ var GlobalTransferPrices = NewTransferPriceBook(nil)
 func NewTransferPriceBook(client AWSPricingAPI, regions ...string) *TransferPriceBook {
 	return &TransferPriceBook{
 		client:   client,
-		regions:  append([]string(nil), regions...),
+		regions:  sortedUniqueRegions(regions),
 		sources:  make(map[string]transferSourcePrices),
 		inflight: make(map[string]chan struct{}),
 		now:      time.Now,
@@ -93,12 +95,30 @@ func (b *TransferPriceBook) SetClient(client AWSPricingAPI) {
 	b.sources = make(map[string]transferSourcePrices)
 }
 
-// SetRegions replaces the regions priced as sources and cross-region destinations and forgets cached prices.
+// SetRegions replaces the regions priced as sources and cross-region destinations, sorted and deduplicated, and
+// forgets cached prices when the set changes.
 func (b *TransferPriceBook) SetRegions(regions []string) {
+	regions = sortedUniqueRegions(regions)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.regions = append([]string(nil), regions...)
+	if slices.Equal(regions, b.regions) {
+		return
+	}
+	b.regions = regions
 	b.sources = make(map[string]transferSourcePrices)
+}
+
+// sortedUniqueRegions returns regions sorted and deduplicated, without blanks or the "auto" sentinel.
+func sortedUniqueRegions(regions []string) []string {
+	out := make([]string, 0, len(regions))
+	for _, r := range regions {
+		r = strings.TrimSpace(r)
+		if r != "" && !strings.EqualFold(r, "auto") {
+			out = append(out, r)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // Regions returns a copy of the priced regions.

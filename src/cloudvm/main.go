@@ -50,8 +50,15 @@ func parseTickerRegions(val string) []string {
 // awsPricingRegion hosts the AWS Price List API endpoint; prices for every region are read from it.
 const awsPricingRegion = "us-east-1"
 
-// newConfiguredTicker builds the spot price ticker from TICKER_* and SCRAPE_INTERVAL_SECONDS and connects its AWS market APIs.
+// newConfiguredTicker builds the spot price ticker from the environment and connects its AWS market APIs.
 func newConfiguredTicker(ctx context.Context, awsProv *AWSProvider) *SpotPriceTicker {
+	spotTicker := newTickerFromEnv(awsProv)
+	configureAWSMarketAPIs(ctx, spotTicker, launchRegionsFromEnv(awsProv))
+	return spotTicker
+}
+
+// newTickerFromEnv builds the spot price ticker from TICKER_*, SCRAPE_INTERVAL_SECONDS, and the launch regions.
+func newTickerFromEnv(awsProv *AWSProvider) *SpotPriceTicker {
 	tickerRegions := parseTickerRegions(os.Getenv("TICKER_REGIONS"))
 	interval := 10 * time.Minute
 	if intervalSec := os.Getenv("SCRAPE_INTERVAL_SECONDS"); intervalSec != "" {
@@ -67,12 +74,12 @@ func newConfiguredTicker(ctx context.Context, awsProv *AWSProvider) *SpotPriceTi
 			spotTicker.SetProbeMaxInstances(n)
 		}
 	}
-	configureAWSMarketAPIs(ctx, spotTicker, awsProv.ConfiguredRegions())
+	spotTicker.SetTransferRegions(launchRegionsFromEnv(awsProv))
 	return spotTicker
 }
 
 // configureAWSMarketAPIs gives the shared on-demand and transfer price books a Price List API client, prices transfers
-// between launchRegions, and gives the ticker, when present, per-region Service Quotas and CloudWatch clients.
+// between launchRegions, which a ticker extends with its market regions, and gives the ticker, when present, per-region Service Quotas and CloudWatch clients.
 func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker, launchRegions []string) {
 	GlobalTransferPrices.SetRegions(launchRegions)
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsPricingRegion))
@@ -290,7 +297,7 @@ func run() error {
 		awsProv.SetRegionScorer(spotTicker)
 		log.Printf("[cloudvm-ticker] Embedded spot price poller started for %d regions", len(spotTicker.Regions())) //nolint:gosec // log length is safe
 	} else if providerType == "aws" {
-		configureAWSMarketAPIs(ctx, nil, awsProv.ConfiguredRegions())
+		configureAWSMarketAPIs(ctx, nil, launchRegionsFromEnv(awsProv))
 	}
 
 	// Background reconciler

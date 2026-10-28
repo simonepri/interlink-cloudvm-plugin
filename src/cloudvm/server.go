@@ -173,12 +173,29 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 			s.runnerConcurrency = c
 		}
 	}
-	if raw := os.Getenv("NODE_REGIONS"); raw != "" {
-		if err := json.Unmarshal([]byte(raw), &s.nodeRegions); err != nil {
-			log.Printf("[cloudvm] ERROR parsing NODE_REGIONS: %v", err)
-		}
-	}
+	s.nodeRegions = parseNodeRegions(os.Getenv("NODE_REGIONS"))
 	return s
+}
+
+// parseNodeRegions reads NODE_REGIONS, a JSON object from virtual node name to the region its pods launch in.
+func parseNodeRegions(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	var nodeRegions map[string]string
+	if err := json.Unmarshal([]byte(raw), &nodeRegions); err != nil {
+		log.Printf("[cloudvm] ERROR parsing NODE_REGIONS: %v", err)
+	}
+	return nodeRegions
+}
+
+// launchRegionsFromEnv returns the provider's configured regions and the NODE_REGIONS regions, sorted and deduplicated.
+func launchRegionsFromEnv(awsProv *AWSProvider) []string {
+	regions := awsProv.ConfiguredRegions()
+	for _, region := range parseNodeRegions(os.Getenv("NODE_REGIONS")) {
+		regions = append(regions, region)
+	}
+	return sortedUniqueRegions(regions)
 }
 
 // regionForNode returns the region of the virtual node a pod is bound to, falling back to the default region.

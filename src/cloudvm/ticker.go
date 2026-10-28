@@ -72,18 +72,20 @@ type SpotPriceTicker struct {
 	regionCallTimeout   time.Duration
 	fetcherFactory      func(ctx context.Context, region string) (SpotPriceFetcher, error)
 
-	metrics       *ObservabilityMetrics
-	advisor       *SpotAdvisorCollector
-	gcpMarket     *GCPMarketCollector
-	solver        *FillSolver
-	catalog       *HardwareCatalog
-	onDemand      *OnDemandPriceBook
-	transfer      *TransferPriceBook
-	spotCapacity  map[string]map[int]float64
-	quotasAPI     AWSServiceQuotasAPI
-	quotasFactory func(region string) AWSServiceQuotasAPI
-	usageFactory  func(region string) AWSUsageAPI
-	probeCaps     map[probeCapKey]probeCap
+	metrics   *ObservabilityMetrics
+	advisor   *SpotAdvisorCollector
+	gcpMarket *GCPMarketCollector
+	solver    *FillSolver
+	catalog   *HardwareCatalog
+	onDemand  *OnDemandPriceBook
+	transfer  *TransferPriceBook
+	// transferRegions are launch regions priced for transfer besides the market regions.
+	transferRegions []string
+	spotCapacity    map[string]map[int]float64
+	quotasAPI       AWSServiceQuotasAPI
+	quotasFactory   func(region string) AWSServiceQuotasAPI
+	usageFactory    func(region string) AWSUsageAPI
+	probeCaps       map[probeCapKey]probeCap
 
 	probeMaxInstances int
 }
@@ -304,6 +306,13 @@ func (t *SpotPriceTicker) SetPricingAPI(api AWSPricingAPI) {
 	defer t.mu.Unlock()
 	t.onDemand = NewOnDemandPriceBook(api)
 	t.transfer = NewTransferPriceBook(api, t.transfer.Regions()...)
+}
+
+// SetTransferRegions sets the launch regions whose transfer prices the ticker exports along with its market regions.
+func (t *SpotPriceTicker) SetTransferRegions(regions []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.transferRegions = append([]string(nil), regions...)
 }
 
 // TransferPrices returns the transfer price book this ticker exports.
@@ -696,8 +705,12 @@ func (t *SpotPriceTicker) syncMarketMetrics(ctx context.Context) {
 		})
 	}
 
-	// AWS data transfer prices between the launch regions, reloaded on the on-demand price schedule
+	// AWS data transfer prices between the launch and market regions, reloaded on the on-demand price schedule
+	t.mu.RLock()
+	transferRegions := sortedUniqueRegions(append(append([]string(nil), t.transferRegions...), t.regions...))
+	t.mu.RUnlock()
 	transferPrices := t.TransferPrices()
+	transferPrices.SetRegions(transferRegions)
 	transferPrices.Refresh(ctx)
 	for _, p := range transferPrices.Prices() {
 		t.metrics.SetTransferPrice("aws", p.Source, p.Destination, string(p.Kind), p.USDPerGB)

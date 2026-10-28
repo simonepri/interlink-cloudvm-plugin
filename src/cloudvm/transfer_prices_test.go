@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 )
 
@@ -257,7 +260,7 @@ func TestSpotPriceTicker_ExportsTransferPrices(t *testing.T) {
 	ticker.SetMetrics(metrics)
 	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return &mockEC2TickerFetcher{}, nil })
 	ticker.SetPricingAPI(&fakeTransferPricing{t: t, products: twoRegionProducts()})
-	ticker.TransferPrices().SetRegions([]string{"us-east-1", "us-east-2"})
+	ticker.SetTransferRegions([]string{"us-east-2"})
 	ticker.SetAdvisorCollector(NewSpotAdvisorCollector("", &mockHTTPClient{err: errors.New("offline")}))
 
 	ticker.syncMarketMetrics(context.Background())
@@ -280,5 +283,108 @@ func TestSpotPriceTicker_ExportsTransferPrices(t *testing.T) {
 	}
 	if price, ok := ticker.TransferPrice("us-east-2", "internet", TransferInternet); !ok || price != 0.09 {
 		t.Errorf("ticker TransferPrice = %v, %v, want 0.09, true", price, ok)
+	}
+}
+
+// allPairProducts prices every route between regions: $0.02 cross-region, $0.01 cross-zone, and $0.09 internet.
+func allPairProducts(regions ...string) []fakeTransferProduct {
+	var products []fakeTransferProduct
+	for _, src := range regions {
+		for _, dst := range regions {
+			if dst != src {
+				products = append(products, fakeTransferProduct{transferType: "InterRegion Outbound", from: src, to: dst, tiers: []fakeTransferTier{{begin: "0", price: usd("0.02")}}})
+			}
+		}
+		products = append(products,
+			fakeTransferProduct{transferType: "IntraRegion", from: src, to: src, tiers: []fakeTransferTier{{begin: "0", price: usd("0.01")}}},
+			fakeTransferProduct{transferType: "AWS Outbound", from: src, toLocation: "External", tiers: []fakeTransferTier{{begin: "0", price: usd("0.09")}}},
+		)
+	}
+	return products
+}
+
+func transferSeries(t *testing.T, ticker *SpotPriceTicker, metrics *ObservabilityMetrics) string {
+	t.Helper()
+	ticker.syncMarketMetrics(context.Background())
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	return rec.Body.String()
+}
+
+func crossRegionLine(src, dst string) string {
+	return `cloudvm_transfer_price_usd_per_gb{destination_region="` + dst + `",provider="aws",source_region="` + src + `",transfer_kind="cross_region"} 0.02`
+}
+
+func TestSpotPriceTicker_PricesTransfersBetweenTickerAndNodeRegions(t *testing.T) {
+	t.Setenv("REGION_STORE_PATH", t.TempDir()+"/regions.json")
+	t.Setenv("AWS_REGION", "us-west-2")
+	t.Setenv("AWS_REGIONS", "")
+	t.Setenv("TICKER_REGIONS", "ap-northeast-1,eu-west-1,us-west-2")
+	t.Setenv("TICKER_INSTANCE_TYPES", "p5.48xlarge")
+	t.Setenv("NODE_REGIONS", `{"vk-apne1":"ap-northeast-1","vk-euw1":"eu-west-1","vk-usw2":"us-west-2","vk-use2":"us-east-2"}`)
+	regions := []string{"ap-northeast-1", "eu-west-1", "us-east-2", "us-west-2"}
+
+	ticker := newTickerFromEnv(NewAWSProvider("us-west-2"))
+	metrics := NewObservabilityMetrics()
+	ticker.SetMetrics(metrics)
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return &mockEC2TickerFetcher{}, nil })
+	ticker.SetPricingAPI(&fakeTransferPricing{t: t, products: allPairProducts(regions...)})
+	ticker.SetAdvisorCollector(NewSpotAdvisorCollector("", &mockHTTPClient{err: errors.New("offline")}))
+
+	body := transferSeries(t, ticker, metrics)
+	for _, src := range regions {
+		for _, dst := range regions {
+			if src != dst && !strings.Contains(body, crossRegionLine(src, dst)) {
+				t.Errorf("missing %s", crossRegionLine(src, dst))
+			}
+		}
+	}
+	if got, want := strings.Count(body, "\ncloudvm_transfer_price_usd_per_gb{"), len(regions)*(len(regions)+1); got != want {
+		t.Errorf("exported %d transfer prices, want %d:\n%s", got, want, body)
+	}
+}
+
+func TestSpotPriceTicker_PricesTransfersBetweenDiscoveredRegions(t *testing.T) {
+	regions := []string{"eu-west-1", "us-east-1", "us-west-2"}
+	fetcher := &mockEC2TickerFetcher{regionsOutput: &ec2.DescribeRegionsOutput{Regions: []ec2types.Region{
+		{RegionName: aws.String("us-west-2")}, {RegionName: aws.String("eu-west-1")}, {RegionName: aws.String("us-east-1")},
+	}}}
+	ticker := NewSpotPriceTicker([]string{"auto"}, []string{"p5.48xlarge"}, time.Minute, "us-west-2")
+	metrics := NewObservabilityMetrics()
+	ticker.SetMetrics(metrics)
+	ticker.SetFetcherFactory(func(_ context.Context, _ string) (SpotPriceFetcher, error) { return fetcher, nil })
+	ticker.SetPricingAPI(&fakeTransferPricing{t: t, products: allPairProducts(regions...)})
+	ticker.SetTransferRegions([]string{"us-west-2"})
+	ticker.SetAdvisorCollector(NewSpotAdvisorCollector("", &mockHTTPClient{err: errors.New("offline")}))
+	ticker.refreshDiscoveredRegions(context.Background())
+
+	body := transferSeries(t, ticker, metrics)
+	for _, src := range regions {
+		for _, dst := range regions {
+			if src != dst && !strings.Contains(body, crossRegionLine(src, dst)) {
+				t.Errorf("missing %s", crossRegionLine(src, dst))
+			}
+		}
+	}
+}
+
+func TestTransferPriceBook_SetRegionsKeepsPricesForTheSameSet(t *testing.T) {
+	client := &fakeTransferPricing{t: t, products: allPairProducts("us-east-1", "us-west-2")}
+	book := NewTransferPriceBook(client, "us-west-2", "us-east-1")
+	book.Refresh(context.Background())
+	calls := client.callCount()
+
+	book.SetRegions([]string{"us-east-1", "auto", "us-west-2", "us-east-1", ""})
+	if got := book.Regions(); !slices.Equal(got, []string{"us-east-1", "us-west-2"}) {
+		t.Errorf("Regions() = %v, want sorted and deduplicated without the auto sentinel", got)
+	}
+	book.Refresh(context.Background())
+	if client.callCount() != calls {
+		t.Error("SetRegions with the same regions forgot cached prices")
+	}
+	book.SetRegions([]string{"us-east-1"})
+	book.Refresh(context.Background())
+	if client.callCount() == calls {
+		t.Error("SetRegions with other regions kept prices priced for the old set")
 	}
 }
