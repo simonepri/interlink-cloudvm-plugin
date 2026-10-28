@@ -47,7 +47,8 @@ type Server struct {
 	instances             map[string]*Instance // key: UID and namespace/podName -> *Instance
 	clusterTag            string
 	defaultRegion         string
-	nodeRegions           map[string]string // virtual node name -> region its pods launch in
+	nodeRegions           map[string]string // virtual node name -> region its pods launch in when the node has no region label
+	nodeRegionLookup      NodeRegionLookup  // region labels of cluster nodes; nil without cluster access
 	reconciler            *Reconciler
 	nodePool              *NodePool
 	kmsClient             KMSClient
@@ -198,14 +199,56 @@ func launchRegionsFromEnv(awsProv *AWSProvider) []string {
 	return sortedUniqueRegions(regions)
 }
 
-// regionForNode returns the region of the virtual node a pod is bound to, falling back to the default region.
-func (s *Server) regionForNode(nodeName string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if region := s.nodeRegions[nodeName]; region != "" {
-		return region
+// SetNodeRegionLookup sets the source of node region labels.
+func (s *Server) SetNodeRegionLookup(l NodeRegionLookup) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nodeRegionLookup = l
+}
+
+// launchRegion returns the region a pod launches in: the cloudvm.vk.io/region annotation, the region label of the node
+// the pod is bound to, the NODE_REGIONS entry of that node, then the pod's topology.kubernetes.io/region node selector.
+// It returns an error rather than a default region when none of them names one.
+func (s *Server) launchRegion(pod *Pod) (string, error) {
+	if region := pod.Metadata.Annotations["cloudvm.vk.io/region"]; region != "" {
+		return region, nil
 	}
-	return s.defaultRegion
+	nodeName := pod.Spec.NodeName
+	s.mu.RLock()
+	lookup := s.nodeRegionLookup
+	mapped := s.nodeRegions[nodeName]
+	s.mu.RUnlock()
+	if lookup != nil && nodeName != "" {
+		if region := lookup.NodeRegion(nodeName); region != "" {
+			return region, nil
+		}
+	}
+	if mapped != "" {
+		return mapped, nil
+	}
+	if region := pod.Spec.NodeSelector[regionLabel]; region != "" {
+		return region, nil
+	}
+	return "", fmt.Errorf("no launch region for node %q: it has no %s label and no NODE_REGIONS entry, and the pod sets neither the cloudvm.vk.io/region annotation nor a %s node selector", nodeName, regionLabel, regionLabel)
+}
+
+// recordNoRegionEvent posts a warning on a pod that was refused for lack of a launch region.
+func (s *Server) recordNoRegionEvent(ctx context.Context, pod *Pod, cause error) {
+	s.mu.RLock()
+	recorder := s.eventRecorder
+	s.mu.RUnlock()
+	if recorder == nil {
+		return
+	}
+	msg := cause.Error()
+	if len(msg) > maxPodEventMessage {
+		msg = msg[:maxPodEventMessage]
+	}
+	eventCtx, cancel := context.WithTimeout(ctx, podEventTimeout)
+	defer cancel()
+	if err := recorder.RecordPodEvent(eventCtx, pod.Metadata.Namespace, pod.Metadata.Name, pod.Metadata.UID, corev1.EventTypeWarning, "CloudVMRegionUnknown", msg); err != nil {
+		log.Printf("[cloudvm] Warning: %v", err)
+	}
 }
 
 // SetRegistryMirrors configures default container registry mirror endpoints.
@@ -661,7 +704,15 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var finalResp *CreateStruct
 	var finalErr error
 
-	spec, err := PodToInstanceSpec(pod, s.clusterTag, s.regionForNode(pod.Spec.NodeName))
+	region, err := s.launchRegion(pod)
+	if err != nil {
+		finalErr = err
+		log.Printf("[cloudvm] Refusing pod %s/%s: %v", pod.Metadata.Namespace, pod.Metadata.Name, err)
+		s.recordNoRegionEvent(r.Context(), pod, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	spec, err := PodToInstanceSpec(pod, s.clusterTag, region)
 	if err != nil {
 		finalErr = err
 		http.Error(w, err.Error(), http.StatusBadRequest)

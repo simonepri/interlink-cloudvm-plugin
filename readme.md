@@ -525,7 +525,14 @@ The idle collector terminates a VM once its last pod has been gone for `IDLE_GRA
 
 ### Regional Virtual Nodes
 
-Run one Virtual Kubelet per region and map each node name to its region with `NODE_REGIONS` (`provider.nodeRegions` in Helm), a JSON object such as `{"virtual-node-region-a":"eu-west-1"}`. A pod bound to a mapped node launches in that node's region. The region is chosen in this order: the `cloudvm.vk.io/region` annotation, the bound node's region, the pod's `topology.kubernetes.io/region` node selector, then `AWS_REGION`.
+Run Virtual Kubelet nodes in any number per region, for example one per GPU class and capacity type. A pod launches in the region of the node it is bound to, chosen in this order:
+
+1. The pod's `cloudvm.vk.io/region` annotation.
+2. The bound node's `topology.kubernetes.io/region` label, which the plugin reads through a node watch. The service account needs `get`, `list`, and `watch` on `nodes`; the Helm chart's ClusterRole grants them.
+3. The bound node's entry in `NODE_REGIONS` (`provider.nodeRegions` in Helm), a JSON object such as `{"virtual-node-region-a":"eu-west-1"}`, for nodes without the label.
+4. The pod's `topology.kubernetes.io/region` node selector.
+
+When none of them names a region, the plugin refuses the pod with HTTP 400 and a `CloudVMRegionUnknown` warning event on the pod, and launches nothing. `AWS_REGION` is not a fallback; it remains the plugin's own home region for pricing and the other uses described in this readme.
 
 ### Availability Zone Filtering and Region Fallback
 

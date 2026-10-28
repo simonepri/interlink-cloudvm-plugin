@@ -272,6 +272,13 @@ func run() error {
 		log.Printf("[cloudvm] Pods get no AWS credentials for their service account roles: %v", err)
 	}
 
+	if nodeWatch, err := NewInClusterNodeWatch(); err != nil {
+		log.Printf("[cloudvm] Node watch unavailable, so pods launch only in regions set by annotation, node selector, or NODE_REGIONS: %v", err)
+	} else {
+		nodeWatch.Start(ctx)
+		server.SetNodeRegionLookup(nodeWatch)
+	}
+
 	podWatch, err := NewInClusterPodWatch()
 	if err != nil {
 		log.Printf("[cloudvm] Pod watch unavailable, so the reconciler keeps VMs of deleted pods and the tunnel refuses tcp streams: %v", err)
