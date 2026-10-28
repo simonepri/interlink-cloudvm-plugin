@@ -16,13 +16,12 @@ import (
 // ProbeGPUCounts are the GPU counts at which the ticker asks AWS how likely it is to get spot capacity.
 var ProbeGPUCounts = []int{8, 64, 256, 1024}
 
-// DefaultProbeMaxInstances is the largest target capacity, in instances, a probe asks about.
-// AWS rejects larger targets with TargetCapacityLimitExceeded once they pass the account's exploration limit, about 50 instances.
-const DefaultProbeMaxInstances = 50
-
 // probeCapRetry is how long the ticker skips probe targets at or above one AWS rejected as too large.
-// AWS sets that limit from the account's recent spot usage, so it can grow; a day later the ticker tries again.
-const probeCapRetry = 24 * time.Hour
+// AWS sets that limit from the account's recent usage, so it can grow; six hours later the ticker tries again.
+const probeCapRetry = 6 * time.Hour
+
+// maxProbeBackoffs is the most extra requests per wanted size and pass that halve a rejected target.
+const maxProbeBackoffs = 3
 
 // probeCapKey identifies the probe group a learned target limit applies to.
 type probeCapKey struct {
@@ -76,10 +75,10 @@ func (t *SpotPriceTicker) probeGroups(ctx context.Context) []probeGroup {
 }
 
 // ProbeSpotCapacity asks AWS for regional spot placement scores per probe group and probed GPU count, keyed like FillLimits.SpotScores.
-// A probe asks about at most probeMaxInstances instances. A larger ProbeGPUCounts entry is probed at that cap and its score is stored under
-// the GPU count actually probed, so a score always means "AWS rates getting this many GPUs at this likelihood"; the planner then takes no
-// spot GPUs beyond the largest probed count that scores well.
-// A request AWS rejects anyway, because the account's limit is lower than the cap, leaves that GPU count unscored and is logged once.
+// A probe asks about the real target size unless the operator set a cap with SetProbeMaxInstances. When AWS rejects a target as above the
+// account's limit, the ticker remembers it for probeCapRetry and probes that wanted size at half the rejected one instead, halving again up
+// to maxProbeBackoffs times until AWS accepts. A score is stored under the GPU count actually probed, so it always means "AWS rates getting
+// this many GPUs at this likelihood"; the planner then takes no spot GPUs beyond the largest probed count that scores well.
 func (t *SpotPriceTicker) ProbeSpotCapacity(ctx context.Context) map[string]map[int]float64 {
 	scores := make(map[string]map[int]float64)
 	regions := t.Regions()
@@ -95,30 +94,23 @@ func (t *SpotPriceTicker) ProbeSpotCapacity(ctx context.Context) map[string]map[
 	for _, group := range t.probeGroups(ctx) {
 		capKey := probeCapKey{group.minGPUMemoryGB, group.gpusPerInstance}
 		probed := make(map[int]bool)
-		for _, wanted := range ProbeGPUCounts {
-			instances := min(ceilDiv(wanted, group.gpusPerInstance), t.maxProbeInstances())
-			if probed[instances] {
-				continue
-			}
-			probed[instances] = true
+		// probe reports whether AWS rejected the target as above the account's limit.
+		probe := func(instances int) bool {
 			gpus := instances * group.gpusPerInstance
-			if t.probeTooLarge(capKey, instances) {
-				continue
-			}
 			for start := 0; start < len(regions); start += maxPlacementScoreRegions {
 				batch := regions[start:min(start+maxPlacementScoreRegions, len(regions))]
 				callCtx, cancel := context.WithTimeout(ctx, t.regionCallTimeout)
 				out, err := fetcher.GetSpotPlacementScores(callCtx, &ec2.GetSpotPlacementScoresInput{
 					InstanceTypes:          group.instanceTypes,
 					RegionNames:            batch,
-					TargetCapacity:         aws.Int32(int32(instances)), //nolint:gosec // probe sizes are small constants
+					TargetCapacity:         aws.Int32(int32(instances)), //nolint:gosec // probe sizes fit in int32
 					SingleAvailabilityZone: aws.Bool(false),
 				})
 				cancel()
 				var apiErr smithy.APIError
 				if errors.As(err, &apiErr) && apiErr.ErrorCode() == "TargetCapacityLimitExceeded" {
 					t.rememberProbeLimit(capKey, instances)
-					break
+					return true
 				}
 				if err != nil {
 					log.Printf("[cloudvm-ticker] Spot capacity probe for %d GPUs of %d-GPU shapes at %d GB failed: %v", gpus, group.gpusPerInstance, group.minGPUMemoryGB, err) //nolint:gosec // integers and an AWS error
@@ -132,17 +124,40 @@ func (t *SpotPriceTicker) ProbeSpotCapacity(ctx context.Context) map[string]map[
 					scores[key][gpus] = float64(aws.ToInt32(item.Score))
 				}
 			}
+			return false
+		}
+		for _, wanted := range ProbeGPUCounts {
+			instances := ceilDiv(wanted, group.gpusPerInstance)
+			if limit := t.maxProbeInstances(); limit > 0 {
+				instances = min(instances, limit)
+			}
+			backoffs := 0
+			for instances >= 1 && !probed[instances] {
+				if limit, ok := t.probeLimit(capKey); ok && instances >= limit {
+					instances = limit / 2
+					continue
+				}
+				probed[instances] = true
+				if !probe(instances) || backoffs >= maxProbeBackoffs {
+					break
+				}
+				backoffs++
+				instances /= 2
+			}
 		}
 	}
 	return scores
 }
 
-// probeTooLarge reports whether AWS recently rejected a target of this many instances, or fewer, for the probe group.
-func (t *SpotPriceTicker) probeTooLarge(key probeCapKey, instances int) bool {
+// probeLimit returns the smallest target AWS recently rejected for the probe group, if that rejection is still honored.
+func (t *SpotPriceTicker) probeLimit(key probeCapKey) (int, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	c, ok := t.probeCaps[key]
-	return ok && time.Now().Before(c.until) && instances >= c.instances
+	if !ok || !time.Now().Before(c.until) {
+		return 0, false
+	}
+	return c.instances, true
 }
 
 // rememberProbeLimit records that AWS rejected a target of this many instances for the probe group, until probeCapRetry passes.
@@ -162,18 +177,16 @@ func (t *SpotPriceTicker) rememberProbeLimit(key probeCapKey, instances int) {
 	t.probeCaps[key] = c
 }
 
-// SetProbeMaxInstances overrides the largest target capacity, in instances, a spot capacity probe asks about; values below 1 restore the default.
+// SetProbeMaxInstances overrides the largest target capacity, in instances, a spot capacity probe asks about; values below 1 remove the cap.
 func (t *SpotPriceTicker) SetProbeMaxInstances(n int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.probeMaxInstances = n
 }
 
+// maxProbeInstances returns the operator's cap on probe targets, or 0 for none.
 func (t *SpotPriceTicker) maxProbeInstances() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if t.probeMaxInstances < 1 {
-		return DefaultProbeMaxInstances
-	}
-	return t.probeMaxInstances
+	return max(t.probeMaxInstances, 0)
 }
