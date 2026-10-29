@@ -19,6 +19,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
+	github.com/simonepri/interlink-cloudvm-plugin/nodeclaim v0.0.0
 	go.mozilla.org/pkcs7 v0.10.0
 	golang.org/x/net v0.61.0
 	golang.org/x/time v0.16.0
@@ -28,6 +29,8 @@ require (
 	k8s.io/client-go v0.36.1
 	sigs.k8s.io/karpenter v1.15.1
 )
+
+replace github.com/simonepri/interlink-cloudvm-plugin/nodeclaim => ./nodeclaim
 
 require (
 	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a // indirect

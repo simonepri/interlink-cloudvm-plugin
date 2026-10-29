@@ -1,4 +1,5 @@
-// Caches the region label of every node through a shared informer so pods launch in the region of the node they bind to.
+// Caches the region label of every node through a shared informer so pods launch in the region of the node they bind
+// to, and remembers which nodes the node agent serves so their pods never launch a VM of their own.
 package main
 
 import (
@@ -13,6 +14,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
 
 // regionLabel is the well-known node label that names the region a node runs in.
@@ -24,21 +27,32 @@ type NodeRegionLookup interface {
 	NodeRegion(nodeName string) string
 }
 
+// NodeAgentLookup reports whether the node agent serves a node, which makes it the Node of a NodeClaim.
+type NodeAgentLookup interface {
+	ServedByNodeAgent(nodeName string) bool
+}
+
 // NodeWatch caches node names and region labels. It needs get, list, and watch on nodes.
 type NodeWatch struct {
 	informer cache.SharedIndexInformer
 	factory  informers.SharedInformerFactory
 }
 
-// NewNodeWatch creates a watch backed by client. Only the name and the region label stay in the cache.
+// NewNodeWatch creates a watch backed by client. Only the name, the region label and the node agent label stay in the
+// cache.
 func NewNodeWatch(client kubernetes.Interface) *NodeWatch {
 	factory := informers.NewSharedInformerFactory(client, 0)
 	inf := factory.Core().V1().Nodes().Informer()
 	_ = inf.SetTransform(func(obj any) (any, error) {
 		if node, ok := obj.(*corev1.Node); ok {
 			trimmed := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: node.Name}}
-			if region := node.Labels[regionLabel]; region != "" {
-				trimmed.Labels = map[string]string{regionLabel: region}
+			for _, key := range []string{regionLabel, nodeclaim.LabelNodeAgent} {
+				if v := node.Labels[key]; v != "" {
+					if trimmed.Labels == nil {
+						trimmed.Labels = map[string]string{}
+					}
+					trimmed.Labels[key] = v
+				}
 			}
 			return trimmed, nil
 		}
@@ -87,4 +101,17 @@ func (w *NodeWatch) NodeRegion(nodeName string) string {
 		return node.Labels[regionLabel]
 	}
 	return ""
+}
+
+// ServedByNodeAgent reports whether the cached node carries the node agent label.
+func (w *NodeWatch) ServedByNodeAgent(nodeName string) bool {
+	if !w.informer.HasSynced() {
+		return false
+	}
+	obj, exists, err := w.informer.GetStore().GetByKey(nodeName)
+	if err != nil || !exists {
+		return false
+	}
+	node, ok := obj.(*corev1.Node)
+	return ok && node.Labels[nodeclaim.LabelNodeAgent] == "true"
 }

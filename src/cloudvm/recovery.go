@@ -73,6 +73,9 @@ func (s *Server) buildRecoveredNode(inst *Instance, podUID, ns, marketType strin
 // AdoptInstance re-adopts an active cloud VM into the server tracked state if it has valid pod tags
 // and has not been explicitly deleted or completed.
 func (s *Server) AdoptInstance(ctx context.Context, inst *Instance) bool {
+	if s.IsClaimInstance(inst.ID) {
+		return true
+	}
 	podUID, podName, ns, marketType := extractInstanceIdentity(inst)
 	if podUID == "" || podName == "" {
 		return false
@@ -163,6 +166,10 @@ func (s *Server) RecoverActiveInstances(ctx context.Context, inv CloudInventory)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, inst := range instances {
+		if s.IsClaimInstance(inst.ID) {
+			// RecoverClaims restores claim VMs from their records.
+			continue
+		}
 		podUID, podName, ns, marketType := extractInstanceIdentity(inst)
 		if s.isTombstonedLocked(podUID) || s.isTombstonedLocked(inst.ID) {
 			log.Printf("[cloudvm] Skipping tombstoned instance %s (pod %s) during startup recovery", sanitizeLog(inst.ID), sanitizeLog(podUID)) //nolint:gosec // sanitized

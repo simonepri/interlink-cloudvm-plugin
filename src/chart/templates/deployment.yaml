@@ -105,6 +105,8 @@ spec:
               value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/completed-pods.json"
             - name: TOMBSTONE_STORE_PATH
               value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/tombstones.json"
+            - name: CLAIM_STORE_PATH
+              value: "{{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}/nodeclaims.json"
             {{- if and .Values.database .Values.database.url }}
             - name: DATABASE_URL
               value: {{ .Values.database.url | quote }}

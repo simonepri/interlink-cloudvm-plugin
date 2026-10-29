@@ -49,6 +49,9 @@ type CloudVMNode struct {
 	UnknownCoTenantsRetries int            `json:"unknownCoTenantsRetries,omitempty"`
 	UnknownSince            time.Time      `json:"unknownSince,omitempty"`
 	RunnerAuthToken         string         `json:"runnerAuthToken,omitempty"`
+	// ClaimName is the NodeClaim the VM was launched for. Such a VM takes only the pods bound to that claim's Node,
+	// and only deleting the claim terminates it.
+	ClaimName string `json:"claimName,omitempty"`
 
 	// idleHoldLogged records that the idle collector logged why it keeps this expired idle node.
 	idleHoldLogged bool
@@ -391,6 +394,8 @@ type AllocationRequest struct {
 	// Accepts reports whether a node meets the pod's instance constraints; nil accepts every node. AllocatePod calls it
 	// under the pool lock, so it must not block or call back into the pool.
 	Accepts func(*CloudVMNode) bool
+	// ClaimName places the pod on the VM of that NodeClaim and nowhere else; empty places it on a VM of no claim.
+	ClaimName string
 }
 
 // Allocation is the node and devices a pod was bin-packed into.
@@ -416,7 +421,7 @@ func (np *NodePool) AllocatePod(a AllocationRequest) (*Allocation, error) {
 
 	req, region, namespace := a.Resources, a.Region, a.Namespace
 	for _, node := range np.nodes {
-		if node.Cordoned {
+		if node.Cordoned || node.ClaimName != a.ClaimName {
 			continue
 		}
 		if a.Spot != nil && node.Spot != *a.Spot {
@@ -436,7 +441,8 @@ func (np *NodePool) AllocatePod(a AllocationRequest) (*Allocation, error) {
 		if a.Accepts != nil && !a.Accepts(node) {
 			continue
 		}
-		if node.isIdle() && !np.reusableLocked(node, now) {
+		// A claim VM lives until its claim is deleted, so it takes pods whether or not it is idle.
+		if node.ClaimName == "" && node.isIdle() && !np.reusableLocked(node, now) {
 			continue
 		}
 
@@ -593,7 +599,7 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	now := time.Now()
 
 	for id, node := range np.nodes {
-		if node.ActivePodCount() != 0 {
+		if node.ActivePodCount() != 0 || node.ClaimName != "" {
 			node.idleHoldLogged = false
 			continue
 		}
@@ -629,7 +635,7 @@ func (np *NodePool) RejectReuse(instanceID, podUID string, reason SpinDownReason
 
 // ClaimForTermination reports whether a path outside the idle collector may terminate a VM, and marks a pooled one
 // for spin-down so no pod is allocated to it before it terminates. It refuses a pooled VM with active pods or
-// unverified co-tenants, and an idle one still in the grace period during which it may be reused.
+// unverified co-tenants, an idle one still in the grace period during which it may be reused, and a NodeClaim's VM.
 func (np *NodePool) ClaimForTermination(instanceID string) bool {
 	np.mu.Lock()
 	defer np.mu.Unlock()
@@ -637,7 +643,7 @@ func (np *NodePool) ClaimForTermination(instanceID string) bool {
 	if !ok || node == nil {
 		return true
 	}
-	if node.ActivePodCount() > 0 || node.UnknownCoTenants {
+	if node.ActivePodCount() > 0 || node.UnknownCoTenants || node.ClaimName != "" {
 		return false
 	}
 	if !node.Cordoned && node.IdleSince != nil && np.idleGracePeriod > 0 && time.Since(*node.IdleSince) <= np.idleGracePeriod {

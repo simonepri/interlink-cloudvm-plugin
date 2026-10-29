@@ -5,6 +5,7 @@ ARG TARGETARCH
 
 WORKDIR /src
 
+COPY nodeclaim ./nodeclaim
 COPY go.mod go.sum ./
 RUN go mod download
 
