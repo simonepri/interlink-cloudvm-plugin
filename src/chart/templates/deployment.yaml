@@ -49,7 +49,11 @@ spec:
             {{- end }}
             - name: NODECLAIM_API_AUDIENCE
               value: {{ .Values.nodeClaimAPI.audience | quote }}
-            {{- with .Values.nodeClaimAPI.allowedUsers }}
+            {{- $users := .Values.nodeClaimAPI.allowedUsers }}
+            {{- if .Values.nodeAgent.enabled }}
+            {{- $users = append $users (printf "system:serviceaccount:%s:%s-node-agent" .Release.Namespace (include "interlink-cloudvm-plugin.fullname" .)) }}
+            {{- end }}
+            {{- with $users }}
             - name: NODECLAIM_API_ALLOWED_USERS
               value: {{ join "," . | quote }}
             {{- end }}

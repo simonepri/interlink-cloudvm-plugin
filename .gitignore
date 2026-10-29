@@ -7,3 +7,6 @@ dist/
 *.out
 # Binary from building the cloudvm package in place
 src/cloudvm/cloudvm
+# Binaries from building or profiling the node agent in place
+src/nodeagent/nodeagent
+*.test

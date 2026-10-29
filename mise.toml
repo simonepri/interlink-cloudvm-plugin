@@ -28,6 +28,7 @@ description = "Run strict Go linting on every Go module"
 run = [
   "cd src && golangci-lint run --config ../.config/golangci.yaml ./...",
   "cd src/nodeclaim && golangci-lint run --config ../../.config/golangci.yaml ./...",
+  "cd src/nodeagent && golangci-lint run --config ../../.config/golangci.yaml ./...",
 ]
 
 [tasks.lint-mod]
@@ -35,6 +36,7 @@ description = "Verify Go module is tidy"
 run = [
   "go -C src mod tidy -diff",
   "go -C src/nodeclaim mod tidy -diff",
+  "go -C src/nodeagent mod tidy -diff",
 ]
 
 [tasks.lint-secrets]
@@ -46,6 +48,7 @@ description = "Check reachable Go code for known vulnerabilities"
 run = [
   "cd src && govulncheck ./...",
   "cd src/nodeclaim && govulncheck ./...",
+  "cd src/nodeagent && govulncheck ./...",
 ]
 
 [tasks.lint-yaml]
@@ -79,6 +82,7 @@ description = "Run race-enabled Go unit tests"
 run = [
   "go -C src test -race -count=1 -cover ./...",
   "go -C src/nodeclaim test -race -count=1 -cover ./...",
+  "go -C src/nodeagent test -race -count=1 -cover ./...",
 ]
 
 [tasks.verify]
@@ -93,6 +97,7 @@ description = "Build the provider binary"
 run = [
   "mkdir -p bin",
   "go -C src build -trimpath -ldflags='-s -w' -o ../bin/interlink-cloudvm-plugin ./cloudvm",
+  "go -C src/nodeagent build -trimpath -ldflags='-s -w' -o ../../bin/cloudvm-node-agent .",
 ]
 
 [tasks.ci]
