@@ -22,6 +22,12 @@ serviceAccount:
 plugin:
   # url is the base URL of the plugin's NodeClaim API, such as http://cloudvm-plugin.cloudvm.svc:4040.
   url: ""
+  # The controller authenticates to the plugin with a projected service account token bound to this audience.
+  # The plugin must accept the same audience and allow this release's service account,
+  # system:serviceaccount:<release namespace>:<service account name>.
+  tokenAudience: cloudvm-plugin
+  # tokenExpirationSeconds is the token lifetime; the kubelet refreshes it at 80% and the controller re-reads it.
+  tokenExpirationSeconds: 3600
 
 # leaderElectionName must differ from the other Karpenter controller's lease (karpenter-leader-election) when
 # both run in one namespace.

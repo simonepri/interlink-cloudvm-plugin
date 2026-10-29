@@ -484,7 +484,7 @@ helm upgrade --install cloudvm-ticker \
 
 `cloudvm-karpenter` runs a second Karpenter controller (core v1.15.0) next to the cluster's existing one. Karpenter splits work by NodeClass kind, so this controller manages only NodePools whose `nodeClassRef` is a `CloudVMNodeClass` and never touches the other controller's NodePools, NodeClaims, or Nodes. It launches one VM per NodeClaim through the plugin's NodeClaim API. Offerings cover every (region, zone, capacity type) in the NodeClass footprint, priced from the plugin's ticker plus an optional cross-region data cost, so Karpenter's cheapest-offering choice also picks the region.
 
-The chart installs only the `CloudVMNodeClass` CRD. The `karpenter.sh` CRDs must come from the cluster's other Karpenter release, which must run the same core minor version.
+The controller authenticates every plugin call with a projected service account token bound to the audience `plugin.tokenAudience` (default `cloudvm-plugin`). The plugin must accept that audience and allow the controller's service account, `system:serviceaccount:<release namespace>:<service account name>`; the controller refuses to start without the token. The chart installs only the `CloudVMNodeClass` CRD. The `karpenter.sh` CRDs must come from the cluster's other Karpenter release, which must run the same core minor version.
 
 ```bash
 helm upgrade --install cloudvm-karpenter \

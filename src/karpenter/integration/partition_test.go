@@ -49,6 +49,7 @@ import (
 
 	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/apis/v1alpha1"
 	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/cloudprovider"
+	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/pluginclient"
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
 
@@ -260,7 +261,15 @@ func TestTwoProvidersPartitionNodePoolsAndNodeClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	providerCfg.GPUClasses = []cloudprovider.GPUClass{{Class: "l4", Models: []string{"l4"}}}
-	cloudVM := cloudprovider.New(kube, nodeclaim.NewClient(plugin.URL, nil), providerCfg, clock.RealClock{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(pluginToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	api, err := pluginclient.New(plugin.URL, tokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloudVM := cloudprovider.New(kube, api, providerCfg, clock.RealClock{})
 	other := &recordingProvider{CloudProvider: fake.NewCloudProvider()}
 
 	// The CloudVMNodeClass must start Ready from its CRD default; the stub's class is made Ready explicitly.
