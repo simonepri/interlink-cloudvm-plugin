@@ -135,7 +135,7 @@ func gpuCatalog() nodeclaim.Catalog {
 		return nodeclaim.Offering{Region: region, Zone: zone, CapacityType: capacityType, PricePerHour: price, Available: true}
 	}
 	return nodeclaim.Catalog{InstanceTypes: []nodeclaim.InstanceType{{
-		Name: "g6.2xlarge", Provider: "aws", CPU: "8", Memory: "32Gi", GPUCount: 1, GPUModel: "L4 24GB", GPUMemoryGB: 24,
+		Name: "g6.2xlarge", Provider: "aws", CPU: "8", Memory: "32Gi", GPUCount: 1, GPUModel: "l4", GPUMemoryGB: 24,
 		GPUManufacturer: "nvidia", Architecture: "amd64", Family: "g6", Generation: "6", Size: "2xlarge",
 		Offerings: []nodeclaim.Offering{
 			offering("us-east-1", "us-east-1a", "spot", 0.40),

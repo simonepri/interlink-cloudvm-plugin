@@ -105,17 +105,6 @@ spec:
                 x-kubernetes-list-map-keys:
                 - region
                 x-kubernetes-list-type: map
-              image:
-                description: Image selects how the VM runs workloads.
-                properties:
-                  mode:
-                    description: Mode is "container" (generic image running the container
-                      runner) or "dlami" (GPU-ready image, faster boot).
-                    enum:
-                    - container
-                    - dlami
-                    type: string
-                type: object
               launchTemplateName:
                 description: LaunchTemplateName names the AWS launch template the
                   plugin launches from in every AWS region.

@@ -39,10 +39,14 @@ karpenter:
 
 # Provider configuration, rendered into the controller's config file.
 config:
-  # gpuClasses maps catalog GPU models to the gpu-class label value, matching the cluster's GPU classes.
+  # gpuClasses maps catalog GPU models to the gpu-class label value, matching the cluster's GPU classes;
+  # memoryGB pins a class to one GPU memory size.
   gpuClasses: []
   # - class: a100-80gb
-  #   models: ["A100 80GB"]
+  #   models: [a100]
+  #   memoryGB: 80
+  # - class: l4
+  #   models: [l4]
   # dataCost adds a per-hour cost to offerings outside homeRegion.
   dataCost: {}
   #   homeRegion: us-east-1

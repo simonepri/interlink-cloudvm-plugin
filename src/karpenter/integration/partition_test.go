@@ -259,7 +259,7 @@ func TestTwoProvidersPartitionNodePoolsAndNodeClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	providerCfg.GPUClasses = []cloudprovider.GPUClass{{Class: "l4", Models: []string{"L4 24GB"}}}
+	providerCfg.GPUClasses = []cloudprovider.GPUClass{{Class: "l4", Models: []string{"l4"}}}
 	cloudVM := cloudprovider.New(kube, nodeclaim.NewClient(plugin.URL, nil), providerCfg, clock.RealClock{})
 	other := &recordingProvider{CloudProvider: fake.NewCloudProvider()}
 

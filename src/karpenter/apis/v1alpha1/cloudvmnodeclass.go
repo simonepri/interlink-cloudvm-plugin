@@ -1,4 +1,4 @@
-// CloudVMNodeClass API: the regions, launch settings and image a CloudVM NodePool launches with.
+// CloudVMNodeClass API: the regions and launch settings a CloudVM NodePool launches with.
 // Karpenter NodePools reference it through spec.template.spec.nodeClassRef.
 
 package v1alpha1
@@ -19,9 +19,6 @@ type CloudVMNodeClassSpec struct {
 	// LaunchTemplateName names the AWS launch template the plugin launches from in every AWS region.
 	// +optional
 	LaunchTemplateName string `json:"launchTemplateName,omitempty"`
-	// Image selects how the VM runs workloads.
-	// +optional
-	Image Image `json:"image,omitzero"`
 	// Annotations are extra cloudvm.vk.io/* launch settings passed to the plugin unchanged.
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k.startsWith('cloudvm.vk.io/'))",message="annotation keys must start with cloudvm.vk.io/"
 	// +optional
@@ -45,14 +42,6 @@ type FootprintRegion struct {
 	// LaunchTemplateID is the AWS launch template ID for this region; it overrides LaunchTemplateName.
 	// +optional
 	LaunchTemplateID string `json:"launchTemplateID,omitempty"`
-}
-
-// Image selects the VM boot image.
-type Image struct {
-	// Mode is "container" (generic image running the container runner) or "dlami" (GPU-ready image, faster boot).
-	// +kubebuilder:validation:Enum=container;dlami
-	// +optional
-	Mode string `json:"mode,omitempty"`
 }
 
 // CloudVMNodeClassStatus reports whether the class is usable.

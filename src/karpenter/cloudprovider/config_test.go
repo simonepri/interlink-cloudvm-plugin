@@ -34,9 +34,13 @@ func TestLoadConfigFile(t *testing.T) {
 	cfg, err := LoadConfig(writeConfig(t, `
 gpuClasses:
   - class: a100-80gb
-    models: ["A100 80GB"]
+    models: [a100]
+    memoryGB: 80
+  - class: a100-40gb
+    models: [a100]
+    memoryGB: 40
   - class: a10g
-    models: ["A10G 24GB", "A10G"]
+    models: [a10g, "A10G 24GB"]
 dataCost:
   homeRegion: us-east-1
   defaultUSDPerHour: 0.02
@@ -52,9 +56,20 @@ nodePoolSelector:
 	if cfg.CatalogTTL.Duration != 30*time.Second {
 		t.Errorf("catalogTTL = %s", cfg.CatalogTTL.Duration)
 	}
-	for model, want := range map[string]string{"a100 80gb": "a100-80gb", "A10G": "a10g", " A10G  24GB ": "a10g", "H100 80GB": ""} {
-		if got := cfg.GPUClassFor(model); got != want {
-			t.Errorf("GPUClassFor(%q) = %q, want %q", model, got, want)
+	for _, tc := range []struct {
+		model    string
+		memoryGB int
+		want     string
+	}{
+		{"a100", 80, "a100-80gb"},
+		{"A100", 40, "a100-40gb"},
+		{"a100", 16, ""},
+		{"A10G", 24, "a10g"},
+		{" A10G  24GB ", 0, "a10g"},
+		{"h100", 80, ""},
+	} {
+		if got := cfg.GPUClassFor(tc.model, tc.memoryGB); got != tc.want {
+			t.Errorf("GPUClassFor(%q, %d) = %q, want %q", tc.model, tc.memoryGB, got, tc.want)
 		}
 	}
 	for region, want := range map[string]float64{"us-east-1": 0, "ap-south-1": 0.15, "eu-west-1": 0.02} {
@@ -67,6 +82,7 @@ nodePoolSelector:
 func TestLoadConfigRejectsInvalid(t *testing.T) {
 	for name, body := range map[string]string{
 		"conflicting model": "gpuClasses: [{class: a, models: [L4]}, {class: b, models: [l4]}]",
+		"negative memory":   "gpuClasses: [{class: a, models: [l4], memoryGB: -1}]",
 		"negative cost":     "dataCost: {homeRegion: x, perRegionUSDPerHour: {y: -1}}",
 		"unknown field":     "gpuClass: []",
 		"bad duration":      "catalogTTL: soon",

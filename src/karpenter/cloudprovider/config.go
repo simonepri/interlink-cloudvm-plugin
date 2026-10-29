@@ -34,12 +34,14 @@ type Config struct {
 	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
 }
 
-// GPUClass assigns a gpu-class label value to GPU models.
+// GPUClass assigns a gpu-class label value to GPU models, optionally only at one GPU memory size.
 type GPUClass struct {
 	// Class is the gpu-class label value, such as a100-80gb.
 	Class string `json:"class"`
-	// Models are catalog GPU model names, such as "A100 80GB", compared case-insensitively.
+	// Models are catalog GPU model names, such as "a100", compared case-insensitively.
 	Models []string `json:"models"`
+	// MemoryGB restricts the class to GPUs with this much memory each; 0 matches any size.
+	MemoryGB int `json:"memoryGB,omitempty"`
 }
 
 // DataCost holds the per-hour cost added to offerings outside the home region.
@@ -120,10 +122,13 @@ func (c *Config) complete() error {
 		if gc.Class == "" {
 			return fmt.Errorf("gpuClasses: class is required")
 		}
+		if gc.MemoryGB < 0 {
+			return fmt.Errorf("gpuClasses[%s]: memoryGB must not be negative", gc.Class)
+		}
 		for _, m := range gc.Models {
-			key := normalizeModel(m)
+			key := fmt.Sprintf("%s/%d", normalizeModel(m), gc.MemoryGB)
 			if prev, ok := seen[key]; ok && prev != gc.Class {
-				return fmt.Errorf("gpuClasses: model %q maps to both %q and %q", m, prev, gc.Class)
+				return fmt.Errorf("gpuClasses: model %q at %d GB maps to both %q and %q", m, gc.MemoryGB, prev, gc.Class)
 			}
 			seen[key] = gc.Class
 		}
@@ -139,17 +144,25 @@ func (c *Config) complete() error {
 	return nil
 }
 
-// GPUClassFor returns the gpu-class of a GPU model, or "" when the mapping has none.
-func (c *Config) GPUClassFor(model string) string {
+// GPUClassFor returns the gpu-class of a GPU model with memoryGB per GPU, or "" when the mapping has none. A class
+// pinned to the GPU's memory size wins over one that matches any size.
+func (c *Config) GPUClassFor(model string, memoryGB int) string {
 	key := normalizeModel(model)
+	anySize := ""
 	for _, gc := range c.GPUClasses {
 		for _, m := range gc.Models {
-			if normalizeModel(m) == key {
+			if normalizeModel(m) != key {
+				continue
+			}
+			if gc.MemoryGB == memoryGB {
 				return gc.Class
+			}
+			if gc.MemoryGB == 0 && anySize == "" {
+				anySize = gc.Class
 			}
 		}
 	}
-	return ""
+	return anySize
 }
 
 // DataCostFor returns the per-hour adder for an offering in a region.
