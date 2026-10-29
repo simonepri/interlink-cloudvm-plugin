@@ -1,0 +1,11 @@
+{{/* Provider configuration file: GPU class mapping, data cost, NodePool selector and catalog cache settings. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cloudvm-karpenter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudvm-karpenter.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml .Values.config | nindent 4 }}

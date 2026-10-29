@@ -3,6 +3,8 @@ actionlint = "1.7.12"
 gitleaks = "8.30.1"
 go = "1.27.3"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
+"go:sigs.k8s.io/controller-runtime/tools/setup-envtest" = "0.24.1"
+"go:sigs.k8s.io/controller-tools/cmd/controller-gen" = "0.21.0"
 golangci-lint = "2.15.0"
 helm = "3.22.1"
 kind = "0.33.0"
@@ -29,6 +31,7 @@ run = [
   "cd src && golangci-lint run --config ../.config/golangci.yaml ./...",
   "cd src/nodeclaim && golangci-lint run --config ../../.config/golangci.yaml ./...",
   "cd src/nodeagent && golangci-lint run --config ../../.config/golangci.yaml ./...",
+  "cd src/karpenter && golangci-lint run --config ../../.config/golangci.yaml ./...",
 ]
 
 [tasks.lint-mod]
@@ -37,6 +40,7 @@ run = [
   "go -C src mod tidy -diff",
   "go -C src/nodeclaim mod tidy -diff",
   "go -C src/nodeagent mod tidy -diff",
+  "go -C src/karpenter mod tidy -diff",
 ]
 
 [tasks.lint-secrets]
@@ -49,11 +53,12 @@ run = [
   "cd src && govulncheck ./...",
   "cd src/nodeclaim && govulncheck ./...",
   "cd src/nodeagent && govulncheck ./...",
+  "cd src/karpenter && govulncheck ./...",
 ]
 
 [tasks.lint-yaml]
 description = "Lint authored YAML files"
-run = "yamllint --config-file .config/yamllint.yaml .github/workflows src/chart/Chart.yaml src/chart/values.yaml"
+run = "yamllint --config-file .config/yamllint.yaml .github/workflows src/chart/Chart.yaml src/chart/values.yaml src/charts/cloudvm-karpenter/Chart.yaml src/charts/cloudvm-karpenter/values.yaml"
 
 [tasks.lint-helm]
 description = "Lint Helm charts and validate template rendering"
@@ -62,6 +67,16 @@ run = [
   "helm template src/chart > /dev/null",
   "helm lint src/charts/cloudvm-ticker",
   "helm template src/charts/cloudvm-ticker > /dev/null",
+  "helm lint src/charts/cloudvm-karpenter --set plugin.url=http://plugin.example:4040",
+  "helm template src/charts/cloudvm-karpenter --set plugin.url=http://plugin.example:4040 > /dev/null",
+]
+
+[tasks.lint-generated]
+description = "Verify the CloudVMNodeClass deepcopy code and CRD match their Go API types"
+dir = "src/karpenter"
+run = [
+  "controller-gen object crd paths=./apis/... output:crd:artifacts:config=../charts/cloudvm-karpenter/crds",
+  "git diff --exit-code -- apis ../charts/cloudvm-karpenter/crds",
 ]
 
 [tasks.lint]
@@ -75,6 +90,7 @@ depends = [
   "lint-vulnerabilities",
   "lint-yaml",
   "lint-helm",
+  "lint-generated",
 ]
 
 [tasks.test]
@@ -83,6 +99,7 @@ run = [
   "go -C src test -race -count=1 -cover ./...",
   "go -C src/nodeclaim test -race -count=1 -cover ./...",
   "go -C src/nodeagent test -race -count=1 -cover ./...",
+  "KUBEBUILDER_ASSETS=\"$(setup-envtest use -p path --bin-dir {{config_root}}/.local/envtest 1.36.x)\" go -C src/karpenter test -race -count=1 -cover ./...",
 ]
 
 [tasks.verify]
@@ -93,11 +110,12 @@ run = [
 ]
 
 [tasks.build]
-description = "Build the provider binary"
+description = "Build the plugin and CloudVM Karpenter controller binaries"
 run = [
   "mkdir -p bin",
   "go -C src build -trimpath -ldflags='-s -w' -o ../bin/interlink-cloudvm-plugin ./cloudvm",
   "go -C src/nodeagent build -trimpath -ldflags='-s -w' -o ../../bin/cloudvm-node-agent .",
+  "go -C src/karpenter build -trimpath -ldflags='-s -w' -o ../../bin/cloudvm-karpenter ./cmd/controller",
 ]
 
 [tasks.ci]

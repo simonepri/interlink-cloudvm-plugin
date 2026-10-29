@@ -480,6 +480,55 @@ helm upgrade --install cloudvm-ticker \
   --set serviceMonitor.enabled=true
 ```
 
+### Karpenter Controller Chart (VM per NodeClaim)
+
+`cloudvm-karpenter` runs a second Karpenter controller (core v1.15.0) next to the cluster's existing one. Karpenter splits work by NodeClass kind, so this controller manages only NodePools whose `nodeClassRef` is a `CloudVMNodeClass` and never touches the other controller's NodePools, NodeClaims, or Nodes. It launches one VM per NodeClaim through the plugin's NodeClaim API. Offerings cover every (region, zone, capacity type) in the NodeClass footprint, priced from the plugin's ticker plus an optional cross-region data cost, so Karpenter's cheapest-offering choice also picks the region.
+
+The chart installs only the `CloudVMNodeClass` CRD. The `karpenter.sh` CRDs must come from the cluster's other Karpenter release, which must run the same core minor version.
+
+```bash
+helm upgrade --install cloudvm-karpenter \
+  oci://ghcr.io/simonepri/charts/cloudvm-karpenter \
+  --namespace karpenter \
+  --set plugin.url=http://interlink-cloudvm-plugin.interlink.svc:4040 \
+  --set-json 'config.gpuClasses=[{"class":"l4","models":["L4 24GB"]}]' \
+  --set-json 'config.dataCost={"homeRegion":"us-east-1","defaultUSDPerHour":0.05}'
+```
+
+Partition pods so each one fits only one controller's NodePools: the two controllers cannot see each other's in-flight NodeClaims, so a pod that fits both gets two launches. Give CloudVM NodePools a taint and a template label that only CloudVM workloads tolerate and select:
+
+```yaml
+apiVersion: karpenter.cloudvm.vk.io/v1alpha1
+kind: CloudVMNodeClass
+metadata:
+  name: gpu
+spec:
+  footprint:
+    - {provider: aws, region: us-east-1, subnetIDs: [subnet-0123456789abcdef0]}
+    - {provider: aws, region: eu-west-1, launchTemplateID: lt-0123456789abcdef0}
+    - {provider: gcp, region: us-central1}
+  launchTemplateName: cloudvm-worker
+  image: {mode: dlami}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: cloudvm-gpu
+spec:
+  template:
+    metadata:
+      labels:
+        capacity-provider: cloudvm
+    spec:
+      nodeClassRef: {group: karpenter.cloudvm.vk.io, kind: CloudVMNodeClass, name: gpu}
+      taints:
+        - {key: virtual-node.interlink/provider, value: cloudvm, effect: NoSchedule}
+      requirements:
+        - {key: karpenter.k8s.aws/instance-gpu-manufacturer, operator: In, values: [nvidia]}
+```
+
+Instance types carry `node.kubernetes.io/instance-type`, `topology.kubernetes.io/region` and `zone`, `karpenter.sh/capacity-type`, the `karpenter.k8s.aws/instance-*` labels, and `gpu-class` from `config.gpuClasses`. This controller registers these keys as well-known labels, so one CloudVM NodePool can serve every GPU class and pods pick one with a `gpu-class` nodeSelector; a pool can still pin a class with a template label or a requirement. Instance types whose GPU model has no `config.gpuClasses` entry get no `gpu-class` label.
+
 ---
 
 ## Development

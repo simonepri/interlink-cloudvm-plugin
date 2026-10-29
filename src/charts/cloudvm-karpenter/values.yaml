@@ -1,0 +1,82 @@
+# Default values of the CloudVM Karpenter controller chart; plugin.url is required.
+
+image:
+  repository: ghcr.io/simonepri/interlink-cloudvm-plugin/karpenter
+  # tag defaults to the chart appVersion.
+  tag: ""
+  # digest pins the image; it takes precedence over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicas: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+plugin:
+  # url is the base URL of the plugin's NodeClaim API, such as http://cloudvm-plugin.cloudvm.svc:4040.
+  url: ""
+
+# leaderElectionName must differ from the other Karpenter controller's lease (karpenter-leader-election) when
+# both run in one namespace.
+leaderElectionName: cloudvm-karpenter-leader-election
+
+logLevel: info
+
+# Karpenter core settings, passed through as environment variables; empty keeps the core default.
+karpenter:
+  featureGates: ""
+  batchMaxDuration: 10s
+  batchIdleDuration: 1s
+  kubeClientQPS: 200
+  kubeClientBurst: 300
+
+# Provider configuration, rendered into the controller's config file.
+config:
+  # gpuClasses maps catalog GPU models to the gpu-class label value, matching the cluster's GPU classes.
+  gpuClasses: []
+  # - class: a100-80gb
+  #   models: ["A100 80GB"]
+  # dataCost adds a per-hour cost to offerings outside homeRegion.
+  dataCost: {}
+  #   homeRegion: us-east-1
+  #   defaultUSDPerHour: 0.0
+  #   perRegionUSDPerHour:
+  #     eu-west-1: 0.05
+  # nodePoolSelector limits this controller to CloudVM NodePools with these labels; empty serves them all.
+  nodePoolSelector: {}
+  catalogTTL: 60s
+  catalogMaxStaleness: 15m
+  unavailableOfferingTTL: 3m
+  maxPods: 110
+  ephemeralStorage: 100Gi
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+metrics:
+  port: 8080
+healthProbe:
+  port: 8081
