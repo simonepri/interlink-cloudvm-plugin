@@ -49,7 +49,6 @@ const (
 	annotationSubnets            = "cloudvm.vk.io/subnets"
 	annotationLaunchTemplateID   = "cloudvm.vk.io/aws-launch-template"
 	annotationLaunchTemplateName = "cloudvm.vk.io/aws-launch-template-name"
-	annotationAMIMode            = "cloudvm.vk.io/ami-mode"
 )
 
 // CloudProvider implements cloudprovider.CloudProvider on top of the plugin's NodeClaim API.
@@ -379,7 +378,6 @@ func launchAnnotations(nodeClass *v1alpha1.CloudVMNodeClass, fr v1alpha1.Footpri
 	} else if fr.Provider == "aws" {
 		set(annotationLaunchTemplateName, nodeClass.Spec.LaunchTemplateName)
 	}
-	set(annotationAMIMode, nodeClass.Spec.Image.Mode)
 	return out
 }
 

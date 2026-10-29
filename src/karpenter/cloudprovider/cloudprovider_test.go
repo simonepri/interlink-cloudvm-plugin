@@ -40,7 +40,6 @@ func testNodeClass() *v1alpha1.CloudVMNodeClass {
 				{Provider: "gcp", Region: "us-central1"},
 			},
 			LaunchTemplateName: "cloudvm-worker",
-			Image:              v1alpha1.Image{Mode: "dlami"},
 			Annotations:        map[string]string{"cloudvm.vk.io/max-egress-rate": "0.50"},
 		},
 		Status: v1alpha1.CloudVMNodeClassStatus{Conditions: []status.Condition{{
@@ -115,7 +114,7 @@ func TestGetSupportedNodeClasses(t *testing.T) {
 
 func TestGetInstanceTypesFiltersFootprintAndDerivesLabels(t *testing.T) {
 	cfg := &Config{
-		GPUClasses: []GPUClass{{Class: "l4", Models: []string{"l4  24gb"}}},
+		GPUClasses: []GPUClass{{Class: "l4", Models: []string{"L4"}, MemoryGB: 24}},
 		DataCost:   DataCost{HomeRegion: "us-east-1", DefaultUSDPerHour: 0.05, PerRegionUSDPerHour: map[string]float64{"eu-west-1": 0.20}},
 	}
 	h := newHarness(t, cfg)
@@ -255,7 +254,7 @@ func TestGetInstanceTypesCatalogCache(t *testing.T) {
 }
 
 func TestCreateChoosesCheapestCompatibleOffering(t *testing.T) {
-	h := newHarness(t, &Config{GPUClasses: []GPUClass{{Class: "l4", Models: []string{"L4 24GB"}}}})
+	h := newHarness(t, &Config{GPUClasses: []GPUClass{{Class: "l4", Models: []string{"l4"}}}})
 	nc := testNodeClaim(
 		req(corev1.LabelInstanceTypeStable, "g6.2xlarge", "g2-standard-8"),
 		req(LabelGPUClass, "l4"),
@@ -272,7 +271,7 @@ func TestCreateChoosesCheapestCompatibleOffering(t *testing.T) {
 	if sent.Name != nc.Name || sent.InstanceType != "g2-standard-8" || sent.Region != "us-central1" || sent.Zone != "us-central1-a" || sent.CapacityType != "spot" {
 		t.Fatalf("launched %+v, want g2-standard-8 spot in us-central1-a (cheapest)", sent)
 	}
-	if sent.Annotations["cloudvm.vk.io/provider"] != "gcp" || sent.Annotations["cloudvm.vk.io/ami-mode"] != "dlami" || sent.Annotations["cloudvm.vk.io/max-egress-rate"] != "0.50" {
+	if sent.Annotations["cloudvm.vk.io/provider"] != "gcp" || sent.Annotations["cloudvm.vk.io/max-egress-rate"] != "0.50" {
 		t.Errorf("launch annotations = %v", sent.Annotations)
 	}
 	if _, ok := sent.Annotations["cloudvm.vk.io/aws-launch-template-name"]; ok {
@@ -490,7 +489,8 @@ func TestIsDrifted(t *testing.T) {
 		{"region removed", func(c *v1alpha1.CloudVMNodeClass) { c.Spec.Footprint = c.Spec.Footprint[1:] }, DriftRegionRemoved},
 		{"zone removed", func(c *v1alpha1.CloudVMNodeClass) { c.Spec.Footprint[0].Zones = []string{"us-east-1b"} }, DriftZoneRemoved},
 		{"subnets changed", func(c *v1alpha1.CloudVMNodeClass) { c.Spec.Footprint[0].SubnetIDs = []string{"subnet-c"} }, DriftNodeClass},
-		{"image changed", func(c *v1alpha1.CloudVMNodeClass) { c.Spec.Image.Mode = "container" }, DriftNodeClass},
+		{"launch template changed", func(c *v1alpha1.CloudVMNodeClass) { c.Spec.LaunchTemplateName = "cloudvm-worker-v2" }, DriftNodeClass},
+		{"passthrough annotation changed", func(c *v1alpha1.CloudVMNodeClass) { c.Spec.Annotations["cloudvm.vk.io/max-egress-rate"] = "1.00" }, DriftNodeClass},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

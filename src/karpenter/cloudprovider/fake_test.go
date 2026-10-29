@@ -147,7 +147,7 @@ func notFound() error {
 func testCatalog() nodeclaim.Catalog {
 	return nodeclaim.Catalog{InstanceTypes: []nodeclaim.InstanceType{
 		{
-			Name: "g6.2xlarge", Provider: "aws", CPU: "8", Memory: "32Gi", GPUCount: 1, GPUModel: "L4 24GB",
+			Name: "g6.2xlarge", Provider: "aws", CPU: "8", Memory: "32Gi", GPUCount: 1, GPUModel: "l4",
 			GPUMemoryGB: 24, GPUManufacturer: "NVIDIA", Architecture: "x86_64", Family: "g6", Generation: "6", Size: "2xlarge",
 			Offerings: []nodeclaim.Offering{
 				{Region: "us-east-1", Zone: "us-east-1a", CapacityType: "spot", PricePerHour: 0.40, Available: true},
@@ -163,7 +163,7 @@ func testCatalog() nodeclaim.Catalog {
 			},
 		},
 		{
-			Name: "g2-standard-8", Provider: "gcp", CPU: "8", Memory: "32Gi", GPUCount: 1, GPUModel: "L4 24GB",
+			Name: "g2-standard-8", Provider: "gcp", CPU: "8", Memory: "32Gi", GPUCount: 1, GPUModel: "l4",
 			GPUMemoryGB: 24, GPUManufacturer: "nvidia", Architecture: "amd64", Family: "g2",
 			Offerings: []nodeclaim.Offering{
 				{Region: "us-central1", Zone: "us-central1-a", CapacityType: "spot", PricePerHour: 0.25, Available: true},

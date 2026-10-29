@@ -491,7 +491,7 @@ helm upgrade --install cloudvm-karpenter \
   oci://ghcr.io/simonepri/charts/cloudvm-karpenter \
   --namespace karpenter \
   --set plugin.url=http://interlink-cloudvm-plugin.interlink.svc:4040 \
-  --set-json 'config.gpuClasses=[{"class":"l4","models":["L4 24GB"]}]' \
+  --set-json 'config.gpuClasses=[{"class":"l4","models":["l4"]},{"class":"a100-80gb","models":["a100"],"memoryGB":80}]' \
   --set-json 'config.dataCost={"homeRegion":"us-east-1","defaultUSDPerHour":0.05}'
 ```
 
@@ -508,7 +508,6 @@ spec:
     - {provider: aws, region: eu-west-1, launchTemplateID: lt-0123456789abcdef0}
     - {provider: gcp, region: us-central1}
   launchTemplateName: cloudvm-worker
-  image: {mode: dlami}
 ---
 apiVersion: karpenter.sh/v1
 kind: NodePool

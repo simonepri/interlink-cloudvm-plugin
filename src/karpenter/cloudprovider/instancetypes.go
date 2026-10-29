@@ -168,7 +168,7 @@ func (c *CloudProvider) requirements(src *nodeclaim.InstanceType, capacity corev
 	reqs.Add(pick(src.GPUModel != "", in(LabelInstanceGPUName, gpuName(src.GPUModel)), absent(LabelInstanceGPUName)))
 	reqs.Add(pick(src.GPUManufacturer != "", in(LabelInstanceGPUManufacturer, strings.ToLower(src.GPUManufacturer)), absent(LabelInstanceGPUManufacturer)))
 	reqs.Add(pick(src.GPUMemoryGB > 0, in(LabelInstanceGPUMemory, strconv.Itoa(src.GPUMemoryGB*1024)), absent(LabelInstanceGPUMemory)))
-	class := c.config.GPUClassFor(src.GPUModel)
+	class := c.config.GPUClassFor(src.GPUModel, src.GPUMemoryGB)
 	reqs.Add(pick(class != "", in(LabelGPUClass, class), absent(LabelGPUClass)))
 	return reqs
 }
@@ -180,7 +180,7 @@ func pick(cond bool, a, b *scheduling.Requirement) *scheduling.Requirement {
 	return b
 }
 
-// gpuName turns a catalog GPU model such as "A100 80GB" into the instance-gpu-name value "a100".
+// gpuName turns a catalog GPU model such as "a100" or "A100 80GB" into the instance-gpu-name value "a100".
 func gpuName(model string) string {
 	fields := strings.Fields(model)
 	fields = slices.DeleteFunc(fields, gpuMemoryToken.MatchString)
