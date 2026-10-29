@@ -59,8 +59,14 @@ const (
 	ReasonInvalidRequest       = "InvalidRequest"
 	ReasonNotFound             = "NotFound"
 	ReasonCatalogUnavailable   = "CatalogUnavailable"
+	ReasonUnauthorized         = "Unauthorized"
+	ReasonForbidden            = "Forbidden"
 	ReasonInternal             = "Internal"
 )
+
+// DefaultTokenAudience is the audience of the service account token a caller presents as a bearer token; the plugin
+// verifies it with a TokenReview and admits only the service accounts it allows.
+const DefaultTokenAudience = "cloudvm-plugin" //nolint:gosec // an audience name, not a credential
 
 // Taint mirrors a Kubernetes node taint without depending on k8s.io/api.
 type Taint struct {

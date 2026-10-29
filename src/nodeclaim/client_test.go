@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
 
@@ -91,5 +92,30 @@ func TestCreateRequestValidate(t *testing.T) {
 	bad.CapacityType = "reserved"
 	if err := bad.Validate(); err == nil {
 		t.Fatal("Validate accepted capacity type reserved")
+	}
+}
+
+func TestTokenFileTransportReadsTheCurrentToken(t *testing.T) {
+	path := t.TempDir() + "/token"
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get("Authorization"))
+		_ = json.NewEncoder(w).Encode(List{})
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, &http.Client{Transport: &TokenFileTransport{Path: path}})
+	if _, err := c.List(context.Background()); err == nil {
+		t.Fatal("List without a token file succeeded")
+	}
+	for _, tok := range []string{"one", "two"} {
+		if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.List(context.Background()); err != nil {
+			t.Fatalf("List: %v", err)
+		}
+	}
+	if len(got) != 2 || got[0] != "Bearer one" || got[1] != "Bearer two" {
+		t.Fatalf("Authorization headers = %q", got)
 	}
 }

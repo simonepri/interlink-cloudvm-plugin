@@ -22,9 +22,11 @@ func newClaimServer(t *testing.T, prov Provider) (*Server, *nodeclaim.Client, st
 	path := t.TempDir() + "/claims.json"
 	t.Setenv("CLAIM_STORE_PATH", path)
 	s := NewServer(prov, "claims-"+t.Name())
+	reviewer, _ := fakeTokenReviewer()
+	s.SetClaimAuthenticator(newClaimAuthenticator(reviewer, nodeclaim.DefaultTokenAudience, []string{testCaller}))
 	srv := httptest.NewServer(s.Routes())
 	t.Cleanup(srv.Close)
-	return s, nodeclaim.NewClient(srv.URL, srv.Client()), srv.URL
+	return s, nodeclaim.NewClient(srv.URL, &http.Client{Transport: bearer("good")}), srv.URL
 }
 
 func claimRequest(name, itype string) *nodeclaim.CreateRequest {

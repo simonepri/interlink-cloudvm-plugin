@@ -83,6 +83,7 @@ type Server struct {
 	logForwarder          *OTLPLogForwarder                    // optional OTLP export of worker logs
 	podCredentials        *PodCredentials                      // optional AWS credentials for pods whose service account has a role
 	claims                *claimRegistry                       // VMs launched for Karpenter NodeClaims
+	claimAuth             *claimAuthenticator                  // verifies NodeClaim API callers; nil refuses them all
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -671,9 +672,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	// VM-per-NodeClaim API for a Karpenter cloud provider and the node agent
-	mux.HandleFunc(nodeclaim.PathNodeClaims, s.handleNodeClaims)
-	mux.HandleFunc(nodeclaim.PathNodeClaims+"/{name}", s.handleNodeClaim)
-	mux.HandleFunc(nodeclaim.PathCatalog, s.handleCatalog)
+	mux.HandleFunc(nodeclaim.PathNodeClaims, s.requireClaimCaller(s.handleNodeClaims))
+	mux.HandleFunc(nodeclaim.PathNodeClaims+"/{name}", s.requireClaimCaller(s.handleNodeClaim))
+	mux.HandleFunc(nodeclaim.PathCatalog, s.requireClaimCaller(s.handleCatalog))
 
 	return mux
 }

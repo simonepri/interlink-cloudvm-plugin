@@ -350,6 +350,7 @@ func run() error {
 		terminator = term
 	}
 
+	server.SetClaimAuthenticator(claimAuthenticatorFromEnv())
 	server.RecoverClaims()
 	go server.RunClaimSync(ctx)
 

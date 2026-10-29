@@ -47,6 +47,12 @@ spec:
             - name: EKS_CLUSTER_REGION
               value: {{ . | quote }}
             {{- end }}
+            - name: NODECLAIM_API_AUDIENCE
+              value: {{ .Values.nodeClaimAPI.audience | quote }}
+            {{- with .Values.nodeClaimAPI.allowedUsers }}
+            - name: NODECLAIM_API_ALLOWED_USERS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- with .Values.provider.nodeRegions }}
             - name: NODE_REGIONS
               value: {{ toJson . | quote }}

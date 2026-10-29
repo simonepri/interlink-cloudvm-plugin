@@ -28,6 +28,10 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
+  # Verifies the service account tokens of NodeClaim API callers.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -45,7 +49,7 @@ subjects:
     name: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- else }}
-# Nodes are cluster-scoped, so the region label read needs a ClusterRole even when the other rules stay namespaced.
+# Nodes and token reviews are cluster-scoped, so they need a ClusterRole even when the other rules stay namespaced.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -57,6 +61,10 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # Verifies the service account tokens of NodeClaim API callers.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
