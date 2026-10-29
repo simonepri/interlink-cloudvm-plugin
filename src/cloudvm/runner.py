@@ -3,6 +3,7 @@
 The bootstrap sets CLOUDVM_RUNNER_BIND and CLOUDVM_RUNNER_CONCURRENCY; the plugin reaches it through the tunnel agent.
 It also serves each pod whose service account has an IAM role the credentials the plugin sends for it on a loopback endpoint.
 """
+import base64
 import datetime
 import hmac
 import http.server
@@ -47,6 +48,45 @@ CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)
 CREDENTIALS_ADDR = os.environ.get("CLOUDVM_CREDENTIALS_ADDR", "127.0.0.1:170")
 pod_credentials = {}
 pod_credentials_guard = threading.Lock()
+# Secret volume files stay on tmpfs, as the kubelet keeps them, and each pod's tree is removed with its container.
+SECRET_VOLUMES_DIR = os.environ.get("CLOUDVM_SECRET_VOLUMES_DIR", '/run/cloudvm/volumes')
+
+def safe_relpath(path):
+    """Returns path when it is relative and stays below its root, or raises ValueError."""
+    if not isinstance(path, str) or os.path.isabs(path) or '..' in path.split('/'):
+        raise ValueError(f"unsafe path {path!r}")
+    return path
+
+def pod_volumes_dir(pod_uid):
+    return os.path.join(SECRET_VOLUMES_DIR, re.sub(r'[^A-Za-z0-9_.-]', '_', pod_uid))
+
+def write_secret_volumes(pod_uid, volumes):
+    """Writes a pod's Secret volumes below its own root-only directory and returns the read-only mount flags."""
+    flags = []
+    if not volumes:
+        return flags
+    root = pod_volumes_dir(pod_uid)
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, mode=0o700)
+    for i, vol in enumerate(volumes):
+        vol_dir = os.path.join(root, str(i))
+        os.makedirs(vol_dir, mode=0o755)
+        for f in vol.get('files') or []:
+            dest = os.path.join(vol_dir, safe_relpath(f.get('path')))
+            os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
+            mode = int(f.get('mode') or 0o644) & 0o777
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            with os.fdopen(fd, 'wb') as out:
+                out.write(base64.b64decode(f.get('data') or ''))
+            os.chmod(dest, mode)
+        source = vol_dir
+        if vol.get('subPath'):
+            source = os.path.join(vol_dir, safe_relpath(vol['subPath']))
+        mount_path = str(vol.get('mountPath', ''))
+        if not mount_path.startswith('/') or ':' in mount_path or ',' in mount_path:
+            raise ValueError(f"invalid mountPath {mount_path!r}")
+        flags.extend(['-v', f"{source}:{mount_path}:ro"])
+    return flags
 
 def snapshotter_args():
     # Lazy pulls need the stargz snapshotter; without it containerd's default snapshotter pulls in full.
@@ -445,6 +485,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 if remains:
                     self.reply(500, b'{"error":"container was not removed"}')
                     return
+                shutil.rmtree(pod_volumes_dir(pod_uid), ignore_errors=True)
             self.send_response(200)
             self.end_headers()
             return
@@ -552,6 +593,14 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 run_cmd.extend(['--gpus', gpu_spec])
             for k, v in env.items():
                 run_cmd.extend(['-e', f"{k}={v}"])
+            try:
+                run_cmd.extend(write_secret_volumes(pod_uid, req.get('secretVolumes') or []))
+            except (OSError, ValueError, TypeError) as e:
+                shutil.rmtree(pod_volumes_dir(pod_uid), ignore_errors=True)
+                with plock:
+                    starting_pods.discard(pod_uid)
+                self.reply(400, json.dumps({"error": f"cannot write secret volumes: {e}"}))
+                return
             image_index = len(run_cmd)
             run_cmd.append(image)
             if isinstance(cmd, list):

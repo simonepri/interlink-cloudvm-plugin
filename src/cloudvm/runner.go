@@ -41,6 +41,7 @@ type StartContainerRequest struct {
 	RunAsUser        *int64            `json:"runAsUser,omitempty"`
 	RunAsGroup       *int64            `json:"runAsGroup,omitempty"`
 	DockerConfigJSON string            `json:"dockerConfigJSON,omitempty"`
+	SecretVolumes    []SecretVolume    `json:"secretVolumes,omitempty"`
 	// AWSCredentials is set when the pod's service account has an IAM role; the runner then serves its credentials.
 	AWSCredentials *PodAWSCredentials `json:"awsCredentials,omitempty"`
 }

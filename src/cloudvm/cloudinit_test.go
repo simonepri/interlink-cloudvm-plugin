@@ -979,3 +979,44 @@ func TestRenderCloudInit_InstallsECRCredentialHelper(t *testing.T) {
 	}
 	assertBashSyntax(t, script)
 }
+
+func TestRenderCloudInit_RedirectsServiceNetworksToTheAgent(t *testing.T) {
+	cfg := CloudInitConfig{
+		PodName:              "svc-pod",
+		Region:               "us-west-2",
+		RunnerAuthToken:      "runner-secret",
+		TunnelEndpoint:       "tunnel.example.internal:443",
+		TunnelTransport:      "router",
+		TunnelGatewayIP:      "172.20.0.10",
+		TunnelCIDRs:          []string{"10.112.0.0/12", "172.20.0.0/16"},
+		TunnelServiceCIDRs:   []string{"172.20.0.0/16"},
+		TargetContainerImage: "alpine",
+	}
+	script, err := RenderCloudInit(&cfg)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	gateway := strings.Index(script, "iptables -t nat -A CLOUDVM_SERVICES -d 172.20.0.10 -j RETURN")
+	redirect := strings.Index(script, "iptables -t nat -A CLOUDVM_SERVICES -p tcp -d 172.20.0.0/16 -j REDIRECT --to-ports 13129")
+	if gateway < 0 || redirect < gateway {
+		t.Fatalf("script must exempt the gateway before redirecting the service network:\n%s", script)
+	}
+	for _, want := range []string{
+		"iptables -t nat -C OUTPUT -j CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -A OUTPUT -j CLOUDVM_SERVICES",
+		`CLOUDVM_TRANSPARENT_PORT="13129"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("rendered script missing %q", want)
+		}
+	}
+	assertBashSyntax(t, script)
+	assertUserDataFits(t, script)
+
+	cfg.TunnelServiceCIDRs = nil
+	if script, err = RenderCloudInit(&cfg); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(script, "CLOUDVM_SERVICES") || !strings.Contains(script, `CLOUDVM_TRANSPARENT_PORT="0"`) {
+		t.Error("a worker without service networks must not redirect connections")
+	}
+}

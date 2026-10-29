@@ -562,6 +562,31 @@ class TCPProxy(object):
         stream.task = asyncio.ensure_future(stream.run())
 
 
+    async def handle_redirected(self, reader, writer):
+        """Tunnels a connection the bootstrap's REDIRECT rule sent here to the address its client dialed."""
+        session = self.session
+        try:
+            target = original_destination(writer.get_extra_info("socket"))
+        except OSError as e:
+            log("redirected connection without a destination: %s" % e)
+            target = None
+        if target is None or session is None:
+            writer.close()
+            return
+        stream = session.open_tcp_stream(target, reader, writer)
+        stream.task = asyncio.ensure_future(stream.run())
+
+
+SO_ORIGINAL_DST = 80
+
+
+def original_destination(sock):
+    """Returns the IPv4 host:port a REDIRECTed connection was addressed to, from its conntrack entry."""
+    raw = sock.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+    port, = struct.unpack("!H", raw[2:4])
+    return "%s:%d" % (socket.inet_ntoa(raw[4:8]), port)
+
+
 def dns_exchange(upstream, query):
     with socket.socket(socket.AF_INET6 if ":" in upstream[0] else socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.settimeout(DNS_TIMEOUT)
@@ -717,6 +742,9 @@ def main():
     proxy_port = int(os.environ.get("CLOUDVM_TCP_PROXY_PORT", DEFAULT_TCP_PROXY_PORT))
     if proxy_port > 0:
         loop.run_until_complete(asyncio.start_server(cfg["proxy"].handle, "127.0.0.1", proxy_port))
+    transparent_port = int(os.environ.get("CLOUDVM_TRANSPARENT_PORT") or 0)
+    if transparent_port > 0:
+        loop.run_until_complete(asyncio.start_server(cfg["proxy"].handle_redirected, "127.0.0.1", transparent_port))
     if os.environ.get("CLOUDVM_DNS_LISTEN"):
         try:
             loop.run_until_complete(start_dns_forwarder(os.environ["CLOUDVM_DNS_LISTEN"], cfg["proxy"]))

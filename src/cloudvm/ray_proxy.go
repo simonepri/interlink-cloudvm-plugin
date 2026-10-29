@@ -8,6 +8,10 @@ const (
 
 	// tcpProxyPort is the port of the VM agent's local HTTP CONNECT proxy (CLOUDVM_TCP_PROXY_PORT default).
 	tcpProxyPort = 13128
+
+	// transparentProxyPort is the port of the VM agent's listener for redirected Service connections
+	// (CLOUDVM_TRANSPARENT_PORT).
+	transparentProxyPort = 13129
 )
 
 // injectRayProxyEnv adds the gRPC proxy settings to every container of a KubeRay pod, keeping values the pod sets.

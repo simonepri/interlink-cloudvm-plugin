@@ -370,6 +370,7 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		TunnelDirectCIDRs:     spec.TunnelDirectCIDRs,
 		TunnelCIDRs:           spec.TunnelCIDRs,
+		TunnelServiceCIDRs:    spec.TunnelServiceCIDRs,
 		ImageMirrors:          spec.ImageMirrors,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                region,

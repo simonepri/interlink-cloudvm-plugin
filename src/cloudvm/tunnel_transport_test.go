@@ -102,6 +102,29 @@ func TestTunnelCIDRs_ClusterAndOtherRegionsOnly(t *testing.T) {
 	}
 }
 
+func TestTunnelRoute_CarriesServiceNetworks(t *testing.T) {
+	state := &tunnelState{TunnelSettings: TunnelSettings{
+		Endpoint:     privateTunnelEndpoint,
+		ClusterCIDRs: []string{"10.112.0.0/12", "172.20.0.0/16"},
+		ServiceCIDRs: []string{"172.20.0.0/16"},
+	}}
+	route, err := state.route("eu-west-1", "tskey-auth-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"172.20.0.0/16"}; !reflect.DeepEqual(route.ServiceCIDRs, want) {
+		t.Fatalf("service CIDRs = %v, want %v", route.ServiceCIDRs, want)
+	}
+	if want := []string{"10.112.0.0/12", "172.20.0.0/16"}; !reflect.DeepEqual(route.TunnelCIDRs, want) {
+		t.Fatalf("tunnel CIDRs = %v, want %v", route.TunnelCIDRs, want)
+	}
+	var spec InstanceSpec
+	spec.applyTunnelRoute(route)
+	if !reflect.DeepEqual(spec.TunnelServiceCIDRs, route.ServiceCIDRs) {
+		t.Fatalf("spec service CIDRs = %v", spec.TunnelServiceCIDRs)
+	}
+}
+
 const privateTunnelEndpoint = "tunnel.example.internal:443"
 
 func TestTunnelSettings_ValidateTransportsFailsFastOnMissingEnv(t *testing.T) {
