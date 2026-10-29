@@ -24,6 +24,9 @@ type pluginServer struct {
 	deletes []string
 }
 
+// pluginToken is the only bearer token the stand-in plugin accepts.
+const pluginToken = "provider-service-account-token"
+
 func newPluginServer(catalog nodeclaim.Catalog) *pluginServer {
 	p := &pluginServer{catalog: catalog, claims: map[string]*nodeclaim.NodeClaim{}}
 	mux := http.NewServeMux()
@@ -56,7 +59,13 @@ func newPluginServer(catalog nodeclaim.Catalog) *pluginServer {
 		delete(p.claims, name)
 		w.WriteHeader(http.StatusAccepted)
 	})
-	p.Server = httptest.NewServer(mux)
+	p.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+pluginToken {
+			writeJSON(w, http.StatusUnauthorized, nodeclaim.ErrorResponse{Reason: "Unauthorized"})
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
 	return p
 }
 

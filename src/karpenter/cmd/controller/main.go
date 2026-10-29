@@ -4,9 +4,7 @@ package main
 
 import (
 	"fmt"
-	"net/http"
 	"os"
-	"time"
 
 	"github.com/samber/lo"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/overlay"
@@ -17,11 +15,8 @@ import (
 
 	_ "github.com/simonepri/interlink-cloudvm-plugin/karpenter/apis/v1alpha1" // registers the NodeClass kind
 	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/cloudprovider"
-	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
+	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/pluginclient"
 )
-
-// pluginTimeout bounds one plugin call; a launch blocks until the cloud returns the instance ID.
-const pluginTimeout = 2 * time.Minute
 
 func main() {
 	pluginURL := os.Getenv("CLOUDVM_PLUGIN_URL")
@@ -34,9 +29,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+	api, err := pluginclient.New(pluginURL, os.Getenv("CLOUDVM_PLUGIN_TOKEN_FILE"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 
 	ctx, op := operator.NewOperator()
-	api := nodeclaim.NewClient(pluginURL, &http.Client{Timeout: pluginTimeout})
 	undecorated := cloudprovider.New(op.GetClient(), api, cfg, op.Clock)
 	cloudProvider := overlay.Decorate(undecorated, op.GetClient(), op.InstanceTypeStore)
 	repairPolicyMatcher := lo.Must(health.NewRepairPolicyMatcher(ctx, cloudProvider))

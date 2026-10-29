@@ -1,6 +1,9 @@
-{{/* Controller Deployment: Karpenter core settings as environment, the provider config file, and its own lease. */}}
+{{/* Controller Deployment: Karpenter core settings, the provider config file, its own lease and plugin token. */}}
 {{- if not .Values.plugin.url }}
 {{- fail "plugin.url is required: set it to the plugin's NodeClaim API base URL" }}
+{{- end }}
+{{- if not .Values.plugin.tokenAudience }}
+{{- fail "plugin.tokenAudience is required: the plugin authenticates the controller by its service account token" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -59,6 +62,8 @@ spec:
               value: {{ .Values.plugin.url | quote }}
             - name: CLOUDVM_CONFIG_PATH
               value: /etc/cloudvm-karpenter/config.yaml
+            - name: CLOUDVM_PLUGIN_TOKEN_FILE
+              value: /var/run/secrets/cloudvm-plugin/token
             - name: LEADER_ELECTION_NAME
               value: {{ .Values.leaderElectionName | quote }}
             - name: LEADER_ELECTION_NAMESPACE
@@ -118,10 +123,20 @@ spec:
             - name: config
               mountPath: /etc/cloudvm-karpenter
               readOnly: true
+            - name: plugin-token
+              mountPath: /var/run/secrets/cloudvm-plugin
+              readOnly: true
       volumes:
         - name: config
           configMap:
             name: {{ include "cloudvm-karpenter.fullname" . }}
+        - name: plugin-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ .Values.plugin.tokenAudience | quote }}
+                  expirationSeconds: {{ .Values.plugin.tokenExpirationSeconds }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
