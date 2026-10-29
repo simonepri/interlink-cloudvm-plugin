@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	"sigs.k8s.io/yaml"
+
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
 
@@ -37,7 +39,7 @@ func (s *tokenServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if got != "Bearer "+s.valid {
 		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(nodeclaim.ErrorResponse{Reason: "Unauthorized"})
+		_ = json.NewEncoder(w).Encode(nodeclaim.ErrorResponse{Reason: nodeclaim.ReasonUnauthorized})
 		return
 	}
 	_ = json.NewEncoder(w).Encode(nodeclaim.List{Items: []nodeclaim.NodeClaim{}})
@@ -72,21 +74,26 @@ func TestClientSendsBearerTokenAndPicksUpRotation(t *testing.T) {
 		t.Fatalf("first request: %v", err)
 	}
 
-	// The kubelet rotates the projected token; the plugin stops accepting the old one.
+	// The kubelet rotates the projected token and the plugin stops accepting the old one.
 	writeToken(t, path, "token-2")
 	srv.mu.Lock()
 	srv.valid = "token-2"
 	srv.mu.Unlock()
-	if _, err := c.List(ctx); err == nil {
-		t.Fatal("request with the old token succeeded")
-	}
 	if _, err := c.List(ctx); err != nil {
-		t.Fatalf("request after a 401 did not re-read the rotated token: %v", err)
+		t.Fatalf("request after rotation did not send the new token: %v", err)
+	}
+
+	// A token the plugin rejects surfaces as an authorization error, not as a missing claim.
+	srv.mu.Lock()
+	srv.valid = "token-3"
+	srv.mu.Unlock()
+	if _, err := c.List(ctx); !nodeclaim.IsUnauthorized(err) {
+		t.Fatalf("err = %v, want an unauthorized error", err)
 	}
 
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	want := []string{"Bearer token-1", "Bearer token-1", "Bearer token-2"}
+	want := []string{"Bearer token-1", "Bearer token-2", "Bearer token-2"}
 	if len(srv.seen) != len(want) {
 		t.Fatalf("saw %v, want %v", srv.seen, want)
 	}
@@ -94,5 +101,23 @@ func TestClientSendsBearerTokenAndPicksUpRotation(t *testing.T) {
 		if srv.seen[i] != want[i] {
 			t.Fatalf("request %d sent %q, want %q", i, srv.seen[i], want[i])
 		}
+	}
+}
+
+func TestChartDefaultAudienceMatchesPlugin(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "charts", "cloudvm-karpenter", "values.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values struct {
+		Plugin struct {
+			TokenAudience string `json:"tokenAudience"`
+		} `json:"plugin"`
+	}
+	if err := yaml.Unmarshal(raw, &values); err != nil {
+		t.Fatal(err)
+	}
+	if values.Plugin.TokenAudience != nodeclaim.DefaultTokenAudience {
+		t.Fatalf("chart tokenAudience = %q, want the plugin default %q", values.Plugin.TokenAudience, nodeclaim.DefaultTokenAudience)
 	}
 }

@@ -61,7 +61,7 @@ func newPluginServer(catalog nodeclaim.Catalog) *pluginServer {
 	})
 	p.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+pluginToken {
-			writeJSON(w, http.StatusUnauthorized, nodeclaim.ErrorResponse{Reason: "Unauthorized"})
+			writeJSON(w, http.StatusUnauthorized, nodeclaim.ErrorResponse{Reason: nodeclaim.ReasonUnauthorized})
 			return
 		}
 		mux.ServeHTTP(w, r)
