@@ -1059,6 +1059,7 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		TunnelDirectCIDRs:     spec.TunnelDirectCIDRs,
 		TunnelCIDRs:           spec.TunnelCIDRs,
+		TunnelServiceCIDRs:    spec.TunnelServiceCIDRs,
 		ImageMirrors:          spec.ImageMirrors,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		TargetContainerImage:  spec.TargetContainerImage,

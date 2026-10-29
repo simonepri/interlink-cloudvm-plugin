@@ -363,6 +363,7 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		TunnelGatewayIP:       spec.TunnelGatewayIP,
 		TunnelDirectCIDRs:     spec.TunnelDirectCIDRs,
 		TunnelCIDRs:           spec.TunnelCIDRs,
+		TunnelServiceCIDRs:    spec.TunnelServiceCIDRs,
 		ImageMirrors:          spec.ImageMirrors,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                spec.Region,
@@ -765,6 +766,17 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		spec.DockerConfigJSON = ResolveImagePullSecrets(r.Context(), parseSecretsFromPayload(body), resolver, spec.PodNamespace, pod.Spec.ImagePullSecrets)
 	}
+	if len(pod.Spec.Volumes) > 0 {
+		s.mu.RLock()
+		resolver := s.secretResolver
+		s.mu.RUnlock()
+		spec.SecretVolumes, err = ResolveSecretVolumes(r.Context(), pod, parseSecretsFromPayload(body), resolver)
+		if err != nil {
+			log.Printf("[cloudvm] Refusing pod %s/%s: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), err) //nolint:gosec // sanitized
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 
 	s.mu.Lock()
 	if len(spec.RegistryMirrors) == 0 && len(s.registryMirrors) > 0 {
@@ -926,6 +938,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			RunAsUser:        spec.RunAsUser,
 			RunAsGroup:       spec.RunAsGroup,
 			DockerConfigJSON: spec.DockerConfigJSON,
+			SecretVolumes:    spec.SecretVolumes,
 			AWSCredentials:   awsCreds,
 		}
 		startErr := s.runner.StartContainer(r.Context(), warmNode, startReq)
@@ -1129,6 +1142,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		RunAsUser:        spec.RunAsUser,
 		RunAsGroup:       spec.RunAsGroup,
 		DockerConfigJSON: spec.DockerConfigJSON,
+		SecretVolumes:    spec.SecretVolumes,
 		AWSCredentials:   awsCreds,
 	}
 	startErr := s.runner.StartContainer(r.Context(), newNode, startReq)

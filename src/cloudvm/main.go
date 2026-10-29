@@ -478,11 +478,20 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 		listenAddr = ":7443"
 	}
 
+	serviceNetworks, err := ParseDirectTCPNetworks(os.Getenv("TUNNEL_TCP_SERVICE_CIDRS"))
+	if err != nil {
+		return nil, err
+	}
+	sharedServices, err := ParseSharedServices(os.Getenv("TUNNEL_SHARED_SERVICES"))
+	if err != nil {
+		return nil, err
+	}
 	settings := TunnelSettings{
 		Endpoint:       endpoint,
 		Transports:     transports,
 		DirectCIDRs:    directCIDRs,
-		ClusterCIDRs:   splitCIDRList(os.Getenv("TUNNEL_TCP_DIRECT_CIDRS")),
+		ClusterCIDRs:   splitCIDRList(os.Getenv("TUNNEL_TCP_DIRECT_CIDRS") + "," + os.Getenv("TUNNEL_TCP_SERVICE_CIDRS")),
+		ServiceCIDRs:   splitCIDRList(os.Getenv("TUNNEL_TCP_SERVICE_CIDRS")),
 		ImageMirrors:   imageMirrors,
 		GatewayIP:      strings.TrimSpace(os.Getenv("TUNNEL_GATEWAY_IP")),
 		PublicEndpoint: strings.TrimSpace(os.Getenv("TUNNEL_PUBLIC_ENDPOINT")),
@@ -538,6 +547,15 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 	}
 	if podWatch != nil {
 		config.PodNamespaces = podWatch
+	}
+	if len(serviceNetworks) > 0 {
+		serviceWatch, err := NewInClusterServiceWatch()
+		if err != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("TUNNEL_TCP_SERVICE_CIDRS needs a service watch: %w", err)
+		}
+		serviceWatch.Start(ctx.Done())
+		config.ServiceNetworks, config.Services, config.SharedServices = serviceNetworks, serviceWatch, sharedServices
 	}
 	gateway, err := NewTunnelGateway(config)
 	if err != nil {

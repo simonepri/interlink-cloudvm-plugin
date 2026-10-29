@@ -49,6 +49,7 @@ type CloudInitConfig struct {
 	TunnelGatewayIP        string
 	TunnelDirectCIDRs      []string
 	TunnelCIDRs            []string
+	TunnelServiceCIDRs     []string
 	RunnerDirectHTTP       bool
 	Region                 string
 	InstanceType           string
@@ -132,6 +133,12 @@ func (c *CloudInitConfig) SpotWatcherScriptSHA256() string {
 // TunnelCIDRList returns the comma-separated networks the worker's agent sends through the tunnel.
 func (c *CloudInitConfig) TunnelCIDRList() string {
 	return strings.Join(c.TunnelCIDRs, ",")
+}
+
+// TransparentProxyPort is the loopback port where the worker's agent accepts the connections the bootstrap redirects
+// to it from the Service networks.
+func (c *CloudInitConfig) TransparentProxyPort() int {
+	return transparentProxyPort
 }
 
 // TunnelAgentScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the tunnel agent by.
@@ -780,9 +787,16 @@ cloudvm_fetch_script {{.SpotWatcherScriptSHA256}} /usr/local/bin/cloudvm-spot-wa
 CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" nohup python3 /usr/local/bin/cloudvm-spot-watcher.py >> {{.SpotWatcherLogPath}} 2>&1 < /dev/null &
 cloudvm_fetch_script {{.TunnelAgentScriptSHA256}} /usr/local/bin/cloudvm-tunnel-agent.py
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
+{{if .TunnelServiceCIDRs}}
+# Connections to cluster Services enter the agent, which tunnels them, so clients need no proxy; the gateway stays direct.
+iptables -t nat -N CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -F CLOUDVM_SERVICES
+{{if .TunnelGatewayIP}}iptables -t nat -A CLOUDVM_SERVICES -d {{.TunnelGatewayIP}} -j RETURN
+{{end}}{{range .TunnelServiceCIDRs}}iptables -t nat -A CLOUDVM_SERVICES -p tcp -d {{.}} -j REDIRECT --to-ports {{$.TransparentProxyPort}} || echo "[cloudvm-bootstrap] cannot intercept {{.}}"
+{{end}}iptables -t nat -C OUTPUT -j CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -A OUTPUT -j CLOUDVM_SERVICES
+{{end}}
 CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
   CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" CLOUDVM_TUNNEL_CIDRS="{{.TunnelCIDRList}}" \
-  CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1" \
+  CLOUDVM_TRANSPARENT_PORT="{{if .TunnelServiceCIDRs}}{{.TransparentProxyPort}}{{else}}0{{end}}" CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1" \
   CLOUDVM_LOG_FILES="bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log,{{.SpotWatcherLogFile}}" \
   nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
 {{end}}

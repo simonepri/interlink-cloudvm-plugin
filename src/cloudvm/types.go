@@ -120,6 +120,8 @@ type InstanceSpec struct {
 	TunnelDirectCIDRs []string `json:"tunnelDirectCidrs,omitempty"`
 	// TunnelCIDRs are the networks the worker's agent sends through the tunnel; it dials every other destination itself.
 	TunnelCIDRs []string `json:"tunnelCidrs,omitempty"`
+	// TunnelServiceCIDRs are the Service networks the worker's agent intercepts every connection to and tunnels.
+	TunnelServiceCIDRs []string `json:"tunnelServiceCidrs,omitempty"`
 	// ImageMirrors maps an upstream registry host to the mirror reference prefix the worker's runner pulls from instead.
 	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
 	// TunnelRoutes holds the tunnel route of every region this launch may use; the Tunnel* fields hold the pinned region's.
@@ -156,6 +158,8 @@ type InstanceSpec struct {
 	AssignedGPUs []int `json:"assignedGPUs,omitempty"`
 	// DockerConfigJSON holds the serialized .dockerconfigjson for private container registry authentication.
 	DockerConfigJSON string `json:"dockerConfigJSON,omitempty"`
+	// SecretVolumes are the Secret volumes the workload container mounts; they never leave the plugin's memory.
+	SecretVolumes []SecretVolume `json:"-"`
 	// RegistryMirrors specifies custom container registry mirror URLs.
 	RegistryMirrors []string `json:"registryMirrors,omitempty"`
 	// OtelEndpoint specifies the OpenTelemetry metrics/traces exporter target.
@@ -253,6 +257,7 @@ type ContainerSpec struct {
 	Env             []EnvVar                      `json:"env,omitempty"`
 	Resources       ContainerResourceRequirements `json:"resources,omitempty"`
 	SecurityContext *SecurityContext              `json:"securityContext,omitempty"`
+	VolumeMounts    []corev1.VolumeMount          `json:"volumeMounts,omitempty"`
 }
 
 type PodSpecWrapper struct {
@@ -263,6 +268,7 @@ type PodSpecWrapper struct {
 	Containers         []ContainerSpec               `json:"containers"`
 	SecurityContext    *PodSecurityContext           `json:"securityContext,omitempty"`
 	ImagePullSecrets   []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	Volumes            []corev1.Volume               `json:"volumes,omitempty"`
 }
 
 // Pod represents the incoming pod definition from InterLink.

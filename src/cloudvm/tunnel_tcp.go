@@ -58,8 +58,8 @@ func refuse(reason, format string, args ...any) error {
 }
 
 // serveWorkerTCP bridges a worker-opened tcp stream to its target: another worker VM when the target is one of their
-// addresses, otherwise a direct connection from the gateway when allowDirect permits it. Both ends must share a
-// namespace.
+// addresses, otherwise a direct connection from the gateway to a Service ClusterIP that allowService permits or to a
+// pod address that allowDirect permits. Both ends must share a namespace, unless the target is a shared Service.
 func (g *TunnelGateway) serveWorkerTCP(instanceID string, reader *bufio.Reader, stream *yamux.Stream, target string) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
@@ -87,6 +87,12 @@ func (g *TunnelGateway) dialFromWorker(instanceID, host, port, target string) (n
 			return nil, err
 		}
 		return g.openWorkerTCP(peer, target)
+	}
+	if g.inServiceNetworks(host) {
+		if err := g.allowService(source, host, port); err != nil {
+			return nil, err
+		}
+		return (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
 	}
 	if err := g.allowDirect(host, port); err != nil {
 		return nil, refuse("direct_forbidden", "%v", err)
@@ -123,6 +129,37 @@ func (g *TunnelGateway) podNamespaceOf(ip, unknownReason string) (string, error)
 		}
 	}
 	return "", refuse(unknownReason, "no pod of a single namespace holds %s", ip)
+}
+
+// inServiceNetworks reports whether host is an IP inside the configured Service networks.
+func (g *TunnelGateway) inServiceNetworks(host string) bool {
+	ip := net.ParseIP(host)
+	for _, network := range g.serviceNetworks {
+		if ip != nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// allowService refuses a stream from a worker of namespace source to a Service ClusterIP unless the Service lies in
+// source or among the shared Services and exposes port. Unlike pod addresses, Services may expose ports below 1024: a
+// ClusterIP reaches only the Service's own endpoints.
+func (g *TunnelGateway) allowService(source, host, port string) error {
+	if g.services == nil || !g.services.HasSynced() {
+		return refuse("unsynced", "the service watch has not synced")
+	}
+	svc, ok := g.services.ServiceByIP(net.ParseIP(host).String())
+	if !ok {
+		return refuse("unknown_target", "no service holds %s", host)
+	}
+	if svc.Namespace != source && !g.sharedServices[svc.Namespace+"/"+svc.Name] {
+		return refuse("namespace_mismatch", "namespace %s may not reach service %s/%s", source, svc.Namespace, svc.Name)
+	}
+	if p, err := strconv.Atoi(port); err != nil || !svc.exposes(p) {
+		return refuse("direct_forbidden", "service %s/%s does not expose tcp port %s", svc.Namespace, svc.Name, port)
+	}
+	return nil
 }
 
 func sameNamespace(source, dest string) error {
@@ -295,7 +332,7 @@ func (g *TunnelGateway) allowDirect(host, port string) error {
 	return fmt.Errorf("target %s is outside the direct forwarding networks", host)
 }
 
-// ParseDirectTCPNetworks parses the comma-separated CIDRs direct forwarding may reach.
+// ParseDirectTCPNetworks parses the comma-separated CIDRs that direct or Service forwarding may reach.
 func ParseDirectTCPNetworks(raw string) ([]*net.IPNet, error) {
 	var networks []*net.IPNet
 	for _, cidr := range strings.Split(raw, ",") {
@@ -305,7 +342,7 @@ func ParseDirectTCPNetworks(raw string) ([]*net.IPNet, error) {
 		}
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid direct forwarding network %q: %w", cidr, err)
+			return nil, fmt.Errorf("invalid forwarding network %q: %w", cidr, err)
 		}
 		networks = append(networks, network)
 	}

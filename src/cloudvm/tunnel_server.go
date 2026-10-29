@@ -34,6 +34,9 @@ type TunnelSettings struct {
 	DirectCIDRs map[string][]string
 	// ClusterCIDRs are the cluster networks workers reach through the tunnel, such as the pod network.
 	ClusterCIDRs []string
+	// ServiceCIDRs are the Service ClusterIP networks, which workers' agents carry through the tunnel even for clients
+	// that use no proxy; ClusterCIDRs lists them too.
+	ServiceCIDRs []string
 	// ImageMirrors maps each region to the registry mirrors its workers pull images from.
 	ImageMirrors map[string]map[string]string
 	// GatewayIP is the gateway ClusterIP router workers pin the Endpoint host to.
@@ -121,6 +124,8 @@ type TunnelRoute struct {
 	// TunnelCIDRs are the networks a worker of the region sends through the tunnel: the cluster networks and the other
 	// regions' worker networks. The worker dials every other destination itself.
 	TunnelCIDRs []string `json:"tunnelCidrs,omitempty"`
+	// ServiceCIDRs are the Service networks a worker's agent intercepts every connection to and sends through the tunnel.
+	ServiceCIDRs []string `json:"serviceCidrs,omitempty"`
 	// ImageMirrors maps an upstream registry host to the mirror reference prefix workers of the region pull from.
 	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
 }
@@ -151,7 +156,7 @@ func (t *tunnelState) tunnelCIDRs(region string) []string {
 // route resolves the tunnel route of workers launched in region, failing when a setting its transport needs is unset.
 func (t *tunnelState) route(region, meshKey string) (TunnelRoute, error) {
 	transport := t.Transports.For(region)
-	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region], TunnelCIDRs: t.tunnelCIDRs(region), ImageMirrors: t.ImageMirrors[region]}
+	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region], TunnelCIDRs: t.tunnelCIDRs(region), ServiceCIDRs: t.ServiceCIDRs, ImageMirrors: t.ImageMirrors[region]}
 	if transport == TunnelTransportPublic {
 		route.Endpoint = t.PublicEndpoint
 		return route, nil
@@ -218,6 +223,7 @@ func (spec *InstanceSpec) applyTunnelRoute(route TunnelRoute) {
 	spec.TunnelGatewayIP = route.GatewayIP
 	spec.TunnelDirectCIDRs = route.DirectCIDRs
 	spec.TunnelCIDRs = route.TunnelCIDRs
+	spec.TunnelServiceCIDRs = route.ServiceCIDRs
 	spec.ImageMirrors = route.ImageMirrors
 }
 

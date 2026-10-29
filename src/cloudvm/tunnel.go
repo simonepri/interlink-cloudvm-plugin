@@ -164,6 +164,9 @@ type TunnelGateway struct {
 	resolver            InstanceAddressResolver
 	directTCPNetworks   []*net.IPNet
 	podNamespaces       PodNamespaces
+	serviceNetworks     []*net.IPNet
+	services            ClusterServices
+	sharedServices      map[string]bool
 	workerNamespace     WorkerNamespaceResolver
 	onTCPRefusal        func(reason string)
 	tcpRefusalLog       refusalLog
@@ -196,6 +199,13 @@ type TunnelGatewayConfig struct {
 	DirectTCPNetworks []*net.IPNet
 	// PodNamespaces maps cluster pod IPs to their namespaces; every tcp stream with a cluster end is refused when nil.
 	PodNamespaces PodNamespaces
+	// ServiceNetworks lists the Service ClusterIP networks workers' tcp streams may reach on the ports their Services
+	// expose.
+	ServiceNetworks []*net.IPNet
+	// Services maps Service ClusterIPs to their Services; every stream into ServiceNetworks is refused when nil.
+	Services ClusterServices
+	// SharedServices holds the namespace/name Services workers of every namespace may reach.
+	SharedServices map[string]bool
 	// WorkerNamespace maps a worker to the namespace of its pods; every tcp stream is refused when nil.
 	WorkerNamespace WorkerNamespaceResolver
 	// OnTCPRefusal is called with a short machine-readable reason for every refused tcp stream and CONNECT request.
@@ -261,6 +271,9 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		resolver:            cfg.Resolver,
 		directTCPNetworks:   cfg.DirectTCPNetworks,
 		podNamespaces:       cfg.PodNamespaces,
+		serviceNetworks:     cfg.ServiceNetworks,
+		services:            cfg.Services,
+		sharedServices:      cfg.SharedServices,
 		workerNamespace:     cfg.WorkerNamespace,
 		onTCPRefusal:        cfg.OnTCPRefusal,
 		clusterDomain:       cfg.ClusterDomain,
