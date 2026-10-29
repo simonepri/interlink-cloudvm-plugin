@@ -14,6 +14,7 @@ RUN go mod download
 COPY karpenter/apis ./apis
 COPY karpenter/cloudprovider ./cloudprovider
 COPY karpenter/cmd ./cmd
+COPY karpenter/pluginclient ./pluginclient
 
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -trimpath \

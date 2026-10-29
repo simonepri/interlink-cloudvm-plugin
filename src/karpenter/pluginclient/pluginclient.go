@@ -1,5 +1,5 @@
 // Package pluginclient builds the plugin NodeClaim API client that authenticates with a projected service account
-// token, re-read from its file so kubelet rotations take effect without a restart.
+// token, re-read from its file on every request so kubelet rotations take effect without a restart.
 package pluginclient
 
 import (
@@ -9,17 +9,14 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/client-go/transport"
-
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
 
 // Timeout bounds one plugin call; a launch blocks until the cloud returns the instance ID.
 const Timeout = 2 * time.Minute
 
-// New returns a client that sends the token in tokenFile as a bearer token on every request. The token is re-read
-// every minute and after the plugin answers 401. It fails when the file is missing or empty, so the controller
-// never calls the plugin unauthenticated.
+// New returns a client that sends the token in tokenFile as a bearer token on every request. It fails when the file
+// is missing or empty, so the controller never starts without a credential for the plugin.
 func New(baseURL, tokenFile string) (*nodeclaim.Client, error) {
 	if tokenFile == "" {
 		return nil, fmt.Errorf("a plugin token file is required")
@@ -31,6 +28,5 @@ func New(baseURL, tokenFile string) (*nodeclaim.Client, error) {
 	if strings.TrimSpace(string(raw)) == "" {
 		return nil, fmt.Errorf("plugin token file %s is empty", tokenFile)
 	}
-	wrap := transport.ResettableTokenSourceWrapTransport(transport.NewCachedFileTokenSource(tokenFile))
-	return nodeclaim.NewClient(baseURL, &http.Client{Timeout: Timeout, Transport: wrap(http.DefaultTransport)}), nil
+	return nodeclaim.NewClient(baseURL, &http.Client{Timeout: Timeout, Transport: &nodeclaim.TokenFileTransport{Path: tokenFile}}), nil
 }
