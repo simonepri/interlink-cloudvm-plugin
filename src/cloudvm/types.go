@@ -170,6 +170,10 @@ type InstanceSpec struct {
 	CustomBootstrapScript string `json:"customBootstrapScript,omitempty"`
 	// RunnerConcurrency specifies the max concurrent containers executed by runner.
 	RunnerConcurrency int `json:"runnerConcurrency,omitempty"`
+	// Zone pins the availability zone the VM launches in; empty lets the cloud choose within the region.
+	Zone string `json:"zone,omitempty"`
+	// NodeClaim marks a VM launched for a Karpenter NodeClaim: it boots with no pod and waits for pods to start.
+	NodeClaim bool `json:"nodeClaim,omitempty"`
 }
 
 // Instance represents an active or terminating cloud VM instance.

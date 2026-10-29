@@ -350,6 +350,10 @@ func run() error {
 		terminator = term
 	}
 
+	server.SetClaimAuthenticator(claimAuthenticatorFromEnv())
+	server.RecoverClaims()
+	go server.RunClaimSync(ctx)
+
 	if inventory != nil {
 		if err := server.RecoverActiveInstances(ctx, inventory); err != nil {
 			log.Printf("[cloudvm] Warning: failed to recover active instances: %v", err)

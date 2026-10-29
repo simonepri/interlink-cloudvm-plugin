@@ -65,6 +65,9 @@ type CloudInitConfig struct {
 	CustomBootstrapScript  string
 	IdleGracePeriodSeconds int `json:"idleGracePeriodSeconds,omitempty"`
 	RunnerConcurrency      int `json:"runnerConcurrency,omitempty"`
+	// NodeClaim boots a VM for a Karpenter NodeClaim: it starts with no pod, so the boot watchdog, which powers off a
+	// VM whose first container does not start, stays off; the plugin terminates a claim VM that never becomes ready.
+	NodeClaim bool `json:"nodeClaim,omitempty"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -278,6 +281,7 @@ echo "CLOUDVM_STATUS: {\"status\": \"BOOTING\", \"pod\": \"{{.PodName}}\", \"reg
 touch /tmp/cloudvm-heartbeat 2>/dev/null || true
 echo "$(date +%s)" > /tmp/cloudvm-heartbeat 2>/dev/null || true
 
+{{if not .NodeClaim}}
 # 1. Arm Self-Destruct Startup Watchdog (terminates VM if workload fails to reach ready within 600s)
 cat << 'EOF' > /usr/local/bin/bootstrap-watchdog.sh
 #!/usr/bin/env bash
@@ -291,6 +295,7 @@ fi
 EOF
 chmod +x /usr/local/bin/bootstrap-watchdog.sh
 nohup /usr/local/bin/bootstrap-watchdog.sh > /var/log/bootstrap-watchdog.log 2>&1 &
+{{end}}
 
 # Ensure AWS instance terminates on poweroff to prevent zombie storage billing
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)

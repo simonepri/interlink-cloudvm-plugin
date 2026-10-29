@@ -127,16 +127,33 @@ func (c *offeringCache) typeZones(ctx context.Context, client EC2FleetClient, re
 
 // offeredFleetOverrides builds the fleet overrides for instanceTypes x subnetIDs, keeping only pairs whose subnet AZ
 // offers the instance type. Pairs whose AZ cannot be resolved are kept, and a failed lookup returns every pair, so a
-// lookup outage degrades to the unfiltered request instead of blocking launches.
-func (p *AWSProvider) offeredFleetOverrides(ctx context.Context, client EC2FleetClient, region string, instanceTypes, subnetIDs []string) ([]ec2types.FleetLaunchTemplateOverridesRequest, error) {
+// lookup outage degrades to the unfiltered request instead of blocking launches. A non-empty zone keeps only the
+// subnets known to be in that zone, and fails when none is.
+func (p *AWSProvider) offeredFleetOverrides(ctx context.Context, client EC2FleetClient, region, zone string, instanceTypes, subnetIDs []string) ([]ec2types.FleetLaunchTemplateOverridesRequest, error) {
 	all := BuildFleetOverrides(instanceTypes, subnetIDs)
-	if len(subnetIDs) == 0 {
+	if len(subnetIDs) == 0 && zone == "" {
 		return all, nil
 	}
 	cache := p.offerings()
 	cleanRegion := sanitizeLog(region)
 
 	subnetAZ, err := cache.subnetZones(ctx, client, region, subnetIDs)
+	if zone != "" {
+		if err != nil {
+			return nil, fmt.Errorf("resolve the zones of subnets %s in %s for zone %s: %w", strings.Join(subnetIDs, ","), region, zone, err)
+		}
+		var inZone []string
+		for _, subnet := range subnetIDs {
+			if subnetAZ[subnet] == zone {
+				inZone = append(inZone, subnet)
+			}
+		}
+		if len(inZone) == 0 {
+			return nil, fmt.Errorf("%w: no subnet of %s in %s is in zone %s", errNoOfferedPlacements, strings.Join(subnetIDs, ","), region, zone)
+		}
+		subnetIDs = inZone
+		all = BuildFleetOverrides(instanceTypes, subnetIDs)
+	}
 	if err != nil {
 		log.Printf("[aws] Warning: skipping AZ offering filter in %s: %v", cleanRegion, err) //nolint:gosec // region sanitized
 		return all, nil

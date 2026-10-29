@@ -24,13 +24,18 @@ description = "Audit GitHub Actions workflows for security issues"
 run = "zizmor .github/workflows"
 
 [tasks.lint-go]
-description = "Run strict Go linting"
-dir = "src"
-run = "golangci-lint run --config ../.config/golangci.yaml ./..."
+description = "Run strict Go linting on every Go module"
+run = [
+  "cd src && golangci-lint run --config ../.config/golangci.yaml ./...",
+  "cd src/nodeclaim && golangci-lint run --config ../../.config/golangci.yaml ./...",
+]
 
 [tasks.lint-mod]
 description = "Verify Go module is tidy"
-run = "go -C src mod tidy -diff"
+run = [
+  "go -C src mod tidy -diff",
+  "go -C src/nodeclaim mod tidy -diff",
+]
 
 [tasks.lint-secrets]
 description = "Scan authored files for committed secrets"
@@ -38,8 +43,10 @@ run = "gitleaks dir . --config .config/gitleaks.toml --no-banner --redact"
 
 [tasks.lint-vulnerabilities]
 description = "Check reachable Go code for known vulnerabilities"
-dir = "src"
-run = "govulncheck ./..."
+run = [
+  "cd src && govulncheck ./...",
+  "cd src/nodeclaim && govulncheck ./...",
+]
 
 [tasks.lint-yaml]
 description = "Lint authored YAML files"
@@ -69,7 +76,10 @@ depends = [
 
 [tasks.test]
 description = "Run race-enabled Go unit tests"
-run = "go -C src test -race -count=1 -cover ./..."
+run = [
+  "go -C src test -race -count=1 -cover ./...",
+  "go -C src/nodeclaim test -race -count=1 -cover ./...",
+]
 
 [tasks.verify]
 description = "Run the complete verification gate"

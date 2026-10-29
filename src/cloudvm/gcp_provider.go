@@ -349,6 +349,7 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		PodName:               spec.PodName,
 		PodNamespace:          spec.PodNamespace,
 		PodUID:                spec.PodUID,
+		NodeClaim:             spec.NodeClaim,
 		RayHeadAddress:        spec.RayHeadAddress,
 		RayVersion:            spec.RayVersion,
 		TargetContainerImage:  spec.TargetContainerImage,

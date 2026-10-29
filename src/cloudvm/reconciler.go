@@ -42,6 +42,22 @@ type TombstoneChecker interface {
 	IsTombstoned(inst *Instance) bool
 }
 
+// ClaimInstanceChecker reports whether a VM belongs to a NodeClaim, whose lifecycle only the claim API drives.
+type ClaimInstanceChecker interface {
+	IsClaimInstance(instanceID string) bool
+}
+
+// InventoryObserver receives every successful inventory scan with the regions whose scan failed.
+type InventoryObserver interface {
+	ObserveInventory(active map[string]*Instance, failedRegions map[string]error)
+}
+
+// isClaimInstance reports whether the tracker owns the VM through a NodeClaim.
+func (r *Reconciler) isClaimInstance(instanceID string) bool {
+	c, ok := r.tracker.(ClaimInstanceChecker)
+	return ok && c.IsClaimInstance(instanceID)
+}
+
 // InstanceTerminator abstracts VM termination for the reconciler.
 type InstanceTerminator interface {
 	Terminate(ctx context.Context, instanceID string) error
@@ -502,6 +518,10 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 		}
 	}
 
+	if obs, ok := r.tracker.(InventoryObserver); ok {
+		obs.ObserveInventory(cloudInstances, errorsByRegion)
+	}
+
 	// 1. Forward check: detect pods whose cloud VM vanished or terminated
 	var deadPods []deadPod
 	var vanishedVMs []string
@@ -601,7 +621,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (*ReconcileResult, error
 	np := r.getNodePool()
 	var zombies []string
 	for _, inst := range activeInstances {
-		if activeInstanceIDs[inst.ID] || reapedIDs[inst.ID] {
+		if activeInstanceIDs[inst.ID] || reapedIDs[inst.ID] || r.isClaimInstance(inst.ID) {
 			continue
 		}
 

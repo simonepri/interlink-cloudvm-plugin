@@ -929,7 +929,11 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 		}
 	}
 
-	overrides, err := p.offeredFleetOverrides(ctx, client, region, instanceTypes, subnetIDs)
+	zone := ""
+	if pinned {
+		zone = spec.Zone
+	}
+	overrides, err := p.offeredFleetOverrides(ctx, client, region, zone, instanceTypes, subnetIDs)
 	if err != nil {
 		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "no_capacity")
 		return nil, err
@@ -1040,6 +1044,7 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		PodName:               spec.PodName,
 		PodNamespace:          spec.PodNamespace,
 		PodUID:                spec.PodUID,
+		NodeClaim:             spec.NodeClaim,
 		Region:                region,
 		InstanceType:          spec.InstanceType,
 		NumGPUs:               spec.NumGPUs,

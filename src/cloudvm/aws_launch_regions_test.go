@@ -184,7 +184,7 @@ func TestOfferingLookupIsCachedUntilTTL(t *testing.T) {
 	p.offeringCache = cache
 
 	for range 2 {
-		if _, err := p.offeredFleetOverrides(context.Background(), client, "us-west-1", []string{"g5.xlarge"}, []string{"subnet-a"}); err != nil {
+		if _, err := p.offeredFleetOverrides(context.Background(), client, "us-west-1", "", []string{"g5.xlarge"}, []string{"subnet-a"}); err != nil {
 			t.Fatalf("offeredFleetOverrides failed: %v", err)
 		}
 	}
@@ -192,7 +192,7 @@ func TestOfferingLookupIsCachedUntilTTL(t *testing.T) {
 		t.Fatalf("DescribeInstanceTypeOfferings called %d times within TTL, want 1", usw1.offeringCalls)
 	}
 	now = now.Add(time.Hour + time.Second)
-	if _, err := p.offeredFleetOverrides(context.Background(), client, "us-west-1", []string{"g5.xlarge"}, []string{"subnet-a"}); err != nil {
+	if _, err := p.offeredFleetOverrides(context.Background(), client, "us-west-1", "", []string{"g5.xlarge"}, []string{"subnet-a"}); err != nil {
 		t.Fatalf("offeredFleetOverrides failed: %v", err)
 	}
 	if usw1.offeringCalls != 2 {
@@ -203,7 +203,7 @@ func TestOfferingLookupIsCachedUntilTTL(t *testing.T) {
 func TestOfferingLookupFailureKeepsAllOverrides(t *testing.T) {
 	p := newTestProvider(t)
 	usw1 := &regionMock{subnetAZ: map[string]string{"subnet-a": "us-west-1a"}, offeringsErr: errors.New("UnauthorizedOperation")}
-	ovs, err := p.offeredFleetOverrides(context.Background(), usw1.client(), "us-west-1", []string{"g5.xlarge", "g6.xlarge"}, []string{"subnet-a"})
+	ovs, err := p.offeredFleetOverrides(context.Background(), usw1.client(), "us-west-1", "", []string{"g5.xlarge", "g6.xlarge"}, []string{"subnet-a"})
 	if err != nil {
 		t.Fatalf("offeredFleetOverrides failed: %v", err)
 	}

@@ -11,6 +11,13 @@ serviceAccount:
   annotations: {}
   name: ""
 
+# Callers of the NodeClaim API (/v1/nodeclaims, /v1/catalog): a bearer service account token for this audience that a
+# TokenReview accepts, from one of these users, such as system:serviceaccount:karpenter:cloudvm-karpenter. With no
+# users every call is refused.
+nodeClaimAPI:
+  audience: "cloudvm-plugin"
+  allowedUsers: []
+
 provider:
   type: "mock"  # "aws" | "gcp" | "mock"
   clusterTag: "interlink-cloudvm"

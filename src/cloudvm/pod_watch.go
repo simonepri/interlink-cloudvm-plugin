@@ -160,7 +160,7 @@ func (r *Reconciler) reapOrphanedVMs(ctx context.Context, instances []*Instance)
 	}
 	var reaped []string
 	for _, inst := range instances {
-		if inst == nil || inst.State == StateTerminated || inst.State == StateFailed {
+		if inst == nil || inst.State == StateTerminated || inst.State == StateFailed || r.isClaimInstance(inst.ID) {
 			continue
 		}
 		podUID, podName, ns, _ := extractInstanceIdentity(inst)

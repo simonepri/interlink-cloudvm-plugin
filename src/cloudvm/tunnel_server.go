@@ -294,6 +294,10 @@ func (s *Server) failTunnelDeadline(ctx context.Context, node *CloudVMNode, req 
 	}
 	s.mu.Unlock()
 	s.nodePool.MarkPodCompleted(req.PodUID, term.ExitCode, term.Reason, term.Message, term.FinishedAt)
+	if node.ClaimName != "" {
+		// A claim's VM outlives this pod; its claim decides when it terminates.
+		return
+	}
 	s.nodePool.UnregisterNode(node.InstanceID)
 	s.TerminateIdleNode(ctx, node)
 }

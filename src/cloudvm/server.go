@@ -22,6 +22,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
 
 func generateToken() (string, error) {
@@ -80,6 +82,8 @@ type Server struct {
 	podLogs               *PodLogBuffer                        // recent container output served to kubectl logs
 	logForwarder          *OTLPLogForwarder                    // optional OTLP export of worker logs
 	podCredentials        *PodCredentials                      // optional AWS credentials for pods whose service account has a role
+	claims                *claimRegistry                       // VMs launched for Karpenter NodeClaims
+	claimAuth             *claimAuthenticator                  // verifies NodeClaim API callers; nil refuses them all
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -128,6 +132,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		completedPods:      make(map[string]*ContainerTerminatedState),
 		inFlightCreates:    make(map[string]*inFlightCreate),
 		podLogs:            NewPodLogBuffer(defaultPodLogPods, defaultPodLogBytes),
+		claims:             newClaimRegistry(os.Getenv("CLAIM_STORE_PATH"), clusterTag),
 	}
 	if tombStore != nil {
 		for k, v := range tombStore.GetAll() {
@@ -340,6 +345,7 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		PodName:               spec.PodName,
 		PodNamespace:          spec.PodNamespace,
 		PodUID:                spec.PodUID,
+		NodeClaim:             spec.NodeClaim,
 		RayHeadAddress:        spec.RayHeadAddress,
 		RayVersion:            spec.RayVersion,
 		TargetContainerImage:  spec.TargetContainerImage,
@@ -665,6 +671,11 @@ func (s *Server) Routes() http.Handler {
 	})
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
+	// VM-per-NodeClaim API for a Karpenter cloud provider and the node agent
+	mux.HandleFunc(nodeclaim.PathNodeClaims, s.requireClaimCaller(s.handleNodeClaims))
+	mux.HandleFunc(nodeclaim.PathNodeClaims+"/{name}", s.requireClaimCaller(s.handleNodeClaim))
+	mux.HandleFunc(nodeclaim.PathCatalog, s.requireClaimCaller(s.handleCatalog))
+
 	return mux
 }
 
@@ -716,6 +727,27 @@ func (s *Server) allocateWarmNode(ctx context.Context, spec *InstanceSpec, req R
 	return alloc.Node, alloc.GPUs, alloc.TPUs, nil
 }
 
+// applyServerDefaults fills the bootstrap settings a spec leaves unset from the server configuration.
+func (s *Server) applyServerDefaults(spec *InstanceSpec) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(spec.RegistryMirrors) == 0 && len(s.registryMirrors) > 0 {
+		spec.RegistryMirrors = s.registryMirrors
+	}
+	if spec.OtelEndpoint == "" && s.otelEndpoint != "" {
+		spec.OtelEndpoint = s.otelEndpoint
+	}
+	if !spec.NodeProblemDetector && s.enableNPD {
+		spec.NodeProblemDetector = true
+	}
+	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
+		spec.CustomBootstrapScript = s.customBootstrapScript
+	}
+	if spec.RunnerConcurrency <= 0 && s.runnerConcurrency > 0 {
+		spec.RunnerConcurrency = s.runnerConcurrency
+	}
+}
+
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -740,7 +772,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var finalResp *CreateStruct
 	var finalErr error
 
+	claimNode, isClaimPod := s.claimForPod(pod)
 	region, err := s.launchRegion(pod)
+	if isClaimPod {
+		// A claim pod runs on its claim's VM, so it needs no launch region.
+		region, err = s.defaultRegion, nil
+	}
 	if err != nil {
 		finalErr = err
 		log.Printf("[cloudvm] Refusing pod %s/%s: %v", pod.Metadata.Namespace, pod.Metadata.Name, err)
@@ -778,22 +815,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	s.applyServerDefaults(spec)
 	s.mu.Lock()
-	if len(spec.RegistryMirrors) == 0 && len(s.registryMirrors) > 0 {
-		spec.RegistryMirrors = s.registryMirrors
-	}
-	if spec.OtelEndpoint == "" && s.otelEndpoint != "" {
-		spec.OtelEndpoint = s.otelEndpoint
-	}
-	if !spec.NodeProblemDetector && s.enableNPD {
-		spec.NodeProblemDetector = true
-	}
-	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
-		spec.CustomBootstrapScript = s.customBootstrapScript
-	}
-	if spec.RunnerConcurrency <= 0 && s.runnerConcurrency > 0 {
-		spec.RunnerConcurrency = s.runnerConcurrency
-	}
 
 	// Single-flight in-flight create check and idempotency under lock
 	if spec.PodUID != "" {
@@ -911,82 +934,25 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 1. Try to bin-pack into an existing warm node
+	// 1. A pod bound to a NodeClaim's Node runs on that claim's VM; any other pod tries to bin-pack into a warm node.
+	if isClaimPod {
+		node, gpus, tpus, err := s.allocateClaimPod(claimNode, spec, reqVec)
+		if err != nil {
+			finalErr = err
+			log.Printf("[cloudvm] Refusing pod %s/%s on claim node %s: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(pod.Spec.NodeName), err) //nolint:gosec // sanitized
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		finalResp = s.startOnNode(r.Context(), node, gpus, tpus, spec, pod, awsCreds, cpuLimitMilli, memLimitBytes)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(finalResp)
+		return
+	}
 	warmNode, assignedGPUs, assignedTPUs, err := s.allocateWarmNode(r.Context(), spec, reqVec)
 	if err == nil && warmNode != nil {
 		log.Printf("[cloudvm] Bin-pack hit! Slicing pod %s/%s into warm node %s (GPUs=%v, TPUs=%v)",
 			spec.PodNamespace, spec.PodName, warmNode.InstanceID, assignedGPUs, assignedTPUs)
-
-		// Start container via runner
-		cName := defaultContainerName
-		if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
-			cName = pod.Spec.Containers[0].Name
-		}
-		startReq := &StartContainerRequest{
-			PodUID:           spec.PodUID,
-			Namespace:        spec.PodNamespace,
-			PodName:          spec.PodName,
-			ContainerName:    cName,
-			Image:            spec.TargetContainerImage,
-			Command:          spec.Command,
-			Args:             spec.Args,
-			Env:              spec.Env,
-			CPUMillicores:    cpuLimitMilli,
-			MemoryBytes:      memLimitBytes,
-			AssignedGPUs:     assignedGPUs,
-			AssignedTPUs:     assignedTPUs,
-			RunAsUser:        spec.RunAsUser,
-			RunAsGroup:       spec.RunAsGroup,
-			DockerConfigJSON: spec.DockerConfigJSON,
-			SecretVolumes:    spec.SecretVolumes,
-			AWSCredentials:   awsCreds,
-		}
-		startErr := s.runner.StartContainer(r.Context(), warmNode, startReq)
-		if startErr != nil {
-			log.Printf("[cloudvm] Initial StartContainer call for bin-pack slice returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
-			go s.retryStartContainer(context.WithoutCancel(r.Context()), warmNode, startReq) //nolint:gosec // detached background retry outlives HTTP request
-		}
-
-		marketType := "on-demand"
-		if warmNode.Spot {
-			marketType = "spot"
-		}
-
-		s.mu.Lock()
-		inst := &Instance{
-			ID:        warmNode.InstanceID,
-			Provider:  warmNode.Provider,
-			Region:    warmNode.Region,
-			IP:        warmNode.GetMeshIP(),
-			State:     StateRunning,
-			CreatedAt: warmNode.CreatedAt,
-			Metadata: map[string]string{
-				"podUID":      spec.PodUID,
-				"podName":     spec.PodName,
-				"namespace":   spec.PodNamespace,
-				"marketType":  marketType,
-				"clusterTag":  s.clusterTag,
-				"runnerToken": warmNode.RunnerAuthToken,
-			},
-		}
-		key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
-		s.instances[key] = inst
-		if spec.PodUID != "" {
-			s.instances[spec.PodUID] = inst
-		}
-		s.mu.Unlock()
-
-		var podJID string
-		if spec.PodUID != "" {
-			podJID = fmt.Sprintf("%s:%s", warmNode.InstanceID, spec.PodUID)
-		} else {
-			podJID = warmNode.InstanceID
-		}
-
-		finalResp = &CreateStruct{
-			PodUID: spec.PodUID,
-			PodJID: podJID,
-		}
+		finalResp = s.startOnNode(r.Context(), warmNode, assignedGPUs, assignedTPUs, spec, pod, awsCreds, cpuLimitMilli, memLimitBytes)
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(finalResp)
 		return
@@ -996,83 +962,14 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[cloudvm] Bin-pack miss. Launching new VM for pod %s/%s (type=%s, gpus=%d, region=%s)...",
 		spec.PodNamespace, spec.PodName, spec.InstanceType, spec.NumGPUs, spec.Region)
 
-	s.mu.Lock()
-	tok := ""
-	if spec.PodUID != "" && s.tokenStore != nil {
-		tok = s.tokenStore.Get(spec.PodUID)
-	}
-	if tok == "" && spec.PodUID != "" {
-		tok = s.launchTokens[spec.PodUID]
-	}
-	if tok == "" {
-		var err error
-		tok, err = generateToken()
-		if err != nil {
-			s.mu.Unlock()
-			finalErr = err
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if spec.PodUID != "" {
-			s.launchTokens[spec.PodUID] = tok
-			if s.tokenStore != nil {
-				_ = s.tokenStore.Set(spec.PodUID, tok)
-			}
-		}
-	}
-	if flight != nil {
-		flight.token = tok
-	}
-	s.mu.Unlock()
-	spec.RunnerAuthToken = tok
-	if err := s.applyTunnelSpec(spec); err != nil {
+	if err := s.prepareLaunch(r.Context(), spec, prov); err != nil {
 		finalErr = err
 		http.Error(w, finalErr.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	// Resolve KMS token encryption (AWS EC2 instances only, key taken strictly from provider configuration)
-	_, isAWS := prov.(*AWSProvider)
-	if !isAWS && spec != nil && strings.ToLower(spec.Provider) == "aws" {
-		isAWS = true
+	if flight != nil {
+		flight.token = spec.RunnerAuthToken
 	}
-	if isAWS && (s.kmsClient != nil || s.kmsKeyID != "") {
-		kmsKeyID := s.kmsKeyID
-		kmsClient := s.kmsClient
-		if kmsClient == nil {
-			region := kmsKeyRegion(kmsKeyID, spec.Region)
-			if region == "" {
-				region = s.defaultRegion
-			}
-			var err error
-			kmsClient, err = NewKMSClientFromConfig(r.Context(), region)
-			if err != nil {
-				finalErr = fmt.Errorf("failed to initialize KMS client for region %s: %w", region, err)
-				http.Error(w, finalErr.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-		ciphertext, err := EncryptRunnerToken(r.Context(), kmsClient, kmsKeyID, tok)
-		if err != nil {
-			finalErr = fmt.Errorf("failed to encrypt runner token with KMS key %s: %w", kmsKeyID, err)
-			http.Error(w, finalErr.Error(), http.StatusInternalServerError)
-			return
-		}
-		spec.KMSEncryptedToken = true
-		spec.KMSKeyID = kmsKeyID
-		spec.KMSCiphertext = ciphertext
-		if err := encryptMeshAuthKey(r.Context(), kmsClient, kmsKeyID, spec); err != nil {
-			finalErr = err
-			http.Error(w, finalErr.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-
-	var preAssignedGPUs []int
-	for i := 0; i < spec.NumGPUs; i++ {
-		preAssignedGPUs = append(preAssignedGPUs, i)
-	}
-	spec.AssignedGPUs = preAssignedGPUs
 
 	// Detach from client HTTP request context so client timeouts or cancellations do not abort in-flight VM launch
 	launchCtx, launchCancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.LaunchTimeout())
@@ -1185,6 +1082,148 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(finalResp)
 }
 
+// prepareLaunch issues the runner token of a new VM, keyed by the pod UID so retries reuse it, and applies the tunnel
+// route, the KMS envelope and the GPU devices the first pod gets.
+func (s *Server) prepareLaunch(ctx context.Context, spec *InstanceSpec, prov Provider) error {
+	s.mu.Lock()
+	tok := ""
+	if spec.PodUID != "" && s.tokenStore != nil {
+		tok = s.tokenStore.Get(spec.PodUID)
+	}
+	if tok == "" && spec.PodUID != "" {
+		tok = s.launchTokens[spec.PodUID]
+	}
+	if tok == "" {
+		var err error
+		tok, err = generateToken()
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if spec.PodUID != "" {
+			s.launchTokens[spec.PodUID] = tok
+			if s.tokenStore != nil {
+				_ = s.tokenStore.Set(spec.PodUID, tok)
+			}
+		}
+	}
+	s.mu.Unlock()
+	spec.RunnerAuthToken = tok
+	if err := s.applyTunnelSpec(spec); err != nil {
+		return err
+	}
+
+	// Resolve KMS token encryption (AWS EC2 instances only, key taken strictly from provider configuration)
+	_, isAWS := prov.(*AWSProvider)
+	if !isAWS && spec != nil && strings.ToLower(spec.Provider) == "aws" {
+		isAWS = true
+	}
+	if isAWS && (s.kmsClient != nil || s.kmsKeyID != "") {
+		kmsKeyID := s.kmsKeyID
+		kmsClient := s.kmsClient
+		if kmsClient == nil {
+			region := kmsKeyRegion(kmsKeyID, spec.Region)
+			if region == "" {
+				region = s.defaultRegion
+			}
+			var err error
+			kmsClient, err = NewKMSClientFromConfig(ctx, region)
+			if err != nil {
+				return fmt.Errorf("failed to initialize KMS client for region %s: %w", region, err)
+			}
+		}
+		ciphertext, err := EncryptRunnerToken(ctx, kmsClient, kmsKeyID, tok)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt runner token with KMS key %s: %w", kmsKeyID, err)
+		}
+		spec.KMSEncryptedToken = true
+		spec.KMSKeyID = kmsKeyID
+		spec.KMSCiphertext = ciphertext
+		if err := encryptMeshAuthKey(ctx, kmsClient, kmsKeyID, spec); err != nil {
+			return err
+		}
+	}
+
+	var preAssignedGPUs []int
+	for i := 0; i < spec.NumGPUs; i++ {
+		preAssignedGPUs = append(preAssignedGPUs, i)
+	}
+	spec.AssignedGPUs = preAssignedGPUs
+	return nil
+}
+
+// startOnNode starts the pod's container on a node it was allocated to, retrying in the background while the VM
+// boots, and records the pod's instance.
+func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus []int, spec *InstanceSpec, pod *Pod, awsCreds *PodAWSCredentials, cpuLimitMilli, memLimitBytes int64) *CreateStruct {
+	// Start container via runner
+	cName := defaultContainerName
+	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
+		cName = pod.Spec.Containers[0].Name
+	}
+	startReq := &StartContainerRequest{
+		PodUID:           spec.PodUID,
+		Namespace:        spec.PodNamespace,
+		PodName:          spec.PodName,
+		ContainerName:    cName,
+		Image:            spec.TargetContainerImage,
+		Command:          spec.Command,
+		Args:             spec.Args,
+		Env:              spec.Env,
+		CPUMillicores:    cpuLimitMilli,
+		MemoryBytes:      memLimitBytes,
+		AssignedGPUs:     gpus,
+		AssignedTPUs:     tpus,
+		RunAsUser:        spec.RunAsUser,
+		RunAsGroup:       spec.RunAsGroup,
+		DockerConfigJSON: spec.DockerConfigJSON,
+		SecretVolumes:    spec.SecretVolumes,
+		AWSCredentials:   awsCreds,
+	}
+	startErr := s.runner.StartContainer(ctx, node, startReq)
+	if startErr != nil {
+		log.Printf("[cloudvm] Initial StartContainer call for bin-pack slice returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
+		go s.retryStartContainer(context.WithoutCancel(ctx), node, startReq) //nolint:gosec // detached background retry outlives HTTP request
+	}
+
+	marketType := "on-demand"
+	if node.Spot {
+		marketType = "spot"
+	}
+
+	s.mu.Lock()
+	inst := &Instance{
+		ID:        node.InstanceID,
+		Provider:  node.Provider,
+		Region:    node.Region,
+		IP:        node.GetMeshIP(),
+		State:     StateRunning,
+		CreatedAt: node.CreatedAt,
+		Metadata: map[string]string{
+			"podUID":      spec.PodUID,
+			"podName":     spec.PodName,
+			"namespace":   spec.PodNamespace,
+			"marketType":  marketType,
+			"clusterTag":  s.clusterTag,
+			"runnerToken": node.RunnerAuthToken,
+		},
+	}
+	key := fmt.Sprintf("%s/%s", spec.PodNamespace, spec.PodName)
+	s.instances[key] = inst
+	if spec.PodUID != "" {
+		s.instances[spec.PodUID] = inst
+	}
+	s.mu.Unlock()
+
+	var podJID string
+	if spec.PodUID != "" {
+		podJID = fmt.Sprintf("%s:%s", node.InstanceID, spec.PodUID)
+	} else {
+		podJID = node.InstanceID
+	}
+
+	return &CreateStruct{PodUID: spec.PodUID, PodJID: podJID}
+}
+
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	// The virtual kubelet sends DELETE; the interLink API forwards it to a plugin as POST.
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
@@ -1279,6 +1318,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
+		if node.ClaimName != "" {
+			// Only deleting its NodeClaim terminates a claim's VM.
+			s.persistClaimPods(node)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if s.nodePool.HasUnknownCoTenants(node.InstanceID) {
 			log.Printf("[cloudvm] Node %s has unknown co-tenants because container listing previously failed. Retaining VM.", node.InstanceID)
 			w.WriteHeader(http.StatusOK)
