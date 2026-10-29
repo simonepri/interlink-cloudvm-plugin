@@ -101,3 +101,21 @@ rbac:
   create: true
   clusterWide: true  # Set to false to restrict secret reading to tenantNamespaces
   tenantNamespaces: []  # e.g. ["default", "ml-workloads"] when clusterWide is false
+
+# CloudVM node agent: shards that register one Node per NodeClaim VM, keep it Ready, and run its pods.
+nodeAgent:
+  enabled: false
+  # Number of StatefulSet shards; each serves the Nodes whose names hash to it.
+  shards: 2
+  # Port of the kubelet API (logs) every served Node advertises.
+  kubeletPort: 10250
+  # Secret of type kubernetes.io/tls with the kubelet API serving certificate; empty uses a self-signed one.
+  servingCertSecret: ""
+  # Extra environment, such as CLAIM_POLL_INTERVAL, POD_STATUS_INTERVAL or LEASE_RENEW_INTERVAL.
+  env: []
+  resources:
+    limits:
+      memory: 1Gi
+    requests:
+      cpu: 200m
+      memory: 256Mi
