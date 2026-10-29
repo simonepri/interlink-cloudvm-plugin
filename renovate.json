@@ -33,6 +33,18 @@
         "breaking-change",
         "major-bump"
       ]
+    },
+    {
+      "description": "Keep the CloudVM Karpenter controller on the Karpenter core release the target clusters run, with the Kubernetes libraries that release uses; bump them together with the clusters' Karpenter",
+      "matchFileNames": [
+        "src/karpenter/go.mod"
+      ],
+      "matchPackageNames": [
+        "sigs.k8s.io/karpenter",
+        "sigs.k8s.io/controller-runtime",
+        "k8s.io/**"
+      ],
+      "enabled": false
     }
   ],
   "customManagers": [
