@@ -109,8 +109,23 @@ nodeAgent:
   shards: 2
   # Port of the kubelet API (logs) every served Node advertises.
   kubeletPort: 10250
-  # Secret of type kubernetes.io/tls with the kubelet API serving certificate; empty uses a self-signed one.
+  # Secret of type kubernetes.io/tls with the kubelet API serving certificate; it replaces servingCert when set.
   servingCertSecret: ""
+  # Kubelet API serving certificate the cluster signs for each shard's pod IP, which the API server verifies.
+  servingCert:
+    # CertificateSigningRequest signer: beta.eks.amazonaws.com/app-serving on EKS, kubernetes.io/kubelet-serving where
+    # kube-controller-manager signs kubelet serving certificates; empty serves a self-signed certificate.
+    signerName: beta.eks.amazonaws.com/app-serving
+    # Lifetime each request asks for and the longest the approver approves; the agent renews at 70 to 90 percent of it.
+    duration: 24h
+    # The approver Deployment, which approves only the shards' requests for their own pod IP.
+    approver:
+      resources:
+        limits:
+          memory: 128Mi
+        requests:
+          cpu: 10m
+          memory: 32Mi
   # Extra environment, such as CLAIM_POLL_INTERVAL, POD_STATUS_INTERVAL or LEASE_RENEW_INTERVAL.
   env: []
   resources:

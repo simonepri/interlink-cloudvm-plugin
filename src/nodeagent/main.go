@@ -1,5 +1,6 @@
 // Package main implements the CloudVM node agent: one process per shard that registers the Nodes of many NodeClaim
-// VMs, keeps them Ready, runs their pods through the plugin, and serves their kubelet API.
+// VMs, keeps them Ready, runs their pods through the plugin, and serves their kubelet API; `approve-serving-certs` runs
+// the approver of the agents' serving certificate requests instead.
 package main
 
 import (
@@ -29,6 +30,9 @@ import (
 // serviceAccountCA is the cluster CA bundle mounted into every pod, the default trust for kubelet API callers.
 const serviceAccountCA = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
+// defaultServingCertDuration is the lifetime requested for, and the longest approved for, a signed serving certificate.
+const defaultServingCertDuration = 24 * time.Hour
+
 // defaultAPITokenFile is where the chart projects the service account token the NodeClaim API admits.
 const defaultAPITokenFile = "/var/run/secrets/cloudvm-plugin/token" //nolint:gosec // a file path, not a credential
 
@@ -38,22 +42,25 @@ func logf(format string, args ...any) {
 
 // Config is the agent's environment.
 type Config struct {
-	PluginURL      string
-	Shard          Shard
-	NodeIP         string
-	KubeletPort    int32
-	CertFile       string
-	KeyFile        string
-	ClientCAFile   string
-	APITokenFile   string // projected token sent to the NodeClaim API
-	ClaimPoll      time.Duration
-	PodStatus      time.Duration
-	LeaseSeconds   int32
-	LeaseRenew     time.Duration
-	NodeStatus     time.Duration
-	PodSyncWorkers int
-	KubeQPS        float32
-	KubeBurst      int
+	PluginURL           string
+	Shard               Shard
+	NodeIP              string
+	KubeletPort         int32
+	PodName             string
+	CertFile            string
+	KeyFile             string
+	ServingSigner       string        // CertificateSigningRequest signer of the serving certificate; empty self-signs
+	ServingCertDuration time.Duration // lifetime requested for the signed serving certificate
+	ClientCAFile        string
+	APITokenFile        string // projected token sent to the NodeClaim API
+	ClaimPoll           time.Duration
+	PodStatus           time.Duration
+	LeaseSeconds        int32
+	LeaseRenew          time.Duration
+	NodeStatus          time.Duration
+	PodSyncWorkers      int
+	KubeQPS             float32
+	KubeBurst           int
 }
 
 func envOr(key, def string) string {
@@ -82,12 +89,14 @@ func envInt(key string, def int) (int, error) {
 // LoadConfig reads the configuration from the environment.
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
-		PluginURL:    os.Getenv("PLUGIN_URL"),
-		NodeIP:       os.Getenv("POD_IP"),
-		CertFile:     os.Getenv("KUBELET_TLS_CERT_FILE"),
-		KeyFile:      os.Getenv("KUBELET_TLS_KEY_FILE"),
-		ClientCAFile: envOr("KUBELET_CLIENT_CA_FILE", serviceAccountCA),
-		APITokenFile: envOr("PLUGIN_API_TOKEN_FILE", defaultAPITokenFile),
+		PluginURL:     os.Getenv("PLUGIN_URL"),
+		NodeIP:        os.Getenv("POD_IP"),
+		PodName:       envOr("POD_NAME", "node-agent-0"),
+		CertFile:      os.Getenv("KUBELET_TLS_CERT_FILE"),
+		KeyFile:       os.Getenv("KUBELET_TLS_KEY_FILE"),
+		ServingSigner: os.Getenv("KUBELET_SERVING_SIGNER"),
+		ClientCAFile:  envOr("KUBELET_CLIENT_CA_FILE", serviceAccountCA),
+		APITokenFile:  envOr("PLUGIN_API_TOKEN_FILE", defaultAPITokenFile),
 	}
 	if cfg.PluginURL == "" {
 		return nil, errors.New("PLUGIN_URL is required")
@@ -95,7 +104,7 @@ func LoadConfig() (*Config, error) {
 	if cfg.NodeIP == "" {
 		return nil, errors.New("POD_IP is required: every served Node advertises it")
 	}
-	shard, err := ParseShard(os.Getenv("SHARD_INDEX"), envOr("SHARD_COUNT", "1"), envOr("POD_NAME", "node-agent-0"))
+	shard, err := ParseShard(os.Getenv("SHARD_INDEX"), envOr("SHARD_COUNT", "1"), cfg.PodName)
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +114,8 @@ func LoadConfig() (*Config, error) {
 	port, err := envInt("KUBELET_PORT", 10250)
 	collect(err)
 	cfg.KubeletPort = int32(min(port, 65535)) //nolint:gosec // bounded above
+	cfg.ServingCertDuration, err = envDuration("KUBELET_SERVING_CERT_DURATION", defaultServingCertDuration)
+	collect(err)
 	cfg.ClaimPoll, err = envDuration("CLAIM_POLL_INTERVAL", 10*time.Second)
 	collect(err)
 	cfg.PodStatus, err = envDuration("POD_STATUS_INTERVAL", 5*time.Second)
@@ -137,13 +148,45 @@ func kubeConfig() (*rest.Config, error) {
 }
 
 func main() {
+	run := runAgent
+	if len(os.Args) > 1 && os.Args[1] == "approve-serving-certs" {
+		run = runApprover
+	}
 	if err := run(); err != nil {
 		logf("exiting: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+// runApprover approves the serving certificate requests of the node agent pods named by the environment.
+func runApprover() error {
+	cfg := ServingCertApproverConfig{
+		SignerName:          os.Getenv("SIGNER_NAME"),
+		AgentNamespace:      os.Getenv("AGENT_NAMESPACE"),
+		AgentServiceAccount: os.Getenv("AGENT_SERVICE_ACCOUNT"),
+	}
+	if cfg.SignerName == "" || cfg.AgentNamespace == "" || cfg.AgentServiceAccount == "" {
+		return errors.New("SIGNER_NAME, AGENT_NAMESPACE and AGENT_SERVICE_ACCOUNT are required")
+	}
+	maxDuration, err := envDuration("MAX_SERVING_CERT_DURATION", defaultServingCertDuration)
+	if err != nil {
+		return err
+	}
+	cfg.MaxDuration = maxDuration
+	restCfg, err := kubeConfig()
+	if err != nil {
+		return fmt.Errorf("kubernetes client config: %w", err)
+	}
+	restCfg.UserAgent = "cloudvm-serving-cert-approver"
+	if cfg.Kube, err = kubernetes.NewForConfig(restCfg); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return NewServingCertApprover(cfg).Run(ctx)
+}
+
+func runAgent() error {
 	cfg, err := LoadConfig()
 	if err != nil {
 		return err
@@ -179,9 +222,15 @@ func run() error {
 		NodeStatus:     cfg.NodeStatus,
 		PodSyncWorkers: cfg.PodSyncWorkers,
 	})
+	servingCert, err := StartServingCertificate(ctx, ServingCertConfig{
+		CertFile: cfg.CertFile, KeyFile: cfg.KeyFile, SignerName: cfg.ServingSigner, PodName: cfg.PodName,
+		PodIP: cfg.NodeIP, Duration: cfg.ServingCertDuration, Kube: kube,
+	})
+	if err != nil {
+		return fmt.Errorf("kubelet API serving certificate: %w", err)
+	}
 	server, err := NewKubeletAPIServer(KubeletAPIConfig{
-		Addr: fmt.Sprintf(":%d", cfg.KubeletPort), CertFile: cfg.CertFile, KeyFile: cfg.KeyFile,
-		NodeIP: cfg.NodeIP, ClientCAFile: cfg.ClientCAFile,
+		Addr: fmt.Sprintf(":%d", cfg.KubeletPort), ServingCertificate: servingCert, ClientCAFile: cfg.ClientCAFile,
 	}, agent.Pods)
 	if err != nil {
 		return err

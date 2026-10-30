@@ -5,16 +5,10 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"math/big"
-	"net"
 	"net/http"
 	"os"
 	"time"
@@ -27,20 +21,15 @@ import (
 type KubeletAPIConfig struct {
 	// Addr is the listen address, such as :10250.
 	Addr string
-	// CertFile and KeyFile hold the serving certificate; when both are empty a self-signed one for NodeIP is made.
-	CertFile, KeyFile string
-	// NodeIP is the address the self-signed certificate names.
-	NodeIP string
+	// ServingCertificate returns the certificate to present; it is read on every handshake, so a renewed one applies to
+	// the next connection.
+	ServingCertificate func() *tls.Certificate
 	// ClientCAFile holds the CAs whose client certificates may call the API.
 	ClientCAFile string
 }
 
 // NewKubeletAPIServer returns the HTTPS server for the provider's pods.
 func NewKubeletAPIServer(cfg KubeletAPIConfig, pods *PodProvider) (*http.Server, error) {
-	cert, err := servingCertificate(cfg)
-	if err != nil {
-		return nil, err
-	}
 	caPEM, err := os.ReadFile(cfg.ClientCAFile)
 	if err != nil {
 		return nil, fmt.Errorf("reading client CA bundle: %w", err)
@@ -62,48 +51,15 @@ func NewKubeletAPIServer(cfg KubeletAPIConfig, pods *PodProvider) (*http.Server,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig: &tls.Config{
-			MinVersion:   tls.VersionTLS12,
-			Certificates: []tls.Certificate{cert},
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-			ClientCAs:    clientCAs,
+			MinVersion: tls.VersionTLS12,
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				if cert := cfg.ServingCertificate(); cert != nil {
+					return cert, nil
+				}
+				return nil, errors.New("no serving certificate available")
+			},
+			ClientAuth: tls.RequireAndVerifyClientCert,
+			ClientCAs:  clientCAs,
 		},
 	}, nil
-}
-
-func servingCertificate(cfg KubeletAPIConfig) (tls.Certificate, error) {
-	if cfg.CertFile != "" || cfg.KeyFile != "" {
-		if cfg.CertFile == "" || cfg.KeyFile == "" {
-			return tls.Certificate{}, errors.New("set both the serving certificate and key files, or neither")
-		}
-		return tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-	}
-	return selfSignedCertificate(cfg.NodeIP)
-}
-
-// selfSignedCertificate makes a one-year ECDSA certificate for the IP, as the kubelet does without a serving cert.
-func selfSignedCertificate(ip string) (tls.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 62))
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "node-agent"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	if parsed := net.ParseIP(ip); parsed != nil {
-		tmpl.IPAddresses = []net.IP{parsed}
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
