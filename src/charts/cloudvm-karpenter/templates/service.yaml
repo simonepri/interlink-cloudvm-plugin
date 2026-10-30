@@ -1,0 +1,17 @@
+{{/* Metrics service of the controller. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cloudvm-karpenter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudvm-karpenter.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http-metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: http-metrics
+      protocol: TCP
+  selector:
+    {{- include "cloudvm-karpenter.selectorLabels" . | nindent 4 }}

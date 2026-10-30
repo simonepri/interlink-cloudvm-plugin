@@ -16,6 +16,16 @@
           "type": "yaml",
           "path": "src/chart/Chart.yaml",
           "jsonpath": "$.appVersion"
+        },
+        {
+          "type": "yaml",
+          "path": "src/charts/cloudvm-karpenter/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "src/charts/cloudvm-karpenter/Chart.yaml",
+          "jsonpath": "$.appVersion"
         }
       ],
       "skip-changelog": true

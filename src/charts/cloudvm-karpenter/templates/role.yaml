@@ -1,0 +1,65 @@
+{{/* Namespaced permissions: this controller's own leader-election lease and node lease cleanup on termination. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cloudvm-karpenter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudvm-karpenter.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["patch", "update"]
+    resourceNames:
+      - {{ .Values.leaderElectionName | quote }}
+  # Kubernetes RBAC cannot restrict create by resource name.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cloudvm-karpenter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cloudvm-karpenter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cloudvm-karpenter.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cloudvm-karpenter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cloudvm-karpenter.fullname" . }}-lease
+  namespace: kube-node-lease
+  labels:
+    {{- include "cloudvm-karpenter.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cloudvm-karpenter.fullname" . }}-lease
+  namespace: kube-node-lease
+  labels:
+    {{- include "cloudvm-karpenter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cloudvm-karpenter.fullname" . }}-lease
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cloudvm-karpenter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

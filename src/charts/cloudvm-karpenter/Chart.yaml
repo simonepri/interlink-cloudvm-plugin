@@ -1,0 +1,22 @@
+# Helm chart of the CloudVM Karpenter controller, a second Karpenter controller that owns CloudVMNodeClass NodePools.
+apiVersion: v2
+name: cloudvm-karpenter
+description: >-
+  Second Karpenter controller with the CloudVM cloud provider; it launches one
+  CloudVM VM per NodeClaim for NodePools that reference a CloudVMNodeClass
+type: application
+version: 0.36.0
+appVersion: 0.36.0
+keywords:
+  - kubernetes
+  - karpenter
+  - interlink
+  - spot
+home: https://github.com/simonepri/interlink-cloudvm-plugin
+maintainers:
+  - name: Simone Primarosa
+    url: https://github.com/simonepri
+sources:
+  - https://github.com/simonepri/interlink-cloudvm-plugin
+annotations:
+  artifacthub.io/license: Apache-2.0
