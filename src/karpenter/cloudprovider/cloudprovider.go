@@ -304,7 +304,7 @@ func (c *CloudProvider) nodeClassFor(ctx context.Context, nc *karpv1.NodeClaim) 
 	return c.nodeClass(ctx, nc.Spec.NodeClassRef.Name)
 }
 
-// toNodeClaim converts a plugin claim; it is the shape Get and List return to Karpenter.
+// toNodeClaim converts a plugin claim; it is the shape Create, Get and List return to Karpenter.
 func (c *CloudProvider) toNodeClaim(src *nodeclaim.NodeClaim, it *cloudprovider.InstanceType) *karpv1.NodeClaim {
 	nodeLabels := maps.Clone(src.Labels)
 	if nodeLabels == nil {
@@ -315,6 +315,8 @@ func (c *CloudProvider) toNodeClaim(src *nodeclaim.NodeClaim, it *cloudprovider.
 	nodeLabels[corev1.LabelTopologyZone] = cmp.Or(src.Zone, nodeLabels[corev1.LabelTopologyZone], src.Region)
 	nodeLabels[karpv1.CapacityTypeLabelKey] = src.CapacityType
 
+	// The claim's capacity is what the node agent reports on the Node, so the NodeClaim states the same resources.
+	// Nodes reserve nothing for system daemons, so allocatable matches capacity.
 	capacity := corev1.ResourceList{}
 	for k, v := range src.Capacity {
 		if q, err := resource.ParseQuantity(v); err == nil {
@@ -325,13 +327,6 @@ func (c *CloudProvider) toNodeClaim(src *nodeclaim.NodeClaim, it *cloudprovider.
 		capacity = it.Capacity.DeepCopy()
 	}
 	allocatable := capacity.DeepCopy()
-	if it != nil {
-		for k, v := range it.Allocatable() {
-			if _, ok := allocatable[k]; !ok {
-				allocatable[k] = v
-			}
-		}
-	}
 	return &karpv1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              src.Name,

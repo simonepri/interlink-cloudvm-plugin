@@ -11,7 +11,6 @@ import (
 	"maps"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,7 +65,9 @@ type claimRecord struct {
 	Namespace    string                  `json:"namespace,omitempty"`
 	CreatedAt    time.Time               `json:"createdAt"`
 	Capacity     ResourceVector          `json:"capacity"`
-	Pods         map[string]claimPod     `json:"pods,omitempty"`
+	// EphemeralStorage is the size of the VM's root volume, empty until the provider reported it.
+	EphemeralStorage string              `json:"ephemeralStorage,omitempty"`
+	Pods             map[string]claimPod `json:"pods,omitempty"`
 }
 
 // claimFlight lets concurrent creates of one claim wait for the first.
@@ -238,25 +239,21 @@ func (s *Server) claimView(rec *claimRecord) nodeclaim.NodeClaim {
 		CreatedAt:    rec.CreatedAt,
 		Labels:       rec.Request.Labels,
 		Taints:       rec.Request.Taints,
-		Capacity:     claimCapacity(rec.Capacity),
+		Capacity:     claimCapacity(rec),
 		Interrupted:  interrupted,
 	}
 }
 
-// claimCapacity renders a VM's capacity as Kubernetes resource quantities.
-func claimCapacity(v ResourceVector) map[string]string {
-	out := map[string]string{
-		"cpu":    v.CPU.String(),
-		"memory": v.Memory.String(),
-		"pods":   strconv.Itoa(defaultClaimPods),
-	}
-	if v.GPUs > 0 {
-		out[nodeclaim.ResourceGPU] = strconv.Itoa(v.GPUs)
-	}
-	if v.TPUs > 0 {
-		out["google.com/tpu"] = strconv.Itoa(v.TPUs)
-	}
-	return out
+// claimCapacity renders a claim VM's hardware as Kubernetes resource quantities.
+func claimCapacity(rec *claimRecord) map[string]string {
+	return nodeclaim.Hardware{
+		CPU:              rec.Capacity.CPU.String(),
+		Memory:           rec.Capacity.Memory.String(),
+		EphemeralStorage: rec.EphemeralStorage,
+		GPUs:             rec.Capacity.GPUs,
+		TPUs:             rec.Capacity.TPUs,
+		Pods:             defaultClaimPods,
+	}.Capacity()
 }
 
 // claimSpec builds the launch spec of a claim through the pod path, so launch annotations mean what they mean on a
@@ -389,6 +386,7 @@ func (s *Server) launchClaim(ctx context.Context, req *nodeclaim.CreateRequest) 
 		CreatedAt:    time.Now(),
 		Capacity:     s.resolveCapacity(ctx, prov, inst.Region, itype, ResourceVector{}),
 	}
+	rec.EphemeralStorage = claimRootVolume(ctx, prov, rec)
 	s.registerClaimNode(rec, spec.RunnerAuthToken)
 	log.Printf("[cloudvm] Launched VM %s (%s, %s) for claim %s", sanitizeLog(inst.ID), sanitizeLog(itype), sanitizeLog(zone), sanitizeLog(req.Name)) //nolint:gosec // sanitized
 	return rec, nil
@@ -405,6 +403,40 @@ func (s *Server) resolveCapacity(ctx context.Context, prov Provider, region, ity
 		}
 	}
 	return GlobalCatalog.ResolveCapacity(ctx, describer, itype, fallback)
+}
+
+// claimRootVolume returns the size of a claim VM's root volume, or "" when the provider cannot tell yet; the claim
+// loop asks again until it can.
+func claimRootVolume(ctx context.Context, prov Provider, rec *claimRecord) string {
+	sizer, ok := prov.(RootVolumeSizer)
+	if !ok {
+		return ""
+	}
+	size, err := sizer.RootVolumeSize(ctx, rec.Region, rec.InstanceID)
+	if err != nil {
+		log.Printf("[cloudvm] Reading the root volume size of VM %s of claim %s: %v", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
+		return ""
+	}
+	return size.String()
+}
+
+// fillClaimRootVolume records the root volume size of a claim that lacks it, such as one whose read failed at launch.
+func (s *Server) fillClaimRootVolume(ctx context.Context, rec *claimRecord) {
+	size := claimRootVolume(ctx, s.ProviderForType(rec.Provider), rec)
+	if size == "" {
+		return
+	}
+	s.claims.mu.Lock()
+	defer s.claims.mu.Unlock()
+	current, ok := s.claims.store.get(rec.Request.Name)
+	if !ok || current.InstanceID != rec.InstanceID || current.EphemeralStorage != "" {
+		return
+	}
+	updated := *current
+	updated.EphemeralStorage = size
+	if err := s.claims.store.set(rec.Request.Name, &updated, false); err != nil {
+		log.Printf("[cloudvm] Warning: persisting the root volume size of claim %s: %v", sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
+	}
 }
 
 // registerClaimNode puts a claim's VM into the node pool with the pods its record lists, and points their pod records
@@ -552,9 +584,10 @@ func (s *Server) RunClaimSync(ctx context.Context) {
 	}
 }
 
-// SyncClaims terminates claim VMs that never became ready, calls the runner of every claim VM that has not heard from
-// the plugin for a minute, which marks VMs without a tunnel ready and keeps idle VMs alive, persists the pods on each
-// VM, and prunes expired memory of deleted claims and unavailable offerings.
+// SyncClaims terminates claim VMs that never became ready, records the root volume size of claims that lack it, calls
+// the runner of every claim VM that has not heard from the plugin for a minute, which marks VMs without a tunnel ready
+// and keeps idle VMs alive, persists the pods on each VM, and prunes expired memory of deleted claims and unavailable
+// offerings.
 func (s *Server) SyncClaims(ctx context.Context) {
 	now := time.Now()
 	readyTimeout := claimReadyTimeout
@@ -569,6 +602,9 @@ func (s *Server) SyncClaims(ctx context.Context) {
 			continue
 		}
 		s.persistClaimPods(node)
+		if rec.EphemeralStorage == "" {
+			s.fillClaimRootVolume(ctx, rec)
+		}
 		ready := s.claimReady(rec.InstanceID)
 		if !ready && now.Sub(rec.CreatedAt) > readyTimeout {
 			log.Printf("[cloudvm] VM %s of claim %s did not become ready within %v; terminating it", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), readyTimeout) //nolint:gosec // sanitized

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // MockProvider provides an in-memory simulation for local testing and CI.
@@ -15,6 +17,21 @@ type MockProvider struct {
 	counter     int
 	terminateFn func(ctx context.Context, instanceID string) error
 	lastSpec    *InstanceSpec
+	// rootVolumeErr, when set, fails RootVolumeSize.
+	rootVolumeErr error
+}
+
+// mockRootVolume is the root volume size of every mock VM.
+const mockRootVolume = "120Gi"
+
+// RootVolumeSize returns mockRootVolume, or rootVolumeErr when set.
+func (m *MockProvider) RootVolumeSize(context.Context, string, string) (resource.Quantity, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.rootVolumeErr != nil {
+		return resource.Quantity{}, m.rootVolumeErr
+	}
+	return resource.MustParse(mockRootVolume), nil
 }
 
 // LastSpec returns the most recent InstanceSpec passed to Launch.

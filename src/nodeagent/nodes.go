@@ -64,13 +64,14 @@ type NodeConfig struct {
 // servedNode is one Node this process keeps alive.
 type servedNode struct {
 	claim nodeclaim.NodeClaim
-	// reported is the claim state whose Node status the controller last received.
-	reported nodeclaim.State
-	notify   func(*corev1.Node)
-	notified chan struct{}
-	node     *corev1.Node
-	cancel   context.CancelFunc
-	done     chan struct{}
+	// reported is the claim state and capacity whose Node status the controller last received.
+	reported         nodeclaim.State
+	reportedCapacity map[string]string
+	notify           func(*corev1.Node)
+	notified         chan struct{}
+	node             *corev1.Node
+	cancel           context.CancelFunc
+	done             chan struct{}
 }
 
 // NodeManager serves the Nodes of this shard's claims.
@@ -232,10 +233,10 @@ func (m *NodeManager) Sync(ctx context.Context) {
 	}
 }
 
-// notifyLocked hands the controller a new Node status when the claim state changed since the last one it received;
-// before the controller registered its callback, the next poll retries.
+// notifyLocked hands the controller a new Node status when the claim state or capacity changed since the last one it
+// received; before the controller registered its callback, the next poll retries.
 func (m *NodeManager) notifyLocked(sn *servedNode) {
-	if sn.claim.State == sn.reported {
+	if sn.claim.State == sn.reported && maps.Equal(sn.claim.Capacity, sn.reportedCapacity) {
 		return
 	}
 	select {
@@ -243,7 +244,7 @@ func (m *NodeManager) notifyLocked(sn *servedNode) {
 	default:
 		return
 	}
-	sn.reported = sn.claim.State
+	sn.reported, sn.reportedCapacity = sn.claim.State, sn.claim.Capacity
 	sn.node.Status = nodeStatus(&sn.claim, m.cfg)
 	n := sn.node.DeepCopy()
 	go sn.notify(n)
@@ -264,7 +265,7 @@ func (m *NodeManager) start(ctx context.Context, c nodeclaim.NodeClaim) {
 		return
 	}
 	desired := buildNode(&c, m.cfg)
-	sn := &servedNode{claim: c, reported: c.State, node: desired, notified: make(chan struct{}), done: make(chan struct{})}
+	sn := &servedNode{claim: c, reported: c.State, reportedCapacity: c.Capacity, node: desired, notified: make(chan struct{}), done: make(chan struct{})}
 	provider := &nodeProvider{sn: sn}
 	nodeCtx, cancel := context.WithCancel(ctx)
 	sn.cancel = cancel

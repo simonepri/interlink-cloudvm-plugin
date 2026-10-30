@@ -10,6 +10,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -303,8 +304,10 @@ func TestCreateChoosesCheapestCompatibleOffering(t *testing.T) {
 	if q := got.Status.Capacity[nodeclaim.ResourceGPU]; q.Value() != 1 {
 		t.Errorf("capacity gpu = %s", q.String())
 	}
-	if q := got.Status.Allocatable[corev1.ResourceEphemeralStorage]; q.IsZero() {
-		t.Error("allocatable lacks ephemeral-storage from the instance type")
+	for name, list := range map[string]corev1.ResourceList{"capacity": got.Status.Capacity, "allocatable": got.Status.Allocatable} {
+		if q := list[corev1.ResourceEphemeralStorage]; q.Cmp(resource.MustParse(fakeRootVolume)) != 0 {
+			t.Errorf("%s ephemeral-storage = %s, want the VM's root volume %s", name, q.String(), fakeRootVolume)
+		}
 	}
 }
 
@@ -536,5 +539,55 @@ func TestOfferingRegionRequirementFiltersCompatibility(t *testing.T) {
 	got := findType(t, its, "g6.2xlarge").Offerings.Compatible(reqs)
 	if len(got) != 1 || got[0].Zone() != "eu-west-1a" {
 		t.Fatalf("region-filtered offerings = %d, want only eu-west-1a", len(got))
+	}
+}
+
+// TestNodeClaimReportsEveryAdvertisedResource checks, for every instance type the provider advertises, that each
+// resource of its capacity, any of which Karpenter may request, is in the NodeClaim that Create, Get and List return
+// and in the plugin's claim record. The node agent reports every resource of that record on the Node, which its
+// TestNodeReportsEveryClaimResource checks.
+func TestNodeClaimReportsEveryAdvertisedResource(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, nil)
+	its, err := h.cp.GetInstanceTypes(ctx, testNodePool(nil))
+	if err != nil || len(its) == 0 {
+		t.Fatalf("GetInstanceTypes = %d types, %v", len(its), err)
+	}
+	for _, it := range its {
+		nc := testNodeClaim(req(corev1.LabelInstanceTypeStable, it.Name))
+		nc.Name = "claim-" + it.Name
+		created, err := h.cp.Create(ctx, nc)
+		if err != nil {
+			t.Fatalf("Create %s: %v", it.Name, err)
+		}
+		got, err := h.cp.Get(ctx, created.Status.ProviderID)
+		if err != nil {
+			t.Fatalf("Get %s: %v", it.Name, err)
+		}
+		listed, err := h.cp.List(ctx)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		returned := map[string]*karpv1.NodeClaim{"Create": created, "Get": got}
+		for _, l := range listed {
+			if l.Name == nc.Name {
+				returned["List"] = l
+			}
+		}
+		record := h.api.claims[nc.Name]
+		for name := range it.Capacity {
+			for method, out := range returned {
+				capacity, allocatable := out.Status.Capacity[name], out.Status.Allocatable[name]
+				if capacity.IsZero() || allocatable.IsZero() {
+					t.Errorf("%s: %s NodeClaim reports %s capacity %s and allocatable %s", it.Name, method, name, capacity.String(), allocatable.String())
+				}
+			}
+			if q, err := resource.ParseQuantity(record.Capacity[string(name)]); err != nil || q.IsZero() {
+				t.Errorf("%s: plugin claim record reports %s = %q, which its Node would lack", it.Name, name, record.Capacity[string(name)])
+			}
+		}
+		if len(returned) != 3 {
+			t.Errorf("%s: List did not return its NodeClaim", it.Name)
+		}
 	}
 }

@@ -5,6 +5,7 @@ package nodeclaim
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -37,8 +38,17 @@ const (
 	TaintUnregistered = "karpenter.sh/unregistered"
 )
 
-// ResourceGPU is the extended resource name of NVIDIA GPUs in claim capacity.
-const ResourceGPU = "nvidia.com/gpu"
+// Resource names of a claim's capacity.
+const (
+	ResourceCPU              = "cpu"
+	ResourceMemory           = "memory"
+	ResourcePods             = "pods"
+	ResourceEphemeralStorage = "ephemeral-storage"
+	// ResourceGPU is the extended resource name of NVIDIA GPUs.
+	ResourceGPU = "nvidia.com/gpu"
+	// ResourceTPU is the extended resource name of Google TPUs.
+	ResourceTPU = "google.com/tpu"
+)
 
 // State is the lifecycle phase of a claim's VM.
 type State string
@@ -124,11 +134,43 @@ type NodeClaim struct {
 	CreatedAt    time.Time         `json:"createdAt"`
 	Labels       map[string]string `json:"labels,omitempty"`
 	Taints       []Taint           `json:"taints,omitempty"`
-	// Capacity holds resource quantities of the instance type, such as {"cpu": "4", "memory": "16Gi",
-	// "nvidia.com/gpu": "1", "pods": "110"}.
+	// Capacity holds the resource quantities the VM offers pods, as Hardware.Capacity renders them, such as
+	// {"cpu": "4", "memory": "16Gi", "ephemeral-storage": "200Gi", "nvidia.com/gpu": "1", "pods": "110"}. The node
+	// agent reports each of them as the Node's capacity and allocatable.
 	Capacity map[string]string `json:"capacity,omitempty"`
 	// Interrupted is true once the cloud announced a spot interruption of the VM.
 	Interrupted bool `json:"interrupted,omitempty"`
+}
+
+// Hardware is what a claim's VM offers pods.
+type Hardware struct {
+	CPU    string
+	Memory string
+	// EphemeralStorage is the size of the root volume that holds container images, writable layers and logs; empty
+	// while the plugin has not read it.
+	EphemeralStorage string
+	GPUs             int
+	TPUs             int
+	Pods             int
+}
+
+// Capacity renders the hardware as a claim's Capacity; resources the VM lacks are left out.
+func (h Hardware) Capacity() map[string]string {
+	out := map[string]string{
+		ResourceCPU:    h.CPU,
+		ResourceMemory: h.Memory,
+		ResourcePods:   strconv.Itoa(h.Pods),
+	}
+	if h.EphemeralStorage != "" {
+		out[ResourceEphemeralStorage] = h.EphemeralStorage
+	}
+	if h.GPUs > 0 {
+		out[ResourceGPU] = strconv.Itoa(h.GPUs)
+	}
+	if h.TPUs > 0 {
+		out[ResourceTPU] = strconv.Itoa(h.TPUs)
+	}
+	return out
 }
 
 // List is the response of GET /v1/nodeclaims.

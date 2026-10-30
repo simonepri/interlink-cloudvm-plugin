@@ -71,6 +71,13 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 		return nil, &nodeclaim.APIError{Status: http.StatusServiceUnavailable, Reason: nodeclaim.ReasonInsufficientCapacity, Message: "no capacity"}
 	}
 	f.nextID++
+	// Like the plugin, the fake reports the launched type's hardware and the VM's root volume.
+	hw := nodeclaim.Hardware{EphemeralStorage: fakeRootVolume, Pods: 110}
+	for _, it := range f.catalog.InstanceTypes {
+		if it.Name == req.InstanceType {
+			hw.CPU, hw.Memory, hw.GPUs = it.CPU, it.Memory, it.GPUCount
+		}
+	}
 	nc := &nodeclaim.NodeClaim{
 		Name:         req.Name,
 		ProviderID:   nodeclaim.FormatProviderID(req.Annotations["cloudvm.vk.io/provider"], req.Region, fmt.Sprintf("i-%04d", f.nextID)),
@@ -82,11 +89,14 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 		CreatedAt:    time.Unix(1_700_000_000, 0).UTC(),
 		Labels:       req.Labels,
 		Taints:       req.Taints,
-		Capacity:     map[string]string{"cpu": "8", "memory": "32Gi", "pods": "110", nodeclaim.ResourceGPU: "1"},
+		Capacity:     hw.Capacity(),
 	}
 	f.claims[req.Name] = nc
 	return nc, nil
 }
+
+// fakeRootVolume is the root volume size of every VM the fake launches.
+const fakeRootVolume = "200Gi"
 
 func cmpZone(req *nodeclaim.CreateRequest) string {
 	if req.Zone == "" {
