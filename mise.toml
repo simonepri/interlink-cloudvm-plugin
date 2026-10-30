@@ -110,7 +110,7 @@ run = [
 ]
 
 [tasks.build]
-description = "Build the plugin and CloudVM Karpenter controller binaries"
+description = "Build the plugin, node agent and CloudVM Karpenter controller binaries"
 run = [
   "mkdir -p bin",
   "go -C src build -trimpath -ldflags='-s -w' -o ../bin/interlink-cloudvm-plugin ./cloudvm",
