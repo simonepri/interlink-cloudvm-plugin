@@ -17,21 +17,21 @@ type MockProvider struct {
 	counter     int
 	terminateFn func(ctx context.Context, instanceID string) error
 	lastSpec    *InstanceSpec
-	// rootVolumeErr, when set, fails RootVolumeSize.
-	rootVolumeErr error
+	// containerStorageErr, when set, fails ContainerStorageSize.
+	containerStorageErr error
 }
 
-// mockRootVolume is the root volume size of every mock VM.
-const mockRootVolume = "120Gi"
+// mockContainerStorage is the size of the disk every mock VM keeps its containers on.
+const mockContainerStorage = "120Gi"
 
-// RootVolumeSize returns mockRootVolume, or rootVolumeErr when set.
-func (m *MockProvider) RootVolumeSize(context.Context, string, string) (resource.Quantity, error) {
+// ContainerStorageSize returns mockContainerStorage, or containerStorageErr when set.
+func (m *MockProvider) ContainerStorageSize(context.Context, string, string) (resource.Quantity, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.rootVolumeErr != nil {
-		return resource.Quantity{}, m.rootVolumeErr
+	if m.containerStorageErr != nil {
+		return resource.Quantity{}, m.containerStorageErr
 	}
-	return resource.MustParse(mockRootVolume), nil
+	return resource.MustParse(mockContainerStorage), nil
 }
 
 // LastSpec returns the most recent InstanceSpec passed to Launch.

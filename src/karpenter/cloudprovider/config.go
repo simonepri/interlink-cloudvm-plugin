@@ -31,7 +31,7 @@ type Config struct {
 	// MaxPods is the pods capacity of every node.
 	MaxPods int64 `json:"maxPods,omitempty"`
 	// EphemeralStorage is the ephemeral-storage every instance type advertises for planning; a launched NodeClaim
-	// reports its VM's root volume size, which the plugin reads.
+	// reports the size of the disk its VM keeps containers on, which the plugin reads.
 	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
 }
 

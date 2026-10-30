@@ -65,7 +65,7 @@ type claimRecord struct {
 	Namespace    string                  `json:"namespace,omitempty"`
 	CreatedAt    time.Time               `json:"createdAt"`
 	Capacity     ResourceVector          `json:"capacity"`
-	// EphemeralStorage is the size of the VM's root volume, empty until the provider reported it.
+	// EphemeralStorage is the size of the disk the VM keeps its containers on, empty until the provider reported it.
 	EphemeralStorage string              `json:"ephemeralStorage,omitempty"`
 	Pods             map[string]claimPod `json:"pods,omitempty"`
 }
@@ -390,7 +390,7 @@ func (s *Server) launchClaim(ctx context.Context, req *nodeclaim.CreateRequest) 
 		CreatedAt:    time.Now(),
 		Capacity:     s.resolveCapacity(ctx, prov, inst.Region, itype, ResourceVector{}),
 	}
-	rec.EphemeralStorage = claimRootVolume(ctx, prov, rec)
+	rec.EphemeralStorage = claimContainerStorage(ctx, prov, rec)
 	s.registerClaimNode(rec, spec.RunnerAuthToken)
 	log.Printf("[cloudvm] Launched VM %s (%s, %s) for claim %s", sanitizeLog(inst.ID), sanitizeLog(itype), sanitizeLog(zone), sanitizeLog(req.Name)) //nolint:gosec // sanitized
 	return rec, nil
@@ -409,24 +409,25 @@ func (s *Server) resolveCapacity(ctx context.Context, prov Provider, region, ity
 	return GlobalCatalog.ResolveCapacity(ctx, describer, itype, fallback)
 }
 
-// claimRootVolume returns the size of a claim VM's root volume, or "" when the provider cannot tell yet; the claim
-// loop asks again until it can.
-func claimRootVolume(ctx context.Context, prov Provider, rec *claimRecord) string {
-	sizer, ok := prov.(RootVolumeSizer)
+// claimContainerStorage returns the size of the disk a claim VM keeps its containers on, or "" when the provider cannot
+// tell yet; the claim loop asks again until it can.
+func claimContainerStorage(ctx context.Context, prov Provider, rec *claimRecord) string {
+	sizer, ok := prov.(ContainerStorageSizer)
 	if !ok {
 		return ""
 	}
-	size, err := sizer.RootVolumeSize(ctx, rec.Region, rec.InstanceID)
+	size, err := sizer.ContainerStorageSize(ctx, rec.Region, rec.InstanceID)
 	if err != nil {
-		log.Printf("[cloudvm] Reading the root volume size of VM %s of claim %s: %v", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
+		log.Printf("[cloudvm] Reading the container storage size of VM %s of claim %s: %v", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
 		return ""
 	}
 	return size.String()
 }
 
-// fillClaimRootVolume records the root volume size of a claim that lacks it, such as one whose read failed at launch.
-func (s *Server) fillClaimRootVolume(ctx context.Context, rec *claimRecord) {
-	size := claimRootVolume(ctx, s.ProviderForType(rec.Provider), rec)
+// fillClaimContainerStorage records the container storage size of a claim that lacks it, such as one whose read failed
+// at launch.
+func (s *Server) fillClaimContainerStorage(ctx context.Context, rec *claimRecord) {
+	size := claimContainerStorage(ctx, s.ProviderForType(rec.Provider), rec)
 	if size == "" {
 		return
 	}
@@ -439,7 +440,7 @@ func (s *Server) fillClaimRootVolume(ctx context.Context, rec *claimRecord) {
 	updated := *current
 	updated.EphemeralStorage = size
 	if err := s.claims.store.set(rec.Request.Name, &updated, false); err != nil {
-		log.Printf("[cloudvm] Warning: persisting the root volume size of claim %s: %v", sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
+		log.Printf("[cloudvm] Warning: persisting the container storage size of claim %s: %v", sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
 	}
 }
 
@@ -588,10 +589,10 @@ func (s *Server) RunClaimSync(ctx context.Context) {
 	}
 }
 
-// SyncClaims terminates claim VMs that never became ready, records the root volume size of claims that lack it, calls
-// the runner of every claim VM that has not heard from the plugin for a minute, which marks VMs without a tunnel ready
-// and keeps idle VMs alive, persists the pods on each VM, and prunes expired memory of deleted claims and unavailable
-// offerings.
+// SyncClaims terminates claim VMs that never became ready, records the container storage size of claims that lack it,
+// calls the runner of every claim VM that has not heard from the plugin for a minute, which marks VMs without a tunnel
+// ready and keeps idle VMs alive, persists the pods on each VM, and prunes expired memory of deleted claims and
+// unavailable offerings.
 func (s *Server) SyncClaims(ctx context.Context) {
 	now := time.Now()
 	readyTimeout := claimReadyTimeout
@@ -607,7 +608,7 @@ func (s *Server) SyncClaims(ctx context.Context) {
 		}
 		s.persistClaimPods(node)
 		if rec.EphemeralStorage == "" {
-			s.fillClaimRootVolume(ctx, rec)
+			s.fillClaimContainerStorage(ctx, rec)
 		}
 		ready := s.claimReady(rec.InstanceID)
 		if !ready && now.Sub(rec.CreatedAt) > readyTimeout {
