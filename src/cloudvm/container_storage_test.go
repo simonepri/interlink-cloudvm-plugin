@@ -1,9 +1,11 @@
-// Tests that an AWS VM's root volume size comes from its launch template version, else from its image.
+// Tests that an AWS VM's container storage is its NVMe instance store, else its root volume sized by its launch template
+// version or its image.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -11,12 +13,18 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
-// rootVolumeEC2 serves one instance, its launch template versions and its image.
+// rootVolumeEC2 serves one instance, its instance type, its launch template versions and its image.
 type rootVolumeEC2 struct {
 	instance      ec2types.Instance
+	storage       *ec2types.InstanceStorageInfo
 	templateSizes map[string]int32 // "<template>/<version>" -> root device size the version sets
 	imageSize     int32
 	calls         int
+}
+
+func (c *rootVolumeEC2) DescribeInstanceTypes(_ context.Context, in *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	c.calls++
+	return &ec2.DescribeInstanceTypesOutput{InstanceTypes: []ec2types.InstanceTypeInfo{{InstanceType: in.InstanceTypes[0], InstanceStorageInfo: c.storage}}}, nil
 }
 
 func (c *rootVolumeEC2) DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
@@ -48,7 +56,10 @@ func (c *rootVolumeEC2) DescribeImages(context.Context, *ec2.DescribeImagesInput
 }
 
 func templateInstance(id, image, template, version string) ec2types.Instance {
-	inst := ec2types.Instance{InstanceId: aws.String(id), ImageId: aws.String(image), RootDeviceName: aws.String("/dev/xvda")}
+	inst := ec2types.Instance{
+		InstanceId: aws.String(id), InstanceType: ec2types.InstanceType("ebs-only." + id), ImageId: aws.String(image),
+		RootDeviceName: aws.String("/dev/xvda"),
+	}
 	if template != "" {
 		inst.Tags = []ec2types.Tag{
 			{Key: aws.String(tagLaunchTemplateID), Value: aws.String(template)},
@@ -58,7 +69,7 @@ func templateInstance(id, image, template, version string) ec2types.Instance {
 	return inst
 }
 
-func TestAWSRootVolumeSize(t *testing.T) {
+func TestAWSContainerStorageOnRootVolume(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
 		name    string
@@ -92,24 +103,59 @@ func TestAWSRootVolumeSize(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := awsRootVolumeGiB(ctx, tt.client, "test-region-"+t.Name(), aws.ToString(tt.client.instance.InstanceId))
-			if (err != nil) != tt.wantErr || got != tt.want {
-				t.Fatalf("awsRootVolumeGiB = %d, %v; want %d (error %v)", got, err, tt.want, tt.wantErr)
+			got, err := awsContainerStorage(ctx, tt.client, "test-region-"+t.Name(), aws.ToString(tt.client.instance.InstanceId))
+			if (err != nil) != tt.wantErr || got.Value() != int64(tt.want)<<30 {
+				t.Fatalf("awsContainerStorage = %s, %v; want %dGi (error %v)", got.String(), err, tt.want, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestAWSRootVolumeSizeIsCachedPerTemplateVersionAndImage(t *testing.T) {
+func TestAWSContainerStorageIsCachedPerInstanceTypeTemplateVersionAndImage(t *testing.T) {
 	ctx := context.Background()
-	client := &rootVolumeEC2{instance: templateInstance("i-1", "ami-1", "lt-1", "7"), templateSizes: map[string]int32{"lt-1/7": 100}}
+	client := &rootVolumeEC2{instance: templateInstance("i-cache", "ami-1", "lt-1", "7"), templateSizes: map[string]int32{"lt-1/7": 100}}
 	for range 2 {
-		if got, err := awsRootVolumeGiB(ctx, client, "test-region-cache", "i-1"); err != nil || got != 100 {
-			t.Fatalf("awsRootVolumeGiB = %d, %v; want 100", got, err)
+		if got, err := awsContainerStorage(ctx, client, "test-region-cache", "i-cache"); err != nil || got.String() != "100Gi" {
+			t.Fatalf("awsContainerStorage = %s, %v; want 100Gi", got.String(), err)
 		}
 	}
-	// Two instance reads and one template read: the second launch reuses the cached size.
-	if client.calls != 3 {
-		t.Fatalf("EC2 calls = %d, want 3", client.calls)
+	// Two instance reads, one instance type read and one template read: the second launch reuses the cached sizes.
+	if client.calls != 4 {
+		t.Fatalf("EC2 calls = %d, want 4", client.calls)
+	}
+}
+
+func TestAWSContainerStorageOnInstanceStore(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name    string
+		storage *ec2types.InstanceStorageInfo
+		want    string
+	}{
+		{
+			name:    "one NVMe disk",
+			storage: &ec2types.InstanceStorageInfo{NvmeSupport: ec2types.EphemeralNvmeSupportRequired, TotalSizeInGB: aws.Int64(250)},
+			want:    "250G",
+		},
+		{
+			name:    "several NVMe disks striped into one",
+			storage: &ec2types.InstanceStorageInfo{NvmeSupport: ec2types.EphemeralNvmeSupportRequired, TotalSizeInGB: aws.Int64(7600)},
+			want:    "7600G",
+		},
+		{
+			name:    "instance store without NVMe stays unmounted",
+			storage: &ec2types.InstanceStorageInfo{NvmeSupport: ec2types.EphemeralNvmeSupportUnsupported, TotalSizeInGB: aws.Int64(800)},
+			want:    "30Gi",
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inst := templateInstance(fmt.Sprintf("i-store-%d", i), "ami-1", "", "")
+			client := &rootVolumeEC2{instance: inst, storage: tt.storage, imageSize: 30}
+			got, err := awsContainerStorage(ctx, client, "test-region-store", aws.ToString(inst.InstanceId))
+			if err != nil || got.String() != tt.want {
+				t.Fatalf("awsContainerStorage = %s, %v; want %s", got.String(), err, tt.want)
+			}
+		})
 	}
 }

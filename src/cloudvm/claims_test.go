@@ -81,8 +81,8 @@ func TestClaimLaunchIsIdempotentAndReportsCapacity(t *testing.T) {
 	if claim.State != nodeclaim.StateLaunching || claim.Capacity["nvidia.com/gpu"] != "1" || claim.Capacity["cpu"] != "4" || claim.Labels["gpu-class"] != "a10g" {
 		t.Fatalf("claim = %+v", claim)
 	}
-	if got := claim.Capacity[nodeclaim.ResourceEphemeralStorage]; got != mockRootVolume {
-		t.Fatalf("ephemeral-storage = %q, want the root volume size %s", got, mockRootVolume)
+	if got := claim.Capacity[nodeclaim.ResourceEphemeralStorage]; got != mockContainerStorage {
+		t.Fatalf("ephemeral-storage = %q, want the container storage size %s", got, mockContainerStorage)
 	}
 	spec := mock.LastSpec()
 	if !spec.NodeClaim || spec.Zone != "us-east-1a" || spec.InstanceType != "g5.xlarge" || spec.MarketType != "spot" || spec.AMIMode != "container" || spec.PodUID != "nodeclaim-nc-a" || spec.MaxEgressRate == "" {
@@ -366,9 +366,9 @@ func TestReconcilerLeavesIdleClaimVMs(t *testing.T) {
 	}
 }
 
-func TestClaimReadsRootVolumeAgainAfterAFailedRead(t *testing.T) {
+func TestClaimReadsContainerStorageAgainAfterAFailedRead(t *testing.T) {
 	mock := NewMockProvider()
-	mock.rootVolumeErr = errors.New("throttled")
+	mock.containerStorageErr = errors.New("throttled")
 	s, client, _ := newClaimServer(t, mock)
 	ctx := context.Background()
 
@@ -377,15 +377,15 @@ func TestClaimReadsRootVolumeAgainAfterAFailedRead(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	if got, ok := claim.Capacity[nodeclaim.ResourceEphemeralStorage]; ok {
-		t.Fatalf("ephemeral-storage = %q before the root volume was read", got)
+		t.Fatalf("ephemeral-storage = %q before the container storage size was read", got)
 	}
 	mock.mu.Lock()
-	mock.rootVolumeErr = nil
+	mock.containerStorageErr = nil
 	mock.mu.Unlock()
 	s.SyncClaims(ctx)
 	got, err := client.Get(ctx, "nc-r")
-	if err != nil || got.Capacity[nodeclaim.ResourceEphemeralStorage] != mockRootVolume {
-		t.Fatalf("Get after sync = %+v, %v; want ephemeral-storage %s", got, err, mockRootVolume)
+	if err != nil || got.Capacity[nodeclaim.ResourceEphemeralStorage] != mockContainerStorage {
+		t.Fatalf("Get after sync = %+v, %v; want ephemeral-storage %s", got, err, mockContainerStorage)
 	}
 }
 

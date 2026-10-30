@@ -489,6 +489,36 @@ if ! command -v containerd >/dev/null 2>&1; then
   echo "[cloudvm-bootstrap] Error: containerd installation failed" >&2
   exit 1
 fi
+# cloudvm_instance_store moves the containerd, stargz and nerdctl state onto the NVMe instance store, striping several
+# disks with mdadm when the image has it, because the root EBS volume caps image unpacking at its throughput.
+cloudvm_instance_store() {
+  local devs base target dir
+  devs=$(lsblk -dnpPo NAME,MODEL | awk -F'"' '/MODEL="Amazon EC2 NVMe Instance Storage/ {print $2}')
+  if [ -z "$devs" ]; then
+    echo "[cloudvm-bootstrap] No NVMe instance store; container storage stays on the root volume"
+    return 0
+  fi
+  # An image that mounts the instance store itself, such as the AWS Deep Learning AMIs, keeps its mount.
+  base=$(lsblk -nrpo MOUNTPOINT $devs | grep -m 1 .)
+  if [ -z "$base" ]; then
+    set -- $devs
+    target=$1
+    if [ $# -gt 1 ] && command -v mdadm >/dev/null 2>&1; then
+      mdadm --create /dev/md/cloudvm-store --level=0 --raid-devices=$# --run "$@" < /dev/null && target=/dev/md/cloudvm-store
+    fi
+    base=/mnt/cloudvm-instance-store
+    if ! { mkfs.xfs -q -K "$target" || mkfs.ext4 -q -m 0 "$target"; } < /dev/null || ! mkdir -p "$base" || ! mount -o noatime "$target" "$base"; then
+      echo "[cloudvm-bootstrap] Warning: cannot mount instance store $target; container storage stays on the root volume" >&2
+      return 0
+    fi
+  fi
+  systemctl stop containerd stargz-snapshotter 2>/dev/null || true
+  for dir in containerd containerd-stargz-grpc nerdctl; do
+    mkdir -p "$base/cloudvm/$dir" "/var/lib/$dir" && mount --bind "$base/cloudvm/$dir" "/var/lib/$dir" || echo "[cloudvm-bootstrap] Warning: /var/lib/$dir stays on the root volume" >&2
+  done
+  echo "[cloudvm-bootstrap] Container storage on instance store $base (${devs//$'\n'/ })"
+}
+cloudvm_instance_store
 if ! nerdctl --version 2>/dev/null | grep -q "version ${CLOUDVM_NERDCTL_VERSION}$"; then
   cloudvm_fetch "https://github.com/containerd/nerdctl/releases/download/v${CLOUDVM_NERDCTL_VERSION}/nerdctl-${CLOUDVM_NERDCTL_VERSION}-linux-amd64.tar.gz" "$CLOUDVM_NERDCTL_SHA256" nerdctl || { echo "[cloudvm-bootstrap] Error: nerdctl install failed" >&2; exit 1; }
 fi
