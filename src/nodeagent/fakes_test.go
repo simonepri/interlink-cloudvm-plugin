@@ -112,13 +112,14 @@ type fakePlugin struct {
 	created   map[string]createRequest // pod UID -> request
 	deleted   []string
 	running   map[string]bool // pod UID -> container running
+	polled    map[string]bool // pod UIDs a /status request named
 	statusReq atomic.Int64
 	server    *httptest.Server
 }
 
 func newFakePlugin(t *testing.T) *fakePlugin {
 	t.Helper()
-	p := &fakePlugin{created: make(map[string]createRequest), running: make(map[string]bool)}
+	p := &fakePlugin{created: make(map[string]createRequest), running: make(map[string]bool), polled: make(map[string]bool)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /create", func(w http.ResponseWriter, r *http.Request) {
 		var req createRequest
@@ -151,6 +152,7 @@ func newFakePlugin(t *testing.T) *fakePlugin {
 		p.mu.Lock()
 		for i := range pods {
 			pod := &pods[i]
+			p.polled[string(pod.UID)] = true
 			st := PodStatus{UID: string(pod.UID), Name: pod.Name, Namespace: pod.Namespace, PodIP: "10.9.0.1"}
 			for _, c := range pod.Spec.Containers {
 				cs := ContainerStatus{Name: c.Name, Image: c.Image}

@@ -1,11 +1,12 @@
-// End-to-end test of one shard against a fake clientset and a fake plugin: pods bound to served Nodes start through
-// /create with their pull secrets and resolved env, report status from /status, and stop through /delete.
+// End-to-end tests of one shard against a fake clientset and a fake plugin: pods bound to served Nodes start through
+// /create, report status from /status, and stop through /delete, while DaemonSet pods stay Pending off the plugin.
 
 package main
 
 import (
 	"context"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
@@ -110,6 +111,78 @@ func TestAgentRunsPodsOnServedNodes(t *testing.T) {
 		case "list secrets", "watch secrets", "list configmaps", "watch configmaps":
 			t.Errorf("the agent made a cluster-wide %s call", call)
 		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentHoldsDaemonSetPodsPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kube := fake.NewClientset()
+	plugin := newFakePlugin(t)
+	agent := NewAgent(AgentConfig{
+		Kube: kube, Claims: newFakeClaims(gpuClaim("vm-a", nodeclaim.StateRunning)), Pods: NewPodAPI(plugin.server.URL, nil),
+		Shard: Shard{Count: 1}, NodeIP: "10.0.0.7", KubeletPort: 10250, ClaimPoll: time.Hour, PodStatus: 20 * time.Millisecond,
+		LeaseSeconds: 40, LeaseRenew: time.Second, NodeStatus: time.Second, OrphanSweep: time.Hour,
+	})
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+	waitFor(t, "node", func() bool { return getNode(t, kube, "vm-a") != nil })
+
+	daemon := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-proxy-x1", Namespace: "system", UID: "uid-daemon",
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "node-proxy", UID: "ds-1"}}},
+		Spec: corev1.PodSpec{NodeName: "vm-a", Containers: []corev1.Container{{Name: "proxy", Image: "proxy"}}},
+	}
+	if _, err := kube.CoreV1().Pods("system").Create(ctx, daemon, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var held *corev1.Pod
+	waitFor(t, "daemonset pod held Pending", func() bool {
+		p, err := kube.CoreV1().Pods("system").Get(ctx, daemon.Name, metav1.GetOptions{})
+		held = p
+		return err == nil && p.Status.Phase == corev1.PodPending && p.Status.Reason == ReasonDaemonSetPod
+	})
+
+	// The workload pod of another namespace still runs on the VM the DaemonSet pod is bound to.
+	workload := testPod("w1", "vm-a")
+	workload.Spec.ImagePullSecrets, workload.Spec.Containers[0].Env = nil, nil
+	if _, err := kube.CoreV1().Pods("team-a").Create(ctx, workload, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "workload create and status poll", func() bool {
+		plugin.mu.Lock()
+		defer plugin.mu.Unlock()
+		_, created := plugin.created["uid-w1"]
+		return created && plugin.polled["uid-w1"]
+	})
+	time.Sleep(100 * time.Millisecond) // several status intervals
+	plugin.mu.Lock()
+	_, daemonCreated := plugin.created["uid-daemon"]
+	daemonPolled := plugin.polled["uid-daemon"]
+	plugin.mu.Unlock()
+	if daemonCreated || daemonPolled {
+		t.Fatalf("the plugin saw the DaemonSet pod: created %v, polled %v", daemonCreated, daemonPolled)
+	}
+	if p, err := kube.CoreV1().Pods("system").Get(ctx, daemon.Name, metav1.GetOptions{}); err != nil || p.ResourceVersion != held.ResourceVersion {
+		t.Fatalf("the DaemonSet pod changed after it was held: %v", err)
+	}
+
+	if err := kube.CoreV1().Pods("system").Delete(ctx, daemon.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "daemonset pod forgotten", func() bool {
+		_, err := agent.Pods.GetPod(ctx, "system", daemon.Name)
+		return err != nil
+	})
+	plugin.mu.Lock()
+	deleted := slices.Clone(plugin.deleted)
+	plugin.mu.Unlock()
+	if slices.Contains(deleted, "uid-daemon") {
+		t.Fatalf("the agent sent the DaemonSet pod to the plugin's /delete: %v", deleted)
 	}
 	cancel()
 	if err := <-done; err != nil {

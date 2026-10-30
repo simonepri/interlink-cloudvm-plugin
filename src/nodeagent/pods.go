@@ -1,5 +1,5 @@
-// PodProvider runs the pods bound to this shard's Nodes through the plugin and reports their status from one batched
-// /status call per interval; it is the single virtual-kubelet pod provider of the process.
+// PodProvider runs the pods bound to this shard's Nodes through the plugin, holds their DaemonSet pods Pending, and
+// reports status from one batched /status call per interval; it is the single virtual-kubelet pod provider.
 
 package main
 
@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
@@ -40,10 +41,27 @@ func NewPodProvider(plugin *PodAPI, kube kubernetes.Interface, nodes *NodeManage
 
 func podKey(namespace, name string) string { return namespace + "/" + name }
 
-// CreatePod starts the pod on its Node's VM.
+// ReasonDaemonSetPod is the status reason of a DaemonSet pod on a served Node, which the agent never runs.
+const ReasonDaemonSetPod = "CloudVMDaemonSetPod"
+
+// isDaemonSetPod reports whether a DaemonSet owns the pod.
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	for _, ref := range pod.OwnerReferences {
+		if nodeclaim.IsDaemonSetOwner(ref.APIVersion, ref.Kind) {
+			return true
+		}
+	}
+	return false
+}
+
+// CreatePod starts the pod on its Node's VM, or holds a DaemonSet pod Pending without sending it to the plugin.
 func (p *PodProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !p.nodes.Serves(pod.Spec.NodeName) {
 		return fmt.Errorf("node %s is not served by this agent", pod.Spec.NodeName)
+	}
+	if isDaemonSetPod(pod) {
+		p.holdDaemonSetPod(pod)
+		return nil
 	}
 	if err := p.plugin.Create(ctx, pod, imagePullSecrets(ctx, p.kube, pod)); err != nil {
 		return err
@@ -64,6 +82,30 @@ func (p *PodProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	return nil
 }
 
+// holdDaemonSetPod reports a DaemonSet pod Pending, once, with a reason that says it never runs. The DaemonSet
+// controller deletes and recreates its pods only in phase Failed or Succeeded, so a Pending pod stays put.
+func (p *PodProvider) holdDaemonSetPod(pod *corev1.Pod) {
+	tracked := pod.DeepCopy()
+	now := metav1.Now()
+	message := "CloudVM nodes do not run DaemonSet pods; the VM runs only the workload it was launched for"
+	tracked.Status = corev1.PodStatus{
+		Phase:   corev1.PodPending,
+		Reason:  ReasonDaemonSetPod,
+		Message: message,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: now},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: ReasonDaemonSetPod, Message: message, LastTransitionTime: now},
+		},
+	}
+	p.mu.Lock()
+	p.pods[podKey(pod.Namespace, pod.Name)] = tracked
+	notify := p.notify
+	p.mu.Unlock()
+	if notify != nil {
+		notify(tracked.DeepCopy())
+	}
+}
+
 // UpdatePod records the new spec; the plugin has no update call, and a running container keeps its spec.
 func (p *PodProvider) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	p.mu.Lock()
@@ -76,10 +118,12 @@ func (p *PodProvider) UpdatePod(_ context.Context, pod *corev1.Pod) error {
 	return nil
 }
 
-// DeletePod stops the pod on its VM and forgets it.
+// DeletePod stops the pod on its VM and forgets it; a DaemonSet pod never reached the VM.
 func (p *PodProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
-	if err := p.plugin.Delete(ctx, pod); err != nil {
-		return err
+	if !isDaemonSetPod(pod) {
+		if err := p.plugin.Delete(ctx, pod); err != nil {
+			return err
+		}
 	}
 	p.mu.Lock()
 	tracked, ok := p.pods[podKey(pod.Namespace, pod.Name)]
@@ -154,7 +198,9 @@ func (p *PodProvider) PollStatus(ctx context.Context) {
 	p.mu.Lock()
 	refs := make([]*corev1.Pod, 0, len(p.pods))
 	for _, pod := range p.pods {
-		refs = append(refs, statusRef(pod))
+		if !isDaemonSetPod(pod) {
+			refs = append(refs, statusRef(pod))
+		}
 	}
 	p.mu.Unlock()
 	statuses, err := p.plugin.Status(ctx, refs)

@@ -936,7 +936,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// 1. A pod bound to a NodeClaim's Node runs on that claim's VM; any other pod tries to bin-pack into a warm node.
 	if isClaimPod {
-		node, gpus, tpus, err := s.allocateClaimPod(claimNode, spec, reqVec)
+		node, gpus, tpus, err := s.allocateClaimPod(claimNode, pod, spec, reqVec)
 		if err != nil {
 			finalErr = err
 			log.Printf("[cloudvm] Refusing pod %s/%s on claim node %s: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(pod.Spec.NodeName), err) //nolint:gosec // sanitized

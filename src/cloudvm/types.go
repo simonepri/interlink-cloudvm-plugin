@@ -7,6 +7,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
 
 // ProviderType represents supported cloud providers.
@@ -224,11 +226,29 @@ type InstanceAdopter interface {
 
 // Minimal Kubernetes Pod representation for InterLink Sidecar API without external k8s.io dependencies.
 type PodMeta struct {
-	Name        string            `json:"name"`
-	Namespace   string            `json:"namespace"`
-	UID         string            `json:"uid,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
+	Name            string            `json:"name"`
+	Namespace       string            `json:"namespace"`
+	UID             string            `json:"uid,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Annotations     map[string]string `json:"annotations,omitempty"`
+	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty"`
+}
+
+// OwnerReference is the part of a pod's owner reference the plugin reads.
+type OwnerReference struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+}
+
+// DaemonSetOwned reports whether a DaemonSet owns the pod.
+func (m *PodMeta) DaemonSetOwned() bool {
+	for _, ref := range m.OwnerReferences {
+		if nodeclaim.IsDaemonSetOwner(ref.APIVersion, ref.Kind) {
+			return true
+		}
+	}
+	return false
 }
 
 type EnvVar struct {

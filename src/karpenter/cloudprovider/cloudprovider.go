@@ -312,7 +312,9 @@ func (c *CloudProvider) toNodeClaim(src *nodeclaim.NodeClaim, it *cloudprovider.
 	}
 	nodeLabels[corev1.LabelInstanceTypeStable] = src.InstanceType
 	nodeLabels[corev1.LabelTopologyRegion] = src.Region
-	nodeLabels[corev1.LabelTopologyZone] = cmp.Or(src.Zone, nodeLabels[corev1.LabelTopologyZone], src.Region)
+	// The zone label names the offering the claim launched from, which is the region for an offering whose zone
+	// the cloud picks; Karpenter prices a NodeClaim by the offering its labels name.
+	nodeLabels[corev1.LabelTopologyZone] = cmp.Or(nodeLabels[corev1.LabelTopologyZone], src.Zone, src.Region)
 	nodeLabels[karpv1.CapacityTypeLabelKey] = src.CapacityType
 
 	// The claim's capacity is what the node agent reports on the Node, so the NodeClaim states the same resources.
