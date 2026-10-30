@@ -3,6 +3,7 @@
 package cloudprovider
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net/http"
@@ -25,6 +26,7 @@ type fakeAPI struct {
 	capacityErrors map[string]bool
 	listErr        error
 	createErr      error
+	launchZone     string // zone a claim without one lands in, as the cloud picks it
 	nextID         int
 }
 
@@ -83,7 +85,7 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 		ProviderID:   nodeclaim.FormatProviderID(req.Annotations["cloudvm.vk.io/provider"], req.Region, fmt.Sprintf("i-%04d", f.nextID)),
 		InstanceType: req.InstanceType,
 		Region:       req.Region,
-		Zone:         req.Zone,
+		Zone:         cmp.Or(req.Zone, f.launchZone),
 		CapacityType: req.CapacityType,
 		State:        nodeclaim.StateLaunching,
 		CreatedAt:    time.Unix(1_700_000_000, 0).UTC(),

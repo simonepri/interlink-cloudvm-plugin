@@ -5,6 +5,7 @@ package cloudprovider
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -414,6 +415,40 @@ func TestDelete(t *testing.T) {
 	}
 	if err := h.cp.Delete(ctx, nc); !cloudprovider.IsNodeClaimNotFoundError(err) {
 		t.Fatalf("second delete err = %v, want NodeClaimNotFoundError", err)
+	}
+}
+
+func TestCreateLabelsRegionWideOfferingWithItsZone(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	h.api.catalog.InstanceTypes[1].Offerings = []nodeclaim.Offering{
+		{Region: "us-east-1", CapacityType: "on-demand", PricePerHour: 0.20, Available: true},
+	}
+	h.api.launchZone = "us-east-1c"
+	created, err := h.cp.Create(ctx, testNodeClaim(req(corev1.LabelInstanceTypeStable, "m7i.xlarge")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent := h.api.creates[0]; sent.Zone != "" {
+		t.Fatalf("launch zone = %q, want none so the cloud picks it", sent.Zone)
+	}
+	got, err := h.cp.Get(ctx, created.Status.ProviderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	its, err := h.cp.GetInstanceTypes(ctx, testNodePool(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Karpenter prices a NodeClaim by the offering whose zone and capacity type match its labels.
+	it := findType(t, its, "m7i.xlarge")
+	for _, nc := range []*karpv1.NodeClaim{created, got} {
+		zone, capacityType := nc.Labels[corev1.LabelTopologyZone], nc.Labels[karpv1.CapacityTypeLabelKey]
+		if !slices.ContainsFunc(it.Offerings, func(o *cloudprovider.Offering) bool {
+			return o.Zone() == zone && o.CapacityType() == capacityType
+		}) {
+			t.Errorf("NodeClaim labels zone %q, capacity type %q match no offering of m7i.xlarge", zone, capacityType)
+		}
 	}
 }
 

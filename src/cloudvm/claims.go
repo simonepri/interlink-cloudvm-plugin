@@ -155,8 +155,12 @@ func (s *Server) claimForPod(pod *Pod) (*CloudVMNode, bool) {
 }
 
 // allocateClaimPod places a pod on its claim's VM. The scheduler already fitted the pod's requests against the Node's
-// allocatable, so only GPU and TPU devices are assigned here; the VM refuses pods of a second namespace.
-func (s *Server) allocateClaimPod(node *CloudVMNode, spec *InstanceSpec, req ResourceVector) (*CloudVMNode, []int, []int, error) {
+// allocatable, so only GPU and TPU devices are assigned here; the VM refuses pods of a second namespace and DaemonSet
+// pods, so a DaemonSet pod never takes the VM's namespace from the workload it was launched for.
+func (s *Server) allocateClaimPod(node *CloudVMNode, pod *Pod, spec *InstanceSpec, req ResourceVector) (*CloudVMNode, []int, []int, error) {
+	if pod.Metadata.DaemonSetOwned() {
+		return nil, nil, nil, fmt.Errorf("%w: claim VMs do not run DaemonSet pods", errClaimPodRefused)
+	}
 	if node == nil {
 		return nil, nil, nil, fmt.Errorf("%w: its NodeClaim has no VM", errClaimPodRefused)
 	}

@@ -51,6 +51,12 @@ func createClaimPod(t *testing.T, url, node, namespace, name string, gpus int) i
 			Name: "main", Image: "busybox", Resources: ContainerResourceRequirements{Limits: limits},
 		}}},
 	}
+	return postClaimPod(t, url, pod)
+}
+
+// postClaimPod posts an interLink create request for the pod and returns the HTTP status.
+func postClaimPod(t *testing.T, url string, pod Pod) int {
+	t.Helper()
 	body, _ := json.Marshal(map[string]any{"pod": pod})
 	resp, err := http.Post(url+"/create", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -145,6 +151,41 @@ func TestClaimPodsShareTheClaimVM(t *testing.T) {
 	s.CollectIdleNodes(ctx)
 	if inst, _ := mock.Status(ctx, instanceID); inst.State != StateRunning || !s.nodePool.HasNode(instanceID) {
 		t.Fatalf("claim VM after its pods left: state %s, pooled %v", inst.State, s.nodePool.HasNode(instanceID))
+	}
+}
+
+func TestClaimRefusesDaemonSetPods(t *testing.T) {
+	mock := NewMockProvider()
+	s, client, url := newClaimServer(t, mock)
+	claim, err := client.Create(context.Background(), claimRequest("nc-ds", "g5.12xlarge"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, _, instanceID, _ := nodeclaim.ParseProviderID(claim.ProviderID)
+
+	daemon := Pod{
+		Metadata: PodMeta{Name: "node-proxy-x1", Namespace: "system", UID: "uid-daemon",
+			OwnerReferences: []OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "node-proxy"}}},
+		Spec: PodSpecWrapper{NodeName: "nc-ds", Containers: []ContainerSpec{{Name: "proxy", Image: "proxy"}}},
+	}
+	if code := postClaimPod(t, url, daemon); code != http.StatusConflict {
+		t.Fatalf("DaemonSet pod: HTTP %d, want 409", code)
+	}
+	if ns, ok := s.nodePool.InstanceNamespace(instanceID); ok {
+		t.Fatalf("a refused DaemonSet pod bound the VM to namespace %q", ns)
+	}
+	if runner := s.runner.(*MockContainerRunner); runner.GetStartRequest("uid-daemon") != nil {
+		t.Fatal("the DaemonSet pod started on the claim VM")
+	}
+
+	if code := createClaimPod(t, url, "nc-ds", "team-a", "w1", 1); code != http.StatusOK {
+		t.Fatalf("workload pod after the DaemonSet pod: HTTP %d, want 200", code)
+	}
+	if ns, _ := s.nodePool.InstanceNamespace(instanceID); ns != "team-a" {
+		t.Fatalf("VM namespace = %q, want the workload's team-a", ns)
+	}
+	if code := createClaimPod(t, url, "nc-ds", "team-b", "w2", 0); code != http.StatusConflict {
+		t.Fatalf("pod of a second namespace: HTTP %d, want 409", code)
 	}
 }
 
