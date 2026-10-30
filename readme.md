@@ -484,13 +484,14 @@ helm upgrade --install cloudvm-ticker \
 
 `cloudvm-karpenter` runs a second Karpenter controller (core v1.15.0) next to the cluster's existing one. Karpenter splits work by NodeClass kind, so this controller manages only NodePools whose `nodeClassRef` is a `CloudVMNodeClass` and never touches the other controller's NodePools, NodeClaims, or Nodes. It launches one VM per NodeClaim through the plugin's NodeClaim API. Offerings cover every (region, zone, capacity type) in the NodeClass footprint, priced from the plugin's ticker plus an optional cross-region data cost, so Karpenter's cheapest-offering choice also picks the region.
 
-The controller authenticates every plugin call with a projected service account token bound to the audience `plugin.tokenAudience` (default `cloudvm-plugin`). The plugin must accept that audience and allow the controller's service account, `system:serviceaccount:<release namespace>:<service account name>`; the controller refuses to start without the token. The chart installs only the `CloudVMNodeClass` CRD. The `karpenter.sh` CRDs must come from the cluster's other Karpenter release, which must run the same core minor version.
+The controller authenticates every plugin call with a projected service account token bound to the audience `plugin.tokenAudience` (default `cloudvm-plugin`). The plugin verifies it with a TokenReview, so set the plugin chart's `nodeClaimAPI.audience` to the same audience and add the controller's service account, `system:serviceaccount:<release namespace>:<service account name>`, to `nodeClaimAPI.allowedUsers` (`NODECLAIM_API_ALLOWED_USERS`); the plugin refuses every call from anyone else, and the controller refuses to start without its token. The chart installs only the `CloudVMNodeClass` CRD. The `karpenter.sh` CRDs must come from the cluster's other Karpenter release, which must run the same core minor version.
 
 ```bash
 helm upgrade --install cloudvm-karpenter \
   oci://ghcr.io/simonepri/charts/cloudvm-karpenter \
   --namespace karpenter \
   --set plugin.url=http://interlink-cloudvm-plugin.interlink.svc:4040 \
+  --set plugin.tokenAudience=cloudvm-plugin \
   --set-json 'config.gpuClasses=[{"class":"l4","models":["l4"]},{"class":"a100-80gb","models":["a100"],"memoryGB":80}]' \
   --set-json 'config.dataCost={"homeRegion":"us-east-1","defaultUSDPerHour":0.05}'
 ```

@@ -23,8 +23,9 @@ plugin:
   # url is the base URL of the plugin's NodeClaim API, such as http://cloudvm-plugin.cloudvm.svc:4040.
   url: ""
   # The controller authenticates to the plugin with a projected service account token bound to this audience.
-  # The plugin must accept the same audience and allow this release's service account,
-  # system:serviceaccount:<release namespace>:<service account name>.
+  # The plugin must use the same audience (its nodeClaimAPI.audience, NODECLAIM_API_AUDIENCE) and list this
+  # release's service account in NODECLAIM_API_ALLOWED_USERS (its nodeClaimAPI.allowedUsers) as
+  # system:serviceaccount:<release namespace>:<service account name>; the plugin refuses every call otherwise.
   tokenAudience: cloudvm-plugin
   # tokenExpirationSeconds is the token lifetime; the kubelet refreshes it at 80% and the controller re-reads it.
   tokenExpirationSeconds: 3600
