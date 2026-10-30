@@ -40,7 +40,7 @@ jobs:
     needs: release
     if: ${{ needs.release.outputs.created == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
