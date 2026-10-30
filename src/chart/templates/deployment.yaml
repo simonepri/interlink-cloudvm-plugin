@@ -47,6 +47,10 @@ spec:
             - name: EKS_CLUSTER_REGION
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.provider.awsRoleArn }}
+            - name: CLOUDVM_AWS_ROLE_ARN
+              value: {{ . | quote }}
+            {{- end }}
             - name: NODECLAIM_API_AUDIENCE
               value: {{ .Values.nodeClaimAPI.audience | quote }}
             {{- $users := .Values.nodeClaimAPI.allowedUsers }}

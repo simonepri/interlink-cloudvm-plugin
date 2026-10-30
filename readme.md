@@ -674,7 +674,7 @@ Without `launchTemplates`, `gpuLaunchTemplateId` boots types with whole GPUs and
 
 ### AWS IAM Permissions
 
-The provider's AWS role needs these actions:
+The provider's AWS role needs these actions. When `CLOUDVM_AWS_ROLE_ARN` (`provider.awsRoleArn` in Helm) names a role, the plugin assumes it with its own credentials for every call except the pod token exchange, so that role needs every action but the last, and the plugin's own role needs only the last and `sts:AssumeRole` on it, plus `sts:TagSession` when its credentials come from EKS Pod Identity, whose session tags pass to every role it assumes. This lets the workers live in another account than the cluster, since an EKS cluster has no resource-based policy that could admit an EKS Auth caller from another account.
 
 | Action | Used for |
 | :--- | :--- |
@@ -688,7 +688,7 @@ The provider's AWS role needs these actions:
 | `ec2:DescribeRegions`, `ec2:DescribeSpotPriceHistory`, `ec2:GetSpotPlacementScores` | Spot price ticker and placement scores |
 | `pricing:GetProducts`, `servicequotas:GetServiceQuota`, `cloudwatch:GetMetricData` | On-demand baselines, data transfer prices, quota limits, and quota usage |
 | `kms:Encrypt` | Runner token encryption when `KMS_KEY_ID` is set |
-| `eks-auth:AssumeRoleForPodIdentity` on the cluster named by `EKS_CLUSTER_NAME` | Pod role credentials for EKS Pod Identity |
+| `eks-auth:AssumeRoleForPodIdentity` on the cluster named by `EKS_CLUSTER_NAME` | Pod role credentials for EKS Pod Identity; always made with the plugin's own credentials |
 
 ### EC2 Launch Pacing
 
@@ -784,4 +784,4 @@ A container on a worker gets the credentials of its pod's own service account ro
 - **Exchange in the plugin.** For a pod with a role, the plugin mints a 10-minute projected token for the pod's service account through the TokenRequest API, bound to the pod so it dies with it, with audience `pods.eks.amazonaws.com` or `sts.amazonaws.com`. It exchanges the token with its own AWS credentials: `eks-auth:AssumeRoleForPodIdentity` against `EKS_CLUSTER_NAME` in `EKS_CLUSTER_REGION` (default `AWS_REGION`), or the unsigned `sts:AssumeRoleWithWebIdentity`. Workers never call AWS for pod credentials, so they may run in another account than the cluster.
 - **Delivery and refresh.** The first credentials ride in `/containers/start`. Every minute the plugin replaces any pod's credentials that are past half their lifetime or have less than 20 minutes left, and pushes them over the runner channel to `POST /containers/credentials?podUID=`, retrying until the runner accepts them. Refreshing stops when the pod finishes or is deleted; after a plugin restart the next status poll resumes it. The plugin never logs credentials.
 - **Serving on the worker.** The plugin drops the webhook's credential variables, and the runner sets `AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:170/v1/credentials` and `AWS_CONTAINER_AUTHORIZATION_TOKEN=<random per-pod secret>` in the container. Its loopback endpoint answers a request carrying that secret with the pod's latest credentials in the container credentials format, `401` for an unknown secret, and `503` until current credentials arrive. Containers share the host network, so the secret is what keeps one pod from reading another's credentials; port 170 is privileged, so no non-root container can bind it while the runner is down. Stopping the pod revokes its secret. The instance role stays unreachable from containers through the IMDS block.
-- **Requirements.** The plugin's service account needs `create` on `serviceaccounts/token` (the chart grants it), and its AWS role needs `eks-auth:AssumeRoleForPodIdentity` on the cluster ARN for Pod Identity. Set `provider.eksClusterName` in the chart.
+- **Requirements.** The plugin's service account needs `create` on `serviceaccounts/token` (the chart grants it), and its own AWS role needs `eks-auth:AssumeRoleForPodIdentity` on the cluster ARN for Pod Identity; the exchange never uses the role `CLOUDVM_AWS_ROLE_ARN` names. Set `provider.eksClusterName` in the chart. Do not chain the plugin's own Pod Identity association into a role in another account through `targetRoleArn`, since the plugin then holds only that role's credentials, which EKS Auth rejects for the cluster; set `CLOUDVM_AWS_ROLE_ARN` to that role instead.

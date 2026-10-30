@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
@@ -823,7 +822,7 @@ func (p *AWSProvider) getClient(ctx context.Context, region string) (EC2FleetCli
 	if c, ok := p.clients[region]; ok {
 		return c, nil
 	}
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := workerAWSConfig.Load(ctx, region)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config for %s: %w", region, err)
 	}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 )
 
@@ -23,7 +22,7 @@ func NewKMSClient(cfg aws.Config) KMSClient {
 
 // NewKMSClientFromConfig loads the default AWS configuration for the specified region and constructs a KMSClient.
 func NewKMSClientFromConfig(ctx context.Context, region string) (KMSClient, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := workerAWSConfig.Load(ctx, region)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config for KMS in region %s: %w", region, err)
 	}

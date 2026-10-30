@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
@@ -82,7 +81,7 @@ func newTickerFromEnv(awsProv *AWSProvider) *SpotPriceTicker {
 // between launchRegions, which a ticker extends with its market regions, and gives the ticker, when present, per-region Service Quotas and CloudWatch clients.
 func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker, launchRegions []string) {
 	GlobalTransferPrices.SetRegions(launchRegions)
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsPricingRegion))
+	cfg, err := workerAWSConfig.Load(ctx, awsPricingRegion)
 	if err != nil {
 		log.Printf("[cloudvm] Warning: AWS on-demand prices and quotas unavailable: %v", err)
 		return
@@ -129,6 +128,9 @@ func run() error {
 	awsRegion := os.Getenv("AWS_REGION")
 	if awsRegion == "" {
 		awsRegion = "us-east-1"
+	}
+	if workerAWSConfig.roleARN != "" {
+		log.Printf("[cloudvm] Managing AWS workers as %s; pod token exchanges keep the plugin's own credentials", workerAWSConfig.roleARN)
 	}
 	var additionalRegions []string
 	if raw := os.Getenv("AWS_REGIONS"); raw != "" {

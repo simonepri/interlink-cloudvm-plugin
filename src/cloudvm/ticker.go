@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
@@ -183,7 +182,7 @@ func NewSpotPriceTicker(regions, instanceTypes []string, scrapeInterval time.Dur
 		onDemand:            GlobalOnDemandPrices,
 		transfer:            GlobalTransferPrices,
 		fetcherFactory: func(ctx context.Context, region string) (SpotPriceFetcher, error) {
-			cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+			cfg, err := workerAWSConfig.Load(ctx, region)
 			if err != nil {
 				return nil, err
 			}

@@ -29,6 +29,9 @@ provider:
   # and its region (default awsRegion).
   eksClusterName: ""
   eksClusterRegion: ""
+  # IAM role the plugin assumes with its own credentials for every AWS call except the pod token exchange, such as a
+  # role in the account that hosts the workers; empty keeps every call on the plugin's own credentials.
+  awsRoleArn: ""
   awsLaunchTemplateId: ""
   awsLaunchTemplateName: ""
   awsSubnetId: ""
