@@ -1,0 +1,171 @@
+{{- /* The CloudVM node agent: a StatefulSet of shards that register the Nodes of NodeClaim VMs and run their pods. */ -}}
+{{- if .Values.nodeAgent.enabled }}
+{{- $name := printf "%s-node-agent" (include "interlink-cloudvm-plugin.fullname" .) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  # Registers, updates and removes the Nodes of its shard's claims.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # Watches scheduled pods and reports the status of the ones bound to its Nodes.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  # Reads a pod's referenced Secrets and ConfigMaps by name; Services back service-link environment variables.
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  clusterIP: None
+  ports:
+    - port: {{ .Values.nodeAgent.kubeletPort }}
+      targetPort: kubelet
+      protocol: TCP
+      name: kubelet
+  selector:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  serviceName: {{ $name }}
+  replicas: {{ .Values.nodeAgent.shards }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ $name }}
+      containers:
+        - name: node-agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/cloudvm-node-agent"]
+          env:
+            - name: PLUGIN_URL
+              value: "http://{{ include "interlink-cloudvm-plugin.fullname" . }}:{{ .Values.service.port }}"
+            # Every shard must agree on the count, so changing it restarts them all.
+            - name: SHARD_COUNT
+              value: "{{ .Values.nodeAgent.shards }}"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KUBELET_PORT
+              value: "{{ .Values.nodeAgent.kubeletPort }}"
+            - name: PLUGIN_API_TOKEN_FILE
+              value: /var/run/secrets/cloudvm-plugin/token
+            {{- with .Values.nodeAgent.servingCertSecret }}
+            - name: KUBELET_TLS_CERT_FILE
+              value: /etc/node-agent/tls/tls.crt
+            - name: KUBELET_TLS_KEY_FILE
+              value: /etc/node-agent/tls/tls.key
+            {{- end }}
+            {{- with .Values.nodeAgent.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: kubelet
+              containerPort: {{ .Values.nodeAgent.kubeletPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: plugin-api-token
+              mountPath: /var/run/secrets/cloudvm-plugin
+              readOnly: true
+            {{- with .Values.nodeAgent.servingCertSecret }}
+            - name: serving-cert
+              mountPath: /etc/node-agent/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        # The NodeClaim API admits this service account's token for its audience.
+        - name: plugin-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ .Values.nodeClaimAPI.audience | quote }}
+                  expirationSeconds: 3600
+        {{- with .Values.nodeAgent.servingCertSecret }}
+        - name: serving-cert
+          secret:
+            secretName: {{ . }}
+        {{- end }}
+{{- end }}
