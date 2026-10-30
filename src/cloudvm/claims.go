@@ -33,6 +33,9 @@ const (
 	claimProbeConcurrency = 32
 	// claimTerminateTimeout bounds the cloud call that terminates a claim's VM.
 	claimTerminateTimeout = 30 * time.Second
+	// claimPodWatchLag is how long a pod placed on a claim VM is kept although the pod watch does not list it, because
+	// the watch can trail the node agent's informer whose pod the create carried.
+	claimPodWatchLag = time.Minute
 	// claimDeletedMemory is how long the pods of a deleted claim's Node keep being refused.
 	claimDeletedMemory = time.Hour
 	// unavailableOfferingTTL is how long an offering that failed for lack of capacity is reported unavailable.
@@ -156,8 +159,9 @@ func (s *Server) claimForPod(pod *Pod) (*CloudVMNode, bool) {
 
 // allocateClaimPod places a pod on its claim's VM. The scheduler already fitted the pod's requests against the Node's
 // allocatable, so only GPU and TPU devices are assigned here; the VM refuses pods of a second namespace and DaemonSet
-// pods, so a DaemonSet pod never takes the VM's namespace from the workload it was launched for.
-func (s *Server) allocateClaimPod(node *CloudVMNode, pod *Pod, spec *InstanceSpec, req ResourceVector) (*CloudVMNode, []int, []int, error) {
+// pods, so a DaemonSet pod never takes the VM's namespace from the workload it was launched for. When the VM lacks
+// free devices, the pods that no longer exist are released first, since the scheduler counted only existing ones.
+func (s *Server) allocateClaimPod(ctx context.Context, node *CloudVMNode, pod *Pod, spec *InstanceSpec, req ResourceVector) (*CloudVMNode, []int, []int, error) {
 	if pod.Metadata.DaemonSetOwned() {
 		return nil, nil, nil, fmt.Errorf("%w: claim VMs do not run DaemonSet pods", errClaimPodRefused)
 	}
@@ -167,19 +171,53 @@ func (s *Server) allocateClaimPod(node *CloudVMNode, pod *Pod, spec *InstanceSpe
 	if owner, ok := s.nodePool.InstanceNamespace(node.InstanceID); ok && owner != spec.PodNamespace {
 		return nil, nil, nil, fmt.Errorf("%w: VM %s runs pods of namespace %q only", errClaimPodRefused, node.InstanceID, owner)
 	}
-	devices := ResourceVector{GPUs: req.GPUs, TPUs: req.TPUs}
-	alloc, err := s.nodePool.AllocatePod(AllocationRequest{
-		Resources: devices,
+	request := AllocationRequest{
+		Resources: ResourceVector{GPUs: req.GPUs, TPUs: req.TPUs},
 		PodUID:    spec.PodUID,
 		Namespace: spec.PodNamespace,
 		PodName:   spec.PodName,
 		ClaimName: node.ClaimName,
-	})
+	}
+	alloc, err := s.nodePool.AllocatePod(request)
+	if err != nil && s.releaseDepartedClaimPods(ctx, node) > 0 {
+		alloc, err = s.nodePool.AllocatePod(request)
+	}
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: VM %s: %w", errClaimPodRefused, node.InstanceID, err)
 	}
 	s.persistClaimPods(alloc.Node)
 	return alloc.Node, alloc.GPUs, alloc.TPUs, nil
+}
+
+// releaseDepartedClaimPods runs the delete path for every pod on a claim's VM that the pod watch no longer lists, such
+// as one deleted while the node agent was down, and returns how many it released. Without a synced pod watch it
+// releases nothing.
+func (s *Server) releaseDepartedClaimPods(ctx context.Context, node *CloudVMNode) int {
+	s.mu.RLock()
+	watch := s.podExistence
+	s.mu.RUnlock()
+	if watch == nil || !watch.HasSynced() {
+		return 0
+	}
+	cutoff := time.Now().Add(-claimPodWatchLag)
+	s.nodePool.mu.RLock()
+	placed := make([]PodAllocation, 0, len(node.ActivePods))
+	for _, a := range node.ActivePods {
+		if a.StartedAt.Before(cutoff) {
+			placed = append(placed, *a)
+		}
+	}
+	s.nodePool.mu.RUnlock()
+	released := 0
+	for _, a := range placed {
+		if watch.PodExists(a.PodUID) {
+			continue
+		}
+		log.Printf("[cloudvm] Pod %s/%s (uid %s) on VM %s of claim %s no longer exists; releasing it", sanitizeLog(a.PodNamespace), sanitizeLog(a.PodName), sanitizeLog(a.PodUID), sanitizeLog(node.InstanceID), sanitizeLog(node.ClaimName)) //nolint:gosec // sanitized
+		s.DeleteOrphanedPod(ctx, a.PodNamespace, a.PodName, a.PodUID)
+		released++
+	}
+	return released
 }
 
 // persistClaimPods writes the pods on a claim's VM to its record when they changed.
@@ -231,7 +269,14 @@ func (s *Server) claimView(rec *claimRecord) nodeclaim.NodeClaim {
 	s.nodePool.mu.RLock()
 	node := s.nodePool.nodes[rec.InstanceID]
 	interrupted := node != nil && node.SpinDownReason == SpinDownInterruption
+	var pods []nodeclaim.PodRef
+	if node != nil {
+		for uid, a := range node.ActivePods {
+			pods = append(pods, nodeclaim.PodRef{Namespace: a.PodNamespace, Name: a.PodName, UID: uid})
+		}
+	}
 	s.nodePool.mu.RUnlock()
+	slices.SortFunc(pods, func(a, b nodeclaim.PodRef) int { return strings.Compare(a.UID, b.UID) })
 	return nodeclaim.NodeClaim{
 		Name:         rec.Request.Name,
 		ProviderID:   nodeclaim.FormatProviderID(string(rec.Provider), rec.Region, rec.InstanceID),
@@ -245,6 +290,7 @@ func (s *Server) claimView(rec *claimRecord) nodeclaim.NodeClaim {
 		Taints:       rec.Request.Taints,
 		Capacity:     claimCapacity(rec),
 		Interrupted:  interrupted,
+		Pods:         pods,
 	}
 }
 
@@ -591,8 +637,8 @@ func (s *Server) RunClaimSync(ctx context.Context) {
 
 // SyncClaims terminates claim VMs that never became ready, records the container storage size of claims that lack it,
 // calls the runner of every claim VM that has not heard from the plugin for a minute, which marks VMs without a tunnel
-// ready and keeps idle VMs alive, persists the pods on each VM, and prunes expired memory of deleted claims and
-// unavailable offerings.
+// ready and keeps idle VMs alive, releases the pods on each VM that no longer exist and persists the rest, and prunes
+// expired memory of deleted claims and unavailable offerings.
 func (s *Server) SyncClaims(ctx context.Context) {
 	now := time.Now()
 	readyTimeout := claimReadyTimeout
@@ -606,6 +652,7 @@ func (s *Server) SyncClaims(ctx context.Context) {
 		if !ok {
 			continue
 		}
+		s.releaseDepartedClaimPods(ctx, node)
 		s.persistClaimPods(node)
 		if rec.EphemeralStorage == "" {
 			s.fillClaimContainerStorage(ctx, rec)

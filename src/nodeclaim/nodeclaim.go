@@ -148,6 +148,16 @@ type NodeClaim struct {
 	Capacity map[string]string `json:"capacity,omitempty"`
 	// Interrupted is true once the cloud announced a spot interruption of the VM.
 	Interrupted bool `json:"interrupted,omitempty"`
+	// Pods are the pods the plugin placed on the VM, sorted by UID. The node agent calls /delete for each one that is
+	// no longer bound to the claim's Node, which frees what the pod held on the VM.
+	Pods []PodRef `json:"pods,omitempty"`
+}
+
+// PodRef identifies a pod placed on a claim's VM.
+type PodRef struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	UID       string `json:"uid"`
 }
 
 // Hardware is what a claim's VM offers pods.

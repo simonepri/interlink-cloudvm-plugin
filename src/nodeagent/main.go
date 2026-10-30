@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 )
@@ -283,6 +284,26 @@ func NewAgent(cfg AgentConfig) *Agent {
 	return &Agent{cfg: cfg, Nodes: nodes, Pods: NewPodProvider(cfg.Pods, cfg.Kube, nodes, cfg.PodStatus)}
 }
 
+// deleteDepartedPods deletes from the VMs the pods that left their Nodes once the pod informer has synced, which covers
+// pods deleted while the agent was down, and again on every claim poll, which covers deletes the plugin failed.
+func (a *Agent) deleteDepartedPods(ctx context.Context, podsSynced cache.InformerSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), podsSynced) {
+		return
+	}
+	ticker := time.NewTicker(a.Nodes.cfg.PollInterval)
+	defer ticker.Stop()
+	for {
+		for _, claim := range a.Nodes.ServedClaims() {
+			a.Pods.DeleteDepartedPods(ctx, &claim)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // Run serves Nodes and pods until ctx ends.
 func (a *Agent) Run(ctx context.Context) error {
 	go a.Nodes.Run(ctx)
@@ -303,6 +324,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	serviceFactory.Start(ctx.Done())
 	defer podFactory.Shutdown()
 	defer serviceFactory.Shutdown()
+	a.Pods.SetPodCache(podInformer.Lister(), podInformer.Informer().HasSynced)
+	go a.deleteDepartedPods(ctx, podInformer.Informer().HasSynced)
 
 	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: a.cfg.Kube.CoreV1().Events("")})

@@ -106,11 +106,14 @@ func (f *fakeClaims) Delete(_ context.Context, name string) error {
 	return nil
 }
 
-// fakePlugin serves /create, /delete, /status and /getLogs and records what it received.
+// fakePlugin serves /create, /delete, /status and /getLogs and records what it received. With slots set, its VM holds
+// that many pods and refuses more with 409 until /delete frees one.
 type fakePlugin struct {
 	mu        sync.Mutex
 	created   map[string]createRequest // pod UID -> request
 	deleted   []string
+	slots     int
+	holding   map[string]bool // pod UIDs on the VM when slots is set
 	running   map[string]bool // pod UID -> container running
 	polled    map[string]bool // pod UIDs a /status request named
 	statusReq atomic.Int64
@@ -119,7 +122,7 @@ type fakePlugin struct {
 
 func newFakePlugin(t *testing.T) *fakePlugin {
 	t.Helper()
-	p := &fakePlugin{created: make(map[string]createRequest), running: make(map[string]bool), polled: make(map[string]bool)}
+	p := &fakePlugin{created: make(map[string]createRequest), holding: make(map[string]bool), running: make(map[string]bool), polled: make(map[string]bool)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /create", func(w http.ResponseWriter, r *http.Request) {
 		var req createRequest
@@ -127,8 +130,15 @@ func newFakePlugin(t *testing.T) *fakePlugin {
 			http.Error(w, "bad pod", http.StatusBadRequest)
 			return
 		}
+		uid := string(req.Pod.UID)
 		p.mu.Lock()
-		p.created[string(req.Pod.UID)] = req
+		if p.slots > 0 && !p.holding[uid] && len(p.holding) >= p.slots {
+			p.mu.Unlock()
+			http.Error(w, "claim VM refuses pod: no warm node capacity available", http.StatusConflict)
+			return
+		}
+		p.holding[uid] = true
+		p.created[uid] = req
 		p.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]string{"PodUID": string(req.Pod.UID), "PodJID": "i-1:" + string(req.Pod.UID)})
 	})
@@ -138,6 +148,7 @@ func newFakePlugin(t *testing.T) *fakePlugin {
 		p.mu.Lock()
 		if req.Pod != nil {
 			p.deleted = append(p.deleted, string(req.Pod.UID))
+			delete(p.holding, string(req.Pod.UID))
 		}
 		p.mu.Unlock()
 	})

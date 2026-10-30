@@ -1,5 +1,5 @@
-// Tests the VM-per-NodeClaim API end to end through its HTTP client: launch, idempotency, pods on claim VMs, deletion,
-// recovery after a restart, capacity errors, readiness and inventory loss, the catalog, and zone pinning.
+// Tests the VM-per-NodeClaim API end to end through its HTTP client: launch, idempotency, pods on claim VMs and their
+// release, deletion, recovery after a restart, capacity errors, readiness and inventory loss, the catalog, and zones.
 package main
 
 import (
@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -468,4 +470,142 @@ func TestOfferedFleetOverridesPinZone(t *testing.T) {
 	if _, err := p.offeredFleetOverrides(context.Background(), region.client(), "us-west-1", "us-west-1c", []string{"g5.xlarge"}, []string{"subnet-a"}); !errors.Is(err, errNoOfferedPlacements) {
 		t.Fatalf("zone without subnets error = %v", err)
 	}
+}
+
+// claimPodWatch is a synced pod watch that lists the pod UIDs in its set.
+type claimPodWatch struct {
+	mu   sync.Mutex
+	uids map[string]bool
+}
+
+func (w *claimPodWatch) HasSynced() bool { return true }
+
+func (w *claimPodWatch) PodExists(uid string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.uids[uid]
+}
+
+func (w *claimPodWatch) set(uids ...string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.uids = make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		w.uids[uid] = true
+	}
+}
+
+// deleteClaimPod posts an interLink delete request for the pod, as the node agent does when the pod leaves its Node.
+func deleteClaimPod(t *testing.T, url, namespace, name string) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"pod": Pod{Metadata: PodMeta{Name: name, Namespace: namespace, UID: "uid-" + name}}})
+	req, _ := http.NewRequest(http.MethodDelete, url+"/delete", bytes.NewReader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("delete %s: %v", name, err)
+	}
+	_ = resp.Body.Close()
+}
+
+// agePlacement backdates when a pod was placed on the claim VM, past the pod watch's lag.
+func agePlacement(s *Server, instanceID, uid string) {
+	node, _ := s.nodePool.Node(instanceID)
+	s.nodePool.mu.Lock()
+	defer s.nodePool.mu.Unlock()
+	node.ActivePods[uid].StartedAt = time.Now().Add(-2 * claimPodWatchLag)
+}
+
+func claimPodUIDs(t *testing.T, client *nodeclaim.Client, name string) []string {
+	t.Helper()
+	claim, err := client.Get(context.Background(), name)
+	if err != nil {
+		t.Fatalf("Get %s: %v", name, err)
+	}
+	uids := make([]string, 0, len(claim.Pods))
+	for _, p := range claim.Pods {
+		uids = append(uids, p.UID)
+	}
+	return uids
+}
+
+func TestClaimPodDeleteFreesItsDevices(t *testing.T) {
+	s, client, url := newClaimServer(t, NewMockProvider())
+	if _, err := client.Create(context.Background(), claimRequest("nc-free", "g5.xlarge")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if code := createClaimPod(t, url, "nc-free", "team-a", "p1", 1); code != http.StatusOK {
+		t.Fatalf("create p1: HTTP %d", code)
+	}
+	if got := claimPodUIDs(t, client, "nc-free"); !slices.Equal(got, []string{"uid-p1"}) {
+		t.Fatalf("claim pods = %v, want uid-p1", got)
+	}
+	// p1 still exists, so its GPU stays taken however long it has run.
+	watch := &claimPodWatch{}
+	watch.set("uid-p1")
+	s.SetPodExistence(watch)
+	_, _, instanceID, _ := nodeclaim.ParseProviderID(mustGet(t, client, "nc-free").ProviderID)
+	agePlacement(s, instanceID, "uid-p1")
+	if code := createClaimPod(t, url, "nc-free", "team-a", "p2", 1); code != http.StatusConflict {
+		t.Fatalf("create p2 while p1 holds the only GPU: HTTP %d, want 409", code)
+	}
+
+	deleteClaimPod(t, url, "team-a", "p1")
+	if code := createClaimPod(t, url, "nc-free", "team-a", "p2", 1); code != http.StatusOK {
+		t.Fatalf("create p2 after p1 was deleted: HTTP %d, want 200", code)
+	}
+	if got := claimPodUIDs(t, client, "nc-free"); !slices.Equal(got, []string{"uid-p2"}) {
+		t.Fatalf("claim pods = %v, want uid-p2", got)
+	}
+}
+
+func TestClaimReleasesPodsDeletedWithoutDeleteCall(t *testing.T) {
+	s, client, url := newClaimServer(t, NewMockProvider())
+	ctx := context.Background()
+	if _, err := client.Create(ctx, claimRequest("nc-stale", "g5.xlarge")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, _, instanceID, _ := nodeclaim.ParseProviderID(mustGet(t, client, "nc-stale").ProviderID)
+	if code := createClaimPod(t, url, "nc-stale", "team-a", "p1", 1); code != http.StatusOK {
+		t.Fatalf("create p1: HTTP %d", code)
+	}
+
+	// p1 was deleted while the node agent was down, so the plugin never got its /delete; the next pod the scheduler
+	// binds to the Node, which it sees empty, takes the GPU.
+	watch := &claimPodWatch{}
+	watch.set("uid-p2")
+	s.SetPodExistence(watch)
+	agePlacement(s, instanceID, "uid-p1")
+	if code := createClaimPod(t, url, "nc-stale", "team-a", "p2", 1); code != http.StatusOK {
+		t.Fatalf("create p2 on the Node p1 left: HTTP %d, want 200", code)
+	}
+	if st, _ := s.runner.GetStatus(ctx, nil, "uid-p1"); st.Running {
+		t.Fatal("the container of the deleted pod p1 still runs")
+	}
+	if got := claimPodUIDs(t, client, "nc-stale"); !slices.Equal(got, []string{"uid-p2"}) {
+		t.Fatalf("claim pods = %v, want uid-p2", got)
+	}
+
+	// The claim loop releases a departed pod without waiting for a create, but keeps one placed within the watch's lag.
+	watch.set()
+	s.SyncClaims(ctx)
+	if got := claimPodUIDs(t, client, "nc-stale"); !slices.Equal(got, []string{"uid-p2"}) {
+		t.Fatalf("claim pods after a sync within the watch lag = %v, want uid-p2", got)
+	}
+	agePlacement(s, instanceID, "uid-p2")
+	s.SyncClaims(ctx)
+	if got := claimPodUIDs(t, client, "nc-stale"); len(got) != 0 {
+		t.Fatalf("claim pods after the sync = %v, want none", got)
+	}
+	if rec, _ := s.claims.store.get("nc-stale"); len(rec.Pods) != 0 {
+		t.Fatalf("persisted claim pods = %v, want none", rec.Pods)
+	}
+}
+
+func mustGet(t *testing.T, client *nodeclaim.Client, name string) *nodeclaim.NodeClaim {
+	t.Helper()
+	claim, err := client.Get(context.Background(), name)
+	if err != nil {
+		t.Fatalf("Get %s: %v", name, err)
+	}
+	return claim
 }
