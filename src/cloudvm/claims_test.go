@@ -75,6 +75,9 @@ func TestClaimLaunchIsIdempotentAndReportsCapacity(t *testing.T) {
 	if claim.State != nodeclaim.StateLaunching || claim.Capacity["nvidia.com/gpu"] != "1" || claim.Capacity["cpu"] != "4" || claim.Labels["gpu-class"] != "a10g" {
 		t.Fatalf("claim = %+v", claim)
 	}
+	if got := claim.Capacity[nodeclaim.ResourceEphemeralStorage]; got != mockRootVolume {
+		t.Fatalf("ephemeral-storage = %q, want the root volume size %s", got, mockRootVolume)
+	}
 	spec := mock.LastSpec()
 	if !spec.NodeClaim || spec.Zone != "us-east-1a" || spec.InstanceType != "g5.xlarge" || spec.MarketType != "spot" || spec.AMIMode != "container" || spec.PodUID != "nodeclaim-nc-a" || spec.MaxEgressRate == "" {
 		t.Fatalf("launch spec = %+v", spec)
@@ -319,6 +322,57 @@ func TestReconcilerLeavesIdleClaimVMs(t *testing.T) {
 	}
 	if inst, _ := mock.Status(ctx, instanceID); inst.State != StateRunning {
 		t.Fatalf("reconciler terminated the idle claim VM: %s", inst.State)
+	}
+}
+
+func TestClaimReadsRootVolumeAgainAfterAFailedRead(t *testing.T) {
+	mock := NewMockProvider()
+	mock.rootVolumeErr = errors.New("throttled")
+	s, client, _ := newClaimServer(t, mock)
+	ctx := context.Background()
+
+	claim, err := client.Create(ctx, claimRequest("nc-r", "g5.xlarge"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got, ok := claim.Capacity[nodeclaim.ResourceEphemeralStorage]; ok {
+		t.Fatalf("ephemeral-storage = %q before the root volume was read", got)
+	}
+	mock.mu.Lock()
+	mock.rootVolumeErr = nil
+	mock.mu.Unlock()
+	s.SyncClaims(ctx)
+	got, err := client.Get(ctx, "nc-r")
+	if err != nil || got.Capacity[nodeclaim.ResourceEphemeralStorage] != mockRootVolume {
+		t.Fatalf("Get after sync = %+v, %v; want ephemeral-storage %s", got, err, mockRootVolume)
+	}
+}
+
+// TestClaimReportsEveryCatalogResource checks that a claim launched for any catalog type reports every resource the
+// shared Hardware contract renders for that type, which is what the Karpenter provider advertises for it.
+func TestClaimReportsEveryCatalogResource(t *testing.T) {
+	s, client, _ := newClaimServer(t, NewMockProvider())
+	ctx := context.Background()
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, []string{"g5.xlarge", "g5.12xlarge"}, time.Hour)
+	s.SetSpotTicker(ticker)
+	cat, err := client.Catalog(ctx, []string{"us-east-1"})
+	if err != nil {
+		t.Fatalf("Catalog: %v", err)
+	}
+	if len(cat.InstanceTypes) == 0 {
+		t.Fatal("catalog is empty")
+	}
+	for i, it := range cat.InstanceTypes {
+		want := nodeclaim.Hardware{CPU: it.CPU, Memory: it.Memory, EphemeralStorage: "1", GPUs: it.GPUCount, Pods: 1}.Capacity()
+		claim, err := client.Create(ctx, claimRequest(fmt.Sprintf("nc-cat-%d", i), it.Name))
+		if err != nil {
+			t.Fatalf("Create %s: %v", it.Name, err)
+		}
+		for name := range want {
+			if claim.Capacity[name] == "" {
+				t.Errorf("claim for %s lacks %s: capacity %v", it.Name, name, claim.Capacity)
+			}
+		}
 	}
 }
 

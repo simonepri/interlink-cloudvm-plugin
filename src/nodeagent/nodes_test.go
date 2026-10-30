@@ -136,6 +136,37 @@ func TestNodeRegistersForKarpenter(t *testing.T) {
 	}
 }
 
+// TestNodeReportsEveryClaimResource checks that the Node reports each resource of its claim's capacity as capacity and
+// allocatable, including one that appears only after the Node registered.
+func TestNodeReportsEveryClaimResource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kube := fake.NewClientset()
+	c := gpuClaim("vm-r", nodeclaim.StateRunning)
+	c.Capacity = nodeclaim.Hardware{CPU: "8", Memory: "32Gi", GPUs: 1, TPUs: 4, Pods: 58}.Capacity()
+	claims := newFakeClaims(c)
+	m := testManager(claims, kube)
+	m.Sync(ctx)
+	defer m.stopAll()
+	waitFor(t, "node creation", func() bool { return getNode(t, kube, "vm-r") != nil })
+
+	// The plugin reads the root volume size after the VM launched.
+	c.Capacity = nodeclaim.Hardware{CPU: "8", Memory: "32Gi", EphemeralStorage: "200Gi", GPUs: 1, TPUs: 4, Pods: 58}.Capacity()
+	claims.set(c)
+	m.Sync(ctx)
+	reports := func(n *corev1.Node) bool {
+		for name, q := range c.Capacity {
+			want := resource.MustParse(q)
+			got, gotAlloc := n.Status.Capacity[corev1.ResourceName(name)], n.Status.Allocatable[corev1.ResourceName(name)]
+			if got.Cmp(want) != 0 || gotAlloc.Cmp(want) != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	waitFor(t, "every claim resource on the node", func() bool { return reports(getNode(t, kube, "vm-r")) })
+}
+
 func TestNodeFollowsClaimLifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

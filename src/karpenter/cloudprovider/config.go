@@ -30,7 +30,8 @@ type Config struct {
 	UnavailableOfferingTTL Duration `json:"unavailableOfferingTTL,omitzero"`
 	// MaxPods is the pods capacity of every node.
 	MaxPods int64 `json:"maxPods,omitempty"`
-	// EphemeralStorage is the ephemeral-storage capacity of every node.
+	// EphemeralStorage is the ephemeral-storage every instance type advertises for planning; a launched NodeClaim
+	// reports its VM's root volume size, which the plugin reads.
 	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
 }
 

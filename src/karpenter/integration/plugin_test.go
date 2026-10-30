@@ -93,7 +93,7 @@ func (p *pluginServer) create(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:    time.Now().UTC(),
 		Labels:       req.Labels,
 		Taints:       req.Taints,
-		Capacity:     map[string]string{"cpu": "8", "memory": "32Gi", "pods": "110", nodeclaim.ResourceGPU: "1"},
+		Capacity:     nodeclaim.Hardware{CPU: "8", Memory: "32Gi", EphemeralStorage: "200Gi", GPUs: 1, Pods: 110}.Capacity(),
 	}
 	p.claims[req.Name] = nc
 	writeJSON(w, http.StatusCreated, nc)

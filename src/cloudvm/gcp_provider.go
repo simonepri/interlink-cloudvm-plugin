@@ -508,7 +508,7 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 			Type:       "PERSISTENT",
 			InitializeParams: &compute.AttachedDiskInitializeParams{
 				SourceImage: sourceImage,
-				DiskSizeGb:  50,
+				DiskSizeGb:  gcpBootDiskGB,
 				DiskType:    fmt.Sprintf("zones/%s/diskTypes/pd-balanced", zone),
 			},
 		},
