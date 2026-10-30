@@ -1,6 +1,7 @@
 {{- /* The CloudVM node agent: a StatefulSet of shards that register the Nodes of NodeClaim VMs and run their pods. */ -}}
 {{- if .Values.nodeAgent.enabled }}
 {{- $name := printf "%s-node-agent" (include "interlink-cloudvm-plugin.fullname" .) }}
+{{- $signer := ternary "" .Values.nodeAgent.servingCert.signerName (ne .Values.nodeAgent.servingCertSecret "") }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -44,6 +45,12 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  {{- if $signer }}
+  # Requests its kubelet API serving certificate and watches the request until it is signed.
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["create", "get", "list", "watch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -124,6 +131,12 @@ spec:
               value: "{{ .Values.nodeAgent.kubeletPort }}"
             - name: PLUGIN_API_TOKEN_FILE
               value: /var/run/secrets/cloudvm-plugin/token
+            {{- if $signer }}
+            - name: KUBELET_SERVING_SIGNER
+              value: {{ $signer | quote }}
+            - name: KUBELET_SERVING_CERT_DURATION
+              value: {{ .Values.nodeAgent.servingCert.duration | quote }}
+            {{- end }}
             {{- with .Values.nodeAgent.servingCertSecret }}
             - name: KUBELET_TLS_CERT_FILE
               value: /etc/node-agent/tls/tls.crt
