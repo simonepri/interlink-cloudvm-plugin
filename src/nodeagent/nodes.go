@@ -135,6 +135,17 @@ func (m *NodeManager) Serves(nodeName string) bool {
 	return ok
 }
 
+// ServedClaims returns the last listed claim of every Node this process keeps alive.
+func (m *NodeManager) ServedClaims() []nodeclaim.NodeClaim {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]nodeclaim.NodeClaim, 0, len(m.served))
+	for _, sn := range m.served {
+		out = append(out, sn.claim)
+	}
+	return out
+}
+
 // ServedCount returns how many Nodes this process keeps alive.
 func (m *NodeManager) ServedCount() int {
 	m.mu.Lock()

@@ -285,6 +285,7 @@ func run() error {
 		podWatch = nil
 	} else {
 		podWatch.Start(ctx)
+		server.SetPodExistence(podWatch)
 	}
 
 	if providerType == "aws" || providerType == "gcp" {

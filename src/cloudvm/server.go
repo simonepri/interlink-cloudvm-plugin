@@ -84,6 +84,7 @@ type Server struct {
 	podCredentials        *PodCredentials                      // optional AWS credentials for pods whose service account has a role
 	claims                *claimRegistry                       // VMs launched for Karpenter NodeClaims
 	claimAuth             *claimAuthenticator                  // verifies NodeClaim API callers; nil refuses them all
+	podExistence          PodExistence                         // optional pod watch that frees claim VM pods whose pod is gone
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -469,6 +470,13 @@ func (s *Server) IsTombstoned(inst *Instance) bool {
 		}
 	}
 	return false
+}
+
+// SetPodExistence lets the claim loop free the share of a claim VM held by a pod that no longer exists.
+func (s *Server) SetPodExistence(pw PodExistence) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.podExistence = pw
 }
 
 // SetContainerRunner overrides the container runner (e.g. HTTPContainerRunner).
@@ -936,7 +944,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// 1. A pod bound to a NodeClaim's Node runs on that claim's VM; any other pod tries to bin-pack into a warm node.
 	if isClaimPod {
-		node, gpus, tpus, err := s.allocateClaimPod(claimNode, pod, spec, reqVec)
+		node, gpus, tpus, err := s.allocateClaimPod(r.Context(), claimNode, pod, spec, reqVec)
 		if err != nil {
 			finalErr = err
 			log.Printf("[cloudvm] Refusing pod %s/%s on claim node %s: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(pod.Spec.NodeName), err) //nolint:gosec // sanitized
@@ -1313,11 +1321,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		wasCordoned = node.Cordoned
 		if err := s.runner.StopContainer(r.Context(), node, uid); err != nil {
 			// The pod's container may still be on the VM, so no later pod may reuse it.
-			log.Printf("[cloudvm] Failed to remove the container of pod %s from node %s: %v", uid, node.InstanceID, err)
+			log.Printf("[cloudvm] Failed to remove the container of pod %s from node %s: %v", sanitizeLog(uid), sanitizeLog(node.InstanceID), err) //nolint:gosec // sanitized
 			s.nodePool.Cordon(node.InstanceID, SpinDownCleanupFailed)
 		}
 		remainingPods = s.nodePool.Release(uid)
-		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", uid, node.InstanceID, remainingPods)
+		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", sanitizeLog(uid), sanitizeLog(node.InstanceID), remainingPods) //nolint:gosec // sanitized
 		if node.ClaimName != "" {
 			// Only deleting its NodeClaim terminates a claim's VM.
 			s.persistClaimPods(node)
@@ -1334,7 +1342,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if !foundInPool {
 		// A lookup miss for a pod in node pool must not lead to terminating the VM
 		if inst != nil && s.nodePool != nil && (s.nodePool.HasActivePods(inst.ID) || s.nodePool.HasNode(inst.ID)) {
-			log.Printf("[cloudvm] Pod %s not allocated to node %s in node pool. Retaining VM.", uid, inst.ID)
+			log.Printf("[cloudvm] Pod %s not allocated to node %s in node pool. Retaining VM.", sanitizeLog(uid), sanitizeLog(inst.ID)) //nolint:gosec // sanitized
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -1343,8 +1351,8 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	// If the node pool has an active idle grace period and the node was not cordoned prior to release,
 	// retain the warm VM during its cooldown window before idle termination.
 	if foundInPool && nodeRef != nil && !wasCordoned && s.nodePool.IdleGracePeriod() > 0 {
-		log.Printf("[cloudvm] Node %s has 0 active pods; holding warm for %v for idle cooldown",
-			nodeRef.InstanceID, s.nodePool.IdleGracePeriod())
+		log.Printf("[cloudvm] Node %s has 0 active pods; holding warm for %v for idle cooldown", //nolint:gosec // sanitized
+			sanitizeLog(nodeRef.InstanceID), s.nodePool.IdleGracePeriod())
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1370,7 +1378,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.tokenStore.Delete(inst.ID)
 	}
 	if err := prov.Terminate(r.Context(), inst.ID); err != nil {
-		log.Printf("[cloudvm] Error terminating instance %s: %v", inst.ID, err)
+		log.Printf("[cloudvm] Error terminating instance %s: %v", sanitizeLog(inst.ID), err) //nolint:gosec // sanitized
 	}
 
 	w.WriteHeader(http.StatusOK)

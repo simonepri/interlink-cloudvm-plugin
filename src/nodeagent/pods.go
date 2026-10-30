@@ -1,5 +1,6 @@
-// PodProvider runs the pods bound to this shard's Nodes through the plugin, holds their DaemonSet pods Pending, and
-// reports status from one batched /status call per interval; it is the single virtual-kubelet pod provider.
+// PodProvider runs the pods bound to this shard's Nodes through the plugin, holds their DaemonSet pods Pending, deletes
+// pods that left a Node, and reports status from one batched /status call per interval; it is the single
+// virtual-kubelet pod provider.
 
 package main
 
@@ -16,7 +17,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 )
 
 // PodProvider implements the virtual kubelet's PodLifecycleHandler and PodNotifier for every served Node.
@@ -29,6 +32,9 @@ type PodProvider struct {
 	mu     sync.Mutex
 	pods   map[string]*corev1.Pod // namespace/name -> pod with the latest reported status
 	notify func(*corev1.Pod)
+	// bound is the pod informer's cache, which tells which pods are bound to a Node once boundSynced is true.
+	bound       corev1listers.PodLister
+	boundSynced func() bool
 }
 
 // NewPodProvider returns a provider that polls pod status every statusInterval.
@@ -54,7 +60,17 @@ func isDaemonSetPod(pod *corev1.Pod) bool {
 	return false
 }
 
-// CreatePod starts the pod on its Node's VM, or holds a DaemonSet pod Pending without sending it to the plugin.
+// SetPodCache gives the provider the pod informer's cache and its sync check; the provider deletes no departed pod
+// before the cache has synced.
+func (p *PodProvider) SetPodCache(lister corev1listers.PodLister, synced func() bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bound, p.boundSynced = lister, synced
+}
+
+// CreatePod starts the pod on its Node's VM, or holds a DaemonSet pod Pending without sending it to the plugin. When
+// the VM refuses the pod, the pods that left the Node are deleted from the VM and the create is tried once more, so
+// a VM that still counts a pod deleted while the agent was down takes the pod the scheduler fitted in its place.
 func (p *PodProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !p.nodes.Serves(pod.Spec.NodeName) {
 		return fmt.Errorf("node %s is not served by this agent", pod.Spec.NodeName)
@@ -63,7 +79,14 @@ func (p *PodProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		p.holdDaemonSetPod(pod)
 		return nil
 	}
-	if err := p.plugin.Create(ctx, pod, imagePullSecrets(ctx, p.kube, pod)); err != nil {
+	secrets := imagePullSecrets(ctx, p.kube, pod)
+	err := p.plugin.Create(ctx, pod, secrets)
+	if isRefusal(err) {
+		if claim, getErr := p.nodes.cfg.Claims.Get(ctx, pod.Spec.NodeName); getErr == nil && p.DeleteDepartedPods(ctx, claim) > 0 {
+			err = p.plugin.Create(ctx, pod, secrets)
+		}
+	}
+	if err != nil {
 		return err
 	}
 	tracked := pod.DeepCopy()
@@ -139,6 +162,37 @@ func (p *PodProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 		notify(terminated)
 	}
 	return nil
+}
+
+// DeleteDepartedPods calls the plugin's /delete for every pod the claim lists on its VM that is no longer bound to the
+// claim's Node, such as one deleted while the agent was down, and returns how many it deleted. It deletes nothing
+// before the pod informer's cache has synced.
+func (p *PodProvider) DeleteDepartedPods(ctx context.Context, claim *nodeclaim.NodeClaim) int {
+	p.mu.Lock()
+	bound, synced := p.bound, p.boundSynced
+	p.mu.Unlock()
+	if bound == nil || !synced() {
+		return 0
+	}
+	deleted := 0
+	for _, ref := range claim.Pods {
+		if pod, err := bound.Pods(ref.Namespace).Get(ref.Name); err == nil && string(pod.UID) == ref.UID && pod.Spec.NodeName == claim.Name {
+			continue
+		}
+		departed := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace, Name: ref.Name, UID: types.UID(ref.UID)}}
+		if err := p.plugin.Delete(ctx, departed); err != nil {
+			logf("deleting pod %s/%s (uid %s), which left node %s: %v", ref.Namespace, ref.Name, ref.UID, claim.Name, err)
+			continue
+		}
+		p.mu.Lock()
+		if tracked, ok := p.pods[podKey(ref.Namespace, ref.Name)]; ok && string(tracked.UID) == ref.UID {
+			delete(p.pods, podKey(ref.Namespace, ref.Name))
+		}
+		p.mu.Unlock()
+		logf("deleted pod %s/%s (uid %s) from the VM of node %s: it is no longer bound to the node", ref.Namespace, ref.Name, ref.UID, claim.Name)
+		deleted++
+	}
+	return deleted
 }
 
 // GetPod returns the tracked pod.

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -181,7 +182,24 @@ func (a *PodAPI) call(ctx context.Context, path string, body any) error {
 	return nil
 }
 
+// StatusError is a non-200 answer of the plugin.
+type StatusError struct {
+	Path    string
+	Code    int
+	Message string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("plugin %s: HTTP %d: %s", e.Path, e.Code, e.Message)
+}
+
+// isRefusal reports whether the plugin refused a pod its Node's VM cannot take.
+func isRefusal(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.Code == http.StatusConflict
+}
+
 func statusError(path string, resp *http.Response) error {
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return fmt.Errorf("plugin %s: HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(msg)))
+	return &StatusError{Path: path, Code: resp.StatusCode, Message: strings.TrimSpace(string(msg))}
 }
