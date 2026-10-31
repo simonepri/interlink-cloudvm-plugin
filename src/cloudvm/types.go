@@ -257,9 +257,11 @@ func (m *PodMeta) DaemonSetOwned() bool {
 	return false
 }
 
+// EnvVar is a container environment variable: a literal value, or a source ResolveEnvSources reads.
 type EnvVar struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Name      string               `json:"name"`
+	Value     string               `json:"value"`
+	ValueFrom *corev1.EnvVarSource `json:"valueFrom,omitempty"`
 }
 
 type ContainerResourceRequirements struct {

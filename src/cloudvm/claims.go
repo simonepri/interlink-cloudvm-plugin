@@ -182,6 +182,12 @@ func (s *Server) allocateClaimPod(ctx context.Context, node *CloudVMNode, pod *P
 	if node == nil {
 		return nil, nil, nil, fmt.Errorf("%w: its NodeClaim has no VM", errClaimPodRefused)
 	}
+	if regional := s.claimIsRegional(node.ClaimName); regional != s.regionalNamespaces[spec.PodNamespace] {
+		if regional {
+			return nil, nil, nil, fmt.Errorf("%w: regional VM %s runs pods of the regional namespaces only", errClaimPodRefused, node.InstanceID)
+		}
+		return nil, nil, nil, fmt.Errorf("%w: pods of regional namespace %q run only on regional VMs", errClaimPodRefused, spec.PodNamespace)
+	}
 	if owner, ok := s.nodePool.InstanceNamespace(node.InstanceID); ok && owner != spec.PodNamespace {
 		return nil, nil, nil, fmt.Errorf("%w: VM %s runs pods of namespace %q only", errClaimPodRefused, node.InstanceID, owner)
 	}
@@ -201,6 +207,20 @@ func (s *Server) allocateClaimPod(ctx context.Context, node *CloudVMNode, pod *P
 	}
 	s.persistClaimPods(alloc.Node)
 	return alloc.Node, alloc.GPUs, alloc.TPUs, nil
+}
+
+// claimIsRegional reports whether the claim's taints mark its VM as a regional VM.
+func (s *Server) claimIsRegional(claimName string) bool {
+	rec, ok := s.claims.store.get(claimName)
+	if !ok {
+		return false
+	}
+	for _, t := range rec.Request.Taints {
+		if t.Key == TaintRegional {
+			return true
+		}
+	}
+	return false
 }
 
 // releaseDepartedClaimPods runs the delete path for every pod on a claim's VM that the pod watch no longer lists, such

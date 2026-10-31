@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,15 +45,17 @@ type inFlightCreate struct {
 }
 
 type Server struct {
-	mu                    sync.RWMutex
-	stopRetryDelay        time.Duration // pause between container stop attempts; zero uses defaultStopRetryDelay
-	providers             map[ProviderType]Provider
-	defaultProv           Provider
-	instances             map[string]*Instance // key: UID and namespace/podName -> *Instance
-	clusterTag            string
-	defaultRegion         string
-	nodeRegions           map[string]string // virtual node name -> region its pods launch in when the node has no region label
-	nodeRegionLookup      NodeRegionLookup  // region labels of cluster nodes; nil without cluster access
+	mu             sync.RWMutex
+	stopRetryDelay time.Duration // pause between container stop attempts; zero uses defaultStopRetryDelay
+	providers      map[ProviderType]Provider
+	defaultProv    Provider
+	instances      map[string]*Instance // key: UID and namespace/podName -> *Instance
+	clusterTag     string
+	defaultRegion  string
+	nodeRegions    map[string]string // virtual node name -> region its pods launch in when the node has no region label
+	// regionalNamespaces are the namespaces whose pods run only on regional VMs, the only pods those VMs run.
+	regionalNamespaces    map[string]bool
+	nodeRegionLookup      NodeRegionLookup // region labels of cluster nodes; nil without cluster access
 	reconciler            *Reconciler
 	nodePool              *NodePool
 	kmsClient             KMSClient
@@ -188,6 +191,11 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		}
 	}
 	s.nodeRegions = parseNodeRegions(os.Getenv("NODE_REGIONS"))
+	if regional, err := ParseRegionalNamespaces(os.Getenv("REGIONAL_NAMESPACES")); err == nil {
+		s.regionalNamespaces = regional
+	} else {
+		log.Printf("[cloudvm] Ignoring REGIONAL_NAMESPACES: %v", err)
+	}
 	s.lifecycle = NewLifecycle(NewLifecycleMetrics(), s.podEventRecorder)
 	return s
 }
@@ -832,6 +840,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if !isClaimPod && s.regionalNamespaces[pod.Metadata.Namespace] {
+		finalErr = fmt.Errorf("pods of regional namespace %q run only on regional NodeClaim VMs", pod.Metadata.Namespace)
+		log.Printf("[cloudvm] Refusing pod %s/%s: %v", sanitizeLog(pod.Metadata.Namespace), sanitizeLog(pod.Metadata.Name), finalErr) //nolint:gosec // sanitized
+		http.Error(w, finalErr.Error(), http.StatusBadRequest)
+		return
+	}
 	spec, err := PodToInstanceSpec(pod, s.clusterTag, region)
 	if err != nil {
 		finalErr = err
@@ -842,6 +856,23 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	podEnv := spec.Env
 	if DetectPodAWSRole(podEnv) != nil {
 		spec.Env = stripWebhookCredentialEnv(podEnv)
+	}
+
+	s.mu.RLock()
+	envResolver := s.secretResolver
+	s.mu.RUnlock()
+	envValues, err := ResolveEnvSources(r.Context(), pod, parseSecretsFromPayload(body), envResolver)
+	if err != nil {
+		finalErr = err
+		log.Printf("[cloudvm] Refusing pod %s/%s: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), err) //nolint:gosec // sanitized
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(envValues) > 0 {
+		if spec.Env == nil {
+			spec.Env = map[string]string{}
+		}
+		maps.Copy(spec.Env, envValues)
 	}
 
 	if len(pod.Spec.ImagePullSecrets) > 0 {

@@ -232,6 +232,8 @@ type TunnelGateway struct {
 	services            ClusterServices
 	sharedServices      map[string]bool
 	workerNamespace     WorkerNamespaceResolver
+	workerRegion        func(instanceID string) (string, bool)
+	regionalServices    RegionalServices
 	onTCPRefusal        func(reason string)
 	tcpRefusalLog       refusalLog
 	clusterDomain       string
@@ -275,6 +277,10 @@ type TunnelGatewayConfig struct {
 	SharedServices map[string]bool
 	// WorkerNamespace maps a worker to the namespace of its pods; every tcp stream is refused when nil.
 	WorkerNamespace WorkerNamespaceResolver
+	// WorkerRegion maps a worker to the region it runs in; no stand-in answers its DNS queries when nil.
+	WorkerRegion func(instanceID string) (string, bool)
+	// RegionalServices finds the stand-ins of regional namespaces; workers see only the real Services when nil.
+	RegionalServices RegionalServices
 	// OnTCPRefusal is called with a short machine-readable reason for every refused tcp stream and CONNECT request.
 	OnTCPRefusal func(reason string)
 	// ClusterDomain is the DNS domain whose names workers' dns streams may resolve; DefaultClusterDomain when empty.
@@ -345,6 +351,8 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		services:            cfg.Services,
 		sharedServices:      cfg.SharedServices,
 		workerNamespace:     cfg.WorkerNamespace,
+		workerRegion:        cfg.WorkerRegion,
+		regionalServices:    cfg.RegionalServices,
 		onTCPRefusal:        cfg.OnTCPRefusal,
 		clusterDomain:       cfg.ClusterDomain,
 		clusterDNSServers:   cfg.ClusterDNSServers,

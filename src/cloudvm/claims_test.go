@@ -812,3 +812,72 @@ func TestClaimReportsUnhealthyWhenContainerCannotBeRemoved(t *testing.T) {
 		t.Fatalf("claim state = %s, want %s so the node agent makes the Node NotReady", got.State, nodeclaim.StateUnhealthy)
 	}
 }
+
+func TestRegionalVMsRunOnlyRegionalNamespaces(t *testing.T) {
+	t.Setenv("REGIONAL_NAMESPACES", "regional")
+	mock := NewMockProvider()
+	s, client, url := newClaimServer(t, mock)
+	ctx := context.Background()
+	regional := claimRequest("nc-regional", "m7i.large")
+	regional.Taints = append(regional.Taints, nodeclaim.Taint{Key: TaintRegional, Value: "true", Effect: "NoSchedule"})
+	if _, err := client.Create(ctx, regional); err != nil {
+		t.Fatalf("Create regional: %v", err)
+	}
+	if _, err := client.Create(ctx, claimRequest("nc-team", "m7i.large")); err != nil {
+		t.Fatalf("Create team: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, node, namespace string
+		want                  int
+	}{
+		{"a team pod on a regional VM", "nc-regional", "team-a", http.StatusConflict},
+		{"a regional pod on a team VM", "nc-team", "regional", http.StatusConflict},
+		{"a regional pod on a regional VM", "nc-regional", "regional", http.StatusOK},
+		{"a team pod on a team VM", "nc-team", "team-a", http.StatusOK},
+	} {
+		if code := createClaimPod(t, url, tc.node, tc.namespace, "p-"+tc.node+"-"+tc.namespace, 0); code != tc.want {
+			t.Errorf("%s: HTTP %d, want %d", tc.name, code, tc.want)
+		}
+	}
+	if runner := s.runner.(*MockContainerRunner); runner.GetStartRequest("uid-p-nc-regional-team-a") != nil {
+		t.Fatal("the team pod started on the regional VM")
+	}
+
+	virtual := Pod{
+		Metadata: PodMeta{Name: "v", Namespace: "regional", UID: "uid-v", Annotations: map[string]string{"cloudvm.vk.io/region": "us-east-1"}},
+		Spec:     PodSpecWrapper{Containers: []ContainerSpec{{Name: "main", Image: "busybox"}}},
+	}
+	if code := postClaimPod(t, url, virtual); code != http.StatusBadRequest {
+		t.Fatalf("a regional pod outside any NodeClaim: HTTP %d, want 400", code)
+	}
+	virtual.Metadata.Namespace, virtual.Metadata.UID = "team-a", "uid-v-team"
+	if code := postClaimPod(t, url, virtual); code != http.StatusOK {
+		t.Fatalf("the same pod of a team namespace: HTTP %d, want 200", code)
+	}
+}
+
+func TestClaimPodGetsResolvedEnvSources(t *testing.T) {
+	s, client, url := newClaimServer(t, NewMockProvider())
+	s.secretResolver = mapSecretResolver{"team-a/cache": {"url": []byte("redis://cache:6379")}}
+	if _, err := client.Create(context.Background(), claimRequest("nc-env", "m7i.large")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	pod := Pod{
+		Metadata: PodMeta{Name: "env", Namespace: "team-a", UID: "uid-env"},
+		Spec: PodSpecWrapper{NodeName: "nc-env", Containers: []ContainerSpec{{Name: "main", Image: "busybox",
+			Env: []EnvVar{{Name: "LITERAL", Value: "x"}, secretEnv("CACHE_URL", "cache", "url", false), fieldEnv("POD_NAMESPACE", "metadata.namespace")}}}},
+	}
+	if code := postClaimPod(t, url, pod); code != http.StatusOK {
+		t.Fatalf("create: HTTP %d", code)
+	}
+	env := s.runner.(*MockContainerRunner).GetStartRequest("uid-env").Env
+	if env["LITERAL"] != "x" || env["CACHE_URL"] != "redis://cache:6379" || env["POD_NAMESPACE"] != "team-a" {
+		t.Fatalf("env = %v", env)
+	}
+	pod.Metadata.Name, pod.Metadata.UID = "missing", "uid-missing"
+	pod.Spec.Containers[0].Env = []EnvVar{secretEnv("CACHE_URL", "absent", "url", false)}
+	if code := postClaimPod(t, url, pod); code != http.StatusBadRequest {
+		t.Fatalf("a pod whose required env secret is missing: HTTP %d, want 400", code)
+	}
+}

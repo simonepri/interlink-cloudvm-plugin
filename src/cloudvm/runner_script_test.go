@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -462,3 +463,37 @@ func TestRunnerScript_ReportsStartTimings(t *testing.T) {
 		t.Errorf("want one full pull of busybox, got %+v", tm)
 	}
 }
+
+func TestRunnerScript_GivesContainersTheNamespaceSearchList(t *testing.T) {
+	for _, tc := range []struct {
+		name, resolv, body, want string
+	}{
+		{"the tunnel's cluster domain gets the pod's namespace first", "nameserver 127.0.0.153\nsearch svc.cluster.local cluster.local ec2.internal\n",
+			`{"podUID":"dns","namespace":"team-a","image":"busybox"}`,
+			"--dns-search team-a.svc.cluster.local --dns-search svc.cluster.local --dns-search cluster.local --dns-search ec2.internal"},
+		{"a host without the tunnel's DNS keeps its own list", "nameserver 10.0.0.2\nsearch ec2.internal\n",
+			`{"podUID":"dns","namespace":"team-a","image":"busybox"}`, ""},
+		{"a pod without a namespace keeps the host's list", "nameserver 127.0.0.153\nsearch svc.cluster.local cluster.local\n",
+			`{"podUID":"dns","image":"busybox"}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, state := newPullingRunnerHarness(t)
+			resolv := filepath.Join(filepath.Dir(h.script), "resolv.conf")
+			if err := os.WriteFile(resolv, []byte(tc.resolv), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			h.env = append(h.env, "CLOUDVM_RESOLV_CONF="+resolv)
+			defer h.start()()
+			resp := h.do(http.MethodPost, "/containers/start", tc.body)
+			_ = resp.Body.Close()
+			waitStatus(t, h, "dns", func(r ContainerStatusResult) bool { return r.Running })
+			run, _ := os.ReadFile(filepath.Join(state, "run"))
+			got := strings.Join(regexpDNSSearch.FindAllString(string(run), -1), " ")
+			if got != tc.want {
+				t.Fatalf("dns search flags = %q, want %q (run: %s)", got, tc.want, run)
+			}
+		})
+	}
+}
+
+var regexpDNSSearch = regexp.MustCompile(`--dns-search \S+`)

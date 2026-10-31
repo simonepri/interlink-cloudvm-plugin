@@ -46,12 +46,132 @@ func (g *TunnelGateway) serveWorkerDNS(instanceID string, reader *bufio.Reader, 
 	if err != nil || len(query) > maxDNSQuery {
 		return
 	}
-	reply, err := g.answerClusterDNS(query)
+	reply, err := g.answerWorkerDNS(instanceID, query)
 	if err != nil {
 		log.Printf("[cloudvm-tunnel] Cannot answer dns query from %s: %v", sanitizeLog(instanceID), err) //nolint:gosec // sanitized
 		return
 	}
 	_, _ = stream.Write(reply)
+}
+
+// answerWorkerDNS answers a worker's query with the endpoints of a regional stand-in when one serves the worker's
+// region and has endpoints, and otherwise as answerClusterDNS does.
+func (g *TunnelGateway) answerWorkerDNS(instanceID string, query []byte) ([]byte, error) {
+	if reply, ok := g.answerFromStandIn(instanceID, query); ok {
+		return reply, nil
+	}
+	return g.answerClusterDNS(query)
+}
+
+// answerFromStandIn answers an A query for <service>.<namespace>.svc.<domain> from a worker whose pods are in
+// namespace with the addresses of the stand-in for that Service in the worker's region. It reports false, so the
+// query goes to the real Service, when there is no stand-in or the stand-in has no ready endpoint.
+func (g *TunnelGateway) answerFromStandIn(instanceID string, query []byte) ([]byte, bool) {
+	if g.regionalServices == nil || g.workerRegion == nil || g.workerNamespace == nil {
+		return nil, false
+	}
+	header, question, err := parseDNSQuery(query)
+	if err != nil || question.Type != dnsmessage.TypeA || question.Class != dnsmessage.ClassINET {
+		return nil, false
+	}
+	name, namespace, ok := serviceOfDNSName(question.Name.String(), g.clusterDomain)
+	if !ok {
+		return nil, false
+	}
+	if workerNamespace, ok := g.workerNamespace(instanceID); !ok || workerNamespace != namespace {
+		return nil, false
+	}
+	region, ok := g.workerRegion(instanceID)
+	if !ok {
+		return nil, false
+	}
+	standIn, ok := g.regionalServices.StandIn(namespace, name, region)
+	if !ok {
+		return nil, false
+	}
+	addrs := g.resolveA(fmt.Sprintf("%s.%s.svc.%s.", standIn.Name, standIn.Namespace, strings.Trim(g.clusterDomain, ".")), header.ID)
+	if len(addrs) == 0 {
+		return nil, false
+	}
+	reply, err := dnsAReply(header, question, addrs)
+	if err != nil {
+		return nil, false
+	}
+	return reply, true
+}
+
+// serviceOfDNSName splits a <service>.<namespace>.svc.<domain> name into its Service and namespace.
+func serviceOfDNSName(fqdn, domain string) (name, namespace string, ok bool) {
+	fqdn = strings.ToLower(strings.TrimSuffix(fqdn, "."))
+	suffix := ".svc." + strings.ToLower(strings.Trim(domain, "."))
+	rest, found := strings.CutSuffix(fqdn, suffix)
+	if !found {
+		return "", "", false
+	}
+	name, namespace, found = strings.Cut(rest, ".")
+	if !found || name == "" || namespace == "" || strings.Contains(namespace, ".") {
+		return "", "", false
+	}
+	return name, namespace, true
+}
+
+// resolveA asks the cluster resolvers for the A records of fqdn and returns them; it returns none when no resolver
+// answers NOERROR.
+func (g *TunnelGateway) resolveA(fqdn string, id uint16) [][4]byte {
+	qname, err := dnsmessage.NewName(fqdn)
+	if err != nil {
+		return nil
+	}
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: id, RecursionDesired: true})
+	if b.StartQuestions() != nil || b.Question(dnsmessage.Question{Name: qname, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}) != nil {
+		return nil
+	}
+	query, err := b.Finish()
+	if err != nil {
+		return nil
+	}
+	for _, server := range g.clusterDNSServers {
+		reply, err := exchangeDNS(server, query, id)
+		if err != nil {
+			continue
+		}
+		var msg dnsmessage.Message
+		if msg.Unpack(reply) != nil || msg.RCode != dnsmessage.RCodeSuccess {
+			return nil
+		}
+		var addrs [][4]byte
+		for _, answer := range msg.Answers {
+			if a, ok := answer.Body.(*dnsmessage.AResource); ok {
+				addrs = append(addrs, a.A)
+			}
+		}
+		return addrs
+	}
+	return nil
+}
+
+// dnsAReply builds a reply to a query that answers its question with addrs.
+func dnsAReply(query dnsmessage.Header, question dnsmessage.Question, addrs [][4]byte) ([]byte, error) {
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID: query.ID, Response: true, Authoritative: true, OpCode: query.OpCode, RecursionDesired: query.RecursionDesired,
+		RecursionAvailable: true,
+	})
+	if err := b.StartQuestions(); err != nil {
+		return nil, err
+	}
+	if err := b.Question(question); err != nil {
+		return nil, err
+	}
+	if err := b.StartAnswers(); err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
+		h := dnsmessage.ResourceHeader{Name: question.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: standInTTL}
+		if err := b.AResource(h, dnsmessage.AResource{A: addr}); err != nil {
+			return nil, err
+		}
+	}
+	return b.Finish()
 }
 
 // answerClusterDNS sends a query for a name inside the cluster domain to the cluster resolvers in turn and returns the
