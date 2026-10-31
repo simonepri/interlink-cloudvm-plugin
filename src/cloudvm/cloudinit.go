@@ -330,6 +330,12 @@ exec > >(cloudvm_mirror /var/log/cloudvm-bootstrap.log) 2>&1
 # cloudvm_mark records when the boot phase in $1 ended; the tunnel agent reports the marks in its handshake.
 cloudvm_mark() { mkdir -p /run/cloudvm && printf '%s %s\n' "$1" "$(date +%s.%N)" >> /run/cloudvm/boot-marks; }
 cloudvm_mark os_boot
+# cloudvm_bootstrap_failed reports the reason in $1 and stops the bootstrap, so the VM never runs a pod without a guard it needs.
+cloudvm_bootstrap_failed() {
+  echo "[cloudvm-bootstrap] FATAL: $1"
+  echo "CLOUDVM_STATUS: {\"status\": \"BOOTSTRAP_FAILED\", \"pod\": \"{{.PodName}}\"}" > /dev/console 2>/dev/null || true
+  exit 1
+}
 echo "=== INTERLINK CLOUDVM BOOTSTRAP: $(date) ==="
 echo "CLOUDVM_STATUS: {\"status\": \"BOOTING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\", \"type\": \"{{.InstanceType}}\"}" > /dev/console 2>/dev/null || true
 
@@ -360,8 +366,14 @@ if [ -n "$INSTANCE_ID" ] && command -v aws >/dev/null 2>&1; then
   aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --instance-initiated-shutdown-behavior terminate --region "{{.Region}}" 2>/dev/null || true
 fi
 
+# Images such as the plain Amazon Linux 2023 AMI ship without iptables, which every guard below needs.
+if ! command -v iptables >/dev/null 2>&1; then
+  dnf install -y iptables-nft || yum install -y iptables-nft || { apt-get update && apt-get install -y iptables; } || true
+fi
+command -v iptables >/dev/null 2>&1 || cloudvm_bootstrap_failed "no iptables to keep containers away from the instance metadata service"
+
 # Prevent non-root container workloads from accessing cloud metadata services (IMDS)
-iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || true
+iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP || cloudvm_bootstrap_failed "cannot block the instance metadata service for non-root users"
 
 # Runner port 9090 dedicated firewall chain inserted at head of INPUT
 iptables -N CLOUDVM_RUNNER 2>/dev/null || true
@@ -899,10 +911,10 @@ cloudvm_fetch_script {{.TunnelAgentScriptSHA256}} /usr/local/bin/cloudvm-tunnel-
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
 {{if .TunnelServiceCIDRs}}
 # Connections to cluster Services enter the agent, which tunnels them, so clients need no proxy; the gateway stays direct.
-iptables -t nat -N CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -F CLOUDVM_SERVICES
-{{if .TunnelGatewayIP}}iptables -t nat -A CLOUDVM_SERVICES -d {{.TunnelGatewayIP}} -j RETURN
-{{end}}{{range .TunnelServiceCIDRs}}iptables -t nat -A CLOUDVM_SERVICES -p tcp -d {{.}} -j REDIRECT --to-ports {{$.TransparentProxyPort}} || echo "[cloudvm-bootstrap] cannot intercept {{.}}"
-{{end}}iptables -t nat -C OUTPUT -j CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -A OUTPUT -j CLOUDVM_SERVICES
+iptables -t nat -N CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -F CLOUDVM_SERVICES || cloudvm_bootstrap_failed "cannot create the Service redirect chain"
+{{if .TunnelGatewayIP}}iptables -t nat -A CLOUDVM_SERVICES -d {{.TunnelGatewayIP}} -j RETURN || cloudvm_bootstrap_failed "cannot exempt the tunnel gateway from the Service redirect"
+{{end}}{{range .TunnelServiceCIDRs}}iptables -t nat -A CLOUDVM_SERVICES -p tcp -d {{.}} -j REDIRECT --to-ports {{$.TransparentProxyPort}} || cloudvm_bootstrap_failed "cannot redirect Service network {{.}} into the tunnel agent"
+{{end}}iptables -t nat -C OUTPUT -j CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -A OUTPUT -j CLOUDVM_SERVICES || cloudvm_bootstrap_failed "cannot hook the Service redirect into OUTPUT"
 {{end}}
 CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
   CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" CLOUDVM_TUNNEL_CIDRS="{{.TunnelCIDRList}}" \

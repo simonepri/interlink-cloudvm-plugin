@@ -1002,7 +1002,8 @@ func TestRenderCloudInit_RedirectsServiceNetworksToTheAgent(t *testing.T) {
 		t.Fatalf("script must exempt the gateway before redirecting the service network:\n%s", script)
 	}
 	for _, want := range []string{
-		"iptables -t nat -C OUTPUT -j CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -A OUTPUT -j CLOUDVM_SERVICES",
+		"iptables -t nat -C OUTPUT -j CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -A OUTPUT -j CLOUDVM_SERVICES || cloudvm_bootstrap_failed",
+		`-j REDIRECT --to-ports 13129 || cloudvm_bootstrap_failed "cannot redirect Service network 172.20.0.0/16 into the tunnel agent"`,
 		`CLOUDVM_TRANSPARENT_PORT="13129"`,
 	} {
 		if !strings.Contains(script, want) {
@@ -1018,5 +1019,82 @@ func TestRenderCloudInit_RedirectsServiceNetworksToTheAgent(t *testing.T) {
 	}
 	if strings.Contains(script, "CLOUDVM_SERVICES") || !strings.Contains(script, `CLOUDVM_TRANSPARENT_PORT="0"`) {
 		t.Error("a worker without service networks must not redirect connections")
+	}
+}
+
+// metadataGuard returns the bootstrap's failure helper and its iptables and metadata guard, which every worker runs.
+func metadataGuard(t *testing.T, script string) string {
+	t.Helper()
+	fn := strings.Index(script, "cloudvm_bootstrap_failed() {")
+	start := strings.Index(script, "# Images such as the plain Amazon Linux 2023 AMI")
+	end := strings.Index(script, "# Runner port 9090")
+	if fn < 0 || start < 0 || end < start {
+		t.Fatalf("bootstrap lacks the iptables guard:\n%s", script)
+	}
+	fnEnd := strings.Index(script[fn:], "\n}\n")
+	return script[fn:fn+fnEnd+3] + script[start:end]
+}
+
+func TestRenderCloudInit_FailsTheBootstrapWithoutTheMetadataGuard(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", Region: "us-east-1", RunnerAuthToken: "tok", TargetContainerImage: "alpine"})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	guard := metadataGuard(t, script)
+	for _, tc := range []struct {
+		name  string
+		tools map[string]string
+		ok    bool
+		want  string
+	}{
+		{"an image without iptables whose package manager installs it", map[string]string{
+			"dnf": "#!/bin/sh\ncp \"$STATE/iptables\" \"$BIN/iptables\"\n",
+		}, true, "-I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP"},
+		{"an image without iptables that cannot install it", map[string]string{
+			"dnf": "#!/bin/sh\nexit 1\n", "yum": "#!/bin/sh\nexit 1\n", "apt-get": "#!/bin/sh\nexit 1\n",
+		}, false, "FATAL: no iptables"},
+		{"iptables that refuses the rule", map[string]string{"iptables": "#!/bin/sh\nexit 1\n"}, false, "FATAL: cannot block the instance metadata service"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bin, state := filepath.Join(dir, "bin"), filepath.Join(dir, "state")
+			for _, d := range []string{bin, state} {
+				if err := os.MkdirAll(d, 0o750); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fakeIPTables := "#!/bin/sh\necho \"$*\" >> \"$STATE/rules\"\n[ \"$1\" != -C ]\n"
+			if err := os.WriteFile(filepath.Join(state, "iptables"), []byte(fakeIPTables), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+				t.Fatal(err)
+			}
+			for name, body := range tc.tools {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command(bash, "-c", guard+"\necho GUARD_PASSED\n") //nolint:gosec // rendered by the test
+			// The fake tools come first; a host iptables on the system paths would hide the missing-iptables cases.
+			for _, d := range []string{"/usr/bin", "/bin"} {
+				if _, err := os.Stat(filepath.Join(d, "iptables")); err == nil {
+					t.Skipf("%s/iptables shadows the fake", d)
+				}
+			}
+			cmd.Env = []string{"PATH=" + bin + ":" + filepath.Dir(bash) + ":/usr/bin:/bin", "BIN=" + bin, "STATE=" + state}
+			out, err := cmd.CombinedOutput()
+			if tc.ok {
+				rules, _ := os.ReadFile(filepath.Join(state, "rules"))
+				if err != nil || !strings.Contains(string(out), "GUARD_PASSED") || !strings.Contains(string(rules), tc.want) {
+					t.Fatalf("guard: %v\n%s\nrules: %s", err, out, rules)
+				}
+				return
+			}
+			if err == nil || strings.Contains(string(out), "GUARD_PASSED") || !strings.Contains(string(out), tc.want) {
+				t.Fatalf("guard must stop the bootstrap with %q: %v\n%s", tc.want, err, out)
+			}
+		})
 	}
 }
