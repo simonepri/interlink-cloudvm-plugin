@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,12 +63,17 @@ func submittedStatuses(containers []corev1.Container) []corev1.ContainerStatus {
 
 func newStatusContractServer(t *testing.T, uid string, result *ContainerStatusResult) *httptest.Server {
 	t.Helper()
+	runner := NewMockContainerRunner()
+	runner.SetStatus(uid, result)
+	return newStatusContractServerWithRunner(t, uid, runner)
+}
+
+func newStatusContractServerWithRunner(t *testing.T, uid string, runner ContainerRunner) *httptest.Server {
+	t.Helper()
 	t.Setenv("COMPLETED_STORE_PATH", filepath.Join(t.TempDir(), "completed.json"))
 	t.Setenv("TOKEN_STORE_PATH", filepath.Join(t.TempDir(), "tokens.json"))
 	server := NewServer(NewMockProvider(), "test-cluster")
 
-	runner := NewMockContainerRunner()
-	runner.SetStatus(uid, result)
 	server.SetContainerRunner(runner)
 
 	capVec, _ := NewResourceVector("4", "16Gi", 1, 0)
@@ -266,5 +274,54 @@ func TestStatusContract_ImagePullFailureWaits(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// flakyRunner answers status calls from its mock until fail is set, then fails them like an unreachable runner.
+type flakyRunner struct {
+	*MockContainerRunner
+	fail atomic.Bool
+}
+
+func (r *flakyRunner) GetStatus(ctx context.Context, node *CloudVMNode, uid string) (*ContainerStatusResult, error) {
+	if r.fail.Load() {
+		return nil, errors.New("in-VM runner error (503) reading status")
+	}
+	return r.MockContainerRunner.GetStatus(ctx, node, uid)
+}
+
+func TestStatusContract_UnansweredRunnerKeepsTheLastKnownState(t *testing.T) {
+	const uid = "uid-contract-flaky"
+	startedAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	runner := &flakyRunner{MockContainerRunner: NewMockContainerRunner()}
+	runner.SetStatus(uid, &ContainerStatusResult{Running: true, Status: "running", StartedAt: startedAt})
+	ts := newStatusContractServerWithRunner(t, uid, runner)
+	pod := contractPod(uid)
+
+	runner.fail.Store(true)
+	for _, c := range queryInterLinkStatus(t, ts, pod).Containers {
+		if w := c.State.Waiting; w == nil || w.Reason != "ContainerCreating" || c.Ready {
+			t.Fatalf("container %s before the runner ever answered: want waiting ContainerCreating, got %+v", c.Name, c)
+		}
+	}
+
+	runner.fail.Store(false)
+	queryInterLinkStatus(t, ts, pod)
+	runner.fail.Store(true)
+	for _, c := range queryInterLinkStatus(t, ts, pod).Containers {
+		if c.State.Running == nil || !c.State.Running.StartedAt.Time.Equal(startedAt) || !c.Ready {
+			t.Errorf("container %s after the runner stopped answering: want the last running state, got %+v", c.Name, c)
+		}
+	}
+}
+
+func TestStatusContract_UnrecognizedRunnerStatusWaitsWithAReason(t *testing.T) {
+	const uid = "uid-contract-unrecognized"
+	ts := newStatusContractServer(t, uid, &ContainerStatusResult{})
+	for _, c := range queryInterLinkStatus(t, ts, contractPod(uid)).Containers {
+		w := c.State.Waiting
+		if w == nil || w.Reason != "ContainerCreating" || c.Ready || c.State.Terminated != nil {
+			t.Errorf("container %s: want waiting ContainerCreating, got %+v", c.Name, c.State)
+		}
 	}
 }

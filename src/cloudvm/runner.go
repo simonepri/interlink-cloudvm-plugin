@@ -162,6 +162,10 @@ func (h *HTTPContainerRunner) GetStatus(ctx context.Context, node *CloudVMNode, 
 		return nil, fmt.Errorf("failed to query in-VM runner at %s: %w", url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// An error reply carries no container state, so it must not read as a container in an unknown state.
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("in-VM runner error (%d) reading status of %s", resp.StatusCode, podUID)
+	}
 
 	var result ContainerStatusResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
