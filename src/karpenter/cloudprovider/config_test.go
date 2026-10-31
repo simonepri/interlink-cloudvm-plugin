@@ -25,7 +25,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.CatalogTTL.Duration != DefaultCatalogTTL || cfg.MaxPods != DefaultMaxPods || cfg.EphemeralStorage != DefaultEphemeralStorage {
+	if cfg.CatalogTTL.Duration != DefaultCatalogTTL || cfg.MaxPods != DefaultMaxPods || cfg.EphemeralStorage != DefaultEphemeralStorage ||
+		cfg.OfferingSpread != (OfferingSpread{PriceTolerance: DefaultSpreadPriceTolerance, MaxOfferings: DefaultSpreadMaxOfferings}) {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
 }
@@ -47,6 +48,9 @@ dataCost:
   perRegionUSDPerHour:
     ap-south-1: 0.15
 catalogTTL: 30s
+offeringSpread:
+  priceTolerance: 0.15
+  maxOfferings: 2
 nodePoolSelector:
   cloudvm-controller: primary
 `))
@@ -55,6 +59,9 @@ nodePoolSelector:
 	}
 	if cfg.CatalogTTL.Duration != 30*time.Second {
 		t.Errorf("catalogTTL = %s", cfg.CatalogTTL.Duration)
+	}
+	if cfg.OfferingSpread != (OfferingSpread{PriceTolerance: 0.15, MaxOfferings: 2}) {
+		t.Errorf("offeringSpread = %+v", cfg.OfferingSpread)
 	}
 	for _, tc := range []struct {
 		model    string
@@ -87,6 +94,8 @@ func TestLoadConfigRejectsInvalid(t *testing.T) {
 		"unknown field":     "gpuClass: []",
 		"bad duration":      "catalogTTL: soon",
 		"bad selector":      `nodePoolSelector: {"bad key!": x}`,
+		"negative spread":   "offeringSpread: {priceTolerance: -0.1}",
+		"negative offers":   "offeringSpread: {maxOfferings: -1}",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := LoadConfig(writeConfig(t, body)); err == nil {

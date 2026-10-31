@@ -26,8 +26,9 @@ type fakeAPI struct {
 	capacityErrors map[string]bool
 	listErr        error
 	createErr      error
-	launchZone     string // zone a claim without one lands in, as the cloud picks it
-	omitStorage    bool   // launched claims lack ephemeral-storage, as when the plugin has not read the VM's disk yet
+	launchZone     string        // zone a claim without one lands in, as the cloud picks it
+	omitStorage    bool          // launched claims lack ephemeral-storage, as when the plugin has not read the VM's disk yet
+	refusalDelay   time.Duration // how long a capacity refusal takes, as EC2 answers a refusal slower than a launch
 	nextID         int
 }
 
@@ -71,6 +72,9 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 		return nil, f.createErr
 	}
 	if f.capacityErrors[req.InstanceType+"/"+cmpZone(req)+"/"+req.CapacityType] {
+		f.mu.Unlock()
+		time.Sleep(f.refusalDelay)
+		f.mu.Lock()
 		return nil, &nodeclaim.APIError{Status: http.StatusServiceUnavailable, Reason: nodeclaim.ReasonInsufficientCapacity, Message: "no capacity"}
 	}
 	f.nextID++
