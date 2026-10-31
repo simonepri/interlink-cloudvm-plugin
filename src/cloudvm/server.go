@@ -45,6 +45,7 @@ type inFlightCreate struct {
 
 type Server struct {
 	mu                    sync.RWMutex
+	stopRetryDelay        time.Duration // pause between container stop attempts; zero uses defaultStopRetryDelay
 	providers             map[ProviderType]Provider
 	defaultProv           Provider
 	instances             map[string]*Instance // key: UID and namespace/podName -> *Instance
@@ -1259,6 +1260,36 @@ func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus 
 	return &CreateStruct{PodUID: spec.PodUID, PodJID: podJID}
 }
 
+const (
+	stopAttempts          = 3
+	defaultStopRetryDelay = 5 * time.Second
+)
+
+// stopContainerWithRetry removes a pod's container, retrying a failed attempt because stopping is idempotent and a
+// slow or briefly unreachable runner usually succeeds on the next try.
+func (s *Server) stopContainerWithRetry(ctx context.Context, node *CloudVMNode, uid string) error {
+	delay := s.stopRetryDelay
+	if delay <= 0 {
+		delay = defaultStopRetryDelay
+	}
+	var err error
+	for attempt := 1; attempt <= stopAttempts; attempt++ {
+		if err = s.runner.StopContainer(ctx, node, uid); err == nil {
+			return nil
+		}
+		log.Printf("[cloudvm] Removing the container of pod %s from node %s failed (attempt %d of %d): %v", sanitizeLog(uid), sanitizeLog(node.InstanceID), attempt, stopAttempts, err) //nolint:gosec // sanitized
+		if attempt == stopAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+	}
+	return err
+}
+
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	// The virtual kubelet sends DELETE; the interLink API forwards it to a plugin as POST.
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
@@ -1348,7 +1379,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		foundInPool = true
 		nodeRef = node
 		wasCordoned = node.Cordoned
-		if err := s.runner.StopContainer(r.Context(), node, uid); err != nil {
+		if err := s.stopContainerWithRetry(r.Context(), node, uid); err != nil {
 			// The pod's container may still be on the VM, so no later pod may reuse it.
 			log.Printf("[cloudvm] Failed to remove the container of pod %s from node %s: %v", sanitizeLog(uid), sanitizeLog(node.InstanceID), err) //nolint:gosec // sanitized
 			s.nodePool.Cordon(node.InstanceID, SpinDownCleanupFailed)

@@ -35,6 +35,9 @@ const (
 // reasonVMLaunching is the Ready=False reason of a Node whose VM has not connected its tunnel yet.
 const reasonVMLaunching = "VMLaunching"
 
+// reasonVMUnhealthy is the Ready=False reason of a Node whose VM cannot take pods safely.
+const reasonVMUnhealthy = "VMUnhealthy"
+
 // defaultPods is the pod capacity of a Node whose claim does not state one, the kubelet default.
 const defaultPods = "110"
 
@@ -462,7 +465,9 @@ func nodeStatus(c *nodeclaim.NodeClaim, cfg NodeConfig) corev1.NodeStatus {
 		Reason:  "KubeletReady",
 		Message: "the VM's tunnel is connected",
 	}
-	if c.State != nodeclaim.StateRunning {
+	if c.State == nodeclaim.StateUnhealthy {
+		ready.Status, ready.Reason, ready.Message = corev1.ConditionFalse, reasonVMUnhealthy, "the VM failed to clean up a pod's container"
+	} else if c.State != nodeclaim.StateRunning {
 		ready.Status, ready.Reason, ready.Message = corev1.ConditionFalse, reasonVMLaunching, "waiting for the VM's tunnel to connect"
 	}
 	now := metav1.Now()

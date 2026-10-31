@@ -200,7 +200,9 @@ func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNo
 	}
 	h.setAuthHeader(httpReq, node)
 
-	resp, err := h.client.Do(httpReq) //nolint:gosec // internal mesh call
+	client := *h.client
+	client.Timeout = DefaultStopTimeout
+	resp, err := client.Do(httpReq) //nolint:gosec // internal mesh call
 	if err != nil {
 		return fmt.Errorf("failed to stop container on VM at %s: %w", url, err)
 	}

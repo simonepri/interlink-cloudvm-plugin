@@ -574,20 +574,31 @@ func (g *TunnelGateway) Close() error {
 type TunnelContainerRunner struct {
 	registry      *SessionRegistry
 	clientTimeout time.Duration
+	stopTimeout   time.Duration
 	fallback      ContainerRunner
 }
+
+// DefaultStopTimeout bounds one container stop request; stopping waits for the container's termination grace period
+// and removes its writable layer, which outlasts the short timeout of the other dispatches.
+const DefaultStopTimeout = time.Minute
 
 // NewTunnelContainerRunner initializes a TunnelContainerRunner.
 func NewTunnelContainerRunner(registry *SessionRegistry) *TunnelContainerRunner {
 	return &TunnelContainerRunner{
 		registry:      registry,
 		clientTimeout: 15 * time.Second,
+		stopTimeout:   DefaultStopTimeout,
 	}
 }
 
 // SetFallback configures an optional fallback ContainerRunner used when no tunnel session is registered.
 func (t *TunnelContainerRunner) SetFallback(fallback ContainerRunner) {
 	t.fallback = fallback
+}
+
+// SetStopTimeout configures the HTTP client timeout for container stop dispatches.
+func (t *TunnelContainerRunner) SetStopTimeout(timeout time.Duration) {
+	t.stopTimeout = timeout
 }
 
 // SetClientTimeout configures the HTTP client timeout for reverse tunnel dispatches.
@@ -724,6 +735,7 @@ func (t *TunnelContainerRunner) StopContainer(ctx context.Context, node *CloudVM
 	t.setAuthHeader(httpReq, node)
 
 	client := t.clientForSession(session)
+	client.Timeout = t.stopTimeout
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("reverse tunnel dispatch StopContainer failed for %s: %w", node.InstanceID, err)
