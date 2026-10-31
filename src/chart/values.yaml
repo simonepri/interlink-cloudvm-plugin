@@ -75,6 +75,8 @@ otelEndpoint: ""
 otlpLogsEndpoint: ""
 nodeProblemDetector:
   enabled: false
+# Pulls eStargz images lazily through the stargz snapshotter on workers; false pulls every image in full.
+lazyImagePulls: true
 customBootstrapScript: ""
 
 service:

@@ -67,6 +67,7 @@ type Server struct {
 	registryMirrors       []string
 	otelEndpoint          string
 	enableNPD             bool
+	disableLazyPulls      bool
 	customBootstrapScript string
 	runnerConcurrency     int
 	launchTimeout         time.Duration
@@ -174,6 +175,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	s.registryMirrors = regMirrors
 	s.otelEndpoint = os.Getenv("OTEL_ENDPOINT")
 	s.enableNPD = os.Getenv("ENABLE_NPD") == "true" || os.Getenv("ENABLE_NPD") == "1"
+	s.disableLazyPulls = os.Getenv("LAZY_IMAGE_PULLS") == "false" || os.Getenv("LAZY_IMAGE_PULLS") == "0"
 	s.customBootstrapScript = os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT")
 	if raw := os.Getenv("MAX_RUNNER_CONCURRENCY"); raw != "" {
 		if c, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && c > 0 {
@@ -385,6 +387,7 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		NodeProblemDetector:   npd,
 		CustomBootstrapScript: script,
 		RunnerConcurrency:     rc,
+		DisableLazyPulls:      spec.DisableLazyPulls || (s != nil && s.disableLazyPulls),
 	}
 }
 
@@ -747,6 +750,9 @@ func (s *Server) applyServerDefaults(spec *InstanceSpec) {
 	}
 	if !spec.NodeProblemDetector && s.enableNPD {
 		spec.NodeProblemDetector = true
+	}
+	if s.disableLazyPulls {
+		spec.DisableLazyPulls = true
 	}
 	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
 		spec.CustomBootstrapScript = s.customBootstrapScript

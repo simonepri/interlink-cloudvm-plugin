@@ -45,6 +45,13 @@
         "k8s.io/**"
       ],
       "enabled": false
+    },
+    {
+      "description": "Never auto-merge a stargz snapshotter bump: CLOUDVM_STARGZ_SHA256 in the boot script and its tests must be updated to the new release tarball by hand",
+      "matchPackageNames": [
+        "containerd/stargz-snapshotter"
+      ],
+      "automerge": false
     }
   ],
   "customManagers": [
@@ -56,6 +63,19 @@
       "matchStrings": [
         "#\\s*renovate:\\s*datasource=(?<datasource>.*?)\\s+depName=(?<depName>.*?)(?:\\s+versioning=(?<versioning>.*?))?\\n.*?=\\s*\"?(?<currentValue>v?[0-9.]+)\"?"
       ]
+    },
+    {
+      "description": "Track the stargz snapshotter release the worker boot script installs",
+      "customType": "regex",
+      "fileMatch": [
+        "^src/cloudvm/cloudinit\\.go$"
+      ],
+      "matchStrings": [
+        "CLOUDVM_STARGZ_VERSION=\"(?<currentValue>[0-9.]+)\""
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "containerd/stargz-snapshotter",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ]
 }

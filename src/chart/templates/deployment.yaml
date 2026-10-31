@@ -166,6 +166,10 @@ spec:
             - name: ENABLE_NPD
               value: "true"
             {{- end }}
+            {{- if eq (toString .Values.lazyImagePulls) "false" }}
+            - name: LAZY_IMAGE_PULLS
+              value: "false"
+            {{- end }}
             {{- if .Values.customBootstrapScript }}
             - name: CUSTOM_BOOTSTRAP_SCRIPT
               value: {{ .Values.customBootstrapScript | quote }}
