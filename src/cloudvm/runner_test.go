@@ -319,3 +319,18 @@ func TestHTTPFramePusher(t *testing.T) {
 		t.Errorf("unexpected received frame: %+v", receivedFrame)
 	}
 }
+
+func TestHTTPContainerRunner_GetStatusRejectsErrorReplies(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"code":"Busy","message":"try again"}`))
+	}))
+	defer ts.Close()
+	host, portStr, _ := net.SplitHostPort(ts.Listener.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	node := &CloudVMNode{InstanceID: "i-test", MeshIP: host}
+
+	if res, err := NewHTTPContainerRunner(port).GetStatus(context.Background(), node, "uid"); err == nil {
+		t.Fatalf("GetStatus = %+v, want an error for a 503 reply that carries no container state", res)
+	}
+}

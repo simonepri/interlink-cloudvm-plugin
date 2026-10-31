@@ -77,6 +77,7 @@ type Server struct {
 	statusPolled          bool                                 // set true when first /status query is received
 	launchTokens          map[string]string                    // podUID -> runnerAuthToken (reused across retries)
 	completedPods         map[string]*ContainerTerminatedState // podUID -> terminal state (retained until /delete)
+	lastRunning           map[string]ContainerStatus           // podUID -> its container's state while the runner last reported it running
 	statusErrLogged       map[string]time.Time                 // podUID -> when its last runner status error was logged
 	inFlightCreates       map[string]*inFlightCreate           // podUID -> in-flight single flight tracker
 	podLogs               *PodLogBuffer                        // recent container output served to kubectl logs
@@ -1290,6 +1291,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	if pod.Metadata.UID != "" {
 		delete(s.instances, pod.Metadata.UID)
+		delete(s.lastRunning, pod.Metadata.UID)
 		delete(s.completedPods, pod.Metadata.UID)
 		delete(s.launchTokens, pod.Metadata.UID)
 		if s.tokenStore != nil {
@@ -1753,12 +1755,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 								cResult, err := s.runner.GetStatus(r.Context(), node, tgt.uid)
 								if err != nil {
 									s.logStatusError(tgt.uid, node.InstanceID, err)
-									status.Ready = false
-									status.State.Waiting = &ContainerWaitingState{
+									status = s.unansweredStatus(tgt.uid, ContainerWaitingState{
 										Reason:  "ContainerCreating",
 										Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", node.InstanceID, node.GetMeshIP()),
-									}
+									})
 								} else if cResult != nil {
+									if !cResult.Running {
+										s.forgetRunning(tgt.uid)
+									}
 									if cResult.NetworkRxBytes > 0 || cResult.NetworkTxBytes > 0 {
 										prov := string(node.Provider)
 										if prov == "" && tgt.inst != nil {
@@ -1784,6 +1788,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 										status.State.Running = &ContainerRunningState{
 											StartedAt: cResult.StartedAt,
 										}
+										s.rememberRunning(tgt.uid, status)
 									case cResult.Reason == "ErrImagePull" || cResult.Reason == "ImagePullBackOff":
 										// The runner keeps retrying the pull, so the container waits like a kubelet's and the pod stays Pending.
 										status.Ready = false
@@ -1808,11 +1813,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 									case cResult.Status == "exited" || cResult.Status == "dead" || cResult.Reason == "Completed" || (cResult.ExitCode != 0 && !cResult.Running):
 										s.recordRunnerTermination(tgt.uid, tgt.jid, cResult, &status)
 									default:
-										status.Ready = false
-										status.State.Waiting = &ContainerWaitingState{
-											Reason:  "ContainerStatusUnknown",
-											Message: fmt.Sprintf("Container status: %s", cResult.Status),
-										}
+										status = s.unansweredStatus(tgt.uid, ContainerWaitingState{
+											Reason:  "ContainerCreating",
+											Message: fmt.Sprintf("Container status: %q", cResult.Status),
+										})
 									}
 								}
 							} else {
@@ -1929,6 +1933,36 @@ func (s *Server) logStatusError(uid, instanceID string, err error) {
 	if due {
 		log.Printf("[cloudvm] Runner status call for pod %s on %s failed: %v", sanitizeLog(uid), sanitizeLog(instanceID), sanitizeLog(err.Error())) //nolint:gosec // sanitized
 	}
+}
+
+// rememberRunning records that the pod's container was last seen running, so a runner that stops answering does not
+// make a running pod look unknown.
+func (s *Server) rememberRunning(uid string, status ContainerStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastRunning == nil {
+		s.lastRunning = map[string]ContainerStatus{}
+	}
+	s.lastRunning[uid] = status
+}
+
+// forgetRunning drops the running state remembered for the pod.
+func (s *Server) forgetRunning(uid string) {
+	s.mu.Lock()
+	delete(s.lastRunning, uid)
+	s.mu.Unlock()
+}
+
+// unansweredStatus is the status of a container the runner has not answered for: the running state it last reported,
+// or else waiting for the given reason.
+func (s *Server) unansweredStatus(uid string, waiting ContainerWaitingState) ContainerStatus {
+	s.mu.RLock()
+	last, ok := s.lastRunning[uid]
+	s.mu.RUnlock()
+	if ok {
+		return last
+	}
+	return ContainerStatus{State: ContainerStatusState{Waiting: &waiting}}
 }
 
 // recordRunnerTermination marks a pod terminated with the runner's exit code, reason, and message and persists it.
