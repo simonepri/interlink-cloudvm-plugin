@@ -21,10 +21,14 @@ import (
 
 // DefaultYamuxConfig returns a tuned Yamux configuration for reverse tunnel gateway and workers.
 // Configures keepalive ping interval of 30 seconds and a 2 MiB receive window per stream, matching the agent's STREAM_WINDOW.
+// A ping or frame may wait 60 seconds before the session is closed, so pings queued behind megabytes of stream data on a
+// slow cross-region link do not end a live session; with the 30-second interval, a dead link is found within the 90
+// seconds after which the agent's READ_IDLE_TIMEOUT gives up on its side.
 func DefaultYamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = true
 	cfg.KeepAliveInterval = 30 * time.Second
+	cfg.ConnectionWriteTimeout = 60 * time.Second
 	cfg.MaxStreamWindowSize = 2 * 1024 * 1024
 	cfg.LogOutput = io.Discard
 	return cfg
@@ -64,17 +68,56 @@ type TunnelHandshakeResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-// SessionRegistry maps instance IDs to active Yamux multiplexed sessions.
+// lostSessionMemory is how long the registry remembers when an instance's session closed.
+const lostSessionMemory = time.Hour
+
+// SessionRegistry maps instance IDs to active Yamux multiplexed sessions and remembers when each instance's session last
+// closed, so callers can tell a VM that is reconnecting from one that never connected.
 type SessionRegistry struct {
 	mu       sync.RWMutex
 	sessions map[string]*yamux.Session
+	lost     map[string]time.Time
+	started  time.Time
 }
 
 // NewSessionRegistry initializes an empty session registry.
 func NewSessionRegistry() *SessionRegistry {
 	return &SessionRegistry{
 		sessions: make(map[string]*yamux.Session),
+		lost:     make(map[string]time.Time),
+		started:  time.Now(),
 	}
+}
+
+// Started returns when the registry was created, before which no session of any instance could be seen.
+func (r *SessionRegistry) Started() time.Time {
+	return r.started
+}
+
+// LostAt returns when the instance's last session closed, if it has no session now and lost one within the last hour.
+func (r *SessionRegistry) LostAt(instanceID string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if s, ok := r.sessions[instanceID]; ok && s != nil {
+		if !s.IsClosed() {
+			return time.Time{}, false
+		}
+		// The session closed but its watcher has not unregistered it yet.
+		return time.Now(), true
+	}
+	at, ok := r.lost[instanceID]
+	return at, ok
+}
+
+// recordLostLocked notes that the instance's session closed now and forgets closes older than lostSessionMemory.
+func (r *SessionRegistry) recordLostLocked(instanceID string) {
+	now := time.Now()
+	for id, at := range r.lost {
+		if now.Sub(at) > lostSessionMemory {
+			delete(r.lost, id)
+		}
+	}
+	r.lost[instanceID] = now
 }
 
 // Register maps an instance ID to an active Yamux session, closing any previous session for that instance.
@@ -85,13 +128,15 @@ func (r *SessionRegistry) Register(instanceID string, session *yamux.Session) {
 		_ = old.Close()
 	}
 	r.sessions[instanceID] = session
+	delete(r.lost, instanceID)
 }
 
-// Unregister removes an instance ID from the session registry.
+// Unregister removes an instance ID from the session registry and records when its session closed.
 func (r *SessionRegistry) Unregister(instanceID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.sessions, instanceID)
+	r.recordLostLocked(instanceID)
 }
 
 // Get retrieves the active Yamux session for the given instance ID.
@@ -143,6 +188,7 @@ func (r *SessionRegistry) Close(instanceID string) error {
 	defer r.mu.Unlock()
 	if s, ok := r.sessions[instanceID]; ok {
 		delete(r.sessions, instanceID)
+		r.recordLostLocked(instanceID)
 		if s != nil {
 			return s.Close()
 		}

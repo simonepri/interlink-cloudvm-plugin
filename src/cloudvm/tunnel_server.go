@@ -19,6 +19,9 @@ import (
 // DefaultTunnelConnectTimeout bounds how long a launched worker may take to open its reverse tunnel.
 const DefaultTunnelConnectTimeout = 10 * time.Minute
 
+// DefaultTunnelReconnectGrace is how long a worker whose tunnel dropped still counts as ready while its agent reconnects.
+const DefaultTunnelReconnectGrace = 2 * time.Minute
+
 // DefaultMeshTags is the tailnet ACL tag workers advertise when joining the mesh.
 const DefaultMeshTags = "tag:clvm-worker"
 
@@ -49,8 +52,11 @@ type TunnelSettings struct {
 	MeshAuthKey string
 	// MeshTags is the comma-separated list of tailnet tags workers advertise.
 	MeshTags string
-	// ConnectTimeout bounds how long a new worker may take to connect before it is failed and terminated.
+	// ConnectTimeout bounds how long a worker may stay without a tunnel, since its launch or since its tunnel dropped,
+	// before it is failed and terminated.
 	ConnectTimeout time.Duration
+	// ReconnectGrace is how long a worker whose tunnel dropped still counts as ready, so a reconnect keeps its Node Ready.
+	ReconnectGrace time.Duration
 	// DirectFallback keeps the legacy private-IP HTTP runner path for same-VPC workers.
 	DirectFallback bool
 }
@@ -70,6 +76,9 @@ func (s *Server) EnableTunnel(settings TunnelSettings) *TunnelMetrics {
 	}
 	if settings.ConnectTimeout <= 0 {
 		settings.ConnectTimeout = DefaultTunnelConnectTimeout
+	}
+	if settings.ReconnectGrace <= 0 {
+		settings.ReconnectGrace = DefaultTunnelReconnectGrace
 	}
 	runner := NewTunnelContainerRunner(settings.Registry)
 	if settings.DirectFallback {
@@ -261,13 +270,35 @@ func encryptMeshAuthKey(ctx context.Context, client KMSClient, keyID string, spe
 	return nil
 }
 
-// tunnelDeadlineExceeded reports whether node was launched longer ago than the connect timeout without ever opening a tunnel.
+// connected reports whether the worker has a tunnel session or lost its last one less than the reconnect grace ago.
+func (t *tunnelState) connected(instanceID string) bool {
+	if t.Registry.Has(instanceID) {
+		return true
+	}
+	at, ok := t.Registry.LostAt(instanceID)
+	return ok && time.Since(at) < t.ReconnectGrace
+}
+
+// disconnectedSince returns since when the worker has been without a tunnel: the latest of its launch, the plugin's
+// start, and the close of its last session.
+func (t *tunnelState) disconnectedSince(instanceID string, launchedAt time.Time) time.Time {
+	since := launchedAt
+	if started := t.Registry.Started(); started.After(since) {
+		since = started
+	}
+	if at, ok := t.Registry.LostAt(instanceID); ok && at.After(since) {
+		since = at
+	}
+	return since
+}
+
+// tunnelDeadlineExceeded reports whether node has been without a tunnel for longer than the connect timeout.
 func (s *Server) tunnelDeadlineExceeded(node *CloudVMNode, launchedAt time.Time) bool {
 	t := s.tunnelConfig()
 	if t == nil || node == nil {
 		return false
 	}
-	return time.Since(launchedAt) >= t.ConnectTimeout && !t.Registry.Has(node.InstanceID)
+	return !t.Registry.Has(node.InstanceID) && time.Since(t.disconnectedSince(node.InstanceID, launchedAt)) >= t.ConnectTimeout
 }
 
 // startRetryTimeout returns how long a new node's first container start is retried.

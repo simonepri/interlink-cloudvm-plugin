@@ -8,12 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/yamux"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
@@ -656,4 +659,104 @@ func mustGet(t *testing.T, client *nodeclaim.Client, name string) *nodeclaim.Nod
 		t.Fatalf("Get %s: %v", name, err)
 	}
 	return claim
+}
+
+// pipeSession returns the gateway end of a Yamux session over an in-memory pipe.
+func pipeSession(t *testing.T) *yamux.Session {
+	t.Helper()
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	go func() { _, _ = yamux.Client(client, DefaultYamuxConfig()) }()
+	session, err := yamux.Server(server, DefaultYamuxConfig())
+	if err != nil {
+		t.Fatalf("yamux server: %v", err)
+	}
+	return session
+}
+
+func TestClaimStaysReadyWhileItsTunnelReconnects(t *testing.T) {
+	mock := NewMockProvider()
+	s, client, _ := newClaimServer(t, mock)
+	registry := NewSessionRegistry()
+	registry.started = time.Now().Add(-time.Hour)
+	const connectTimeout, grace = 10 * time.Minute, 2 * time.Minute
+	s.EnableTunnel(TunnelSettings{
+		Registry: registry, Endpoint: "tunnel.example.internal:443", MeshAuthKey: "tskey-auth-test",
+		ConnectTimeout: connectTimeout, ReconnectGrace: grace,
+	})
+	ctx := context.Background()
+	claim, err := client.Create(ctx, claimRequest("nc-r", "g5.xlarge"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, _, instanceID, _ := nodeclaim.ParseProviderID(claim.ProviderID)
+	rec, _ := s.claims.store.get("nc-r")
+	old := *rec
+	old.CreatedAt = time.Now().Add(-time.Hour)
+	_ = s.claims.store.set("nc-r", &old, false)
+	state := func() nodeclaim.State {
+		got, err := client.Get(ctx, "nc-r")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		return got.State
+	}
+	backdateLoss := func(by time.Duration) {
+		registry.mu.Lock()
+		registry.lost[instanceID] = time.Now().Add(-by)
+		registry.mu.Unlock()
+	}
+
+	registry.Register(instanceID, pipeSession(t))
+	if got := state(); got != nodeclaim.StateRunning {
+		t.Fatalf("connected claim state = %s, want Running", got)
+	}
+
+	_ = registry.Close(instanceID)
+	s.SyncClaims(ctx)
+	if got := state(); got != nodeclaim.StateRunning {
+		t.Fatalf("claim state right after its tunnel dropped = %s, want Running", got)
+	}
+
+	backdateLoss(grace + time.Second)
+	s.SyncClaims(ctx)
+	if got := state(); got != nodeclaim.StateLaunching {
+		t.Fatalf("claim state after the reconnect grace = %s, want Launching", got)
+	}
+	if inst, _ := mock.Status(ctx, instanceID); inst.State == StateTerminated {
+		t.Fatal("a VM of an hour-old claim was terminated minutes after its tunnel dropped")
+	}
+
+	registry.Register(instanceID, pipeSession(t))
+	if got := state(); got != nodeclaim.StateRunning {
+		t.Fatalf("reconnected claim state = %s, want Running", got)
+	}
+
+	_ = registry.Close(instanceID)
+	backdateLoss(connectTimeout + time.Second)
+	s.SyncClaims(ctx)
+	if inst, _ := mock.Status(ctx, instanceID); inst.State != StateTerminated {
+		t.Fatalf("VM without a tunnel for longer than the connect timeout: state = %s, want terminated", inst.State)
+	}
+}
+
+func TestClaimSyncGivesVMsTheConnectTimeoutAfterAPluginRestart(t *testing.T) {
+	mock := NewMockProvider()
+	s, client, _ := newClaimServer(t, mock)
+	s.EnableTunnel(TunnelSettings{Endpoint: "tunnel.example.internal:443", MeshAuthKey: "tskey-auth-test"})
+	ctx := context.Background()
+	claim, err := client.Create(ctx, claimRequest("nc-s", "g5.xlarge"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, _, instanceID, _ := nodeclaim.ParseProviderID(claim.ProviderID)
+	rec, _ := s.claims.store.get("nc-s")
+	old := *rec
+	old.CreatedAt = time.Now().Add(-time.Hour)
+	_ = s.claims.store.set("nc-s", &old, false)
+
+	s.SyncClaims(ctx)
+	if inst, _ := mock.Status(ctx, instanceID); inst.State == StateTerminated {
+		t.Fatal("an hour-old VM was terminated before it could reconnect to a restarted plugin")
+	}
 }

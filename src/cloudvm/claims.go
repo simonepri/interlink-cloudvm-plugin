@@ -264,14 +264,24 @@ func (s *Server) persistClaimPods(node *CloudVMNode) {
 	}
 }
 
-// claimReady reports whether a claim's VM takes pods: its tunnel is connected, or without a tunnel its runner answered.
+// claimReady reports whether a claim's VM takes pods: its tunnel is connected or reconnecting within the grace, or
+// without a tunnel its runner answered.
 func (s *Server) claimReady(instanceID string) bool {
 	if t := s.tunnelConfig(); t != nil {
-		return t.Registry.Has(instanceID)
+		return t.connected(instanceID)
 	}
 	s.claims.mu.Lock()
 	defer s.claims.mu.Unlock()
 	return s.claims.ready[instanceID]
+}
+
+// claimUnreadySince returns since when a claim's VM has not taken pods: its creation, or with a tunnel the time it has
+// been without one, so a VM whose tunnel dropped gets the full timeout to reconnect.
+func (s *Server) claimUnreadySince(rec *claimRecord) time.Time {
+	if t := s.tunnelConfig(); t != nil {
+		return t.disconnectedSince(rec.InstanceID, rec.CreatedAt)
+	}
+	return rec.CreatedAt
 }
 
 // claimView renders a claim in the API shape.
@@ -667,7 +677,7 @@ func (s *Server) RunClaimSync(ctx context.Context) {
 	}
 }
 
-// SyncClaims terminates claim VMs that never became ready, records the container storage size of claims that lack it,
+// SyncClaims terminates claim VMs that stayed unready past the timeout, records the container storage size of claims that lack it,
 // calls the runner of every claim VM that has not heard from the plugin for a minute, which marks VMs without a tunnel
 // ready and keeps idle VMs alive, releases the pods on each VM that no longer exist and persists the rest, and prunes
 // expired memory of deleted claims and unavailable offerings.
@@ -690,8 +700,8 @@ func (s *Server) SyncClaims(ctx context.Context) {
 			s.fillClaimContainerStorage(ctx, rec)
 		}
 		ready := s.claimReady(rec.InstanceID)
-		if !ready && now.Sub(rec.CreatedAt) > readyTimeout {
-			log.Printf("[cloudvm] VM %s of claim %s did not become ready within %v; terminating it", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), readyTimeout) //nolint:gosec // sanitized
+		if !ready && now.Sub(s.claimUnreadySince(rec)) > readyTimeout {
+			log.Printf("[cloudvm] VM %s of claim %s has not been ready for %v; terminating it", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), readyTimeout) //nolint:gosec // sanitized
 			if _, err := s.deleteClaim(ctx, rec.Request.Name); err != nil {
 				log.Printf("[cloudvm] Error terminating unready claim VM %s: %v", sanitizeLog(rec.InstanceID), err) //nolint:gosec // sanitized
 			}
