@@ -143,7 +143,7 @@ func (g *TunnelGateway) inServiceNetworks(host string) bool {
 }
 
 // allowService refuses a stream from a worker of namespace source to a Service ClusterIP unless the Service lies in
-// source or among the shared Services and exposes port. Unlike pod addresses, Services may expose ports below 1024: a
+// source, among the shared Services, or is one that a Service of source stands in for, and exposes port. Unlike pod addresses, Services may expose ports below 1024: a
 // ClusterIP reaches only the Service's own endpoints.
 func (g *TunnelGateway) allowService(source, host, port string) error {
 	if g.services == nil || !g.services.HasSynced() {
@@ -153,7 +153,8 @@ func (g *TunnelGateway) allowService(source, host, port string) error {
 	if !ok {
 		return refuse("unknown_target", "no service holds %s", host)
 	}
-	if svc.Namespace != source && !g.sharedServices[svc.Namespace+"/"+svc.Name] {
+	if svc.Namespace != source && !g.sharedServices[svc.Namespace+"/"+svc.Name] &&
+		(g.regionalServices == nil || !g.regionalServices.StandsInFor(source, svc.Namespace, svc.Name)) {
 		return refuse("namespace_mismatch", "namespace %s may not reach service %s/%s", source, svc.Namespace, svc.Name)
 	}
 	if p, err := strconv.Atoi(port); err != nil || !svc.exposes(p) {
@@ -376,6 +377,19 @@ func bridge(reader io.Reader, conn io.WriteCloser, upstream io.ReadWriteCloser) 
 		closeBoth()
 	}()
 	<-done
+}
+
+// WorkerRegion returns the region a worker VM runs in.
+func (s *Server) WorkerRegion(instanceID string) (string, bool) {
+	np := s.NodePool()
+	if np == nil {
+		return "", false
+	}
+	node, ok := np.Node(instanceID)
+	if !ok || node.Region == "" {
+		return "", false
+	}
+	return node.Region, true
 }
 
 // WorkerNamespace returns the namespace of the pods a worker VM runs.

@@ -513,6 +513,10 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 	if err != nil {
 		return nil, err
 	}
+	regionalNamespaces, err := ParseRegionalNamespaces(os.Getenv("REGIONAL_NAMESPACES"))
+	if err != nil {
+		return nil, err
+	}
 	settings := TunnelSettings{
 		Endpoint:       endpoint,
 		Transports:     transports,
@@ -583,13 +587,16 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 		config.PodNamespaces = podWatch
 	}
 	if len(serviceNetworks) > 0 {
-		serviceWatch, err := NewInClusterServiceWatch()
+		serviceWatch, err := NewInClusterServiceWatch(regionalNamespaces)
 		if err != nil {
 			_ = listener.Close()
 			return nil, fmt.Errorf("TUNNEL_TCP_SERVICE_CIDRS needs a service watch: %w", err)
 		}
 		serviceWatch.Start(ctx.Done())
 		config.ServiceNetworks, config.Services, config.SharedServices = serviceNetworks, serviceWatch, sharedServices
+		if len(regionalNamespaces) > 0 {
+			config.RegionalServices, config.WorkerRegion = serviceWatch, server.WorkerRegion
+		}
 	}
 	gateway, err := NewTunnelGateway(config)
 	if err != nil {

@@ -605,6 +605,15 @@ Errors carry `{"reason", "message"}`: `Unauthorized` (`401`) and `Forbidden` (`4
 - **Zones.** On AWS a claim with a `zone` launches only into the subnets of that zone. GCP launches ignore the zone, and the catalog lists AWS types only.
 - **State.** Claims persist in `CLAIM_STORE_PATH` (the chart puts it on the data volume), so run one replica, which the tunnel requires anyway.
 
+### Regional Services
+
+A regional service puts a copy of a cluster Service next to the workers of one region, such as a read replica of a cache, so their traffic stays inside the region and falls back to the cluster Service when the copy is gone.
+
+- **Stand-ins.** A Service in a namespace listed in `REGIONAL_NAMESPACES` stands in for the Service `<namespace>/<name>` that its `cloudvm.vk.io/regional-service-for` annotation names, for the workers of the region its `topology.kubernetes.io/region` label names. Make it headless, so the cluster resolver answers its name with the addresses of its ready pods, which on CloudVM nodes are the VMs' private addresses. The annotation is ignored on Services of other namespaces, and the first stand-in by namespace and name wins when several serve one Service and region.
+- **DNS.** When a worker whose pods belong to `<namespace>` and that runs in the stand-in's region asks for the `A` record of `<name>.<namespace>.svc.<domain>`, the gateway resolves the stand-in's own name and answers with its addresses and a 5 second TTL. When the stand-in has no ready pod, its name does not resolve, or the query is for another type, the gateway forwards the original query, so the worker gets the real Service. Workers of other regions and namespaces always get the real Service.
+- **Reach.** Pods of a regional namespace may reach, through the tunnel, the ClusterIP of every Service that one of their namespace's Services stands in for, for example to replicate from it or to forward writes to it, in addition to the Services of their own namespace and `TUNNEL_SHARED_SERVICES`.
+- **Regional VMs.** A NodeClaim whose taints include the key `cloudvm.vk.io/regional` launches a regional VM. It takes only pods of the regional namespaces, and pods of a regional namespace run only on regional VMs: the plugin refuses a pod that breaks either rule with `409` on a claim VM, and a regional namespace's pod outside any NodeClaim with `400`. A regional VM still takes pods of one namespace only, like every claim VM, so each regional namespace needs its own regional VMs.
+
 ### Regional Virtual Nodes
 
 Run Virtual Kubelet nodes in any number per region, for example one per GPU class and capacity type. A pod launches in the region of the node it is bound to, chosen in this order:
@@ -723,6 +732,7 @@ With `PROVIDER_TYPE=aws` or `gcp`, the plugin refuses to start unless workers ca
 | `RUNNER_DIRECT_FALLBACK` | `false` | Also call the runner on the worker's private IP |
 | `TUNNEL_TCP_SERVICE_CIDRS` | (empty: workers reach no Service) | Comma-separated Service ClusterIP networks, such as `172.20.0.0/16`, that workers reach through the tunnel; needs `list` and `watch` on `services` cluster-wide |
 | `TUNNEL_SHARED_SERVICES` | (empty) | Comma-separated `namespace/name` Services that workers of every namespace may reach, such as `s3-system/s3-gateway` |
+| `REGIONAL_NAMESPACES` | (empty: no regional services) | Comma-separated namespaces whose Services may stand in for another namespace's Service in one region, and whose pods run only on regional VMs (see [Regional Services](#regional-services)); stand-ins need `TUNNEL_TCP_SERVICE_CIDRS` |
 
 `CLUSTER_FACTS` picks each region's path to the gateway with `regions.<region>.tunnelTransport`:
 
@@ -758,6 +768,8 @@ The gateway forwards tcp streams in three directions: cluster pods send HTTP CON
 
 Workers also reach Service ClusterIPs inside `TUNNEL_TCP_SERVICE_CIDRS`, on any TCP port the Service exposes, when the Service is in the worker's namespace or listed in `TUNNEL_SHARED_SERVICES`; the gateway learns ClusterIPs from a cluster-wide Service watch and refuses with the reasons above (`direct_forbidden` for a port the Service does not expose). The plugin adds these networks to the workers' `CLOUDVM_TUNNEL_CIDRS`, and the bootstrap redirects every IPv4 TCP connection to them, except to `TUNNEL_GATEWAY_IP`, into the agent, so a pod with `AWS_ENDPOINT_URL_S3=http://s3-gateway.s3-system.svc` works unchanged: the DNS forwarder's search list resolves `s3-gateway.s3-system.svc` as `s3-gateway.s3-system.svc.cluster.local`.
 
+The runner gives each container the kubelet's `ClusterFirst` search list when the agent took over DNS: `<pod namespace>.svc.<domain>`, `svc.<domain>` and `<domain>`, then the VM's other search domains, through `nerdctl run --dns-search`. A pod that names a Service of its own namespace by its bare name, such as `redis:6379`, therefore resolves it as in the cluster. The runner reads the domain from the `svc.<domain>` entry the agent puts first in the VM's `/etc/resolv.conf` (`CLOUDVM_RESOLV_CONF` overrides the path); a VM without it keeps the host's search list.
+
 Tunneled Service traffic is bounded by the worker's single-threaded agent and the single plugin replica that every worker shares. On a laptop over loopback, where no network latency limits the 2 MiB stream window, one stream carried about 100-135 MiB/s from the cluster to the worker (the direction of S3 downloads), four streams together about 210 MiB/s, and one stream about 800 MiB/s from the worker to the cluster. Bulk S3 reads and writes go faster, and spare the shared gateway, when workers call S3 directly with a pod identity role; the in-cluster path suits small objects and buckets that only the cell can reach.
 
 Tunnel workers download the runner and the tunnel agent at boot instead of carrying them in their user data, which keeps it far below the 16 KiB EC2 limit. The bootstrap requests `https://<tunnel endpoint>/bootstrap/<sha256>` with `curl`, after the step that makes the tunnel host reachable, and stops with a `BOOTSTRAP_FAILED` console status when the download fails or the file's sha256 differs from the one the user data pins. The gateway answers a connection that opens with an HTTP `GET` instead of a handshake with the embedded script of that hash (`runner.py`, `tunnel_agent.py`, or `spot_watcher.py`) and `404` for any other path; the scripts are public, so the request carries no credential. Workers without a tunnel endpoint still receive the runner inline.
@@ -771,6 +783,10 @@ For high-compliance environments, set `KMS_KEY_ID` (or `provider.kmsKeyId` in He
 - Only the base64 ciphertext is placed into EC2 user-data. Zero plaintext authentication secrets appear in launch templates, user-data, or cloud-init logs.
 - During instance boot, cloud-init runs `aws kms decrypt` to populate `/etc/cloudvm/runner-token` (`chmod 0600`), and the in-VM micro-runner enforces Bearer authentication on port `:9090`.
 - The EC2 instance role attached to worker VMs requires `kms:Decrypt` permissions on the specified KMS key ARN.
+
+### Environment Variables from Secrets
+
+The plugin resolves the environment variables of a pod's first container that name a source, as the kubelet does, before it starts the container: `secretKeyRef` from the create request's `secrets` or the Kubernetes API (the same `get` on `secrets` that Secret volumes need), and `fieldRef` to `metadata.name`, `metadata.namespace` or `metadata.uid`. A missing optional Secret or key leaves the variable out; a missing required one refuses the pod with `400`. Other sources, such as `configMapKeyRef`, `resourceFieldRef` and `fieldRef` to the pod's status, stay empty. The node agent's pod controller already resolves every source for pods on NodeClaim VMs, so this matters for pods of virtual nodes whose virtual kubelet passes the sources through.
 
 ### Private Container Registries and imagePullSecrets
 

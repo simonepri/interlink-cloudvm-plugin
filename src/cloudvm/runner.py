@@ -61,6 +61,7 @@ PROFILING_POD_LABELS = frozenset(l for l in os.environ.get("CLOUDVM_PROFILING_PO
 # A container whose CUDA_INJECTION64_PATH names this library gets the host's copy at that path, or loses the variable
 # when the host has none, so CUDA never tries to load a missing library.
 PARCAGPU_LIBRARY_NAME = 'libparcagpucupti.so'
+HOST_RESOLV_CONF = os.environ.get("CLOUDVM_RESOLV_CONF", '/etc/resolv.conf')
 PARCAGPU_LIBRARY = os.environ.get("CLOUDVM_PARCAGPU_LIBRARY", '/opt/cloudvm/parcagpu/' + PARCAGPU_LIBRARY_NAME)
 
 def safe_relpath(path):
@@ -279,6 +280,24 @@ def parcagpu_mounts(env):
     env.pop('CUDA_INJECTION64_PATH', None)
     env.pop('PARCAGPU_PC_SAMPLING_RATE', None)
     return []
+
+def cluster_dns_search(namespace, path=None):
+    """Returns the kubelet's ClusterFirst search list for a pod of namespace, then the host's other search domains.
+
+    The tunnel agent puts svc.<cluster domain> first in the host's search list when it takes over DNS; without it, or
+    without a namespace, the container keeps the host's list and this returns an empty list.
+    """
+    try:
+        with open(path or HOST_RESOLV_CONF) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    search = [d for l in lines if l.startswith(("search ", "domain ")) for d in l.split()[1:]]
+    if not namespace or not search or not search[0].startswith("svc."):
+        return []
+    domain = search[0][len("svc."):]
+    first = [namespace + ".svc." + domain, "svc." + domain, domain]
+    return first + [d for d in search if d not in first]
 
 def credentials_env(secret):
     """Returns the env that points every AWS SDK in a container at the pod's credential endpoint."""
@@ -645,6 +664,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 user_flag,
                 shm_flag,
             ]
+            for domain in cluster_dns_search(str(req.get('namespace') or '')):
+                run_cmd.extend(['--dns-search', domain])
             if cpu_milli and cpu_milli > 0:
                 run_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
             if mem_bytes and mem_bytes > 0:
