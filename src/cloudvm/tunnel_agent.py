@@ -35,6 +35,8 @@ DEFAULT_TCP_PROXY_PORT = "13128"
 # A dns stream carries one DNS query, ended by the agent's FIN, and its reply.
 DNS_STREAM_HEADER = b'{"stream":"dns","version":1}\n'
 DNS_TIMEOUT = 5
+# A profiles stream carries one HTTP/2 connection of the host's parca-agent, which the gateway relays to the profile store.
+PROFILES_STREAM_HEADER = b'{"stream":"profiles","version":1}\n'
 MAX_LOG_MESSAGE = 16 * 1024
 LOG_READ_CHUNK = 64 * 1024
 LOG_POLL_SECONDS = 1
@@ -253,6 +255,17 @@ class Session(object):
         header = (json.dumps({"stream": TCP_STREAM_KIND, "version": 1, "target": target}) + "\n").encode()
         stream.send_window -= len(header)
         self.send(T_DATA, 0, stream.sid, len(header), header)
+        return stream
+
+    def open_profiles_stream(self, local_reader, local_writer):
+        """Opens a stream carrying one profiler connection to the gateway's profiles relay."""
+        stream = Stream(self, self.next_sid, local=(local_reader, local_writer))
+        self.next_sid += 2
+        self.streams[stream.sid] = stream
+        self.send(T_WINDOW, F_SYN, stream.sid, STREAM_WINDOW - INITIAL_WINDOW)
+        stream.send_window -= len(PROFILES_STREAM_HEADER)
+        self.send(T_DATA, 0, stream.sid, len(PROFILES_STREAM_HEADER), PROFILES_STREAM_HEADER)
+        stream.task = asyncio.ensure_future(stream.run())
         return stream
 
     def open_dns_stream(self, query):
@@ -601,6 +614,24 @@ class TCPProxy(object):
         stream.task = asyncio.ensure_future(stream.run())
 
 
+async def start_profiles_listener(path, proxy):
+    """Accepts the host profiler's connections on a Unix socket only root can reach and tunnels each to the gateway."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    if os.path.exists(path):
+        os.unlink(path)
+
+    async def handle(reader, writer):
+        session = proxy.session
+        if session is None:
+            writer.close()
+            return
+        session.open_profiles_stream(reader, writer)
+
+    await asyncio.start_unix_server(handle, path)
+
+
 SO_ORIGINAL_DST = 80
 
 
@@ -771,6 +802,11 @@ def main():
     transparent_port = int(os.environ.get("CLOUDVM_TRANSPARENT_PORT") or 0)
     if transparent_port > 0:
         loop.run_until_complete(asyncio.start_server(cfg["proxy"].handle_redirected, "127.0.0.1", transparent_port))
+    if os.environ.get("CLOUDVM_PROFILES_SOCKET"):
+        try:
+            loop.run_until_complete(start_profiles_listener(os.environ["CLOUDVM_PROFILES_SOCKET"], cfg["proxy"]))
+        except OSError as e:
+            log("cannot accept profiler connections: %s" % e)
     if os.environ.get("CLOUDVM_DNS_LISTEN"):
         try:
             loop.run_until_complete(start_dns_forwarder(os.environ["CLOUDVM_DNS_LISTEN"], cfg["proxy"]))

@@ -52,6 +52,14 @@
         "containerd/stargz-snapshotter"
       ],
       "automerge": false
+    },
+    {
+      "description": "Never auto-merge a parca-agent or ParcaGPU bump: the release checksum in the boot script and its tests must be updated by hand",
+      "matchPackageNames": [
+        "parca-dev/parca-agent",
+        "parca-dev/parcagpu"
+      ],
+      "automerge": false
     }
   ],
   "customManagers": [
@@ -75,6 +83,32 @@
       ],
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "containerd/stargz-snapshotter",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "Track the parca-agent release profiled workers install",
+      "customType": "regex",
+      "fileMatch": [
+        "^src/cloudvm/cloudinit\\.go$"
+      ],
+      "matchStrings": [
+        "CLOUDVM_PARCA_AGENT_VERSION=\"(?<currentValue>[0-9.]+)\""
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "parca-dev/parca-agent",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "Track the ParcaGPU release profiled GPU workers install",
+      "customType": "regex",
+      "fileMatch": [
+        "^src/cloudvm/cloudinit\\.go$"
+      ],
+      "matchStrings": [
+        "CLOUDVM_PARCAGPU_VERSION=\"(?<currentValue>[0-9.]+)\""
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "parca-dev/parcagpu",
       "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ]

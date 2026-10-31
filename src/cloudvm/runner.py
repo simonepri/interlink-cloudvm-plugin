@@ -1,6 +1,7 @@
 """In-VM container runner: serves the plugin's create, status, logs, and delete calls by driving the VM's containerd through nerdctl.
 
-The bootstrap sets CLOUDVM_RUNNER_BIND and CLOUDVM_RUNNER_CONCURRENCY; the plugin reaches it through the tunnel agent.
+The bootstrap sets CLOUDVM_RUNNER_BIND and CLOUDVM_RUNNER_CONCURRENCY, and on profiled workers CLOUDVM_PROFILING; the plugin
+reaches it through the tunnel agent.
 It also serves each pod whose service account has an IAM role the credentials the plugin sends for it on a loopback endpoint.
 """
 import base64
@@ -53,6 +54,14 @@ pod_credentials = {}
 pod_credentials_guard = threading.Lock()
 # Secret volume files stay on tmpfs, as the kubelet keeps them, and each pod's tree is removed with its container.
 SECRET_VOLUMES_DIR = os.environ.get("CLOUDVM_SECRET_VOLUMES_DIR", '/run/cloudvm/volumes')
+# On a profiled worker the runner tells the host's parca-agent which pod each container belongs to through these
+# variables, and exposes the pod labels CLOUDVM_PROFILING_POD_LABELS names by their sanitized names.
+PROFILING = os.environ.get("CLOUDVM_PROFILING") == "1"
+PROFILING_POD_LABELS = frozenset(l for l in os.environ.get("CLOUDVM_PROFILING_POD_LABELS", "").split(",") if l)
+# A container whose CUDA_INJECTION64_PATH names this library gets the host's copy at that path, or loses the variable
+# when the host has none, so CUDA never tries to load a missing library.
+PARCAGPU_LIBRARY_NAME = 'libparcagpucupti.so'
+PARCAGPU_LIBRARY = os.environ.get("CLOUDVM_PARCAGPU_LIBRARY", '/opt/cloudvm/parcagpu/' + PARCAGPU_LIBRARY_NAME)
 
 def safe_relpath(path):
     """Returns path when it is relative and stays below its root, or raises ValueError."""
@@ -239,6 +248,37 @@ def set_pod_credentials(pod_uid, creds):
 def forget_pod_credentials(pod_uid):
     with pod_credentials_guard:
         pod_credentials.pop(pod_uid, None)
+
+def sanitize_label_name(name):
+    """Returns name with every character outside [a-zA-Z0-9_] replaced by an underscore, as Prometheus labels need."""
+    return re.sub(r'[^a-zA-Z0-9_]', '_', name)
+
+def profiling_env(req):
+    """Returns the variables that name the container's pod to the host's parca-agent."""
+    env = {
+        'CLOUDVM_POD_NAMESPACE': str(req.get('namespace') or ''),
+        'CLOUDVM_POD_NAME': str(req.get('podName') or ''),
+        'CLOUDVM_POD_UID': str(req.get('podUID') or ''),
+        'CLOUDVM_CONTAINER_NAME': str(req.get('containerName') or ''),
+        'CLOUDVM_CONTAINER_IMAGE': str(req.get('image') or ''),
+        'CLOUDVM_NODE_NAME': str(req.get('nodeName') or ''),
+    }
+    for key, value in (req.get('podLabels') or {}).items():
+        name = sanitize_label_name(str(key))
+        if name in PROFILING_POD_LABELS:
+            env['CLOUDVM_POD_LABEL_' + name] = str(value)
+    return {k: v for k, v in env.items() if v}
+
+def parcagpu_mounts(env):
+    """Mounts the host's ParcaGPU library where the container's CUDA_INJECTION64_PATH expects it, or drops the variable."""
+    path = env.get('CUDA_INJECTION64_PATH', '')
+    if os.path.basename(path) != PARCAGPU_LIBRARY_NAME or not os.path.isabs(path):
+        return []
+    if os.path.isfile(PARCAGPU_LIBRARY):
+        return ['-v', f"{PARCAGPU_LIBRARY}:{path}:ro"]
+    env.pop('CUDA_INJECTION64_PATH', None)
+    env.pop('PARCAGPU_PC_SAMPLING_RATE', None)
+    return []
 
 def credentials_env(secret):
     """Returns the env that points every AWS SDK in a container at the pod's credential endpoint."""
@@ -613,6 +653,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 gpu_devs = ','.join(str(g) for g in gpus)
                 gpu_spec = f'"device={gpu_devs}"'
                 run_cmd.extend(['--gpus', gpu_spec])
+            if PROFILING:
+                env.update(profiling_env(req))
+            run_cmd.extend(parcagpu_mounts(env))
             for k, v in env.items():
                 run_cmd.extend(['-e', f"{k}={v}"])
             try:

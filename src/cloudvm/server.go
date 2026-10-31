@@ -70,6 +70,7 @@ type Server struct {
 	otelEndpoint          string
 	enableNPD             bool
 	disableLazyPulls      bool
+	profiling             *WorkerProfiling
 	customBootstrapScript string
 	runnerConcurrency     int
 	launchTimeout         time.Duration
@@ -278,6 +279,13 @@ func (s *Server) SetOtelEndpoint(endpoint string) {
 	s.otelEndpoint = endpoint
 }
 
+// SetProfiling makes every VM the plugin launches run parca-agent with profiling; nil leaves VMs unprofiled.
+func (s *Server) SetProfiling(profiling *WorkerProfiling) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.profiling = profiling
+}
+
 // SetEnableNPD enables or disables Node Problem Detector on provisioned VMs.
 func (s *Server) SetEnableNPD(enabled bool) {
 	s.mu.Lock()
@@ -343,6 +351,12 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		npd = s.enableNPD
 		s.mu.RUnlock()
 	}
+	profiling := spec.Profiling
+	if profiling == nil && s != nil {
+		s.mu.RLock()
+		profiling = s.profiling
+		s.mu.RUnlock()
+	}
 	script := spec.CustomBootstrapScript
 	if script == "" && s != nil {
 		s.mu.RLock()
@@ -393,6 +407,7 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		CustomBootstrapScript: script,
 		RunnerConcurrency:     rc,
 		DisableLazyPulls:      spec.DisableLazyPulls || (s != nil && s.disableLazyPulls),
+		Profiling:             profiling,
 	}
 }
 
@@ -768,6 +783,9 @@ func (s *Server) applyServerDefaults(spec *InstanceSpec) {
 	if s.disableLazyPulls {
 		spec.DisableLazyPulls = true
 	}
+	if spec.Profiling == nil && s.profiling != nil {
+		spec.Profiling = s.profiling
+	}
 	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
 		spec.CustomBootstrapScript = s.customBootstrapScript
 	}
@@ -1064,6 +1082,8 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Namespace:        spec.PodNamespace,
 		PodName:          spec.PodName,
 		ContainerName:    cName,
+		NodeName:         pod.Spec.NodeName,
+		PodLabels:        pod.Metadata.Labels,
 		Image:            spec.TargetContainerImage,
 		Command:          spec.Command,
 		Args:             spec.Args,
@@ -1201,6 +1221,8 @@ func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus 
 		Namespace:        spec.PodNamespace,
 		PodName:          spec.PodName,
 		ContainerName:    cName,
+		NodeName:         pod.Spec.NodeName,
+		PodLabels:        pod.Metadata.Labels,
 		Image:            spec.TargetContainerImage,
 		Command:          spec.Command,
 		Args:             spec.Args,

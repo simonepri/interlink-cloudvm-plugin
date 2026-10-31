@@ -29,8 +29,9 @@ func newTunnelFixture(t *testing.T, connectTimeout time.Duration) *tunnelFixture
 	return newTunnelFixtureWith(t, TunnelSettings{ConnectTimeout: connectTimeout})
 }
 
-// newTunnelFixtureWith fills the endpoint and mesh key the shared fixture uses into settings.
-func newTunnelFixtureWith(t *testing.T, settings TunnelSettings) *tunnelFixture {
+// newTunnelFixtureWith fills the endpoint and mesh key the shared fixture uses into settings; options adjust the gateway
+// config.
+func newTunnelFixtureWith(t *testing.T, settings TunnelSettings, options ...func(*TunnelGatewayConfig)) *tunnelFixture {
 	t.Helper()
 	cleanTempStores()
 	t.Cleanup(cleanTempStores)
@@ -46,7 +47,7 @@ func newTunnelFixtureWith(t *testing.T, settings TunnelSettings) *tunnelFixture 
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	gateway, err := NewTunnelGateway(TunnelGatewayConfig{
+	config := TunnelGatewayConfig{
 		Listener:           listener,
 		Registry:           registry,
 		TokenValidator:     server.ValidateTunnelToken,
@@ -54,7 +55,11 @@ func newTunnelFixtureWith(t *testing.T, settings TunnelSettings) *tunnelFixture 
 		OnReject:           metrics.RecordRejection,
 		OnBootstrapRequest: metrics.RecordBootstrapRequest,
 		LogSink:            server,
-	})
+	}
+	for _, option := range options {
+		option(&config)
+	}
+	gateway, err := NewTunnelGateway(config)
 	if err != nil {
 		t.Fatalf("gateway: %v", err)
 	}

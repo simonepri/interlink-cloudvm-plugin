@@ -71,6 +71,8 @@ type CloudInitConfig struct {
 	NodeClaim bool `json:"nodeClaim,omitempty"`
 	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
+	// Profiling runs parca-agent on a tunnel worker, uploading through the tunnel; nil leaves the VM unprofiled.
+	Profiling *WorkerProfiling `json:"-"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -170,6 +172,34 @@ func stripPythonComments(src string) string {
 		}
 	}
 	return strings.Join(kept, "\n")
+}
+
+// profilesSocket is where the tunnel agent accepts the host profiler's connections to the gateway's profiles relay.
+const profilesSocket = "/run/cloudvm-profiles/profiles.sock"
+
+// ProfilesSocket returns the Unix socket the host profiler uploads through.
+func (c *CloudInitConfig) ProfilesSocket() string {
+	return profilesSocket
+}
+
+// ParcaAgentFlags returns the parca-agent flags of the worker's systemd unit: uploads through the tunnel agent's socket,
+// the process variables that carry pod metadata, and the operator's flags, with systemd's % specifiers escaped.
+func (c *CloudInitConfig) ParcaAgentFlags() string {
+	if c.Profiling == nil {
+		return ""
+	}
+	flags := []string{
+		"--config-path=/etc/parca-agent/parca-agent.yaml",
+		"--remote-store-address=unix://" + profilesSocket,
+		"--remote-store-insecure",
+		"--http-address=127.0.0.1:7071",
+		"--instrument-cuda-launch=${CLOUDVM_CUDA_LAUNCH}",
+	}
+	for _, v := range c.Profiling.EnvVars() {
+		flags = append(flags, "--include-env-var="+v)
+	}
+	flags = append(flags, c.Profiling.Args...)
+	return strings.ReplaceAll(strings.Join(flags, " "), "%", "%%")
 }
 
 // RunnerBindAddress returns the interface the in-VM runner listens on: loopback when only the tunnel agent may reach it.
@@ -844,6 +874,9 @@ RUNNER_EOF
 chmod 700 /usr/local/bin/cloudvm-runner.py
 if command -v python3 >/dev/null 2>&1; then
   CLOUDVM_RUNNER_BIND="{{.RunnerBindAddress}}" CLOUDVM_RUNNER_CONCURRENCY="{{if .RunnerConcurrency}}{{.RunnerConcurrency}}{{end}}" \
+{{- if and .Profiling .TunnelEndpoint}}
+    CLOUDVM_PROFILING=1 CLOUDVM_PROFILING_POD_LABELS="{{.Profiling.PodLabelList}}" \
+{{- end}}
     nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
 cloudvm_mark runner
@@ -875,7 +908,59 @@ CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CL
   CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" CLOUDVM_TUNNEL_CIDRS="{{.TunnelCIDRList}}" \
   CLOUDVM_TRANSPARENT_PORT="{{if .TunnelServiceCIDRs}}{{.TransparentProxyPort}}{{else}}0{{end}}" CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1" \
   CLOUDVM_LOG_FILES="bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log,{{.SpotWatcherLogFile}}" \
+{{- if .Profiling}}
+  CLOUDVM_PROFILES_SOCKET="{{.ProfilesSocket}}" \
+{{- end}}
   nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
+{{if .Profiling}}
+# 5c. Continuous profiling: the pinned, checksum-verified parca-agent profiles every process on the VM and uploads through
+# the tunnel agent's socket; on GPU workers it also reads the CUDA probes of the ParcaGPU library the runner mounts.
+CLOUDVM_PARCA_AGENT_VERSION="0.50.0"
+CLOUDVM_PARCA_AGENT_SHA256="b27f1e844fb7e27c918021e0f8118381f3a95e13deddfadd8f9f56b36c103ad1"
+CLOUDVM_PARCAGPU_VERSION="0.3.4"
+CLOUDVM_PARCAGPU_SHA256="e7af75c58b654a243767df50d979b0d2678d5f170d345589befff6be82970a3e"
+# cloudvm_install URL SHA256 DEST downloads a file, verifies its checksum, and installs it executable at DEST.
+cloudvm_install() {
+  curl -fsSL --retry 5 "$1" -o "$3.tmp" && echo "$2  $3.tmp" | sha256sum -c - >/dev/null && chmod 0755 "$3.tmp" && mv "$3.tmp" "$3" && return 0
+  rm -f "$3.tmp"
+  return 1
+}
+CLOUDVM_CUDA_LAUNCH=false
+if command -v nvidia-smi >/dev/null 2>&1; then
+  mkdir -p /opt/cloudvm/parcagpu
+  if cloudvm_install "https://github.com/parca-dev/parcagpu/releases/download/v${CLOUDVM_PARCAGPU_VERSION}/libparcagpucupti-amd64.so" "$CLOUDVM_PARCAGPU_SHA256" /opt/cloudvm/parcagpu/libparcagpucupti.so; then
+    CLOUDVM_CUDA_LAUNCH=true
+  else
+    echo "[cloudvm-bootstrap] Warning: ParcaGPU install failed; CUDA kernels go unprofiled" >&2
+  fi
+fi
+if cloudvm_install "https://github.com/parca-dev/parca-agent/releases/download/v${CLOUDVM_PARCA_AGENT_VERSION}/parca-agent_${CLOUDVM_PARCA_AGENT_VERSION}_Linux_x86_64" "$CLOUDVM_PARCA_AGENT_SHA256" /usr/local/bin/parca-agent; then
+  mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug || true
+  mkdir -p /etc/parca-agent
+  cat << 'PARCA_EOF' > /etc/parca-agent/parca-agent.yaml
+{{.Profiling.Config}}PARCA_EOF
+  echo "CLOUDVM_CUDA_LAUNCH=$CLOUDVM_CUDA_LAUNCH" > /etc/parca-agent/env
+  cat << 'PARCA_EOF' > /etc/systemd/system/parca-agent.service
+[Unit]
+Description=parca-agent continuous profiler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+EnvironmentFile=/etc/parca-agent/env
+ExecStart=/usr/local/bin/parca-agent {{.ParcaAgentFlags}}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+PARCA_EOF
+  systemctl daemon-reload
+  systemctl enable --now parca-agent.service || echo "[cloudvm-bootstrap] Warning: parca-agent did not start; the VM goes unprofiled" >&2
+else
+  echo "[cloudvm-bootstrap] Warning: parca-agent install failed; the VM goes unprofiled" >&2
+fi
+{{end}}
 {{end}}
 
 
