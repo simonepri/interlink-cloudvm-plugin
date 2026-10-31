@@ -40,6 +40,7 @@ func TestRenderCloudInit_RunsStargzSnapshotterForLazyPulls(t *testing.T) {
 		`CLOUDVM_STARGZ_SHA256="515a3c3af0012f192ace31fb79e910597977c77227e976680aeaaef6e9ae50a9"`,
 		"cat << 'STARGZ_EOF' > /etc/containerd-stargz-grpc/config.toml\n[[resolver.host.\"docker.io\".mirrors]]\nhost = \"mirror.gcr.io\"\nSTARGZ_EOF\n",
 		"[proxy_plugins.stargz]\n  type = \"snapshot\"\n  address = \"/run/containerd-stargz-grpc/containerd-stargz-grpc.sock\"\n  [proxy_plugins.stargz.exports]\n    root = \"/var/lib/containerd-stargz-grpc\"\n",
+		"    enable_remote_snapshot_annotations = \"true\"\nCONTAINERD_EOF",
 		"Wants=stargz-snapshotter.service\\nAfter=stargz-snapshotter.service",
 		"Type=notify",
 		"Environment=HOME=/root DOCKER_CONFIG=/root/.docker",
