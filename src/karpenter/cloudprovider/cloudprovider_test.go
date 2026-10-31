@@ -317,7 +317,7 @@ func TestCreateChoosesCheapestCompatibleOffering(t *testing.T) {
 	if len(sent.Taints) != 2 {
 		t.Errorf("taints = %v, want the pool taint and the startup taint", sent.Taints)
 	}
-	if got.Status.ProviderID != "cloudvm://gcp/us-central1/i-0001" {
+	if got.Status.ProviderID != "cloudvm://gcp/us-central1/i-0001/vm" {
 		t.Errorf("providerID = %q", got.Status.ProviderID)
 	}
 	for k, v := range map[string]string{
@@ -498,7 +498,7 @@ func TestGet(t *testing.T) {
 	if got.Name != "cloudvm-gpu-abcde" || got.Labels[corev1.LabelTopologyZone] != "eu-west-1a" || got.Status.NodeName != got.Name {
 		t.Fatalf("got %+v", got.ObjectMeta)
 	}
-	if _, err := h.cp.Get(ctx, "cloudvm://aws/us-east-1/i-missing"); !cloudprovider.IsNodeClaimNotFoundError(err) {
+	if _, err := h.cp.Get(ctx, "cloudvm://aws/us-east-1/i-missing/vm"); !cloudprovider.IsNodeClaimNotFoundError(err) {
 		t.Fatalf("missing err = %v, want NodeClaimNotFoundError", err)
 	}
 	if _, err := h.cp.Get(ctx, "aws:///us-east-1a/i-0123"); !cloudprovider.IsNodeClaimNotFoundError(err) {

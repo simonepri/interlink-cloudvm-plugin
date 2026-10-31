@@ -79,7 +79,7 @@ func TestNodeRegistersForKarpenter(t *testing.T) {
 
 	waitFor(t, "node creation", func() bool { return getNode(t, kube, "vm-a") != nil })
 	n := getNode(t, kube, "vm-a")
-	if n.Spec.ProviderID != "cloudvm://aws/eu-west-1/i-vm-a" {
+	if n.Spec.ProviderID != "cloudvm://aws/eu-west-1/i-vm-a/vm" {
 		t.Errorf("providerID = %q", n.Spec.ProviderID)
 	}
 	for k, v := range map[string]string{
