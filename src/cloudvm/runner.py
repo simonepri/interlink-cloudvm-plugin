@@ -6,6 +6,7 @@ It also serves each pod whose service account has an IAM role the credentials th
 """
 import base64
 import datetime
+import hashlib
 import hmac
 import http.server
 import json
@@ -21,6 +22,7 @@ import urllib.parse
 
 PORT = 9090
 CONTAINER_CLI = 'nerdctl'
+SNAPSHOT_CLI = 'ctr'
 STARGZ_SOCKET = os.environ.get("CLOUDVM_STARGZ_SOCKET", '/run/containerd-stargz-grpc/containerd-stargz-grpc.sock')
 IMAGE_MIRRORS_PATH = os.environ.get("CLOUDVM_IMAGE_MIRRORS", '/etc/cloudvm/image-mirrors.json')
 HOST_DOCKER_CONFIG_DIR = os.environ.get("CLOUDVM_DOCKER_CONFIG", '/root/.docker')
@@ -104,6 +106,27 @@ def write_secret_volumes(pod_uid, volumes):
 def snapshotter_args():
     # Lazy pulls need the stargz snapshotter; without it containerd's default snapshotter pulls in full.
     return ['--snapshotter=stargz'] if os.path.exists(STARGZ_SOCKET) else []
+
+def remote_layer_count(img):
+    """Counts the layers of img that the stargz snapshotter mounted remotely; 0 when it cannot tell.
+
+    The snapshotter labels each layer snapshot it mounts from the registry, and names layer snapshots by chain ID. A
+    layer it could not mount remotely is downloaded and unpacked like any other, so the pull succeeds either way.
+    """
+    try:
+        res = subprocess.run([CONTAINER_CLI, *snapshotter_args(), 'image', 'inspect', '--format', '{{json .RootFS.Layers}}', img],
+                             capture_output=True, text=True)
+        diff_ids = json.loads(res.stdout) if res.returncode == 0 else []
+        count, chain = 0, ''
+        for diff_id in diff_ids or []:
+            chain = diff_id if not chain else 'sha256:' + hashlib.sha256(f"{chain} {diff_id}".encode()).hexdigest()
+            info = subprocess.run([SNAPSHOT_CLI, '--namespace', 'default', 'snapshots', '--snapshotter', 'stargz', 'info', chain],
+                                  capture_output=True, text=True)
+            if info.returncode == 0 and 'containerd.io/snapshot/remote' in (json.loads(info.stdout).get('Labels') or {}):
+                count += 1
+        return count, len(diff_ids or [])
+    except Exception:
+        return 0, 0
 
 def split_image_ref(ref):
     """Returns the registry host and the repository path plus tag or digest of an image reference."""
@@ -713,8 +736,10 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                             attempts += 1
                             err = pull_image(img, auth_cfg, lazy)
                         if err is None:
-                            record_timing(uid, pullFinishedAt=now_iso(), image=img, pullAttempts=attempts, lazyPull=lazy and bool(snapshotter_args()))
-                            print(f"[cloudvm-runner] pulled {img} for {uid}" + (" (mirror failed, used upstream)" if img != imgs[0] else ""), flush=True)
+                            remote, layers = remote_layer_count(img) if lazy and snapshotter_args() else (0, 0)
+                            record_timing(uid, pullFinishedAt=now_iso(), image=img, pullAttempts=attempts, lazyPull=remote > 0)
+                            print(f"[cloudvm-runner] pulled {img} for {uid}" + (" (mirror failed, used upstream)" if img != imgs[0] else "")
+                                  + (f"; {remote} of {layers} layers mounted remotely" if lazy and snapshotter_args() else ""), flush=True)
                             c[idx] = img
                             if not lazy and c[1] == '--snapshotter=stargz':
                                 del c[1]

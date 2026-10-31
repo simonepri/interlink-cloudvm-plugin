@@ -74,7 +74,7 @@ type RunnerTimings struct {
 	// Image is the reference the runner pulled, which is a mirror's when the mirror served it.
 	Image        string `json:"image,omitempty"`
 	PullAttempts int    `json:"pullAttempts,omitempty"`
-	// LazyPull reports that the stargz snapshotter pulled the image, fetching its layers on first read.
+	// LazyPull reports that the stargz snapshotter mounted at least one image layer from the registry, fetching it on first read.
 	LazyPull bool `json:"lazyPull,omitempty"`
 }
 

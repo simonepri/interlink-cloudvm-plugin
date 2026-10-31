@@ -497,3 +497,70 @@ func TestRunnerScript_GivesContainersTheNamespaceSearchList(t *testing.T) {
 }
 
 var regexpDNSSearch = regexp.MustCompile(`--dns-search \S+`)
+
+// fakeStargzNerdctl pulls with the stargz snapshotter and reports two layers; fakeCtr labels the snapshot named in
+// $state/remote as one the snapshotter mounted remotely.
+const fakeStargzNerdctl = `#!/usr/bin/env bash
+state="$FAKE_NERDCTL_STATE"
+[ "$1" = --snapshotter=stargz ] && shift
+case "$1" in
+  pull) exit 0 ;;
+  image) printf '["sha256:aaaa","sha256:bbbb"]\n'; exit 0 ;;
+  run) touch "$state/created"; exit 0 ;;
+  inspect)
+    if [ -f "$state/created" ]; then
+      printf '[{"State":{"Status":"running","Running":true,"ExitCode":0,"StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}}]'
+      exit 0
+    fi
+    exit 1 ;;
+  *) exit 0 ;;
+esac
+`
+
+const fakeCtr = `#!/usr/bin/env bash
+state="$FAKE_NERDCTL_STATE"
+name="${@: -1}"
+if grep -qxF "$name" "$state/remote" 2>/dev/null; then
+  printf '{"Name":"%s","Labels":{"containerd.io/snapshot/remote":"remote snapshot"}}\n' "$name"
+else
+  printf '{"Name":"%s","Labels":{}}\n' "$name"
+fi
+`
+
+func TestRunnerScript_LazyPullReportsOnlyRemoteMounts(t *testing.T) {
+	// Layer snapshots are named by chain ID: the second is the SHA-256 of "<first chain ID> <second diff ID>".
+	const secondChain = "sha256:2c4d8760379f05d0ad1ed610712309f0114e7345e6e6a351494cff030ffdf197"
+	for _, tc := range []struct {
+		name, remote string
+		want         bool
+	}{
+		{"remote mount", secondChain, true},
+		{"local unpack", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRunnerHarness(t)
+			dir := filepath.Dir(h.script)
+			for name, body := range map[string]string{"nerdctl": fakeStargzNerdctl, "ctr": fakeCtr} {
+				if err := os.WriteFile(filepath.Join(dir, "bin", name), []byte(body), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(dir, "state", "remote"), []byte(tc.remote+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sock := filepath.Join(dir, "stargz.sock")
+			if err := os.WriteFile(sock, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			h.env = append(h.env, "CLOUDVM_STARGZ_SOCKET="+sock)
+			defer h.start()()
+
+			resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"lazy","image":"ghcr.io/example/app:1"}`)
+			_ = resp.Body.Close()
+			waitStatus(t, h, "lazy", func(r ContainerStatusResult) bool { return r.Timings != nil && !r.Timings.PullFinishedAt.IsZero() })
+			if got := h.status("lazy").Timings.LazyPull; got != tc.want {
+				t.Errorf("lazyPull = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
