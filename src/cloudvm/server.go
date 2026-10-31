@@ -794,6 +794,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	injectRayProxyEnv(pod)
+	freeRayFixedPorts(pod)
 
 	var flight *inFlightCreate
 	var finalResp *CreateStruct
