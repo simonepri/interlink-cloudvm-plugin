@@ -159,30 +159,37 @@ func (p *AWSProvider) rankRegions(scorer RegionPlacementScorer, regions, instanc
 	return out
 }
 
-// quotaFits reports whether some requested type fits the region's remaining quota: the measured limit less the
-// account-wide usage AWS reports, or less this plugin's live fleet when that usage could not be read. A quota the
-// ticker has not measured fits.
+// quotaFits reports whether some requested type fits the region's remaining quota. A quota the ticker has not
+// measured fits.
 func (p *AWSProvider) quotaFits(quotas regionQuotas, region string, instanceTypes []string, capacityType string) bool {
-	usage := p.quotaUsage
-	if usage == nil {
-		usage = GlobalFleetTracker.QuotaVCPUsInUse
-	}
 	for _, t := range instanceTypes {
-		quota := awsQuotaName(t, capacityType)
-		limit, ok := quotas.QuotaVCPUs(region, quota)
-		if !ok {
-			return true
-		}
-		inUse, known := quotas.QuotaUsedVCPUs(region, quota)
-		if !known {
-			inUse = usage("aws", region, quota)
-		}
+		headroom, known := p.quotaHeadroom(quotas, region, t, capacityType)
 		capacity := CapacityForInstanceType(t, ResourceVector{})
-		if limit-inUse >= float64(capacity.CPU.Value()) {
+		if !known || headroom >= float64(capacity.CPU.Value()) {
 			return true
 		}
 	}
 	return false
+}
+
+// quotaHeadroom returns the vCPUs left under the quota that covers instanceType in the region: the measured limit less
+// the account-wide usage AWS reports, or less this plugin's live fleet when that usage could not be read. known is
+// false when the ticker has not measured the limit.
+func (p *AWSProvider) quotaHeadroom(quotas regionQuotas, region, instanceType, capacityType string) (headroom float64, known bool) {
+	quota := awsQuotaName(instanceType, capacityType)
+	limit, ok := quotas.QuotaVCPUs(region, quota)
+	if !ok {
+		return 0, false
+	}
+	inUse, ok := quotas.QuotaUsedVCPUs(region, quota)
+	if !ok {
+		usage := p.quotaUsage
+		if usage == nil {
+			usage = GlobalFleetTracker.QuotaVCPUsInUse
+		}
+		inUse = usage("aws", region, quota)
+	}
+	return limit - inUse, true
 }
 
 // regionScores returns each region's best placement score across instanceTypes.

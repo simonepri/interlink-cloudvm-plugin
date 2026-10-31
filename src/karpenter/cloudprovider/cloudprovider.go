@@ -74,7 +74,7 @@ func New(kubeClient client.Client, api nodeclaim.API, cfg *Config, clk clock.Clo
 		api:         api,
 		config:      cfg,
 		catalog:     newCatalogCache(api, clk, cfg.CatalogTTL.Duration, cfg.CatalogMaxStaleness.Duration),
-		unavailable: newUnavailableOfferings(clk, cfg.UnavailableOfferingTTL.Duration),
+		unavailable: newUnavailableOfferings(clk),
 		poolFilter:  labels.SelectorFromSet(cfg.NodePoolSelector),
 		clock:       clk,
 		tracer:      noop.NewTracerProvider().Tracer(TracerName),
@@ -167,7 +167,11 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *
 		if err == nil || !nodeclaim.IsInsufficientCapacity(err) {
 			return out, err
 		}
-		c.unavailable.MarkUnavailable(chosen.it.Name, chosen.offering.Zone(), chosen.offering.CapacityType())
+		ttl := c.config.UnavailableOfferingTTL.Duration
+		if nodeclaim.IsQuotaExceeded(err) {
+			ttl = c.config.QuotaExceededTTL.Duration
+		}
+		c.unavailable.MarkUnavailable(chosen.it.Name, chosen.offering.Zone(), chosen.offering.CapacityType(), ttl)
 		candidates = slices.DeleteFunc(candidates, func(o candidate) bool { return o == chosen })
 		refusal = err
 		if attempt >= c.config.LaunchFallback.MaxAttempts || !c.clock.Now().Before(deadline) || ctx.Err() != nil {
