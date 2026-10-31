@@ -80,6 +80,18 @@ nodeProblemDetector:
 # Pulls eStargz images lazily through the stargz snapshotter on workers; false pulls every image in full.
 lazyImagePulls: true
 customBootstrapScript: ""
+# Runs the pinned parca-agent on every tunnel worker; workers upload through the tunnel, and the plugin forwards their
+# profiles to this Parca gRPC server with the token, which never reaches a worker.
+profiling:
+  endpoint: ""  # host:port of the Parca server; empty leaves workers unprofiled
+  insecure: false  # plaintext gRPC instead of TLS
+  tokenSecret:
+    name: ""  # Secret holding the Parca bearer token; empty sends no token
+    key: token
+  # parca-agent config written for the in-cluster agent's __meta_kubernetes_* labels, such as its relabel_configs.
+  agentConfig: ""
+  # Extra parca-agent flags, such as --off-cpu-threshold=0.001 or --metadata-external-labels=cluster=<name>.
+  agentArgs: []
 
 service:
   type: ClusterIP

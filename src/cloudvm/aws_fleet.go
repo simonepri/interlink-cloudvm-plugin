@@ -1083,6 +1083,7 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		CustomBootstrapScript: spec.CustomBootstrapScript,
 		RunnerConcurrency:     spec.RunnerConcurrency,
 		DisableLazyPulls:      spec.DisableLazyPulls,
+		Profiling:             spec.Profiling,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to generate cloud-init: %w", err)

@@ -236,6 +236,7 @@ type TunnelGateway struct {
 	tcpRefusalLog       refusalLog
 	clusterDomain       string
 	clusterDNSServers   []string
+	profilesRelay       *ProfilesRelay
 	closeOnce           sync.Once
 	closed              chan struct{}
 }
@@ -281,6 +282,8 @@ type TunnelGatewayConfig struct {
 	// ClusterDNSServers are the host:port resolvers that answer workers' dns streams; the nameservers of the plugin
 	// pod's /etc/resolv.conf when empty.
 	ClusterDNSServers []string
+	// ProfilesRelay forwards workers' profiles streams to the Parca server; workers' profiles streams are closed when nil.
+	ProfilesRelay *ProfilesRelay
 }
 
 // WorkerLogSink consumes the newline-delimited WorkerLogRecord stream a worker opens on its tunnel session.
@@ -345,6 +348,7 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		onTCPRefusal:        cfg.OnTCPRefusal,
 		clusterDomain:       cfg.ClusterDomain,
 		clusterDNSServers:   cfg.ClusterDNSServers,
+		profilesRelay:       cfg.ProfilesRelay,
 		closed:              make(chan struct{}),
 	}
 	return gw, nil
@@ -466,8 +470,8 @@ func (g *TunnelGateway) acceptWorkerStreams(instanceID string, session *yamux.Se
 	}
 }
 
-// serveWorkerStream reads the stream header and hands a log stream to the log sink, a tcp stream to its target, and a
-// dns stream to the cluster resolver; it closes any other stream.
+// serveWorkerStream reads the stream header and hands a log stream to the log sink, a tcp stream to its target, a dns
+// stream to the cluster resolver, and a profiles stream to the profiles relay; it closes any other stream.
 func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Stream) {
 	defer stream.Close()
 	if err := stream.SetReadDeadline(time.Now().Add(g.handshakeTimeout)); err != nil {
@@ -492,6 +496,8 @@ func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Strea
 		g.serveWorkerTCP(instanceID, reader, stream, header.Target)
 	case header.Stream == WorkerDNSStreamKind:
 		g.serveWorkerDNS(instanceID, reader, stream)
+	case header.Stream == WorkerProfilesStreamKind && g.profilesRelay != nil:
+		g.profilesRelay.Serve(stream, reader)
 	}
 }
 
