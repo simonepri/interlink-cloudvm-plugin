@@ -65,6 +65,12 @@ config:
   #     eu-west-1: 0.05
   # nodePoolSelector limits this controller to CloudVM NodePools with these labels; empty serves them all.
   nodePoolSelector: {}
+  # offeringSpread lets each claim of a scale-up launch with one of the maxOfferings cheapest compatible offerings
+  # priced within priceTolerance (a fraction) of the cheapest, chosen by the claim's name, so a batch probes several
+  # regions for capacity at once; a claim may cost up to priceTolerance more. maxOfferings: 1 turns spreading off.
+  offeringSpread:
+    priceTolerance: 0.10
+    maxOfferings: 4
   catalogTTL: 60s
   catalogMaxStaleness: 15m
   unavailableOfferingTTL: 3m

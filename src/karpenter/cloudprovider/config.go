@@ -1,4 +1,4 @@
-// Controller configuration: the GPU class mapping, cross-region data cost, NodePool scope and catalog cache settings.
+// Controller configuration: GPU class mapping, cross-region data cost, offering spread, NodePool scope and catalog caching.
 
 package cloudprovider
 
@@ -28,6 +28,8 @@ type Config struct {
 	CatalogMaxStaleness Duration `json:"catalogMaxStaleness,omitzero"`
 	// UnavailableOfferingTTL is how long an offering stays unavailable after the plugin reports no capacity for it.
 	UnavailableOfferingTTL Duration `json:"unavailableOfferingTTL,omitzero"`
+	// OfferingSpread spreads the claims of one scale-up across the cheapest compatible offerings.
+	OfferingSpread OfferingSpread `json:"offeringSpread,omitzero"`
 	// MaxPods is the pods capacity of every node.
 	MaxPods int64 `json:"maxPods,omitempty"`
 	// EphemeralStorage is the ephemeral-storage an instance type advertises when the plugin does not report the size
@@ -43,6 +45,18 @@ type GPUClass struct {
 	Models []string `json:"models"`
 	// MemoryGB restricts the class to GPUs with this much memory each; 0 matches any size.
 	MemoryGB int `json:"memoryGB,omitempty"`
+}
+
+// OfferingSpread bounds the offerings a claim may launch with besides the cheapest compatible one. Each claim picks
+// one of them by a hash of its name, so a batch of claims probes several offerings for capacity at once; the price of
+// that is that a claim may cost up to PriceTolerance more than the cheapest offering.
+type OfferingSpread struct {
+	// PriceTolerance is how much more than the cheapest compatible offering, as a fraction of its price, an offering
+	// may cost and still be chosen, such as 0.10 for 10%.
+	PriceTolerance float64 `json:"priceTolerance,omitempty"`
+	// MaxOfferings is how many of the cheapest compatible offerings within the tolerance claims spread across; 1
+	// launches every claim with the cheapest offering.
+	MaxOfferings int `json:"maxOfferings,omitempty"`
 }
 
 // DataCost holds the per-hour cost added to offerings outside the home region.
@@ -74,6 +88,8 @@ const (
 	DefaultCatalogTTL             = time.Minute
 	DefaultCatalogMaxStaleness    = 15 * time.Minute
 	DefaultUnavailableOfferingTTL = 3 * time.Minute
+	DefaultSpreadPriceTolerance   = 0.10
+	DefaultSpreadMaxOfferings     = 4
 	DefaultMaxPods                = 110
 	DefaultEphemeralStorage       = "100Gi"
 )
@@ -105,6 +121,18 @@ func (c *Config) complete() error {
 	}
 	if c.UnavailableOfferingTTL.Duration == 0 {
 		c.UnavailableOfferingTTL.Duration = DefaultUnavailableOfferingTTL
+	}
+	if c.OfferingSpread.PriceTolerance == 0 {
+		c.OfferingSpread.PriceTolerance = DefaultSpreadPriceTolerance
+	}
+	if c.OfferingSpread.PriceTolerance < 0 {
+		return fmt.Errorf("offeringSpread.priceTolerance: must not be negative")
+	}
+	if c.OfferingSpread.MaxOfferings == 0 {
+		c.OfferingSpread.MaxOfferings = DefaultSpreadMaxOfferings
+	}
+	if c.OfferingSpread.MaxOfferings < 0 {
+		return fmt.Errorf("offeringSpread.maxOfferings: must be positive")
 	}
 	if c.MaxPods == 0 {
 		c.MaxPods = DefaultMaxPods

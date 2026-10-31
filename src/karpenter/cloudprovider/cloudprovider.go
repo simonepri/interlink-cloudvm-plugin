@@ -124,7 +124,7 @@ func (c *CloudProvider) instanceTypesFor(ctx context.Context, nodeClass *v1alpha
 	return c.instanceTypes(catalog, nodeClass)
 }
 
-// Create launches one VM for the cheapest launchable offering compatible with the NodeClaim.
+// Create launches one VM for a launchable offering compatible with the NodeClaim, spread among the cheapest ones.
 func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *karpv1.NodeClaim, err error) {
 	called := time.Now()
 	defer func() { c.traceCreate(nc, called, out, err) }()
@@ -143,10 +143,11 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *
 		return nil, err
 	}
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nc.Spec.Requirements...)
-	it, offering := cheapestOffering(its, reqs)
-	if offering == nil {
+	chosen, ok := spreadOffering(compatibleOfferings(its, reqs), nc.Name, c.config.OfferingSpread)
+	if !ok {
 		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no launchable offering matches the nodeclaim requirements"))
 	}
+	it, offering := chosen.it, chosen.offering
 	region := offering.Requirements.Get(corev1.LabelTopologyRegion).Any()
 	zone := offering.Zone()
 	capacityType := offering.CapacityType()
@@ -182,30 +183,6 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *
 	out.Labels = resolved
 	out.Annotations = map[string]string{AnnotationNodeClassHash: hashLaunch(launch)}
 	return out, nil
-}
-
-// cheapestOffering returns the cheapest launchable offering compatible with reqs among the instance types the
-// requirements allow, breaking price ties by instance type and zone name for a stable choice.
-func cheapestOffering(its []*cloudprovider.InstanceType, reqs scheduling.Requirements) (*cloudprovider.InstanceType, *cloudprovider.Offering) {
-	var bestIT *cloudprovider.InstanceType
-	var best *cloudprovider.Offering
-	allowed := reqs.Get(corev1.LabelInstanceTypeStable)
-	for _, it := range its {
-		if !allowed.Has(it.Name) {
-			continue
-		}
-		for _, o := range it.Offerings.Launchable().Compatible(reqs) {
-			if best == nil || cmp.Or(
-				cmp.Compare(o.Price, best.Price),
-				strings.Compare(it.Name, bestIT.Name),
-				strings.Compare(o.Zone(), best.Zone()),
-				strings.Compare(o.CapacityType(), best.CapacityType()),
-			) < 0 {
-				bestIT, best = it, o
-			}
-		}
-	}
-	return bestIT, best
 }
 
 // Delete starts terminating the NodeClaim's VM, keyed by the NodeClaim name the VM launched under; it returns
