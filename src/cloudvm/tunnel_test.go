@@ -2,8 +2,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -330,4 +332,37 @@ func TestReverseTunnel_EndToEnd(t *testing.T) {
 	// 7. Test unregister on close
 	cancel()
 	_ = gw.Close()
+}
+
+func TestTunnelStopOutlivesTheDispatchTimeout(t *testing.T) {
+	client, server := net.Pipe()
+	srvSession, err := yamux.Server(server, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliSession, err := yamux.Client(client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srvSession.Close() }()
+	defer func() { _ = cliSession.Close() }()
+	go func() {
+		stream, err := srvSession.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = stream.Close() }()
+		_, _ = http.ReadRequest(bufio.NewReader(stream))
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(stream, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+	}()
+
+	registry := NewSessionRegistry()
+	registry.Register("i-slow-stop", cliSession)
+	runner := NewTunnelContainerRunner(registry)
+	runner.SetClientTimeout(50 * time.Millisecond)
+	runner.SetStopTimeout(5 * time.Second)
+	if err := runner.StopContainer(context.Background(), &CloudVMNode{InstanceID: "i-slow-stop"}, "uid"); err != nil {
+		t.Fatalf("StopContainer failed although it finished within the stop timeout: %v", err)
+	}
 }

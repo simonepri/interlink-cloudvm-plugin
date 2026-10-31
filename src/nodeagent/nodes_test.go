@@ -271,3 +271,23 @@ func TestShardServesOnlyItsNodes(t *testing.T) {
 		t.Fatalf("shards served %d nodes in total, want %d", total, len(claims))
 	}
 }
+
+func TestNodeIsNotReadyWhenClaimIsUnhealthy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kube := fake.NewClientset()
+	claims := newFakeClaims(gpuClaim("vm-u", nodeclaim.StateRunning))
+	m := testManager(claims, kube)
+	m.Sync(ctx)
+	defer m.stopAll()
+	waitFor(t, "ready node", func() bool { n := getNode(t, kube, "vm-u"); return n != nil && readyStatus(n) == corev1.ConditionTrue })
+
+	claims.set(gpuClaim("vm-u", nodeclaim.StateUnhealthy))
+	m.Sync(ctx)
+	waitFor(t, "NotReady node", func() bool { return readyStatus(getNode(t, kube, "vm-u")) == corev1.ConditionFalse })
+	for _, c := range getNode(t, kube, "vm-u").Status.Conditions {
+		if c.Type == corev1.NodeReady && c.Reason != reasonVMUnhealthy {
+			t.Fatalf("Ready reason = %q, want %q", c.Reason, reasonVMUnhealthy)
+		}
+	}
+}

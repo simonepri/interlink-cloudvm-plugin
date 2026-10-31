@@ -760,3 +760,55 @@ func TestClaimSyncGivesVMsTheConnectTimeoutAfterAPluginRestart(t *testing.T) {
 		t.Fatal("an hour-old VM was terminated before it could reconnect to a restarted plugin")
 	}
 }
+
+// flakyStopRunner fails the first failures stop requests of the mock runner.
+type flakyStopRunner struct {
+	*MockContainerRunner
+	failures int
+	calls    int
+}
+
+func (f *flakyStopRunner) StopContainer(ctx context.Context, node *CloudVMNode, uid string) error {
+	f.calls++
+	if f.calls <= f.failures {
+		return fmt.Errorf("stop timed out")
+	}
+	return f.MockContainerRunner.StopContainer(ctx, node, uid)
+}
+
+func TestClaimPodDeleteRetriesSlowContainerStop(t *testing.T) {
+	s, client, url := newClaimServer(t, NewMockProvider())
+	runner := &flakyStopRunner{MockContainerRunner: NewMockContainerRunner(), failures: 2}
+	s.SetContainerRunner(runner)
+	s.stopRetryDelay = time.Millisecond
+	if _, err := client.Create(context.Background(), claimRequest("nc-slow", "g5.xlarge")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if code := createClaimPod(t, url, "nc-slow", "team-a", "p1", 0); code != http.StatusOK {
+		t.Fatalf("create pod: HTTP %d", code)
+	}
+	deleteClaimPod(t, url, "team-a", "p1")
+	if got := mustGet(t, client, "nc-slow"); got.State == nodeclaim.StateUnhealthy {
+		t.Fatalf("claim state = %s after a stop that succeeded on retry", got.State)
+	}
+	if runner.calls != 3 {
+		t.Fatalf("stop attempts = %d, want 3", runner.calls)
+	}
+}
+
+func TestClaimReportsUnhealthyWhenContainerCannotBeRemoved(t *testing.T) {
+	s, client, url := newClaimServer(t, NewMockProvider())
+	runner := &flakyStopRunner{MockContainerRunner: NewMockContainerRunner(), failures: 1 << 30}
+	s.SetContainerRunner(runner)
+	s.stopRetryDelay = time.Millisecond
+	if _, err := client.Create(context.Background(), claimRequest("nc-stuck", "g5.xlarge")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if code := createClaimPod(t, url, "nc-stuck", "team-a", "p1", 0); code != http.StatusOK {
+		t.Fatalf("create pod: HTTP %d", code)
+	}
+	deleteClaimPod(t, url, "team-a", "p1")
+	if got := mustGet(t, client, "nc-stuck"); got.State != nodeclaim.StateUnhealthy {
+		t.Fatalf("claim state = %s, want %s so the node agent makes the Node NotReady", got.State, nodeclaim.StateUnhealthy)
+	}
+}

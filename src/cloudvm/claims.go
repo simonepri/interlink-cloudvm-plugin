@@ -293,6 +293,9 @@ func (s *Server) claimView(rec *claimRecord) nodeclaim.NodeClaim {
 	s.nodePool.mu.RLock()
 	node := s.nodePool.nodes[rec.InstanceID]
 	interrupted := node != nil && node.SpinDownReason == SpinDownInterruption
+	if node != nil && node.SpinDownReason == SpinDownCleanupFailed {
+		state = nodeclaim.StateUnhealthy
+	}
 	var pods []nodeclaim.PodRef
 	if node != nil {
 		for uid, a := range node.ActivePods {
