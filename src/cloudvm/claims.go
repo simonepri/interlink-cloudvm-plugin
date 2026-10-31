@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim/lifecycletrace"
 )
 
 const (
@@ -402,7 +403,9 @@ func (s *Server) launchClaim(ctx context.Context, req *nodeclaim.CreateRequest) 
 	}
 	launchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.LaunchTimeout())
 	defer cancel()
+	launchRequested := time.Now()
 	inst, err := prov.Launch(launchCtx, spec)
+	s.lifecycle.VMLaunched(lifecycletrace.ForNodeClaim(req.Name), spec, req.Name, launchRequested, inst, err)
 	if err != nil {
 		log.Printf("[cloudvm] Failed to launch VM for claim %s: %v", sanitizeLog(req.Name), err) //nolint:gosec // sanitized
 		if isRegionFallbackError(err) {

@@ -438,3 +438,27 @@ func TestRunnerScript_StopRemovesContainer(t *testing.T) {
 		t.Fatalf("expected HTTP 500 when the container remains, got %d", resp.StatusCode)
 	}
 }
+
+func TestRunnerScript_ReportsStartTimings(t *testing.T) {
+	h := newRunnerHarness(t)
+	defer h.start()()
+
+	before := time.Now().Add(-time.Second)
+	resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"timed","image":"busybox"}`)
+	_ = resp.Body.Close()
+	var res ContainerStatusResult
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if res = h.status("timed"); res.Timings != nil && !res.Timings.PullFinishedAt.IsZero() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	tm := res.Timings
+	if tm == nil || tm.AcceptedAt.Before(before) || tm.PullStartedAt.Before(tm.AcceptedAt) || tm.PullFinishedAt.Before(tm.PullStartedAt) {
+		t.Fatalf("want ordered accept, pull start and pull end times, got %+v", tm)
+	}
+	if tm.Image != "busybox" || tm.PullAttempts != 1 || tm.LazyPull {
+		t.Errorf("want one full pull of busybox, got %+v", tm)
+	}
+}

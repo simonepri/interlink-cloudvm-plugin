@@ -41,6 +41,9 @@ LOG_POLL_SECONDS = 1
 CONTAINER_POLL_SECONDS = 5
 CONTAINER_PREFIX = "cloudvm-"
 DEFAULT_LOG_FILES = "bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log"
+# The bootstrap appends "<phase> <epoch seconds>" here as each boot phase ends.
+DEFAULT_BOOT_MARKS = "/run/cloudvm/boot-marks"
+MAX_BOOT_MARKS = 16
 
 
 def log(msg):
@@ -483,6 +486,27 @@ async def list_containers(cli):
     return [n for n in out.decode().split() if n.startswith(CONTAINER_PREFIX)]
 
 
+def boot_marks(path, uptime_path="/proc/uptime"):
+    """Returns when the VM's boot phases ended: instance_start when the kernel booted, then the bootstrap's own marks."""
+    def iso(t):
+        return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
+    marks = []
+    try:
+        with open(uptime_path) as f:
+            marks.append({"phase": "instance_start", "at": iso(time.time() - float(f.read().split()[0]))})
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and len(marks) < MAX_BOOT_MARKS:
+                    marks.append({"phase": parts[0], "at": iso(float(parts[1]))})
+    except (OSError, ValueError):
+        pass
+    return marks
+
+
 def parse_log_files(spec):
     files = []
     for item in spec.split(","):
@@ -698,6 +722,7 @@ async def connect_once(cfg):
             "instanceId": cfg["instance_id"],
             "authToken": read_file(cfg["token_file"]).decode(),
             "platform": cfg["platform"],
+            "boot": boot_marks(cfg["boot_marks_file"]),
         }
         attestation = read_file(cfg["attestation_file"])
         if attestation:
@@ -726,6 +751,7 @@ def main():
         "platform": os.environ.get("CLOUDVM_PLATFORM", "aws"),
         "token_file": os.environ.get("CLOUDVM_RUNNER_TOKEN_FILE", "/etc/cloudvm/runner-token"),
         "attestation_file": os.environ.get("CLOUDVM_ATTESTATION_FILE", "/etc/cloudvm/attestation"),
+        "boot_marks_file": os.environ.get("CLOUDVM_BOOT_MARKS_FILE", DEFAULT_BOOT_MARKS),
         "runner_addr": (runner_host, int(runner_port)),
         "ca_file": os.environ.get("CLOUDVM_TUNNEL_CA_FILE") or None,
         "collector": LogCollector(

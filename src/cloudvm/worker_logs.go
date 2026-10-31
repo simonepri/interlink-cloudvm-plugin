@@ -137,6 +137,7 @@ func (s *Server) recordWorkerLog(forwarder *OTLPLogForwarder, instanceID string,
 		Time:       ts,
 		Body:       rec.Message,
 		Attributes: attrs,
+		TraceID:    s.lifecycle.LogTraceID(instanceID, rec.PodUID),
 	})
 }
 

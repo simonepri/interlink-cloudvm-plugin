@@ -39,6 +39,23 @@ type TunnelHandshakeRequest struct {
 	AuthToken   string `json:"authToken,omitempty"`
 	Platform    string `json:"platform,omitempty"`    // "aws" or "gcp"
 	Attestation []byte `json:"attestation,omitempty"` // PKCS#7 or JWT bytes
+	// Boot lists the BootMarks of the worker's boot phases; it stays raw so a malformed list never fails a handshake.
+	Boot json.RawMessage `json:"boot,omitempty"`
+}
+
+// BootMark is the end of one boot phase of a worker, such as os_boot or container_runtime, on the worker's clock.
+type BootMark struct {
+	Phase string    `json:"phase"`
+	At    time.Time `json:"at"`
+}
+
+// BootMarks decodes the handshake's boot phases, or returns none when the worker sent none or a malformed list.
+func (r *TunnelHandshakeRequest) BootMarks() []BootMark {
+	var marks []BootMark
+	if len(r.Boot) == 0 || json.Unmarshal(r.Boot, &marks) != nil {
+		return nil
+	}
+	return marks
 }
 
 // TunnelHandshakeResponse acknowledges the reverse tunnel connection status.
@@ -160,6 +177,7 @@ type TunnelGateway struct {
 	handshakeTimeout    time.Duration
 	onReject            func(reason string)
 	onBootstrap         func(result string)
+	onConnect           func(req *TunnelHandshakeRequest)
 	logSink             WorkerLogSink
 	resolver            InstanceAddressResolver
 	directTCPNetworks   []*net.IPNet
@@ -188,6 +206,8 @@ type TunnelGatewayConfig struct {
 	OnReject func(reason string)
 	// OnBootstrapRequest is called with "served", "not_found", or "bad_request" for every bootstrap script request.
 	OnBootstrapRequest func(result string)
+	// OnConnect is called with the handshake of every worker whose session the gateway registered.
+	OnConnect func(req *TunnelHandshakeRequest)
 	// LogSink receives the log stream each worker opens on its session; workers' log streams are closed when nil.
 	LogSink WorkerLogSink
 	// IdentityValidator, when set, runs after the token check and may demand proof of the worker's cloud identity.
@@ -267,6 +287,7 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		handshakeTimeout:    cfg.HandshakeTimeout,
 		onReject:            cfg.OnReject,
 		onBootstrap:         cfg.OnBootstrapRequest,
+		onConnect:           cfg.OnConnect,
 		logSink:             cfg.LogSink,
 		resolver:            cfg.Resolver,
 		directTCPNetworks:   cfg.DirectTCPNetworks,
@@ -373,6 +394,9 @@ func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 
 	g.registry.Register(req.InstanceID, session)
 	log.Printf("[cloudvm-tunnel] Registered reverse tunnel session for instance %s from %s", sanitizeLog(req.InstanceID), conn.RemoteAddr()) //nolint:gosec // sanitized
+	if g.onConnect != nil {
+		g.onConnect(&req)
+	}
 
 	go g.acceptWorkerStreams(req.InstanceID, session)
 

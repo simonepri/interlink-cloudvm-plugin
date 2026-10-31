@@ -41,6 +41,8 @@ type LogEntry struct {
 	Time       time.Time
 	Body       string
 	Attributes map[string]string
+	// TraceID is the hex ID of the lifecycle trace the record belongs to, or empty.
+	TraceID string
 }
 
 func (e *LogEntry) size() int {
@@ -220,6 +222,7 @@ type otlpLogRecord struct {
 	ObservedTimeUnixNano string         `json:"observedTimeUnixNano"`
 	Body                 otlpAnyValue   `json:"body"`
 	Attributes           []otlpKeyValue `json:"attributes,omitempty"`
+	TraceID              string         `json:"traceId,omitempty"`
 }
 
 type otlpKeyValue struct {
@@ -253,6 +256,7 @@ func encodeOTLPLogs(batch []LogEntry) otlpLogsRequest {
 			ObservedTimeUnixNano: observed,
 			Body:                 otlpAnyValue{StringValue: e.Body},
 			Attributes:           sortedAttributes(e.Attributes),
+			TraceID:              e.TraceID,
 		})
 	}
 	return req

@@ -234,6 +234,8 @@ type PodMeta struct {
 	Labels          map[string]string `json:"labels,omitempty"`
 	Annotations     map[string]string `json:"annotations,omitempty"`
 	OwnerReferences []OwnerReference  `json:"ownerReferences,omitempty"`
+	// CreationTimestamp is when the API server created the pod, where the pod's lifecycle trace starts.
+	CreationTimestamp time.Time `json:"creationTimestamp,omitzero"`
 }
 
 // OwnerReference is the part of a pod's owner reference the plugin reads.
