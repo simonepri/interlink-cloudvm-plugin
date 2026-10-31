@@ -73,7 +73,7 @@ registryMirrors: []
 otelEndpoint: ""
 # OTLP/HTTP collector URL that receives worker bootstrap, runner, and container logs; empty disables forwarding.
 otlpLogsEndpoint: ""
-# OTLP/HTTP collector URL that receives the pod and VM lifecycle traces; empty disables tracing.
+# OTLP/HTTP collector URL that receives the plugin and node agent lifecycle traces; empty disables tracing.
 otlpTracesEndpoint: ""
 nodeProblemDetector:
   enabled: false

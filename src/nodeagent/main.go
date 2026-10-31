@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim/lifecycletrace"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -62,6 +64,8 @@ type Config struct {
 	PodSyncWorkers      int
 	KubeQPS             float32
 	KubeBurst           int
+	// TracesEndpoint is the OTLP/HTTP collector URL of the lifecycle traces; empty records none.
+	TracesEndpoint string
 }
 
 func envOr(key, def string) string {
@@ -90,14 +94,15 @@ func envInt(key string, def int) (int, error) {
 // LoadConfig reads the configuration from the environment.
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
-		PluginURL:     os.Getenv("PLUGIN_URL"),
-		NodeIP:        os.Getenv("POD_IP"),
-		PodName:       envOr("POD_NAME", "node-agent-0"),
-		CertFile:      os.Getenv("KUBELET_TLS_CERT_FILE"),
-		KeyFile:       os.Getenv("KUBELET_TLS_KEY_FILE"),
-		ServingSigner: os.Getenv("KUBELET_SERVING_SIGNER"),
-		ClientCAFile:  envOr("KUBELET_CLIENT_CA_FILE", serviceAccountCA),
-		APITokenFile:  envOr("PLUGIN_API_TOKEN_FILE", defaultAPITokenFile),
+		PluginURL:      os.Getenv("PLUGIN_URL"),
+		NodeIP:         os.Getenv("POD_IP"),
+		PodName:        envOr("POD_NAME", "node-agent-0"),
+		CertFile:       os.Getenv("KUBELET_TLS_CERT_FILE"),
+		KeyFile:        os.Getenv("KUBELET_TLS_KEY_FILE"),
+		ServingSigner:  os.Getenv("KUBELET_SERVING_SIGNER"),
+		ClientCAFile:   envOr("KUBELET_CLIENT_CA_FILE", serviceAccountCA),
+		APITokenFile:   envOr("PLUGIN_API_TOKEN_FILE", defaultAPITokenFile),
+		TracesEndpoint: os.Getenv("CLOUDVM_OTLP_TRACES_ENDPOINT"),
 	}
 	if cfg.PluginURL == "" {
 		return nil, errors.New("PLUGIN_URL is required")
@@ -205,9 +210,23 @@ func runAgent() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	var tracer trace.Tracer
+	if cfg.TracesEndpoint != "" {
+		tp, err := lifecycletrace.NewProvider(ctx, cfg.TracesEndpoint, "cloudvm-node-agent")
+		if err != nil {
+			return err
+		}
+		defer func() {
+			flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = tp.Shutdown(flushCtx)
+		}()
+		tracer = tp.Tracer(lifecycleTracerName)
+	}
 	httpClient := &http.Client{Timeout: 60 * time.Second}
 	agent := NewAgent(AgentConfig{
-		Kube: kube,
+		Tracer: tracer,
+		Kube:   kube,
 		Claims: nodeclaim.NewClient(cfg.PluginURL, &http.Client{
 			Timeout:   httpClient.Timeout,
 			Transport: &nodeclaim.TokenFileTransport{Path: cfg.APITokenFile},
@@ -265,6 +284,7 @@ type AgentConfig struct {
 	NodeStatus     time.Duration
 	OrphanSweep    time.Duration
 	PodSyncWorkers int
+	Tracer         trace.Tracer
 }
 
 // Agent is one shard: its NodeManager, its pod provider, and the shared pod informer and controller.
@@ -279,7 +299,7 @@ func NewAgent(cfg AgentConfig) *Agent {
 	nodes := NewNodeManager(NodeConfig{
 		Shard: cfg.Shard, Claims: cfg.Claims, Kube: cfg.Kube, NodeIP: cfg.NodeIP, KubeletPort: cfg.KubeletPort,
 		PollInterval: cfg.ClaimPoll, LeaseDurationSeconds: cfg.LeaseSeconds, LeaseRenewInterval: cfg.LeaseRenew,
-		StatusInterval: cfg.NodeStatus, OrphanSweepInterval: cfg.OrphanSweep,
+		StatusInterval: cfg.NodeStatus, OrphanSweepInterval: cfg.OrphanSweep, Tracer: cfg.Tracer,
 	})
 	return &Agent{cfg: cfg, Nodes: nodes, Pods: NewPodProvider(cfg.Pods, cfg.Kube, nodes, cfg.PodStatus)}
 }

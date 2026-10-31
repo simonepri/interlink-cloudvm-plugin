@@ -11,6 +11,7 @@ import (
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -59,6 +60,8 @@ type NodeConfig struct {
 	OrphanSweepInterval time.Duration
 	// MissingPolls is how many successful claim lists in a row must miss a claim before its Node is deleted.
 	MissingPolls int
+	// Tracer records the Node's stages in each claim's lifecycle trace; nil records nothing.
+	Tracer trace.Tracer
 }
 
 // servedNode is one Node this process keeps alive.
@@ -72,6 +75,8 @@ type servedNode struct {
 	node             *corev1.Node
 	cancel           context.CancelFunc
 	done             chan struct{}
+	// registeredAt is when this process started serving the Node.
+	registeredAt time.Time
 }
 
 // NodeManager serves the Nodes of this shard's claims.
@@ -255,6 +260,9 @@ func (m *NodeManager) notifyLocked(sn *servedNode) {
 	default:
 		return
 	}
+	if sn.reported != nodeclaim.StateRunning && sn.claim.State == nodeclaim.StateRunning {
+		m.traceReady(&sn.claim, sn.registeredAt, time.Now())
+	}
 	sn.reported, sn.reportedCapacity = sn.claim.State, sn.claim.Capacity
 	sn.node.Status = nodeStatus(&sn.claim, m.cfg)
 	n := sn.node.DeepCopy()
@@ -276,7 +284,7 @@ func (m *NodeManager) start(ctx context.Context, c nodeclaim.NodeClaim) {
 		return
 	}
 	desired := buildNode(&c, m.cfg)
-	sn := &servedNode{claim: c, reported: c.State, reportedCapacity: c.Capacity, node: desired, notified: make(chan struct{}), done: make(chan struct{})}
+	sn := &servedNode{claim: c, reported: c.State, reportedCapacity: c.Capacity, node: desired, notified: make(chan struct{}), done: make(chan struct{}), registeredAt: time.Now()}
 	provider := &nodeProvider{sn: sn}
 	nodeCtx, cancel := context.WithCancel(ctx)
 	sn.cancel = cancel
@@ -306,6 +314,7 @@ func (m *NodeManager) start(ctx context.Context, c nodeclaim.NodeClaim) {
 	}
 	m.served[c.Name] = sn
 	m.mu.Unlock()
+	m.traceRegistered(&c, sn.registeredAt)
 	go func() {
 		defer close(sn.done)
 		if err := ctrl.Run(nodeCtx); err != nil && nodeCtx.Err() == nil {

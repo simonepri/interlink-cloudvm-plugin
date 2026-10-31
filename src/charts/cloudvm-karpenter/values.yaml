@@ -36,6 +36,9 @@ leaderElectionName: cloudvm-karpenter-leader-election
 
 logLevel: info
 
+# OTLP/HTTP collector URL that receives the NodeClaims' Karpenter stages as traces; empty disables tracing.
+otlpTracesEndpoint: ""
+
 # Karpenter core settings, passed through as environment variables; empty keeps the core default.
 karpenter:
   featureGates: ""
