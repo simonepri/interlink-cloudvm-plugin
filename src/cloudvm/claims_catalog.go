@@ -41,10 +41,15 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	writeClaimJSON(w, http.StatusOK, s.buildCatalog(ctx, ticker, regions))
 }
 
+// launchableTypeLister is implemented by providers that boot instance types only from launch templates.
+type launchableTypeLister interface {
+	LaunchableInstanceTypes(ctx context.Context, region string, facts map[string]InstanceTypeFacts) map[string]bool
+}
+
 // buildCatalog lists the ticker's tracked types and the default CPU types in the given regions. A type gets a spot
 // offering in each zone the ticker prices it in, or one region-wide spot offering at the on-demand price when the
-// ticker does not track it, and one region-wide on-demand offering at its list price. Offerings that recently failed
-// for lack of capacity are unavailable.
+// ticker does not track it, and one region-wide on-demand offering at its list price. A region offers only the types its
+// launch templates accept. Offerings that recently failed for lack of capacity are unavailable.
 func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regions []string) *nodeclaim.Catalog {
 	names := ticker.TrackedInstanceTypes()
 	for _, n := range DefaultCPUInstanceTypes {
@@ -59,6 +64,13 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 		}
 	}
 	facts := globalInstanceFacts.resolve(ctx, describer, names)
+	// A type boots in a region only from a launch template that accepts it, so the catalog offers it only there.
+	launchable := make(map[string]map[string]bool, len(regions))
+	if lister, ok := s.defaultProv.(launchableTypeLister); ok {
+		for _, region := range regions {
+			launchable[region] = lister.LaunchableInstanceTypes(ctx, region, facts)
+		}
+	}
 
 	spot := make(map[string]map[string]map[string]float64) // type -> region -> zone -> price
 	for _, e := range ticker.AllPrices() {
@@ -96,6 +108,9 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 		}
 		it := catalogInstanceType(f)
 		for _, region := range regions {
+			if set, ok := launchable[region]; ok && !set[name] {
+				continue
+			}
 			onDemand := GlobalOnDemandPrices.Cached(region, name)
 			zones := spot[name][region]
 			for _, zone := range slices.Sorted(maps.Keys(zones)) {

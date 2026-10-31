@@ -36,14 +36,22 @@ const templateArchTTL = time.Hour
 // templateArchRetry is how soon a failed architecture read is retried, so a throttled call does not pin a guess for an hour.
 const templateArchRetry = time.Minute
 
+// noGPUSlices excludes GPU slices, which need NVIDIA's GRID driver that no legacy template is known to ship; only a
+// launchTemplates entry boots them.
+var noGPUSlices = corev1.NodeSelectorRequirement{Key: labelGPUSlice, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}}
+
+// defaultLaunchTemplate is the template a region whose cluster facts name none boots every type from but GPU slices.
+func defaultLaunchTemplate() LaunchTemplateFact {
+	return LaunchTemplateFact{Name: defaultLaunchTemplateName, Requirements: []corev1.NodeSelectorRequirement{noGPUSlices}}
+}
+
 // regionTemplates returns a region's launch templates in the order launches try them. Without a launchTemplates
-// list, the GPU template takes types with whole GPUs and the default template every other type except GPU slices,
-// which need NVIDIA's GRID driver that neither template is known to ship; only a launchTemplates entry boots them.
+// list, the GPU template takes types with whole GPUs and the default template every other type except GPU slices.
 func regionTemplates(fact RegionalClusterFact) []LaunchTemplateFact {
 	if len(fact.LaunchTemplates) > 0 {
 		return fact.LaunchTemplates
 	}
-	noSlices := corev1.NodeSelectorRequirement{Key: labelGPUSlice, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"true"}}
+	noSlices := noGPUSlices
 	var out []LaunchTemplateFact
 	if fact.GPULaunchTemplateID != "" {
 		out = append(out, LaunchTemplateFact{ID: fact.GPULaunchTemplateID, Requirements: []corev1.NodeSelectorRequirement{
@@ -201,4 +209,25 @@ func groupByTemplate(templates []resolvedTemplate, instanceTypes []string, facts
 		groups[i].InstanceTypes = append(groups[i].InstanceTypes, name)
 	}
 	return groups
+}
+
+// launchableTypes returns the names of the instance types that some template accepts.
+func launchableTypes(templates []resolvedTemplate, facts map[string]InstanceTypeFacts) map[string]bool {
+	out := make(map[string]bool, len(facts))
+	for name, f := range facts {
+		if _, ok := templateFor(templates, f); ok {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// LaunchableInstanceTypes returns the names among facts that the region's launch templates boot, the same set a launch
+// in the region draws its candidates from.
+func (p *AWSProvider) LaunchableInstanceTypes(ctx context.Context, region string, facts map[string]InstanceTypeFacts) map[string]bool {
+	var tc launchTemplateClient
+	if c, err := p.getClient(ctx, region); err == nil {
+		tc, _ = c.(launchTemplateClient)
+	}
+	return launchableTypes(resolveTemplates(ctx, tc, region, p.regionTemplates(region)), facts)
 }
