@@ -627,6 +627,9 @@ if [ -x /usr/local/bin/containerd-stargz-grpc ]; then
   address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
   [proxy_plugins.stargz.exports]
     root = "/var/lib/containerd-stargz-grpc"
+    # The transfer service passes the image reference and layer digests to the snapshotter only with this export;
+    # without them the snapshotter cannot mount a layer remotely, and containerd downloads and unpacks every layer.
+    enable_remote_snapshot_annotations = "true"
 CONTAINERD_EOF
   # containerd 2.x pulls through the transfer service, which needs unpack platforms for each snapshotter it unpacks into.
   grep -q '# cloudvm-unpack-stargz' /etc/containerd/config.toml || cat << 'CONTAINERD_EOF' >> /etc/containerd/config.toml
