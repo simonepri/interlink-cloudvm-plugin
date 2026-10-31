@@ -591,7 +591,7 @@ Next to the per-pod interLink API, the plugin launches one VM per Karpenter Node
 | `GET /v1/nodeclaims[?providerID=]` | Lists the claims, each `Launching` until its VM's tunnel connects (or, without a tunnel, its runner answers) and `Running` after, with `interrupted` set after a spot interruption notice and `pods`, the `namespace`, `name` and `uid` of every pod placed on the VM. |
 | `GET /v1/nodeclaims/{name}` | Returns one claim, or `404`. |
 | `DELETE /v1/nodeclaims/{name}` | Terminates the claim's VM and answers `202`; `404` once the claim is gone. |
-| `GET /v1/catalog[?regions=a,b]` | Lists the ticker's tracked instance types and the default CPU types with one offering per region, zone and capacity type: spot per zone at the ticker's price, on-demand per region at the list price. Needs `ENABLE_TICKER=true`. |
+| `GET /v1/catalog[?regions=a,b]` | Lists the ticker's tracked instance types and the default CPU types with one offering per region, zone and capacity type: spot per zone at the ticker's price, on-demand per region at the list price. A region lists only the types one of its [launch templates](#launch-templates) accepts. Needs `ENABLE_TICKER=true`. |
 
 Errors carry `{"reason", "message"}`: `Unauthorized` (`401`) and `Forbidden` (`403`) for callers (see below), `InsufficientCapacity` (`503`) when the cloud has no capacity, quota or offering for the request, after which the offering is reported unavailable for 3 minutes; `InvalidRequest` (`400`, or `409` for a claim deleted during its launch); `NotFound` (`404`).
 

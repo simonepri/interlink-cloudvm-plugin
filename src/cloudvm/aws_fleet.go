@@ -631,11 +631,11 @@ func (p *AWSProvider) configuredTemplates(region string) []LaunchTemplateFact {
 const defaultLaunchTemplateName = "interlink-cloudvm-worker"
 
 // regionTemplates returns the region's launch templates from cluster facts, in the order launches try them, or the
-// default template when the facts name none.
+// default template, which boots every type except GPU slices, when the facts name none.
 func (p *AWSProvider) regionTemplates(region string) []LaunchTemplateFact {
 	templates := p.configuredTemplates(region)
 	if len(templates) == 0 {
-		templates = []LaunchTemplateFact{{Name: defaultLaunchTemplateName}}
+		templates = []LaunchTemplateFact{defaultLaunchTemplate()}
 	}
 	return templates
 }
