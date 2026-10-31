@@ -213,6 +213,38 @@ func TestGetInstanceTypesZoneRestriction(t *testing.T) {
 	}
 }
 
+func TestGetInstanceTypesAdvertiseThePlannedDisk(t *testing.T) {
+	h := newHarness(t, nil)
+	h.api.catalog.InstanceTypes[0].EphemeralStorage = "250G"
+	its, err := h.cp.GetInstanceTypes(context.Background(), testNodePool(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, it := range its {
+		q := it.Capacity[corev1.ResourceEphemeralStorage]
+		got[it.Name] = q.String()
+	}
+	if got["g6.2xlarge"] != "250G" || got["m7i.xlarge"] != DefaultEphemeralStorage {
+		t.Errorf("ephemeral-storage = %v, want the planned 250G for g6.2xlarge and the %s default for a type without one", got, DefaultEphemeralStorage)
+	}
+}
+
+func TestCreateReportsThePlannedDiskBeforeThePluginReadsIt(t *testing.T) {
+	h := newHarness(t, nil)
+	h.api.omitStorage = true
+	h.api.catalog.InstanceTypes[0].EphemeralStorage = "250G"
+	got, err := h.cp.Create(context.Background(), testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.2xlarge")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, list := range map[string]corev1.ResourceList{"capacity": got.Status.Capacity, "allocatable": got.Status.Allocatable} {
+		if q := list[corev1.ResourceEphemeralStorage]; q.Cmp(resource.MustParse("250G")) != 0 {
+			t.Errorf("%s ephemeral-storage = %s, want the 250G the instance type was planned with", name, q.String())
+		}
+	}
+}
+
 func TestGetInstanceTypesNodePoolSelector(t *testing.T) {
 	h := newHarness(t, &Config{NodePoolSelector: map[string]string{"cloudvm-controller": "blue"}})
 	its, err := h.cp.GetInstanceTypes(context.Background(), testNodePool(map[string]string{"cloudvm-controller": "green"}))

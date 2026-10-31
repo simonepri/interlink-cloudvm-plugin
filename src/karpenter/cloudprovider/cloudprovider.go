@@ -328,6 +328,13 @@ func (c *CloudProvider) toNodeClaim(src *nodeclaim.NodeClaim, it *cloudprovider.
 	if len(capacity) == 0 && it != nil {
 		capacity = it.Capacity.DeepCopy()
 	}
+	// A claim whose plugin has not read its disk yet still has the disk its instance type was planned with; without
+	// it Karpenter takes the launched node for one that cannot hold the pods it was launched for.
+	if _, ok := capacity[corev1.ResourceEphemeralStorage]; !ok && it != nil {
+		if q, ok := it.Capacity[corev1.ResourceEphemeralStorage]; ok {
+			capacity[corev1.ResourceEphemeralStorage] = q
+		}
+	}
 	allocatable := capacity.DeepCopy()
 	return &karpv1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{

@@ -18,7 +18,7 @@ import (
 func sliceCatalogClient() *mockEC2FleetClient {
 	return &mockEC2FleetClient{describeInstanceTypesFn: func(_ context.Context, in *ec2.DescribeInstanceTypesInput) (*ec2.DescribeInstanceTypesOutput, error) {
 		out := &ec2.DescribeInstanceTypesOutput{}
-		for _, name := range in.Filters[0].Values {
+		for _, name := range filterNames(in) {
 			gpus, mem := int32(1), int32(24576)
 			if name == "g6f.xlarge" {
 				gpus, mem = 0, 2861
@@ -36,6 +36,18 @@ func sliceCatalogClient() *mockEC2FleetClient {
 		}
 		return out, nil
 	}}
+}
+
+// filterNames returns the instance types a DescribeInstanceTypes call asks for, by filter or by name.
+func filterNames(in *ec2.DescribeInstanceTypesInput) []string {
+	if len(in.Filters) > 0 {
+		return in.Filters[0].Values
+	}
+	var out []string
+	for _, n := range in.InstanceTypes {
+		out = append(out, string(n))
+	}
+	return out
 }
 
 func TestClaimCatalogOffersOnlyTypesALaunchTemplateAccepts(t *testing.T) {

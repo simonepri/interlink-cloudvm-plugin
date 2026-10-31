@@ -3,6 +3,7 @@
 package cloudprovider
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
 	"slices"
@@ -107,11 +108,16 @@ func (c *CloudProvider) capacity(src *nodeclaim.InstanceType) (corev1.ResourceLi
 	if err != nil {
 		return nil, fmt.Errorf("memory: %w", err)
 	}
+	// The plugin plans the disk size of the type; the configured size covers a plugin that cannot tell.
+	storage, err := resource.ParseQuantity(cmp.Or(src.EphemeralStorage, c.config.EphemeralStorage))
+	if err != nil {
+		return nil, fmt.Errorf("ephemeral storage: %w", err)
+	}
 	out := corev1.ResourceList{
 		corev1.ResourceCPU:              cpu,
 		corev1.ResourceMemory:           mem,
 		corev1.ResourcePods:             *resource.NewQuantity(c.config.MaxPods, resource.DecimalSI),
-		corev1.ResourceEphemeralStorage: resource.MustParse(c.config.EphemeralStorage),
+		corev1.ResourceEphemeralStorage: storage,
 	}
 	if src.GPUCount > 0 {
 		out[nodeclaim.ResourceGPU] = *resource.NewQuantity(int64(src.GPUCount), resource.DecimalSI)

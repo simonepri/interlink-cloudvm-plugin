@@ -106,10 +106,8 @@ func (c *templateArchCache) arch(ctx context.Context, client launchTemplateClien
 	return arch
 }
 
-func readTemplateArch(ctx context.Context, client launchTemplateClient, t LaunchTemplateFact) (string, error) {
-	if client == nil {
-		return "", nil
-	}
+// latestTemplateData returns the data of the template's $Latest version, or nil when EC2 reports none.
+func latestTemplateData(ctx context.Context, client launchTemplateClient, t LaunchTemplateFact) (*ec2types.ResponseLaunchTemplateData, error) {
 	in := &ec2.DescribeLaunchTemplateVersionsInput{Versions: []string{"$Latest"}}
 	if t.ID != "" {
 		in.LaunchTemplateId = aws.String(t.ID)
@@ -118,12 +116,23 @@ func readTemplateArch(ctx context.Context, client launchTemplateClient, t Launch
 	}
 	versions, err := client.DescribeLaunchTemplateVersions(ctx, in)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if len(versions.LaunchTemplateVersions) == 0 || versions.LaunchTemplateVersions[0].LaunchTemplateData == nil {
+	if len(versions.LaunchTemplateVersions) == 0 {
+		return nil, nil
+	}
+	return versions.LaunchTemplateVersions[0].LaunchTemplateData, nil
+}
+
+func readTemplateArch(ctx context.Context, client launchTemplateClient, t LaunchTemplateFact) (string, error) {
+	if client == nil {
 		return "", nil
 	}
-	image := aws.ToString(versions.LaunchTemplateVersions[0].LaunchTemplateData.ImageId)
+	data, err := latestTemplateData(ctx, client, t)
+	if err != nil || data == nil {
+		return "", err
+	}
+	image := aws.ToString(data.ImageId)
 	if image == "" || strings.HasPrefix(image, "resolve:ssm:") {
 		return "", nil
 	}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -436,7 +437,7 @@ func (s *Server) launchClaim(ctx context.Context, req *nodeclaim.CreateRequest) 
 		CreatedAt:    time.Now(),
 		Capacity:     s.resolveCapacity(ctx, prov, inst.Region, itype, ResourceVector{}),
 	}
-	rec.EphemeralStorage = claimContainerStorage(ctx, prov, rec)
+	rec.EphemeralStorage = cmp.Or(claimContainerStorage(ctx, prov, rec), plannedContainerStorage(ctx, prov, rec, spec))
 	s.registerClaimNode(rec, spec.RunnerAuthToken)
 	log.Printf("[cloudvm] Launched VM %s (%s, %s) for claim %s", sanitizeLog(inst.ID), sanitizeLog(itype), sanitizeLog(zone), sanitizeLog(req.Name)) //nolint:gosec // sanitized
 	return rec, nil
@@ -465,6 +466,21 @@ func claimContainerStorage(ctx context.Context, prov Provider, rec *claimRecord)
 	size, err := sizer.ContainerStorageSize(ctx, rec.Region, rec.InstanceID)
 	if err != nil {
 		log.Printf("[cloudvm] Reading the container storage size of VM %s of claim %s: %v", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
+		return ""
+	}
+	return size.String()
+}
+
+// plannedContainerStorage returns the container storage size the claim's instance type gives a VM, or "" when the
+// provider cannot plan it. It covers a launch whose instance cannot be read yet, such as one EC2 has not propagated.
+func plannedContainerStorage(ctx context.Context, prov Provider, rec *claimRecord, spec *InstanceSpec) string {
+	planner, ok := prov.(ContainerStoragePlanner)
+	if !ok {
+		return ""
+	}
+	size, err := planner.PlannedContainerStorage(ctx, rec.Region, rec.InstanceType, LaunchTemplateFact{ID: spec.LaunchTemplateID, Name: spec.LaunchTemplateName})
+	if err != nil {
+		log.Printf("[cloudvm] Planning the container storage size of %s for claim %s: %v", sanitizeLog(rec.InstanceType), sanitizeLog(rec.Request.Name), err) //nolint:gosec // sanitized
 		return ""
 	}
 	return size.String()
