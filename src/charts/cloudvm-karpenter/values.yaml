@@ -79,6 +79,8 @@ config:
   catalogTTL: 60s
   catalogMaxStaleness: 15m
   unavailableOfferingTTL: 3m
+  # quotaExceededTTL is how long an offering stays unavailable after a cloud quota refused it.
+  quotaExceededTTL: 10m
   maxPods: 110
   ephemeralStorage: 100Gi
 

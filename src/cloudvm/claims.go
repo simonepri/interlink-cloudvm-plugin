@@ -454,7 +454,11 @@ func (s *Server) launchClaim(ctx context.Context, req *nodeclaim.CreateRequest) 
 	if err != nil {
 		log.Printf("[cloudvm] Failed to launch VM for claim %s: %v", sanitizeLog(req.Name), err) //nolint:gosec // sanitized
 		if isRegionFallbackError(err) {
-			return nil, apiError(http.StatusServiceUnavailable, nodeclaim.ReasonInsufficientCapacity, err.Error())
+			refusal := &claimAPIError{status: http.StatusServiceUnavailable, reason: nodeclaim.ReasonInsufficientCapacity, msg: err.Error()}
+			if ClassifyAWSError(err) == "quota" || ClassifyGCPError(err) == "quota" {
+				refusal.cause = nodeclaim.CauseQuota
+			}
+			return nil, refusal
 		}
 		if errors.Is(err, errNamespaceFirewallMissing) || errors.Is(err, errNoInstanceTypeFits) {
 			return nil, apiError(http.StatusBadRequest, nodeclaim.ReasonInvalidRequest, err.Error())
@@ -772,6 +776,7 @@ func (s *Server) SyncClaims(ctx context.Context) {
 type claimAPIError struct {
 	status int
 	reason string
+	cause  string
 	msg    string
 }
 
@@ -790,7 +795,7 @@ func writeClaimJSON(w http.ResponseWriter, status int, v any) {
 func writeClaimError(w http.ResponseWriter, err error) {
 	var apiErr *claimAPIError
 	if errors.As(err, &apiErr) {
-		writeClaimJSON(w, apiErr.status, nodeclaim.ErrorResponse{Reason: apiErr.reason, Message: apiErr.msg})
+		writeClaimJSON(w, apiErr.status, nodeclaim.ErrorResponse{Reason: apiErr.reason, Cause: apiErr.cause, Message: apiErr.msg})
 		return
 	}
 	writeClaimJSON(w, http.StatusInternalServerError, nodeclaim.ErrorResponse{Reason: nodeclaim.ReasonInternal, Message: err.Error()})

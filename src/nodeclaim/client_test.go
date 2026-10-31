@@ -40,7 +40,7 @@ func TestClientRoundTrip(t *testing.T) {
 			t.Errorf("regions = %q", got)
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(ErrorResponse{Reason: ReasonInsufficientCapacity})
+		_ = json.NewEncoder(w).Encode(ErrorResponse{Reason: ReasonInsufficientCapacity, Cause: CauseQuota})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -66,8 +66,11 @@ func TestClientRoundTrip(t *testing.T) {
 	if err := c.Delete(ctx, "a"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := c.Catalog(ctx, []string{"a", "b"}); !IsInsufficientCapacity(err) {
-		t.Fatalf("Catalog error = %v, want insufficient capacity", err)
+	if _, err := c.Catalog(ctx, []string{"a", "b"}); !IsInsufficientCapacity(err) || !IsQuotaExceeded(err) {
+		t.Fatalf("Catalog error = %v, want insufficient capacity for a quota", err)
+	}
+	if IsQuotaExceeded(&APIError{Reason: ReasonInsufficientCapacity}) {
+		t.Fatal("a capacity shortage without a cause reads as a quota refusal")
 	}
 }
 

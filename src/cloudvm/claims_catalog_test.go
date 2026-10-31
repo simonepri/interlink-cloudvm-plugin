@@ -1,9 +1,11 @@
 // Tests that the claim catalog offers an instance type in a region only when one of the region's launch templates
-// accepts it.
+// accepts it, and offers it as available only while the region's measured quota can fit it.
 package main
 
 import (
+	"cmp"
 	"context"
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -12,6 +14,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
 
 // sliceCatalogClient describes a whole-GPU type and a GPU slice, which AWS reports with zero GPUs.
@@ -101,5 +105,57 @@ func TestClaimCatalogOffersOnlyTypesALaunchTemplateAccepts(t *testing.T) {
 				t.Errorf("GPU types in the catalog = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestClaimCatalogHidesTypesLargerThanTheQuotaHeadroom(t *testing.T) {
+	globalInstanceFacts = &instanceFactsCache{facts: make(map[string]InstanceTypeFacts)}
+	globalTemplateArch = &templateArchCache{entries: make(map[string]templateArchEntry)}
+	vcpus := map[string]int32{"g6.2xlarge": 8, "g6.48xlarge": 192}
+	describer := &mockEC2FleetClient{describeInstanceTypesFn: func(_ context.Context, in *ec2.DescribeInstanceTypesInput) (*ec2.DescribeInstanceTypesOutput, error) {
+		out := &ec2.DescribeInstanceTypesOutput{}
+		for _, name := range filterNames(in) {
+			out.InstanceTypes = append(out.InstanceTypes, ec2types.InstanceTypeInfo{
+				InstanceType:  ec2types.InstanceType(name),
+				VCpuInfo:      &ec2types.VCpuInfo{DefaultVCpus: aws.Int32(cmp.Or(vcpus[name], 4))},
+				MemoryInfo:    &ec2types.MemoryInfo{SizeInMiB: aws.Int64(32768)},
+				ProcessorInfo: &ec2types.ProcessorInfo{SupportedArchitectures: []ec2types.ArchitectureType{ec2types.ArchitectureTypeX8664}},
+				GpuInfo: &ec2types.GpuInfo{Gpus: []ec2types.GpuDeviceInfo{{
+					Name: aws.String("L4"), Manufacturer: aws.String("NVIDIA"), Count: aws.Int32(1),
+					MemoryInfo: &ec2types.GpuDeviceMemoryInfo{SizeInMiB: aws.Int32(24576)},
+				}}},
+			})
+		}
+		return out, nil
+	}}
+	p := newTestProvider(t)
+	p.SetRegionClient("us-east-1", describer)
+	p.SetRegionClient("us-west-1", describer)
+	p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{}})
+	s, client, _ := newClaimServer(t, p)
+	types := []string{"g6.2xlarge", "g6.48xlarge"}
+	ticker := NewSpotPriceTicker([]string{"us-east-1"}, types, time.Hour)
+	for _, name := range types {
+		ticker.prices[tickerKey("us-east-1", "us-east-1a", name)] = &SpotPriceEntry{Region: "us-east-1", AvailabilityZone: "us-east-1a", InstanceType: name, SpotPriceUSD: 0.4}
+	}
+	// 32 of the 64 spot vCPUs are in use: the 8-vCPU type fits and the 192-vCPU type never can.
+	key := quotaKey("aws", "us-east-1", "g_vt_spot")
+	ticker.solver.SetLimits(FillLimits{QuotaVCPUs: map[string]float64{key: 64}, QuotaUsedVCPUs: map[string]float64{key: 32}})
+	s.SetSpotTicker(ticker)
+
+	cat, err := client.Catalog(context.Background(), []string{"us-east-1"})
+	if err != nil {
+		t.Fatalf("Catalog: %v", err)
+	}
+	available := map[string]bool{}
+	for _, it := range cat.InstanceTypes {
+		for _, o := range it.Offerings {
+			if o.CapacityType == nodeclaim.CapacityTypeSpot && o.Zone == "us-east-1a" {
+				available[it.Name] = o.Available
+			}
+		}
+	}
+	if want := map[string]bool{"g6.2xlarge": true, "g6.48xlarge": false}; !maps.Equal(available, want) {
+		t.Fatalf("spot offerings available = %v, want %v", available, want)
 	}
 }

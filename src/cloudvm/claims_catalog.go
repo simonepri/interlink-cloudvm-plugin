@@ -52,7 +52,8 @@ type launchableTypeLister interface {
 // buildCatalog lists the ticker's tracked types and the default CPU types in the given regions. A type gets a spot
 // offering in each zone the ticker prices it in, or one region-wide spot offering at the on-demand price when the
 // ticker does not track it, and one region-wide on-demand offering at its list price. A region offers only the types its
-// launch templates accept. Offerings that recently failed for lack of capacity are unavailable.
+// launch templates accept. Offerings that recently failed for lack of capacity are unavailable, and so are offerings of a
+// type with more vCPUs than its region's measured quota has left.
 func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regions []string) *nodeclaim.Catalog {
 	names := ticker.TrackedInstanceTypes()
 	for _, n := range DefaultCPUInstanceTypes {
@@ -96,10 +97,18 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 		unavailable[key] = now.Before(until)
 	}
 	s.claims.mu.Unlock()
-	offer := func(itype, region, zone, capacityType string, price float64) nodeclaim.Offering {
+	awsProv, _ := s.defaultProv.(*AWSProvider)
+	fitsQuota := func(f InstanceTypeFacts, region, capacityType string) bool {
+		if awsProv == nil {
+			return true
+		}
+		headroom, known := awsProv.quotaHeadroom(ticker, region, f.Name, capacityType)
+		return !known || headroom >= float64(f.VCPUs)
+	}
+	offer := func(f InstanceTypeFacts, region, zone, capacityType string, price float64) nodeclaim.Offering {
 		return nodeclaim.Offering{
 			Region: region, Zone: zone, CapacityType: capacityType, PricePerHour: price,
-			Available: !unavailable[offeringKey(itype, region, zone, capacityType)],
+			Available: !unavailable[offeringKey(f.Name, region, zone, capacityType)] && fitsQuota(f, region, capacityType),
 		}
 	}
 
@@ -121,14 +130,14 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 			onDemand := GlobalOnDemandPrices.Cached(region, name)
 			zones := spot[name][region]
 			for _, zone := range slices.Sorted(maps.Keys(zones)) {
-				it.Offerings = append(it.Offerings, offer(name, region, zone, nodeclaim.CapacityTypeSpot, zones[zone]))
+				it.Offerings = append(it.Offerings, offer(f, region, zone, nodeclaim.CapacityTypeSpot, zones[zone]))
 			}
 			if onDemand > 0 {
 				if len(zones) == 0 {
 					// A spot price never exceeds the on-demand price, so the list price bounds an untracked spot type.
-					it.Offerings = append(it.Offerings, offer(name, region, "", nodeclaim.CapacityTypeSpot, onDemand))
+					it.Offerings = append(it.Offerings, offer(f, region, "", nodeclaim.CapacityTypeSpot, onDemand))
 				}
-				it.Offerings = append(it.Offerings, offer(name, region, "", nodeclaim.CapacityTypeOnDemand, onDemand))
+				it.Offerings = append(it.Offerings, offer(f, region, "", nodeclaim.CapacityTypeOnDemand, onDemand))
 			}
 			if !storageKnown || len(it.Offerings) == offered {
 				continue

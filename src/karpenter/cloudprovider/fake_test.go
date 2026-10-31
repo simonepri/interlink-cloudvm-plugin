@@ -14,7 +14,7 @@ import (
 )
 
 // fakeAPI records calls and serves a fixed catalog; capacityErrors lists "type/zone/capacity" triples that fail
-// with InsufficientCapacity.
+// with InsufficientCapacity, and quotaErrors those that fail with it for a quota.
 type fakeAPI struct {
 	mu             sync.Mutex
 	catalog        nodeclaim.Catalog
@@ -24,6 +24,7 @@ type fakeAPI struct {
 	creates        []nodeclaim.CreateRequest
 	deletes        []string
 	capacityErrors map[string]bool
+	quotaErrors    map[string]bool
 	listErr        error
 	createErr      error
 	launchZone     string        // zone a claim without one lands in, as the cloud picks it
@@ -34,7 +35,7 @@ type fakeAPI struct {
 }
 
 func newFakeAPI(catalog nodeclaim.Catalog) *fakeAPI {
-	return &fakeAPI{catalog: catalog, claims: map[string]*nodeclaim.NodeClaim{}, capacityErrors: map[string]bool{}}
+	return &fakeAPI{catalog: catalog, claims: map[string]*nodeclaim.NodeClaim{}, capacityErrors: map[string]bool{}, quotaErrors: map[string]bool{}}
 }
 
 func (f *fakeAPI) Catalog(_ context.Context, regions []string) (*nodeclaim.Catalog, error) {
@@ -71,6 +72,9 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 	}
 	if f.createErr != nil {
 		return nil, f.createErr
+	}
+	if f.quotaErrors[req.InstanceType+"/"+cmpZone(req)+"/"+req.CapacityType] {
+		return nil, &nodeclaim.APIError{Status: http.StatusServiceUnavailable, Reason: nodeclaim.ReasonInsufficientCapacity, Cause: nodeclaim.CauseQuota, Message: "VcpuLimitExceeded"}
 	}
 	if f.capacityErrors[req.InstanceType+"/"+cmpZone(req)+"/"+req.CapacityType] {
 		f.mu.Unlock()
