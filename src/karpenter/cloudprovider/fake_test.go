@@ -27,6 +27,7 @@ type fakeAPI struct {
 	listErr        error
 	createErr      error
 	launchZone     string // zone a claim without one lands in, as the cloud picks it
+	omitStorage    bool   // launched claims lack ephemeral-storage, as when the plugin has not read the VM's disk yet
 	nextID         int
 }
 
@@ -79,6 +80,9 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 		if it.Name == req.InstanceType {
 			hw.CPU, hw.Memory, hw.GPUs = it.CPU, it.Memory, it.GPUCount
 		}
+	}
+	if f.omitStorage {
+		hw.EphemeralStorage = ""
 	}
 	nc := &nodeclaim.NodeClaim{
 		Name:         req.Name,

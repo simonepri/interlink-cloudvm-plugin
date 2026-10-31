@@ -19,6 +19,8 @@ type MockProvider struct {
 	lastSpec    *InstanceSpec
 	// containerStorageErr, when set, fails ContainerStorageSize.
 	containerStorageErr error
+	// plannedStorageErr, when set, fails PlannedContainerStorage.
+	plannedStorageErr error
 }
 
 // mockContainerStorage is the size of the disk every mock VM keeps its containers on.
@@ -30,6 +32,16 @@ func (m *MockProvider) ContainerStorageSize(context.Context, string, string) (re
 	defer m.mu.RUnlock()
 	if m.containerStorageErr != nil {
 		return resource.Quantity{}, m.containerStorageErr
+	}
+	return resource.MustParse(mockContainerStorage), nil
+}
+
+// PlannedContainerStorage returns mockContainerStorage, or plannedStorageErr when set.
+func (m *MockProvider) PlannedContainerStorage(context.Context, string, string, LaunchTemplateFact) (resource.Quantity, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.plannedStorageErr != nil {
+		return resource.Quantity{}, m.plannedStorageErr
 	}
 	return resource.MustParse(mockContainerStorage), nil
 }

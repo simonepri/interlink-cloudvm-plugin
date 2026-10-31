@@ -371,6 +371,7 @@ func TestReconcilerLeavesIdleClaimVMs(t *testing.T) {
 func TestClaimReadsContainerStorageAgainAfterAFailedRead(t *testing.T) {
 	mock := NewMockProvider()
 	mock.containerStorageErr = errors.New("throttled")
+	mock.plannedStorageErr = errors.New("throttled")
 	s, client, _ := newClaimServer(t, mock)
 	ctx := context.Background()
 
@@ -388,6 +389,20 @@ func TestClaimReadsContainerStorageAgainAfterAFailedRead(t *testing.T) {
 	got, err := client.Get(ctx, "nc-r")
 	if err != nil || got.Capacity[nodeclaim.ResourceEphemeralStorage] != mockContainerStorage {
 		t.Fatalf("Get after sync = %+v, %v; want ephemeral-storage %s", got, err, mockContainerStorage)
+	}
+}
+
+func TestClaimReportsThePlannedDiskWhenTheInstanceCannotBeRead(t *testing.T) {
+	mock := NewMockProvider()
+	mock.containerStorageErr = errors.New("InvalidInstanceID.NotFound")
+	_, client, _ := newClaimServer(t, mock)
+
+	claim, err := client.Create(context.Background(), claimRequest("nc-p", "g5.xlarge"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := claim.Capacity[nodeclaim.ResourceEphemeralStorage]; got != mockContainerStorage {
+		t.Fatalf("ephemeral-storage at launch = %q, want the planned %s", got, mockContainerStorage)
 	}
 }
 
@@ -442,6 +457,9 @@ func TestClaimCatalogOfferings(t *testing.T) {
 	}
 	if g5 == nil || g5.GPUCount != 1 || g5.CPU != "4" || g5.Family != "g5" || g5.Size != "xlarge" {
 		t.Fatalf("g5.xlarge = %+v", g5)
+	}
+	if g5.EphemeralStorage != mockContainerStorage {
+		t.Fatalf("g5.xlarge ephemeral storage = %q, want the planned %s", g5.EphemeralStorage, mockContainerStorage)
 	}
 	var spot, onDemand bool
 	for _, o := range g5.Offerings {

@@ -7,7 +7,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -18,6 +20,12 @@ import (
 // ContainerStorageSizer reports the size of the disk a launched VM keeps its containers on.
 type ContainerStorageSizer interface {
 	ContainerStorageSize(ctx context.Context, region, instanceID string) (resource.Quantity, error)
+}
+
+// ContainerStoragePlanner reports the size of the disk a VM of an instance type will keep its containers on, before it
+// launches. A pinned template, when named, boots the VM; otherwise the region's launch templates choose.
+type ContainerStoragePlanner interface {
+	PlannedContainerStorage(ctx context.Context, region, instanceType string, pinned LaunchTemplateFact) (resource.Quantity, error)
 }
 
 // EC2 tags EC2 sets on every instance launched from a launch template.
@@ -168,4 +176,95 @@ const gcpBootDiskGB = 50
 // ContainerStorageSize returns the size of the boot disk every GCP worker launches with and keeps its containers on.
 func (p *GCPProvider) ContainerStorageSize(context.Context, string, string) (resource.Quantity, error) { //nolint:unparam // ContainerStorageSizer returns an error for AWS reads
 	return *resource.NewQuantity(gcpBootDiskGB<<30, resource.BinarySI), nil
+}
+
+// plannedStorageClient is the EC2 subset that plans an instance type's container storage.
+type plannedStorageClient interface {
+	launchTemplateClient
+	InstanceTypeDescriber
+}
+
+type plannedRootEntry struct {
+	gib     int32
+	expires time.Time
+}
+
+// plannedRootCache holds the root volume size of each template's $Latest version, which launches use.
+var plannedRootCache sync.Map
+
+// PlannedContainerStorage returns the size of the disk a VM of the instance type will keep its containers on: its
+// NVMe instance store when it has one, else the root volume the launching template and its image give it. It reads
+// the same sources as ContainerStorageSize, but from the instance type and template instead of a running instance.
+func (p *AWSProvider) PlannedContainerStorage(ctx context.Context, region, instanceType string, pinned LaunchTemplateFact) (resource.Quantity, error) {
+	c, err := p.getClient(ctx, region)
+	if err != nil {
+		return resource.Quantity{}, err
+	}
+	client, ok := c.(plannedStorageClient)
+	if !ok {
+		return resource.Quantity{}, fmt.Errorf("the EC2 client of %s cannot describe launch templates", region)
+	}
+	storeGB, err := instanceStoreGB(ctx, client, instanceType)
+	if err != nil {
+		return resource.Quantity{}, err
+	}
+	if storeGB > 0 {
+		return *resource.NewQuantity(storeGB*1e9, resource.DecimalSI), nil
+	}
+	t := pinned
+	if t.ID == "" && t.Name == "" {
+		f, ok := globalInstanceFacts.resolve(ctx, client, []string{instanceType})[instanceType]
+		if !ok {
+			return resource.Quantity{}, fmt.Errorf("instance type %s not found", instanceType)
+		}
+		chosen, ok := templateFor(resolveTemplates(ctx, client, region, p.regionTemplates(region)), f)
+		if !ok {
+			return resource.Quantity{}, fmt.Errorf("no launch template of %s accepts %s", region, instanceType)
+		}
+		t = chosen.LaunchTemplateFact
+	}
+	gib, err := plannedRootGiB(ctx, client, region, t)
+	if err != nil {
+		return resource.Quantity{}, err
+	}
+	return *resource.NewQuantity(int64(gib)<<30, resource.BinarySI), nil
+}
+
+// plannedRootGiB returns the size of the root EBS volume the template's $Latest version gives its instances: the size
+// the template sets for the image's root device, or else the size the image sets.
+func plannedRootGiB(ctx context.Context, client launchTemplateClient, region string, t LaunchTemplateFact) (int32, error) {
+	key := region + "/" + t.ID + "/" + t.Name
+	if v, ok := plannedRootCache.Load(key); ok && time.Now().Before(v.(plannedRootEntry).expires) {
+		return v.(plannedRootEntry).gib, nil
+	}
+	data, err := latestTemplateData(ctx, client, t)
+	if err != nil {
+		return 0, fmt.Errorf("ec2:DescribeLaunchTemplateVersions %s%s: %w", t.ID, t.Name, err)
+	}
+	var image string
+	if data != nil {
+		image = aws.ToString(data.ImageId)
+	}
+	if image == "" || strings.HasPrefix(image, "resolve:ssm:") {
+		return 0, fmt.Errorf("launch template %s%s names no image EC2 can size", t.ID, t.Name)
+	}
+	images, err := client.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{image}})
+	if err != nil {
+		return 0, fmt.Errorf("ec2:DescribeImages %s: %w", image, err)
+	}
+	if len(images.Images) == 0 {
+		return 0, fmt.Errorf("image %s not found", image)
+	}
+	root := aws.ToString(images.Images[0].RootDeviceName)
+	gib := imageRootGiB(images.Images[0].BlockDeviceMappings, root)
+	for _, m := range data.BlockDeviceMappings {
+		if aws.ToString(m.DeviceName) == root && m.Ebs != nil && aws.ToInt32(m.Ebs.VolumeSize) > 0 {
+			gib = *m.Ebs.VolumeSize
+		}
+	}
+	if gib <= 0 {
+		return 0, fmt.Errorf("neither launch template %s%s nor image %s sizes root device %s", t.ID, t.Name, image, root)
+	}
+	plannedRootCache.Store(key, plannedRootEntry{gib: gib, expires: time.Now().Add(templateArchTTL)})
+	return gib, nil
 }

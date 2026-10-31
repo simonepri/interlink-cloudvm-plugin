@@ -159,3 +159,75 @@ func TestAWSContainerStorageOnInstanceStore(t *testing.T) {
 		})
 	}
 }
+
+// plannedEC2 serves an instance type, a launch template's latest version and its image, for planning before launch.
+type plannedEC2 struct {
+	*mockEC2FleetClient
+	storage     *ec2types.InstanceStorageInfo
+	image       string
+	templateGiB int32 // root device size the template sets, or 0 to leave it to the image
+	imageGiB    int32
+}
+
+func (c *plannedEC2) DescribeInstanceTypes(_ context.Context, in *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	if len(in.InstanceTypes) == 0 {
+		return &ec2.DescribeInstanceTypesOutput{InstanceTypes: []ec2types.InstanceTypeInfo{{
+			InstanceType: ec2types.InstanceType(in.Filters[0].Values[0]), VCpuInfo: &ec2types.VCpuInfo{DefaultVCpus: aws.Int32(4)},
+		}}}, nil
+	}
+	return &ec2.DescribeInstanceTypesOutput{InstanceTypes: []ec2types.InstanceTypeInfo{{InstanceType: in.InstanceTypes[0], InstanceStorageInfo: c.storage}}}, nil
+}
+
+func (c *plannedEC2) DescribeLaunchTemplateVersions(_ context.Context, in *ec2.DescribeLaunchTemplateVersionsInput, _ ...func(*ec2.Options)) (*ec2.DescribeLaunchTemplateVersionsOutput, error) {
+	if in.Versions[0] != "$Latest" {
+		return nil, errors.New("planning must read the latest template version")
+	}
+	data := &ec2types.ResponseLaunchTemplateData{ImageId: aws.String(c.image)}
+	if c.templateGiB > 0 {
+		data.BlockDeviceMappings = []ec2types.LaunchTemplateBlockDeviceMapping{
+			{DeviceName: aws.String("/dev/xvda"), Ebs: &ec2types.LaunchTemplateEbsBlockDevice{VolumeSize: aws.Int32(c.templateGiB)}},
+		}
+	}
+	return &ec2.DescribeLaunchTemplateVersionsOutput{LaunchTemplateVersions: []ec2types.LaunchTemplateVersion{{LaunchTemplateData: data}}}, nil
+}
+
+func (c *plannedEC2) DescribeImages(context.Context, *ec2.DescribeImagesInput, ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	return &ec2.DescribeImagesOutput{Images: []ec2types.Image{{
+		RootDeviceName: aws.String("/dev/xvda"),
+		BlockDeviceMappings: []ec2types.BlockDeviceMapping{
+			{DeviceName: aws.String("/dev/xvda"), Ebs: &ec2types.EbsBlockDevice{VolumeSize: aws.Int32(c.imageGiB)}},
+		},
+	}}}, nil
+}
+
+func TestPlannedContainerStorage(t *testing.T) {
+	nvme := &ec2types.InstanceStorageInfo{NvmeSupport: ec2types.EphemeralNvmeSupportRequired, TotalSizeInGB: aws.Int64(900)}
+	tests := []struct {
+		name    string
+		client  *plannedEC2
+		pinned  LaunchTemplateFact
+		want    string
+		wantErr bool
+	}{
+		{"instance store", &plannedEC2{mockEC2FleetClient: &mockEC2FleetClient{}, storage: nvme, image: "ami-1", imageGiB: 30}, LaunchTemplateFact{}, "900G", false},
+		{"template sizes the root device", &plannedEC2{mockEC2FleetClient: &mockEC2FleetClient{}, image: "ami-1", templateGiB: 200, imageGiB: 30}, LaunchTemplateFact{}, "200Gi", false},
+		{"image sizes the root device", &plannedEC2{mockEC2FleetClient: &mockEC2FleetClient{}, image: "ami-1", imageGiB: 30}, LaunchTemplateFact{}, "30Gi", false},
+		{"pinned template", &plannedEC2{mockEC2FleetClient: &mockEC2FleetClient{}, image: "ami-1", templateGiB: 80, imageGiB: 30}, LaunchTemplateFact{Name: "pinned"}, "80Gi", false},
+		{"image resolved from SSM", &plannedEC2{mockEC2FleetClient: &mockEC2FleetClient{}, image: "resolve:ssm:/ami"}, LaunchTemplateFact{}, "", true},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			globalInstanceFacts = &instanceFactsCache{facts: make(map[string]InstanceTypeFacts)}
+			globalTemplateArch = &templateArchCache{entries: make(map[string]templateArchEntry)}
+			region := fmt.Sprintf("test-region-planned-%d", i)
+			p := newTestProvider(t)
+			p.SetClusterFacts(&ClusterFacts{Regions: map[string]RegionalClusterFact{region: {LaunchTemplates: []LaunchTemplateFact{{ID: "lt-planned"}}}}})
+			p.SetRegionClient(region, tt.client)
+
+			got, err := p.PlannedContainerStorage(context.Background(), region, fmt.Sprintf("planned%d.xlarge", i), tt.pinned)
+			if (err != nil) != tt.wantErr || (!tt.wantErr && got.String() != tt.want) {
+				t.Fatalf("PlannedContainerStorage = %s, %v; want %s (error %v)", got.String(), err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}

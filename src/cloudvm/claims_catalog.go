@@ -4,12 +4,15 @@ package main
 
 import (
 	"context"
+	"log"
 	"maps"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
@@ -100,6 +103,7 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 		}
 	}
 
+	planner, _ := s.defaultProv.(ContainerStoragePlanner)
 	out := &nodeclaim.Catalog{InstanceTypes: make([]nodeclaim.InstanceType, 0, len(facts))}
 	for _, name := range names {
 		f, ok := facts[name]
@@ -107,10 +111,13 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 			continue
 		}
 		it := catalogInstanceType(f)
+		var storage *resource.Quantity
+		storageKnown := planner != nil
 		for _, region := range regions {
 			if set, ok := launchable[region]; ok && !set[name] {
 				continue
 			}
+			offered := len(it.Offerings)
 			onDemand := GlobalOnDemandPrices.Cached(region, name)
 			zones := spot[name][region]
 			for _, zone := range slices.Sorted(maps.Keys(zones)) {
@@ -123,8 +130,21 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 				}
 				it.Offerings = append(it.Offerings, offer(name, region, "", nodeclaim.CapacityTypeOnDemand, onDemand))
 			}
+			if !storageKnown || len(it.Offerings) == offered {
+				continue
+			}
+			// The type reports the smallest disk any of its regions gives it, so a claim never falls short of it.
+			if size, err := planner.PlannedContainerStorage(ctx, region, name, LaunchTemplateFact{}); err != nil {
+				storageKnown = false
+				log.Printf("[cloudvm] Planning the container storage size of %s in %s: %v", sanitizeLog(name), sanitizeLog(region), err) //nolint:gosec // sanitized
+			} else if storage == nil || size.Cmp(*storage) < 0 {
+				storage = &size
+			}
 		}
 		if len(it.Offerings) > 0 {
+			if storageKnown && storage != nil {
+				it.EphemeralStorage = storage.String()
+			}
 			out.InstanceTypes = append(out.InstanceTypes, it)
 		}
 	}

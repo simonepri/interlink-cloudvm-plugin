@@ -207,19 +207,22 @@ type Offering struct {
 
 // InstanceType describes one catalog instance type and its offerings.
 type InstanceType struct {
-	Name            string     `json:"name"`
-	Provider        string     `json:"provider"`
-	CPU             string     `json:"cpu"`
-	Memory          string     `json:"memory"`
-	GPUCount        int        `json:"gpuCount,omitempty"`
-	GPUModel        string     `json:"gpuModel,omitempty"`
-	GPUMemoryGB     int        `json:"gpuMemoryGB,omitempty"`
-	GPUManufacturer string     `json:"gpuManufacturer,omitempty"`
-	Architecture    string     `json:"architecture"`
-	Family          string     `json:"family,omitempty"`
-	Generation      string     `json:"generation,omitempty"`
-	Size            string     `json:"size,omitempty"`
-	Offerings       []Offering `json:"offerings"`
+	Name            string `json:"name"`
+	Provider        string `json:"provider"`
+	CPU             string `json:"cpu"`
+	Memory          string `json:"memory"`
+	GPUCount        int    `json:"gpuCount,omitempty"`
+	GPUModel        string `json:"gpuModel,omitempty"`
+	GPUMemoryGB     int    `json:"gpuMemoryGB,omitempty"`
+	GPUManufacturer string `json:"gpuManufacturer,omitempty"`
+	// EphemeralStorage is the size of the disk a VM of this type keeps its containers on, as the plugin plans it
+	// before launch; the smallest across the requested regions. Empty when the plugin cannot tell.
+	EphemeralStorage string     `json:"ephemeralStorage,omitempty"`
+	Architecture     string     `json:"architecture"`
+	Family           string     `json:"family,omitempty"`
+	Generation       string     `json:"generation,omitempty"`
+	Size             string     `json:"size,omitempty"`
+	Offerings        []Offering `json:"offerings"`
 }
 
 // Catalog is the response of GET /v1/catalog.
