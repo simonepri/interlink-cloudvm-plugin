@@ -375,7 +375,7 @@ func TestCreateCountsDataCostInChoice(t *testing.T) {
 }
 
 func TestCreateInsufficientCapacityMarksOfferingUnavailable(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, &Config{LaunchFallback: LaunchFallback{MaxAttempts: 1}})
 	h.api.capacityErrors["g6.2xlarge/eu-west-1a/spot"] = true
 	ctx := context.Background()
 	nc := testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.2xlarge"))
@@ -432,6 +432,9 @@ func TestCreatePluginErrorIsNotCapacity(t *testing.T) {
 	_, err := h.cp.Create(context.Background(), testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.2xlarge")))
 	if err == nil || cloudprovider.IsInsufficientCapacityError(err) {
 		t.Fatalf("err = %v, want a plain error", err)
+	}
+	if len(h.api.creates) != 1 {
+		t.Fatalf("plugin creates = %d, want no other offering tried after an error that is not about capacity", len(h.api.creates))
 	}
 }
 

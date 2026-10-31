@@ -123,3 +123,60 @@ func TestSpreadOfferingIsStablePerClaim(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateFallsBackWithinTheCallUntilABatchSucceedsInOneRound(t *testing.T) {
+	h := scaleUpHarness(t, nil)
+	h.api.capacityErrors["g6.12xlarge/us-east-1/on-demand"] = true
+	h.api.capacityErrors["g6.12xlarge/us-east-2/on-demand"] = true
+	got := launchBatch(t, h, 40)
+	for name, region := range got {
+		switch region {
+		case "":
+			t.Errorf("%s failed; its Create should have tried the next offering", name)
+		case "ap-northeast-1":
+			t.Errorf("%s launched past the price tolerance of the cheapest offering with capacity", name)
+		}
+	}
+	creates := map[string]int{}
+	for _, c := range h.api.creates {
+		creates[c.Name]++
+	}
+	for name, n := range creates {
+		if n > DefaultLaunchMaxAttempts {
+			t.Errorf("%s tried %d offerings, more than the %d attempts", name, n, DefaultLaunchMaxAttempts)
+		}
+	}
+}
+
+func TestCreateReportsTheShortageAfterTheMaxAttempts(t *testing.T) {
+	h := scaleUpHarness(t, &Config{LaunchFallback: LaunchFallback{MaxAttempts: 2}})
+	for _, region := range scaleUpRegions {
+		h.api.capacityErrors["g6.12xlarge/"+region+"/on-demand"] = true
+	}
+	h.api.refusalDelay = 0
+	_, err := h.cp.Create(context.Background(), testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.12xlarge")))
+	if !cloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("err = %v, want InsufficientCapacityError", err)
+	}
+	if len(h.api.creates) != 2 {
+		t.Fatalf("plugin creates = %d, want 2", len(h.api.creates))
+	}
+	if h.api.creates[0].Region == h.api.creates[1].Region {
+		t.Fatalf("both attempts went to %s", h.api.creates[0].Region)
+	}
+}
+
+func TestCreateStartsNoAttemptAfterTheFallbackTimeout(t *testing.T) {
+	h := scaleUpHarness(t, nil)
+	h.api.capacityErrors["g6.12xlarge/us-east-1/on-demand"] = true
+	h.api.capacityErrors["g6.12xlarge/us-east-2/on-demand"] = true
+	h.api.refusalDelay = 0
+	h.api.onRefusal = func() { h.clock.Step(DefaultLaunchFallbackTimeout) }
+	nc := testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.12xlarge"), req(corev1.LabelTopologyRegion, "us-east-1", "us-east-2"))
+	if _, err := h.cp.Create(context.Background(), nc); !cloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("err = %v, want InsufficientCapacityError", err)
+	}
+	if len(h.api.creates) != 1 {
+		t.Fatalf("plugin creates = %d, want 1 once the timeout passed", len(h.api.creates))
+	}
+}

@@ -15,7 +15,7 @@ import (
 )
 
 func TestCreateRecordsItsStagesInTheClaimTrace(t *testing.T) {
-	h := newHarness(t, nil)
+	h := newHarness(t, &Config{LaunchFallback: LaunchFallback{MaxAttempts: 1}})
 	spans := tracetest.NewInMemoryExporter()
 	h.cp.SetTracer(sdktrace.NewTracerProvider(sdktrace.WithSyncer(spans)).Tracer(TracerName))
 	h.api.capacityErrors["g6.2xlarge/eu-west-1a/spot"] = true
