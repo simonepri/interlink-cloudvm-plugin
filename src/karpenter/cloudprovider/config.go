@@ -1,4 +1,4 @@
-// Controller configuration: GPU class mapping, cross-region data cost, offering spread, NodePool scope and catalog caching.
+// Controller configuration: GPU class mapping, data cost, offering spread, launch fallback, NodePool scope and caching.
 
 package cloudprovider
 
@@ -30,6 +30,8 @@ type Config struct {
 	UnavailableOfferingTTL Duration `json:"unavailableOfferingTTL,omitzero"`
 	// OfferingSpread spreads the claims of one scale-up across the cheapest compatible offerings.
 	OfferingSpread OfferingSpread `json:"offeringSpread,omitzero"`
+	// LaunchFallback bounds how many offerings one Create call tries after capacity refusals.
+	LaunchFallback LaunchFallback `json:"launchFallback,omitzero"`
 	// MaxPods is the pods capacity of every node.
 	MaxPods int64 `json:"maxPods,omitempty"`
 	// EphemeralStorage is the ephemeral-storage an instance type advertises when the plugin does not report the size
@@ -57,6 +59,16 @@ type OfferingSpread struct {
 	// MaxOfferings is how many of the cheapest compatible offerings within the tolerance claims spread across; 1
 	// launches every claim with the cheapest offering.
 	MaxOfferings int `json:"maxOfferings,omitempty"`
+}
+
+// LaunchFallback bounds the offerings a Create call tries: after the cloud refuses an offering for lack of capacity or
+// quota, the call tries the claim's next choice until MaxAttempts offerings were tried or Timeout has passed since the
+// call began, and only then reports the shortage to Karpenter.
+type LaunchFallback struct {
+	// MaxAttempts is the most offerings one Create call tries; 1 reports the first refusal.
+	MaxAttempts int `json:"maxAttempts,omitempty"`
+	// Timeout is how long after a Create call began it may still start a launch with another offering.
+	Timeout Duration `json:"timeout,omitzero"`
 }
 
 // DataCost holds the per-hour cost added to offerings outside the home region.
@@ -90,6 +102,8 @@ const (
 	DefaultUnavailableOfferingTTL = 3 * time.Minute
 	DefaultSpreadPriceTolerance   = 0.10
 	DefaultSpreadMaxOfferings     = 4
+	DefaultLaunchMaxAttempts      = 3
+	DefaultLaunchFallbackTimeout  = time.Minute
 	DefaultMaxPods                = 110
 	DefaultEphemeralStorage       = "100Gi"
 )
@@ -133,6 +147,15 @@ func (c *Config) complete() error {
 	}
 	if c.OfferingSpread.MaxOfferings < 0 {
 		return fmt.Errorf("offeringSpread.maxOfferings: must be positive")
+	}
+	if c.LaunchFallback.MaxAttempts == 0 {
+		c.LaunchFallback.MaxAttempts = DefaultLaunchMaxAttempts
+	}
+	if c.LaunchFallback.MaxAttempts < 0 {
+		return fmt.Errorf("launchFallback.maxAttempts: must be positive")
+	}
+	if c.LaunchFallback.Timeout.Duration == 0 {
+		c.LaunchFallback.Timeout.Duration = DefaultLaunchFallbackTimeout
 	}
 	if c.MaxPods == 0 {
 		c.MaxPods = DefaultMaxPods
