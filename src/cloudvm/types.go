@@ -176,6 +176,8 @@ type InstanceSpec struct {
 	Zone string `json:"zone,omitempty"`
 	// NodeClaim marks a VM launched for a Karpenter NodeClaim: it boots with no pod and waits for pods to start.
 	NodeClaim bool `json:"nodeClaim,omitempty"`
+	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
+	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
 }
 
 // Instance represents an active or terminating cloud VM instance.

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"text/template"
 )
@@ -68,6 +69,8 @@ type CloudInitConfig struct {
 	// NodeClaim boots a VM for a Karpenter NodeClaim: it starts with no pod, so the boot watchdog, which powers off a
 	// VM whose first container does not start, stays off; the plugin terminates a claim VM that never becomes ready.
 	NodeClaim bool `json:"nodeClaim,omitempty"`
+	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
+	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -236,6 +239,26 @@ func (c *CloudInitConfig) RegistryMirrorsJSON() string {
 		return "[]"
 	}
 	return string(b)
+}
+
+// StargzConfigTOML returns the stargz snapshotter config: its lazy fetches try the Docker Hub mirrors normal pulls use,
+// and authenticate through the host docker config, whose ECR credential helper mints a fresh token for each fetch.
+func (c *CloudInitConfig) StargzConfigTOML() string {
+	var b strings.Builder
+	for _, m := range c.RegistryMirrors {
+		if !strings.Contains(m, "://") {
+			m = "https://" + m
+		}
+		u, err := url.Parse(m)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "[[resolver.host.\"docker.io\".mirrors]]\nhost = %q\n", u.Host+strings.TrimRight(u.Path, "/"))
+		if u.Scheme == "http" {
+			b.WriteString("insecure = true\n")
+		}
+	}
+	return b.String()
 }
 
 // ImageMirrorsJSON returns the JSON object mapping upstream registry hosts to mirror prefixes for the in-VM runner.
@@ -542,18 +565,22 @@ grep -q '# cloudvm-unpack-overlayfs' /etc/containerd/config.toml || cat << 'CONT
   platform = "linux/amd64"
   snapshotter = "overlayfs"
 CONTAINERD_EOF
-# The snapshotter pulls eStargz layers lazily (other images pull in full) with the docker keychain the runner also uses.
+{{if not .DisableLazyPulls}}
+# The snapshotter pulls eStargz layers lazily (other images pull in full) and keeps its layer cache on the containerd disk.
 if [ ! -x /usr/local/bin/containerd-stargz-grpc ]; then
   cloudvm_fetch "https://github.com/containerd/stargz-snapshotter/releases/download/v${CLOUDVM_STARGZ_VERSION}/stargz-snapshotter-v${CLOUDVM_STARGZ_VERSION}-linux-amd64.tar.gz" "$CLOUDVM_STARGZ_SHA256" containerd-stargz-grpc || echo "[cloudvm-bootstrap] Warning: stargz snapshotter install failed; images pull in full" >&2
 fi
 if [ -x /usr/local/bin/containerd-stargz-grpc ]; then
-  mkdir -p /etc/containerd-stargz-grpc
-  touch /etc/containerd-stargz-grpc/config.toml
+  mkdir -p /etc/containerd-stargz-grpc /etc/systemd/system/containerd.service.d
+  cat << 'STARGZ_EOF' > /etc/containerd-stargz-grpc/config.toml
+{{.StargzConfigTOML}}STARGZ_EOF
   grep -q 'proxy_plugins.stargz' /etc/containerd/config.toml || cat << 'CONTAINERD_EOF' >> /etc/containerd/config.toml
 
 [proxy_plugins.stargz]
   type = "snapshot"
   address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+  [proxy_plugins.stargz.exports]
+    root = "/var/lib/containerd-stargz-grpc"
 CONTAINERD_EOF
   # containerd 2.x pulls through the transfer service, which needs unpack platforms for each snapshotter it unpacks into.
   grep -q '# cloudvm-unpack-stargz' /etc/containerd/config.toml || cat << 'CONTAINERD_EOF' >> /etc/containerd/config.toml
@@ -563,22 +590,31 @@ CONTAINERD_EOF
   platform = "linux/amd64"
   snapshotter = "stargz"
 CONTAINERD_EOF
+  printf '[Unit]\nWants=stargz-snapshotter.service\nAfter=stargz-snapshotter.service\n' > /etc/systemd/system/containerd.service.d/10-stargz.conf
+  # Lazy fetches authenticate with the host docker config, whose ECR helper mints a fresh token each time one expires.
   cat << 'STARGZ_EOF' > /etc/systemd/system/stargz-snapshotter.service
 [Unit]
 Description=stargz snapshotter
+Wants=network-online.target
+After=network-online.target
 Before=containerd.service
 
 [Service]
+Type=notify
 Environment=HOME=/root DOCKER_CONFIG=/root/.docker PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock --config=/etc/containerd-stargz-grpc/config.toml
 Restart=always
+RestartSec=1
+RuntimeDirectory=containerd-stargz-grpc
+StateDirectory=containerd-stargz-grpc
 
 [Install]
 WantedBy=multi-user.target
 STARGZ_EOF
   systemctl daemon-reload
-  systemctl enable --now stargz-snapshotter.service || true
+  systemctl enable --now stargz-snapshotter.service || echo "[cloudvm-bootstrap] Warning: stargz snapshotter did not start; images pull in full" >&2
 fi
+{{end}}
 
 {{if .RegistryMirrors}}
 # Docker Hub pulls try these mirrors first
