@@ -1,5 +1,5 @@
 // Verifies the pod and VM lifecycle recorder: the spans, stage metrics and pod events each runner status and worker
-// handshake produce, and what a plugin restarted mid-start records.
+// handshake produce, what a plugin restarted mid-start records, and that the scraped /metrics route serves the metrics.
 package main
 
 import (
@@ -243,6 +243,27 @@ func TestLifecycle_CountsCreateResponsesByStatus(t *testing.T) {
 	handler(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/create", nil))
 	if got := testutil.ToFloat64(m.createResponses.WithLabelValues("pod", "409")); got != 1 {
 		t.Errorf("want one counted 409, got %v", got)
+	}
+}
+
+func TestRoutes_MetricsServesLifecycleMetrics(t *testing.T) {
+	s := NewServer(NewMockProvider(), "test-cluster")
+	offering := lifecycleOffering{provider: "aws", region: "us-west-2", instanceType: "c6i.xlarge", capacityType: "spot"}
+	s.lifecycle.metrics.observePodStage(stagePending, offering, 1)
+	s.lifecycle.metrics.observeVMStage(stageReady, offering, 1)
+	s.lifecycle.metrics.createResponses.WithLabelValues("pod", "200").Inc()
+
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	for _, series := range []string{
+		"cloudvm_pod_stage_duration_seconds_bucket{",
+		"cloudvm_vm_stage_duration_seconds_bucket{",
+		"cloudvm_create_responses_total{",
+	} {
+		if !strings.Contains(rec.Body.String(), series) {
+			t.Errorf("/metrics must serve %s", series)
+		}
 	}
 }
 
