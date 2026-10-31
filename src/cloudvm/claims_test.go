@@ -298,14 +298,18 @@ func TestClaimRecoveryKeepsPodDevices(t *testing.T) {
 	}
 }
 
-// capacityProvider fails every launch for lack of capacity.
+// capacityProvider fails every launch for lack of capacity, or with err when set.
 type capacityProvider struct {
 	*MockProvider
 	launches int
+	err      error
 }
 
 func (p *capacityProvider) Launch(context.Context, *InstanceSpec) (*Instance, error) {
 	p.launches++
+	if p.err != nil {
+		return nil, p.err
+	}
 	return nil, fmt.Errorf("launch fleet failed: %w", errNoInstancesLaunched)
 }
 
@@ -314,8 +318,8 @@ func TestClaimCapacityErrorMarksOfferingUnavailable(t *testing.T) {
 	_, client, _ := newClaimServer(t, prov)
 	ctx := context.Background()
 	for range 2 {
-		if _, err := client.Create(ctx, claimRequest("nc-e", "g5.xlarge")); !nodeclaim.IsInsufficientCapacity(err) {
-			t.Fatalf("Create error = %v, want insufficient capacity", err)
+		if _, err := client.Create(ctx, claimRequest("nc-e", "g5.xlarge")); !nodeclaim.IsInsufficientCapacity(err) || nodeclaim.IsQuotaExceeded(err) {
+			t.Fatalf("Create error = %v, want insufficient capacity without a quota cause", err)
 		}
 	}
 	if prov.launches != 1 {
@@ -323,6 +327,14 @@ func TestClaimCapacityErrorMarksOfferingUnavailable(t *testing.T) {
 	}
 	if _, err := client.Create(ctx, &nodeclaim.CreateRequest{Name: "x"}); err == nil || nodeclaim.IsInsufficientCapacity(err) {
 		t.Fatalf("invalid Create error = %v", err)
+	}
+}
+
+func TestClaimQuotaRefusalCarriesTheQuotaCause(t *testing.T) {
+	prov := &capacityProvider{MockProvider: NewMockProvider(), err: errors.New("operation error EC2: CreateFleet, VcpuLimitExceeded: You have requested more vCPU capacity than your current vCPU limit allows")}
+	_, client, _ := newClaimServer(t, prov)
+	if _, err := client.Create(context.Background(), claimRequest("nc-q", "g5.xlarge")); !nodeclaim.IsQuotaExceeded(err) {
+		t.Fatalf("Create error = %v, want insufficient capacity with the quota cause", err)
 	}
 }
 

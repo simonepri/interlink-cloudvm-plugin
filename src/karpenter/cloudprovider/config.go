@@ -28,6 +28,9 @@ type Config struct {
 	CatalogMaxStaleness Duration `json:"catalogMaxStaleness,omitzero"`
 	// UnavailableOfferingTTL is how long an offering stays unavailable after the plugin reports no capacity for it.
 	UnavailableOfferingTTL Duration `json:"unavailableOfferingTTL,omitzero"`
+	// QuotaExceededTTL is how long an offering stays unavailable after a cloud quota refused it; a quota frees up
+	// only as the account's usage drops, so it is longer than UnavailableOfferingTTL.
+	QuotaExceededTTL Duration `json:"quotaExceededTTL,omitzero"`
 	// OfferingSpread spreads the claims of one scale-up across the cheapest compatible offerings.
 	OfferingSpread OfferingSpread `json:"offeringSpread,omitzero"`
 	// LaunchFallback bounds how many offerings one Create call tries after capacity refusals.
@@ -100,6 +103,7 @@ const (
 	DefaultCatalogTTL             = time.Minute
 	DefaultCatalogMaxStaleness    = 15 * time.Minute
 	DefaultUnavailableOfferingTTL = 3 * time.Minute
+	DefaultQuotaExceededTTL       = 10 * time.Minute
 	DefaultSpreadPriceTolerance   = 0.10
 	DefaultSpreadMaxOfferings     = 4
 	DefaultLaunchMaxAttempts      = 3
@@ -156,6 +160,9 @@ func (c *Config) complete() error {
 	}
 	if c.LaunchFallback.Timeout.Duration == 0 {
 		c.LaunchFallback.Timeout.Duration = DefaultLaunchFallbackTimeout
+	}
+	if c.QuotaExceededTTL.Duration == 0 {
+		c.QuotaExceededTTL.Duration = DefaultQuotaExceededTTL
 	}
 	if c.MaxPods == 0 {
 		c.MaxPods = DefaultMaxPods

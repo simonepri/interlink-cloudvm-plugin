@@ -27,7 +27,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.CatalogTTL.Duration != DefaultCatalogTTL || cfg.MaxPods != DefaultMaxPods || cfg.EphemeralStorage != DefaultEphemeralStorage ||
 		cfg.OfferingSpread != (OfferingSpread{PriceTolerance: DefaultSpreadPriceTolerance, MaxOfferings: DefaultSpreadMaxOfferings}) ||
-		cfg.LaunchFallback.MaxAttempts != DefaultLaunchMaxAttempts || cfg.LaunchFallback.Timeout.Duration != DefaultLaunchFallbackTimeout {
+		cfg.LaunchFallback.MaxAttempts != DefaultLaunchMaxAttempts || cfg.LaunchFallback.Timeout.Duration != DefaultLaunchFallbackTimeout ||
+		cfg.QuotaExceededTTL.Duration != DefaultQuotaExceededTTL {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
 }

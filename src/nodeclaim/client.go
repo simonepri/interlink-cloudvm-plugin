@@ -22,6 +22,7 @@ const maxErrorBody = 64 << 10
 type APIError struct {
 	Status  int
 	Reason  string
+	Cause   string
 	Message string
 }
 
@@ -39,6 +40,12 @@ func IsNotFound(err error) bool { return hasReason(err, ReasonNotFound) }
 
 // IsInsufficientCapacity reports whether err says the cloud had no capacity or quota for the requested offering.
 func IsInsufficientCapacity(err error) bool { return hasReason(err, ReasonInsufficientCapacity) }
+
+// IsQuotaExceeded reports whether err says a cloud quota refused the requested offering.
+func IsQuotaExceeded(err error) bool {
+	var apiErr *APIError
+	return IsInsufficientCapacity(err) && errors.As(err, &apiErr) && apiErr.Cause == CauseQuota
+}
 
 // Client calls the plugin's VM-per-NodeClaim API.
 type Client struct {
@@ -144,7 +151,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		apiErr := &APIError{Status: resp.StatusCode}
 		var parsed ErrorResponse
 		if json.Unmarshal(raw, &parsed) == nil && parsed.Reason != "" {
-			apiErr.Reason, apiErr.Message = parsed.Reason, parsed.Message
+			apiErr.Reason, apiErr.Cause, apiErr.Message = parsed.Reason, parsed.Cause, parsed.Message
 		} else {
 			apiErr.Reason, apiErr.Message = ReasonInternal, strings.TrimSpace(string(raw))
 		}

@@ -91,6 +91,10 @@ const (
 	ReasonInternal             = "Internal"
 )
 
+// CauseQuota is the cause of an InsufficientCapacity error that a cloud quota, rather than a shortage of capacity,
+// refused; it lasts until the account's usage drops or the quota is raised, so it outlives a capacity shortage.
+const CauseQuota = "Quota"
+
 // DefaultTokenAudience is the audience of the service account token a caller presents as a bearer token; the plugin
 // verifies it with a TokenReview and admits only the service accounts it allows.
 const DefaultTokenAudience = "cloudvm-plugin" //nolint:gosec // an audience name, not a credential
@@ -241,7 +245,9 @@ type Catalog struct {
 
 // ErrorResponse is the JSON body of every non-2xx response.
 type ErrorResponse struct {
-	Reason  string `json:"reason"`
+	Reason string `json:"reason"`
+	// Cause refines the reason, such as CauseQuota for an InsufficientCapacity error; empty when there is none.
+	Cause   string `json:"cause,omitempty"`
 	Message string `json:"message"`
 }
 
