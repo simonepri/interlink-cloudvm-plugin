@@ -61,6 +61,7 @@ type CloudProvider struct {
 	catalog     *catalogCache
 	unavailable *unavailableOfferings
 	poolFilter  labels.Selector
+	clock       clock.Clock
 	tracer      trace.Tracer
 }
 
@@ -75,6 +76,7 @@ func New(kubeClient client.Client, api nodeclaim.API, cfg *Config, clk clock.Clo
 		catalog:     newCatalogCache(api, clk, cfg.CatalogTTL.Duration, cfg.CatalogMaxStaleness.Duration),
 		unavailable: newUnavailableOfferings(clk, cfg.UnavailableOfferingTTL.Duration),
 		poolFilter:  labels.SelectorFromSet(cfg.NodePoolSelector),
+		clock:       clk,
 		tracer:      noop.NewTracerProvider().Tracer(TracerName),
 	}
 }
@@ -124,7 +126,10 @@ func (c *CloudProvider) instanceTypesFor(ctx context.Context, nodeClass *v1alpha
 	return c.instanceTypes(catalog, nodeClass)
 }
 
-// Create launches one VM for a launchable offering compatible with the NodeClaim, spread among the cheapest ones.
+// Create launches one VM for a launchable offering compatible with the NodeClaim, spread among the cheapest ones. When
+// the cloud refuses an offering for lack of capacity or quota, Create marks it unavailable and tries the next choice
+// itself, within the configured number of attempts and time, so a claim does not wait for another Karpenter round per
+// offering without capacity.
 func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *karpv1.NodeClaim, err error) {
 	called := time.Now()
 	defer func() { c.traceCreate(nc, called, out, err) }()
@@ -143,10 +148,37 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *
 		return nil, err
 	}
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nc.Spec.Requirements...)
-	chosen, ok := spreadOffering(compatibleOfferings(its, reqs), nc.Name, c.config.OfferingSpread)
-	if !ok {
-		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no launchable offering matches the nodeclaim requirements"))
+	candidates := compatibleOfferings(its, reqs)
+	deadline := c.clock.Now().Add(c.config.LaunchFallback.Timeout.Duration)
+	var refusal error
+	for attempt := 1; ; attempt++ {
+		// Offerings refused since the catalog was read, by this claim or a concurrent one, are no longer candidates.
+		candidates = slices.DeleteFunc(candidates, func(o candidate) bool {
+			return c.unavailable.IsUnavailable(o.it.Name, o.offering.Zone(), o.offering.CapacityType())
+		})
+		chosen, ok := spreadOffering(candidates, nc.Name, c.config.OfferingSpread)
+		if !ok {
+			if refusal != nil {
+				return nil, cloudprovider.NewInsufficientCapacityError(refusal)
+			}
+			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("no launchable offering matches the nodeclaim requirements"))
+		}
+		out, err = c.launch(ctx, nc, nodeClass, chosen)
+		if err == nil || !nodeclaim.IsInsufficientCapacity(err) {
+			return out, err
+		}
+		c.unavailable.MarkUnavailable(chosen.it.Name, chosen.offering.Zone(), chosen.offering.CapacityType())
+		candidates = slices.DeleteFunc(candidates, func(o candidate) bool { return o == chosen })
+		refusal = err
+		if attempt >= c.config.LaunchFallback.MaxAttempts || !c.clock.Now().Before(deadline) || ctx.Err() != nil {
+			return nil, cloudprovider.NewInsufficientCapacityError(refusal)
+		}
+		log.FromContext(ctx).V(1).Info("trying the next offering after a capacity refusal", "attempt", attempt, "error", err.Error())
 	}
+}
+
+// launch asks the plugin for a VM of the chosen offering for the NodeClaim.
+func (c *CloudProvider) launch(ctx context.Context, nc *karpv1.NodeClaim, nodeClass *v1alpha1.CloudVMNodeClass, chosen candidate) (*karpv1.NodeClaim, error) {
 	it, offering := chosen.it, chosen.offering
 	region := offering.Requirements.Get(corev1.LabelTopologyRegion).Any()
 	zone := offering.Zone()
@@ -169,15 +201,11 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *
 	}
 	created, err := c.api.Create(ctx, req)
 	if err != nil {
-		if nodeclaim.IsInsufficientCapacity(err) {
-			c.unavailable.MarkUnavailable(it.Name, zone, capacityType)
-			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("launching %s in %s (%s): %w", it.Name, zone, capacityType, err))
-		}
 		return nil, fmt.Errorf("launching %s in %s (%s): %w", it.Name, zone, capacityType, err)
 	}
 	log.FromContext(ctx).V(1).Info("launched cloudvm instance", "instance-type", it.Name, "zone", zone, "capacity-type", capacityType, "price", offering.Price, "provider-id", created.ProviderID)
 
-	out = c.toNodeClaim(created, it)
+	out := c.toNodeClaim(created, it)
 	resolved := resolvedLabels(it, offering)
 	maps.Copy(resolved, out.Labels)
 	out.Labels = resolved

@@ -29,6 +29,7 @@ type fakeAPI struct {
 	launchZone     string        // zone a claim without one lands in, as the cloud picks it
 	omitStorage    bool          // launched claims lack ephemeral-storage, as when the plugin has not read the VM's disk yet
 	refusalDelay   time.Duration // how long a capacity refusal takes, as EC2 answers a refusal slower than a launch
+	onRefusal      func()        // runs before each capacity refusal returns
 	nextID         int
 }
 
@@ -74,6 +75,9 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 	if f.capacityErrors[req.InstanceType+"/"+cmpZone(req)+"/"+req.CapacityType] {
 		f.mu.Unlock()
 		time.Sleep(f.refusalDelay)
+		if f.onRefusal != nil {
+			f.onRefusal()
+		}
 		f.mu.Lock()
 		return nil, &nodeclaim.APIError{Status: http.StatusServiceUnavailable, Reason: nodeclaim.ReasonInsufficientCapacity, Message: "no capacity"}
 	}
