@@ -59,20 +59,32 @@ type claimPod struct {
 
 // claimRecord is the persisted state of one NodeClaim's VM.
 type claimRecord struct {
-	Request      nodeclaim.CreateRequest `json:"request"`
-	InstanceID   string                  `json:"instanceId"`
-	Provider     ProviderType            `json:"provider"`
-	Region       string                  `json:"region"`
-	Zone         string                  `json:"zone,omitempty"`
-	InstanceType string                  `json:"instanceType"`
-	CapacityType string                  `json:"capacityType"`
-	IP           string                  `json:"ip,omitempty"`
-	Namespace    string                  `json:"namespace,omitempty"`
-	CreatedAt    time.Time               `json:"createdAt"`
-	Capacity     ResourceVector          `json:"capacity"`
+	Request    nodeclaim.CreateRequest `json:"request"`
+	InstanceID string                  `json:"instanceId"`
+	// ProviderID is the providerID the claim's Node and NodeClaim carry, empty for a claim persisted by an earlier
+	// release, which carries the legacy format; see claimRecord.providerID.
+	ProviderID   string         `json:"providerID,omitempty"`
+	Provider     ProviderType   `json:"provider"`
+	Region       string         `json:"region"`
+	Zone         string         `json:"zone,omitempty"`
+	InstanceType string         `json:"instanceType"`
+	CapacityType string         `json:"capacityType"`
+	IP           string         `json:"ip,omitempty"`
+	Namespace    string         `json:"namespace,omitempty"`
+	CreatedAt    time.Time      `json:"createdAt"`
+	Capacity     ResourceVector `json:"capacity"`
 	// EphemeralStorage is the size of the disk the VM keeps its containers on, empty until the provider reported it.
 	EphemeralStorage string              `json:"ephemeralStorage,omitempty"`
 	Pods             map[string]claimPod `json:"pods,omitempty"`
+}
+
+// providerID returns the providerID the claim was launched with. A Node's providerID never changes and Karpenter
+// matches NodeClaims to cloud instances by it, so a claim persisted by an earlier release keeps the legacy format.
+func (rec *claimRecord) providerID() string {
+	if rec.ProviderID != "" {
+		return rec.ProviderID
+	}
+	return nodeclaim.FormatLegacyProviderID(string(rec.Provider), rec.Region, rec.InstanceID)
 }
 
 // claimFlight lets concurrent creates of one claim wait for the first.
@@ -281,7 +293,7 @@ func (s *Server) claimView(rec *claimRecord) nodeclaim.NodeClaim {
 	slices.SortFunc(pods, func(a, b nodeclaim.PodRef) int { return strings.Compare(a.UID, b.UID) })
 	return nodeclaim.NodeClaim{
 		Name:         rec.Request.Name,
-		ProviderID:   nodeclaim.FormatProviderID(string(rec.Provider), rec.Region, rec.InstanceID),
+		ProviderID:   rec.providerID(),
 		InstanceType: rec.InstanceType,
 		Region:       rec.Region,
 		Zone:         rec.Zone,
@@ -430,6 +442,7 @@ func (s *Server) launchClaim(ctx context.Context, req *nodeclaim.CreateRequest) 
 	rec := &claimRecord{
 		Request:      *req,
 		InstanceID:   inst.ID,
+		ProviderID:   nodeclaim.FormatProviderID(string(inst.Provider), inst.Region, inst.ID),
 		Provider:     inst.Provider,
 		Region:       inst.Region,
 		Zone:         zone,

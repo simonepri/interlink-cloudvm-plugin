@@ -18,8 +18,14 @@ const (
 	PathCatalog = "/v1/catalog"
 )
 
-// ProviderIDScheme prefixes every providerID the plugin issues: cloudvm://<cloud>/<region>/<instance-id>.
+// ProviderIDScheme prefixes every providerID the plugin issues: cloudvm://<cloud>/<region>/<instance-id>/vm.
 const ProviderIDScheme = "cloudvm://"
+
+// providerIDSuffix ends every providerID the plugin issues so that its last path segment is not an instance ID. The
+// AWS cloud controller manager reads the last segment of any providerID that does not start with aws:// as an EC2
+// instance in its own account and deletes a NotReady Node whose instance it cannot find there, which would delete
+// the Node of every live VM whose workers run in another account or region while its Ready condition is not True.
+const providerIDSuffix = "/vm"
 
 // Capacity types a claim launches with, the values of the karpenter.sh/capacity-type label.
 const (
@@ -256,15 +262,22 @@ type API interface {
 
 // FormatProviderID builds the providerID of a VM.
 func FormatProviderID(cloud, region, instanceID string) string {
+	return FormatLegacyProviderID(cloud, region, instanceID) + providerIDSuffix
+}
+
+// FormatLegacyProviderID builds the providerID that claims launched by earlier releases carry, without the suffix;
+// such a claim keeps it because a Node's providerID never changes.
+func FormatLegacyProviderID(cloud, region, instanceID string) string {
 	return ProviderIDScheme + cloud + "/" + region + "/" + instanceID
 }
 
-// ParseProviderID splits a providerID into its cloud, region and instance ID.
+// ParseProviderID splits a providerID, current or legacy, into its cloud, region and instance ID.
 func ParseProviderID(providerID string) (cloud, region, instanceID string, err error) {
 	rest, ok := strings.CutPrefix(providerID, ProviderIDScheme)
+	rest = strings.TrimSuffix(rest, providerIDSuffix)
 	parts := strings.Split(rest, "/")
 	if !ok || len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return "", "", "", fmt.Errorf("providerID %q is not %s<cloud>/<region>/<instance-id>", providerID, ProviderIDScheme)
+		return "", "", "", fmt.Errorf("providerID %q is not %s<cloud>/<region>/<instance-id>%s", providerID, ProviderIDScheme, providerIDSuffix)
 	}
 	return parts[0], parts[1], parts[2], nil
 }

@@ -112,6 +112,36 @@ func TestClaimLaunchIsIdempotentAndReportsCapacity(t *testing.T) {
 	}
 }
 
+func TestClaimKeepsTheProviderIDItsNodeWasCreatedWith(t *testing.T) {
+	mock := NewMockProvider()
+	s, client, _ := newClaimServer(t, mock)
+	ctx := context.Background()
+	claim, err := client.Create(ctx, claimRequest("nc-new", "g5.xlarge"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cloud, region, instanceID, _ := nodeclaim.ParseProviderID(claim.ProviderID)
+	if want := nodeclaim.FormatProviderID(cloud, region, instanceID); claim.ProviderID != want {
+		t.Fatalf("new claim providerID = %q, want %q", claim.ProviderID, want)
+	}
+
+	// A claim persisted by an earlier release has no stored providerID; its Node and NodeClaim carry the legacy one.
+	rec, _ := s.claims.store.get("nc-new")
+	legacy := *rec
+	legacy.ProviderID = ""
+	_ = s.claims.store.set("nc-new", &legacy, false)
+	want := nodeclaim.FormatLegacyProviderID(cloud, region, instanceID)
+	if got, err := client.Get(ctx, "nc-new"); err != nil || got.ProviderID != want {
+		t.Fatalf("legacy claim = %+v, %v, want providerID %q", got, err, want)
+	}
+	if got, err := client.GetByProviderID(ctx, want); err != nil || got.Name != "nc-new" {
+		t.Fatalf("GetByProviderID(legacy) = %+v, %v", got, err)
+	}
+	if items, err := client.List(ctx); err != nil || len(items) != 1 || items[0].ProviderID != want {
+		t.Fatalf("List = %+v, %v, want the legacy providerID", items, err)
+	}
+}
+
 func TestClaimPodsShareTheClaimVM(t *testing.T) {
 	mock := NewMockProvider()
 	s, client, url := newClaimServer(t, mock)

@@ -22,7 +22,7 @@ func TestClientRoundTrip(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(NodeClaim{Name: gotCreate.Name, ProviderID: FormatProviderID("aws", "eu-west-1", "i-1")})
 	})
 	mux.HandleFunc("GET "+PathNodeClaims, func(w http.ResponseWriter, r *http.Request) {
-		items := []NodeClaim{{Name: "a", ProviderID: "cloudvm://aws/eu-west-1/i-1"}}
+		items := []NodeClaim{{Name: "a", ProviderID: "cloudvm://aws/eu-west-1/i-1/vm"}}
 		if id := r.URL.Query().Get("providerID"); id != "" && id != items[0].ProviderID {
 			items = nil
 		}
@@ -48,16 +48,16 @@ func TestClientRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	claim, err := c.Create(ctx, &CreateRequest{Name: "a", InstanceType: "g5.xlarge", Region: "eu-west-1", CapacityType: CapacityTypeSpot})
-	if err != nil || claim.ProviderID != "cloudvm://aws/eu-west-1/i-1" || gotCreate.InstanceType != "g5.xlarge" {
+	if err != nil || claim.ProviderID != "cloudvm://aws/eu-west-1/i-1/vm" || gotCreate.InstanceType != "g5.xlarge" {
 		t.Fatalf("Create = %+v, %v (sent %+v)", claim, err, gotCreate)
 	}
 	if items, err := c.List(ctx); err != nil || len(items) != 1 {
 		t.Fatalf("List = %v, %v", items, err)
 	}
-	if got, err := c.GetByProviderID(ctx, "cloudvm://aws/eu-west-1/i-1"); err != nil || got.Name != "a" {
+	if got, err := c.GetByProviderID(ctx, "cloudvm://aws/eu-west-1/i-1/vm"); err != nil || got.Name != "a" {
 		t.Fatalf("GetByProviderID = %+v, %v", got, err)
 	}
-	if _, err := c.GetByProviderID(ctx, "cloudvm://aws/eu-west-1/i-2"); !IsNotFound(err) {
+	if _, err := c.GetByProviderID(ctx, "cloudvm://aws/eu-west-1/i-2/vm"); !IsNotFound(err) {
 		t.Fatalf("GetByProviderID(missing) error = %v, want not found", err)
 	}
 	if _, err := c.Get(ctx, "b"); !IsNotFound(err) {
@@ -76,7 +76,7 @@ func TestProviderIDRoundTrip(t *testing.T) {
 	if err != nil || cloud != "gcp" || region != "us-central1" || id != "vm-1" {
 		t.Fatalf("ParseProviderID = %q %q %q %v", cloud, region, id, err)
 	}
-	for _, bad := range []string{"", "aws:///i-1", "cloudvm://aws/i-1", "kwok://a/b/c"} {
+	for _, bad := range []string{"", "aws:///i-1", "cloudvm://aws/i-1", "cloudvm://aws/r/i-1/x", "kwok://a/b/c"} {
 		if _, _, _, err := ParseProviderID(bad); err == nil {
 			t.Errorf("ParseProviderID(%q) succeeded", bad)
 		}
