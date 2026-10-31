@@ -26,7 +26,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.CatalogTTL.Duration != DefaultCatalogTTL || cfg.MaxPods != DefaultMaxPods || cfg.EphemeralStorage != DefaultEphemeralStorage ||
-		cfg.OfferingSpread != (OfferingSpread{PriceTolerance: DefaultSpreadPriceTolerance, MaxOfferings: DefaultSpreadMaxOfferings}) {
+		cfg.OfferingSpread != (OfferingSpread{PriceTolerance: DefaultSpreadPriceTolerance, MaxOfferings: DefaultSpreadMaxOfferings}) ||
+		cfg.LaunchFallback.MaxAttempts != DefaultLaunchMaxAttempts || cfg.LaunchFallback.Timeout.Duration != DefaultLaunchFallbackTimeout ||
+		cfg.QuotaExceededTTL.Duration != DefaultQuotaExceededTTL {
 		t.Fatalf("defaults not applied: %+v", cfg)
 	}
 }
@@ -96,6 +98,7 @@ func TestLoadConfigRejectsInvalid(t *testing.T) {
 		"bad selector":      `nodePoolSelector: {"bad key!": x}`,
 		"negative spread":   "offeringSpread: {priceTolerance: -0.1}",
 		"negative offers":   "offeringSpread: {maxOfferings: -1}",
+		"negative attempts": "launchFallback: {maxAttempts: -1}",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := LoadConfig(writeConfig(t, body)); err == nil {

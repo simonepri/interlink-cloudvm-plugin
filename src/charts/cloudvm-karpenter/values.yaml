@@ -71,9 +71,16 @@ config:
   offeringSpread:
     priceTolerance: 0.10
     maxOfferings: 4
+  # launchFallback makes one launch try the claim's next offering after the cloud refuses one for lack of capacity or
+  # quota, up to maxAttempts offerings and while less than timeout has passed, before Karpenter hears of the shortage.
+  launchFallback:
+    maxAttempts: 3
+    timeout: 60s
   catalogTTL: 60s
   catalogMaxStaleness: 15m
   unavailableOfferingTTL: 3m
+  # quotaExceededTTL is how long an offering stays unavailable after a cloud quota refused it.
+  quotaExceededTTL: 10m
   maxPods: 110
   ephemeralStorage: 100Gi
 

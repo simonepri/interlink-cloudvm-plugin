@@ -14,7 +14,7 @@ import (
 )
 
 // fakeAPI records calls and serves a fixed catalog; capacityErrors lists "type/zone/capacity" triples that fail
-// with InsufficientCapacity.
+// with InsufficientCapacity, and quotaErrors those that fail with it for a quota.
 type fakeAPI struct {
 	mu             sync.Mutex
 	catalog        nodeclaim.Catalog
@@ -24,16 +24,18 @@ type fakeAPI struct {
 	creates        []nodeclaim.CreateRequest
 	deletes        []string
 	capacityErrors map[string]bool
+	quotaErrors    map[string]bool
 	listErr        error
 	createErr      error
 	launchZone     string        // zone a claim without one lands in, as the cloud picks it
 	omitStorage    bool          // launched claims lack ephemeral-storage, as when the plugin has not read the VM's disk yet
 	refusalDelay   time.Duration // how long a capacity refusal takes, as EC2 answers a refusal slower than a launch
+	onRefusal      func()        // runs before each capacity refusal returns
 	nextID         int
 }
 
 func newFakeAPI(catalog nodeclaim.Catalog) *fakeAPI {
-	return &fakeAPI{catalog: catalog, claims: map[string]*nodeclaim.NodeClaim{}, capacityErrors: map[string]bool{}}
+	return &fakeAPI{catalog: catalog, claims: map[string]*nodeclaim.NodeClaim{}, capacityErrors: map[string]bool{}, quotaErrors: map[string]bool{}}
 }
 
 func (f *fakeAPI) Catalog(_ context.Context, regions []string) (*nodeclaim.Catalog, error) {
@@ -71,9 +73,15 @@ func (f *fakeAPI) Create(_ context.Context, req *nodeclaim.CreateRequest) (*node
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
+	if f.quotaErrors[req.InstanceType+"/"+cmpZone(req)+"/"+req.CapacityType] {
+		return nil, &nodeclaim.APIError{Status: http.StatusServiceUnavailable, Reason: nodeclaim.ReasonInsufficientCapacity, Cause: nodeclaim.CauseQuota, Message: "VcpuLimitExceeded"}
+	}
 	if f.capacityErrors[req.InstanceType+"/"+cmpZone(req)+"/"+req.CapacityType] {
 		f.mu.Unlock()
 		time.Sleep(f.refusalDelay)
+		if f.onRefusal != nil {
+			f.onRefusal()
+		}
 		f.mu.Lock()
 		return nil, &nodeclaim.APIError{Status: http.StatusServiceUnavailable, Reason: nodeclaim.ReasonInsufficientCapacity, Message: "no capacity"}
 	}

@@ -1,4 +1,4 @@
-// Tests of offering choice for a scale-up: claims spread across the cheapest offerings within the price tolerance.
+// Tests of offering choice for a scale-up: spread across the cheapest offerings, in-call fallback, quota memory.
 
 package cloudprovider
 
@@ -121,5 +121,94 @@ func TestSpreadOfferingIsStablePerClaim(t *testing.T) {
 		if again.offering.Zone() != first.offering.Zone() {
 			t.Fatalf("claim %s chose %s, then %s", nc.Name, first.offering.Zone(), again.offering.Zone())
 		}
+	}
+}
+
+func TestCreateFallsBackWithinTheCallUntilABatchSucceedsInOneRound(t *testing.T) {
+	h := scaleUpHarness(t, nil)
+	h.api.capacityErrors["g6.12xlarge/us-east-1/on-demand"] = true
+	h.api.capacityErrors["g6.12xlarge/us-east-2/on-demand"] = true
+	got := launchBatch(t, h, 40)
+	for name, region := range got {
+		switch region {
+		case "":
+			t.Errorf("%s failed; its Create should have tried the next offering", name)
+		case "ap-northeast-1":
+			t.Errorf("%s launched past the price tolerance of the cheapest offering with capacity", name)
+		}
+	}
+	creates := map[string]int{}
+	for _, c := range h.api.creates {
+		creates[c.Name]++
+	}
+	for name, n := range creates {
+		if n > DefaultLaunchMaxAttempts {
+			t.Errorf("%s tried %d offerings, more than the %d attempts", name, n, DefaultLaunchMaxAttempts)
+		}
+	}
+}
+
+func TestCreateReportsTheShortageAfterTheMaxAttempts(t *testing.T) {
+	h := scaleUpHarness(t, &Config{LaunchFallback: LaunchFallback{MaxAttempts: 2}})
+	for _, region := range scaleUpRegions {
+		h.api.capacityErrors["g6.12xlarge/"+region+"/on-demand"] = true
+	}
+	h.api.refusalDelay = 0
+	_, err := h.cp.Create(context.Background(), testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.12xlarge")))
+	if !cloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("err = %v, want InsufficientCapacityError", err)
+	}
+	if len(h.api.creates) != 2 {
+		t.Fatalf("plugin creates = %d, want 2", len(h.api.creates))
+	}
+	if h.api.creates[0].Region == h.api.creates[1].Region {
+		t.Fatalf("both attempts went to %s", h.api.creates[0].Region)
+	}
+}
+
+func TestCreateStartsNoAttemptAfterTheFallbackTimeout(t *testing.T) {
+	h := scaleUpHarness(t, nil)
+	h.api.capacityErrors["g6.12xlarge/us-east-1/on-demand"] = true
+	h.api.capacityErrors["g6.12xlarge/us-east-2/on-demand"] = true
+	h.api.refusalDelay = 0
+	h.api.onRefusal = func() { h.clock.Step(DefaultLaunchFallbackTimeout) }
+	nc := testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.12xlarge"), req(corev1.LabelTopologyRegion, "us-east-1", "us-east-2"))
+	if _, err := h.cp.Create(context.Background(), nc); !cloudprovider.IsInsufficientCapacityError(err) {
+		t.Fatalf("err = %v, want InsufficientCapacityError", err)
+	}
+	if len(h.api.creates) != 1 {
+		t.Fatalf("plugin creates = %d, want 1 once the timeout passed", len(h.api.creates))
+	}
+}
+
+func TestCreateRemembersAQuotaRefusalLongerThanACapacityRefusal(t *testing.T) {
+	h := scaleUpHarness(t, nil)
+	h.api.refusalDelay = 0
+	h.api.quotaErrors["g6.12xlarge/us-east-1/on-demand"] = true
+	h.api.capacityErrors["g6.12xlarge/us-east-2/on-demand"] = true
+	nc := testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.12xlarge"), req(corev1.LabelTopologyRegion, "us-east-1", "us-east-2", "us-west-2"))
+	if _, err := h.cp.Create(context.Background(), nc); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Step(DefaultUnavailableOfferingTTL)
+	if h.cp.unavailable.IsUnavailable("g6.12xlarge", "us-east-2", "on-demand") {
+		t.Error("the capacity refusal outlived the unavailable-offering TTL")
+	}
+	if !h.cp.unavailable.IsUnavailable("g6.12xlarge", "us-east-1", "on-demand") {
+		t.Error("the quota refusal expired with the capacity TTL")
+	}
+	h.clock.Step(DefaultQuotaExceededTTL - DefaultUnavailableOfferingTTL)
+	if h.cp.unavailable.IsUnavailable("g6.12xlarge", "us-east-1", "on-demand") {
+		t.Error("the quota refusal outlived the quota TTL")
+	}
+}
+
+func TestMarkUnavailableKeepsTheLongerRefusal(t *testing.T) {
+	h := scaleUpHarness(t, nil)
+	h.cp.unavailable.MarkUnavailable("g6.12xlarge", "us-east-1", "on-demand", DefaultQuotaExceededTTL)
+	h.cp.unavailable.MarkUnavailable("g6.12xlarge", "us-east-1", "on-demand", DefaultUnavailableOfferingTTL)
+	h.clock.Step(DefaultUnavailableOfferingTTL)
+	if !h.cp.unavailable.IsUnavailable("g6.12xlarge", "us-east-1", "on-demand") {
+		t.Fatal("a later capacity refusal shortened the quota refusal")
 	}
 }
