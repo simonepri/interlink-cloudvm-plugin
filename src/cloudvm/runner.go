@@ -58,6 +58,20 @@ type ContainerStatusResult struct {
 	FinishedAt     time.Time `json:"finishedAt,omitempty"`
 	NetworkRxBytes int64     `json:"networkRxBytes,omitempty"`
 	NetworkTxBytes int64     `json:"networkTxBytes,omitempty"`
+	// Timings tells when the runner reached each step of the container's start; older runners send none.
+	Timings *RunnerTimings `json:"timings,omitempty"`
+}
+
+// RunnerTimings are the runner's clock times of a container's start steps; a step not reached yet is zero.
+type RunnerTimings struct {
+	AcceptedAt     time.Time `json:"acceptedAt,omitzero"`
+	PullStartedAt  time.Time `json:"pullStartedAt,omitzero"`
+	PullFinishedAt time.Time `json:"pullFinishedAt,omitzero"`
+	// Image is the reference the runner pulled, which is a mirror's when the mirror served it.
+	Image        string `json:"image,omitempty"`
+	PullAttempts int    `json:"pullAttempts,omitempty"`
+	// LazyPull reports that the stargz snapshotter pulled the image, fetching its layers on first read.
+	LazyPull bool `json:"lazyPull,omitempty"`
 }
 
 // HostStatsResult encapsulates VM host-level telemetry from the in-VM runner.

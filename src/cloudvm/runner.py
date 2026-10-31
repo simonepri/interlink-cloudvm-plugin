@@ -38,6 +38,9 @@ pod_locks_guard = threading.Lock()
 starting_pods = set()
 start_failures = {}
 pull_failures = {}
+# pod_timings holds when each pod's start reached acceptedAt, pullStartedAt and pullFinishedAt, for the plugin's traces.
+pod_timings = {}
+pod_timings_guard = threading.Lock()
 host_config_lock = threading.Lock()
 DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)
 RUNNER_CONCURRENCY = int(os.environ.get("CLOUDVM_RUNNER_CONCURRENCY") or DEFAULT_RUNNER_CONCURRENCY)
@@ -175,6 +178,18 @@ def clean_time(value):
     if isinstance(value, str) and re.match(r'^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}:\d{2})$', value):
         return value
     return "0001-01-01T00:00:00Z"
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+def record_timing(uid, **fields):
+    with pod_timings_guard:
+        if uid in pod_timings:
+            pod_timings[uid].update(fields)
+
+def pod_timing(uid):
+    with pod_timings_guard:
+        return dict(pod_timings.get(uid) or {})
 
 def get_pod_lock(uid):
     with pod_locks_guard:
@@ -378,6 +393,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "networkRxBytes": rx_bytes,
                     "networkTxBytes": tx_bytes,
+                    "timings": pod_timing(pod_uid),
                 }
                 self.reply(200, json.dumps(resp))
                 return
@@ -416,6 +432,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "finishedAt": finished_at,
                         "networkRxBytes": rx_bytes,
                         "networkTxBytes": tx_bytes,
+                        "timings": pod_timing(pod_uid),
                     }
                     self.reply(200, json.dumps(resp))
                     return
@@ -435,6 +452,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "message": pull_error,
                         "networkRxBytes": rx_bytes,
                         "networkTxBytes": tx_bytes,
+                        "timings": pod_timing(pod_uid),
                     }
                     self.reply(200, json.dumps(resp))
                     return
@@ -475,6 +493,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
                     pull_failures.pop(pod_uid, None)
+                    with pod_timings_guard:
+                        pod_timings.pop(pod_uid, None)
                 container_name = f"cloudvm-{pod_uid}"
                 try:
                     subprocess.run([CONTAINER_CLI, 'stop', container_name], capture_output=True)
@@ -539,6 +559,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 starting_pods.add(pod_uid)
                 start_failures.pop(pod_uid, None)
                 pull_failures.pop(pod_uid, None)
+                with pod_timings_guard:
+                    pod_timings[pod_uid] = {"acceptedAt": now_iso()}
 
             original_image = str(req.get('image', ''))
             image = rewrite_image(original_image)
@@ -614,15 +636,20 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 # 1. Pull: try the mirrored reference, then the original, and back off exponentially while the pod stays Pending
                 delay = PULL_BACKOFF_START
                 lazy = True
+                attempts = 0
+                record_timing(uid, pullStartedAt=now_iso())
                 while True:
                     err_msg = "image pull failed"
                     for img in imgs:
+                        attempts += 1
                         err = pull_image(img, auth_cfg, lazy)
                         if err and lazy and re.search(r'unpack|snapshotter', err, re.I):
                             print(f"[cloudvm-runner] lazy pull of {img} for {uid} failed, retrying with the default snapshotter: {err}", flush=True)
                             lazy = False
+                            attempts += 1
                             err = pull_image(img, auth_cfg, lazy)
                         if err is None:
+                            record_timing(uid, pullFinishedAt=now_iso(), image=img, pullAttempts=attempts, lazyPull=lazy and bool(snapshotter_args()))
                             print(f"[cloudvm-runner] pulled {img} for {uid}" + (" (mirror failed, used upstream)" if img != imgs[0] else ""), flush=True)
                             c[idx] = img
                             if not lazy and c[1] == '--snapshotter=stargz':

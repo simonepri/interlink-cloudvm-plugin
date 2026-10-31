@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim/lifecycletrace"
 )
 
 func generateToken() (string, error) {
@@ -87,6 +88,7 @@ type Server struct {
 	claims                *claimRegistry                       // VMs launched for Karpenter NodeClaims
 	claimAuth             *claimAuthenticator                  // verifies NodeClaim API callers; nil refuses them all
 	podExistence          PodExistence                         // optional pod watch that frees claim VM pods whose pod is gone
+	lifecycle             *Lifecycle                           // traces, stage metrics and pod events of pod and VM starts
 }
 
 // NewServer initializes an InterLink Server with a default provider.
@@ -184,6 +186,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		}
 	}
 	s.nodeRegions = parseNodeRegions(os.Getenv("NODE_REGIONS"))
+	s.lifecycle = NewLifecycle(NewLifecycleMetrics(), s.podEventRecorder)
 	return s
 }
 
@@ -499,6 +502,15 @@ func (s *Server) SetPodEventRecorder(r PodEventRecorder) {
 	s.eventRecorder = r
 }
 
+func (s *Server) podEventRecorder() PodEventRecorder {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.eventRecorder
+}
+
+// Lifecycle returns the recorder of pod and VM starts.
+func (s *Server) Lifecycle() *Lifecycle { return s.lifecycle }
+
 // SetSecretResolver sets the Kubernetes secret resolver for imagePullSecrets.
 func (s *Server) SetSecretResolver(sr SecretResolver) {
 	s.mu.Lock()
@@ -658,7 +670,7 @@ func (s *Server) TerminateIdleNode(ctx context.Context, node *CloudVMNode) {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	// Standard InterLink REST provider endpoints
-	mux.HandleFunc("/create", s.handleCreate)
+	mux.HandleFunc("/create", s.lifecycle.metrics.countCreateResponses("pod", s.handleCreate))
 	mux.HandleFunc("/delete", s.handleDelete)
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/getLogs", s.handleGetLogs)
@@ -666,7 +678,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/pinglink", s.handleHealthz)
 
 	// Deprecated / compat endpoints
-	mux.HandleFunc("/pods/create", s.handleCreate)
+	mux.HandleFunc("/pods/create", s.lifecycle.metrics.countCreateResponses("pod", s.handleCreate))
 	mux.HandleFunc("/pods/delete", s.handleDelete)
 	mux.HandleFunc("/pods/status", s.handleStatus)
 
@@ -684,7 +696,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	// VM-per-NodeClaim API for a Karpenter cloud provider and the node agent
-	mux.HandleFunc(nodeclaim.PathNodeClaims, s.requireClaimCaller(s.handleNodeClaims))
+	mux.HandleFunc(nodeclaim.PathNodeClaims, s.lifecycle.metrics.countCreateResponses("nodeclaim", s.requireClaimCaller(s.handleNodeClaims)))
 	mux.HandleFunc(nodeclaim.PathNodeClaims+"/{name}", s.requireClaimCaller(s.handleNodeClaim))
 	mux.HandleFunc(nodeclaim.PathCatalog, s.requireClaimCaller(s.handleCatalog))
 
@@ -905,6 +917,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		s.inFlightCreates[spec.PodUID] = flight
 	}
 	s.mu.Unlock()
+	if isClaimPod {
+		s.lifecycle.PodAccepted(pod, spec, pod.Spec.NodeName, claimNode)
+	} else {
+		s.lifecycle.PodAccepted(pod, spec, "", nil)
+	}
 
 	if flight != nil {
 		defer func() {
@@ -990,7 +1007,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	launchCtx, launchCancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.LaunchTimeout())
 	defer launchCancel()
 
+	launchRequested := time.Now()
 	inst, err := prov.Launch(launchCtx, spec)
+	s.lifecycle.VMLaunched(lifecycletrace.ForPod(spec.PodUID), spec, "", launchRequested, inst, err)
 	if err != nil {
 		log.Printf("[cloudvm] Failed to launch VM for %s: %v", spec.PodName, err)
 		s.recordNamespaceFirewallEvent(launchCtx, spec, err)
@@ -1313,6 +1332,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	delete(s.completedPods, podName)
 	podCredentials := s.podCredentials
 	s.mu.Unlock()
+	s.lifecycle.PodDeleted(uid)
 	if podCredentials != nil {
 		podCredentials.Forget(uid)
 		podCredentials.Forget(pod.Metadata.UID)
@@ -1759,6 +1779,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 									}
 								}
 								cResult, err := s.runner.GetStatus(r.Context(), node, tgt.uid)
+								s.lifecycle.RunnerStatus(node, tgt.uid, cResult)
 								if err != nil {
 									s.logStatusError(tgt.uid, node.InstanceID, err)
 									status = s.unansweredStatus(tgt.uid, ContainerWaitingState{

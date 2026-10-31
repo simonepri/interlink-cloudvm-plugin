@@ -16,6 +16,7 @@ import (
 	_ "github.com/simonepri/interlink-cloudvm-plugin/karpenter/apis/v1alpha1" // registers the NodeClass kind
 	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/cloudprovider"
 	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/pluginclient"
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim/lifecycletrace"
 )
 
 func main() {
@@ -37,6 +38,14 @@ func main() {
 
 	ctx, op := operator.NewOperator()
 	undecorated := cloudprovider.New(op.GetClient(), api, cfg, op.Clock)
+	if endpoint := os.Getenv("CLOUDVM_OTLP_TRACES_ENDPOINT"); endpoint != "" {
+		tp, err := lifecycletrace.NewProvider(ctx, endpoint, "cloudvm-karpenter")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		undecorated.SetTracer(tp.Tracer(cloudprovider.TracerName))
+	}
 	cloudProvider := overlay.Decorate(undecorated, op.GetClient(), op.InstanceTypeStore)
 	repairPolicyMatcher := lo.Must(health.NewRepairPolicyMatcher(ctx, cloudProvider))
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))

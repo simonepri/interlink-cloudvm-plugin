@@ -4,8 +4,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -135,5 +137,16 @@ func TestOTLPLogForwarder_ExportsBatches(t *testing.T) {
 	}
 	if rec, n := c.find("c"); n != 1 || rec.resource["cloudvm.instance_id"] != "i-1" {
 		t.Errorf("collector record = %+v (%d)", rec, n)
+	}
+}
+
+func TestEncodeOTLPLogs_CarriesTheTraceID(t *testing.T) {
+	req := encodeOTLPLogs([]LogEntry{{Time: time.Unix(0, 1), Body: "x", TraceID: "0102030405060708090a0b0c0d0e0f10"}, {Time: time.Unix(0, 2), Body: "y"}})
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), `"traceId":"0102030405060708090a0b0c0d0e0f10"`); got != 1 {
+		t.Errorf("want the trace ID on the one record that has it, got %s", raw)
 	}
 }

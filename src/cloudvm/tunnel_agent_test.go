@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"math/big"
@@ -247,5 +248,40 @@ print(k("2024-01-01T00:00:00.123456789Z") < k("2024-01-01T00:00:00.5Z") < k("202
 `)
 	if want := "True\nTrue\n"; out != want {
 		t.Fatalf("log_time_key results = %q, want %q", out, want)
+	}
+}
+
+func TestTunnelAgent_BootMarksDecodeAsHandshakeBootPhases(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not available")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "agent.py"), []byte(tunnelAgentScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marks := filepath.Join(dir, "boot-marks")
+	if err := os.WriteFile(marks, []byte("os_boot 1700000000.25\nnot-a-mark\nrunner 1700000090.5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uptime := filepath.Join(dir, "uptime")
+	if err := os.WriteFile(uptime, []byte("120.00 400.00\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := "import json, sys; sys.path.insert(0, sys.argv[1]); import agent; print(json.dumps({'boot': agent.boot_marks(sys.argv[2], sys.argv[3])}))"
+	out, err := exec.Command(python, "-I", "-c", script, dir, marks, uptime).Output() //nolint:gosec // test-controlled arguments
+	if err != nil {
+		t.Fatalf("boot_marks: %v", err)
+	}
+	var req TunnelHandshakeRequest
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatalf("decode %s: %v", out, err)
+	}
+	got := req.BootMarks()
+	if len(got) != 3 || got[0].Phase != "instance_start" || got[1].Phase != "os_boot" || got[2].Phase != "runner" {
+		t.Fatalf("want instance_start then the bootstrap's marks, got %+v", got)
+	}
+	if want := time.Unix(1700000090, 5e8); !got[2].At.Equal(want) {
+		t.Errorf("runner mark at %s, want %s", got[2].At, want)
 	}
 }

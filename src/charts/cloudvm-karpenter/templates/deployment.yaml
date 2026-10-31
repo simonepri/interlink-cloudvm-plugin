@@ -64,6 +64,10 @@ spec:
               value: /etc/cloudvm-karpenter/config.yaml
             - name: CLOUDVM_PLUGIN_TOKEN_FILE
               value: /var/run/secrets/cloudvm-plugin/token
+            {{- if .Values.otlpTracesEndpoint }}
+            - name: CLOUDVM_OTLP_TRACES_ENDPOINT
+              value: {{ .Values.otlpTracesEndpoint | quote }}
+            {{- end }}
             - name: LEADER_ELECTION_NAME
               value: {{ .Values.leaderElectionName | quote }}
             - name: LEADER_ELECTION_NAMESPACE

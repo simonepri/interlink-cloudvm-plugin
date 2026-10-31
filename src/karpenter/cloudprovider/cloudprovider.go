@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -59,6 +61,7 @@ type CloudProvider struct {
 	catalog     *catalogCache
 	unavailable *unavailableOfferings
 	poolFilter  labels.Selector
+	tracer      trace.Tracer
 }
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -72,8 +75,15 @@ func New(kubeClient client.Client, api nodeclaim.API, cfg *Config, clk clock.Clo
 		catalog:     newCatalogCache(api, clk, cfg.CatalogTTL.Duration, cfg.CatalogMaxStaleness.Duration),
 		unavailable: newUnavailableOfferings(clk, cfg.UnavailableOfferingTTL.Duration),
 		poolFilter:  labels.SelectorFromSet(cfg.NodePoolSelector),
+		tracer:      noop.NewTracerProvider().Tracer(TracerName),
 	}
 }
+
+// TracerName is the instrumentation scope of the provider's lifecycle spans.
+const TracerName = "github.com/simonepri/interlink-cloudvm-plugin/karpenter"
+
+// SetTracer records each NodeClaim's wait for Create and its launch call in the claim's lifecycle trace.
+func (c *CloudProvider) SetTracer(t trace.Tracer) { c.tracer = t }
 
 // Name returns the provider name.
 func (c *CloudProvider) Name() string { return Name }
@@ -115,7 +125,9 @@ func (c *CloudProvider) instanceTypesFor(ctx context.Context, nodeClass *v1alpha
 }
 
 // Create launches one VM for the cheapest launchable offering compatible with the NodeClaim.
-func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
+func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *karpv1.NodeClaim, err error) {
+	called := time.Now()
+	defer func() { c.traceCreate(nc, called, out, err) }()
 	nodeClass, err := c.nodeClassFor(ctx, nc)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -164,7 +176,7 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (*karp
 	}
 	log.FromContext(ctx).V(1).Info("launched cloudvm instance", "instance-type", it.Name, "zone", zone, "capacity-type", capacityType, "price", offering.Price, "provider-id", created.ProviderID)
 
-	out := c.toNodeClaim(created, it)
+	out = c.toNodeClaim(created, it)
 	resolved := resolvedLabels(it, offering)
 	maps.Copy(resolved, out.Labels)
 	out.Labels = resolved

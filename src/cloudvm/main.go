@@ -17,6 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/pricing"
 	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
+	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim/lifecycletrace"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 func parseCommaList(val string) []string {
@@ -267,6 +269,15 @@ func run() error {
 	server.RegisterProvider(ProviderMock, mockProv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if endpoint := strings.TrimSpace(os.Getenv("CLOUDVM_OTLP_TRACES_ENDPOINT")); endpoint != "" {
+		tp, err := lifecycletrace.NewProvider(ctx, endpoint, "interlink-cloudvm-plugin")
+		if err != nil {
+			return err
+		}
+		defer shutdownTracerProvider(tp)
+		server.Lifecycle().SetTracerProvider(tp)
+		log.Printf("[cloudvm] Exporting pod and VM lifecycle traces to %s", endpoint) //nolint:gosec // configuration value
+	}
 	if pc, err := NewPodCredentialsFromEnv(ctx, awsRegion); err == nil {
 		server.SetPodCredentials(pc)
 		go server.RunPodCredentials(ctx)
@@ -449,6 +460,15 @@ func run() error {
 	}
 }
 
+// shutdownTracerProvider flushes the spans still queued for export.
+func shutdownTracerProvider(tp *sdktrace.TracerProvider) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tp.Shutdown(ctx); err != nil {
+		log.Printf("[cloudvm] Flushing lifecycle traces failed: %v", err)
+	}
+}
+
 // startTunnelGateway listens for worker reverse tunnels and routes every runner call through them; podWatch, when set,
 // attributes cluster ends of tcp streams to namespaces.
 // nodeWatchSyncTimeout bounds how long startup waits for the first node list.
@@ -546,6 +566,7 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 		IdentityValidator:  server.ValidateTunnelIdentity,
 		OnReject:           metrics.RecordRejection,
 		OnBootstrapRequest: metrics.RecordBootstrapRequest,
+		OnConnect:          server.Lifecycle().WorkerConnected,
 		LogSink:            server,
 		Resolver:           server.ResolveInstanceAddress,
 		DirectTCPNetworks:  directTCPNetworks,

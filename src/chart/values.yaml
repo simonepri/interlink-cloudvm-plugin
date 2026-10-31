@@ -73,6 +73,8 @@ registryMirrors: []
 otelEndpoint: ""
 # OTLP/HTTP collector URL that receives worker bootstrap, runner, and container logs; empty disables forwarding.
 otlpLogsEndpoint: ""
+# OTLP/HTTP collector URL that receives the plugin and node agent lifecycle traces; empty disables tracing.
+otlpTracesEndpoint: ""
 nodeProblemDetector:
   enabled: false
 # Pulls eStargz images lazily through the stargz snapshotter on workers; false pulls every image in full.

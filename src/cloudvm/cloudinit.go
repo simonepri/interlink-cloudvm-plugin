@@ -297,6 +297,9 @@ cloudvm_mirror() {
   done
 }
 exec > >(cloudvm_mirror /var/log/cloudvm-bootstrap.log) 2>&1
+# cloudvm_mark records when the boot phase in $1 ended; the tunnel agent reports the marks in its handshake.
+cloudvm_mark() { mkdir -p /run/cloudvm && printf '%s %s\n' "$1" "$(date +%s.%N)" >> /run/cloudvm/boot-marks; }
+cloudvm_mark os_boot
 echo "=== INTERLINK CLOUDVM BOOTSTRAP: $(date) ==="
 echo "CLOUDVM_STATUS: {\"status\": \"BOOTING\", \"pod\": \"{{.PodName}}\", \"region\": \"{{.Region}}\", \"type\": \"{{.InstanceType}}\"}" > /dev/console 2>/dev/null || true
 
@@ -437,6 +440,7 @@ fi
 
 # 3. Configure Multi-Cloud Spot Interruption Watcher (AWS IMDSv2 & GCP Metadata). Tunnel workers instead report notices to
 # the plugin through the spot watcher, so Ray drains the worker before the VM goes away.
+cloudvm_mark network
 {{if not .TunnelEndpoint}}
 cat << 'EOF' > /usr/local/bin/spot-monitor.sh
 #!/usr/bin/env bash
@@ -635,6 +639,7 @@ for i in $(seq 1 30); do
   sleep 1
 done
 {{end}}
+cloudvm_mark container_runtime
 
 {{if .OtelEndpoint}}
 # Configure OpenTelemetry host metrics forwarding
@@ -841,6 +846,7 @@ if command -v python3 >/dev/null 2>&1; then
   CLOUDVM_RUNNER_BIND="{{.RunnerBindAddress}}" CLOUDVM_RUNNER_CONCURRENCY="{{if .RunnerConcurrency}}{{.RunnerConcurrency}}{{end}}" \
     nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
+cloudvm_mark runner
 {{if .TunnelEndpoint}}
 # 5b. Reverse Tunnel Agent: dials the tunnel gateway outbound and carries every provider call to the local runner
 echo "[cloudvm-bootstrap] Starting reverse tunnel agent towards {{.TunnelEndpoint}}..."
