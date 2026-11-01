@@ -164,10 +164,6 @@ type InstanceSpec struct {
 	SecretVolumes []SecretVolume `json:"-"`
 	// RegistryMirrors specifies custom container registry mirror URLs.
 	RegistryMirrors []string `json:"registryMirrors,omitempty"`
-	// OtelEndpoint specifies the OpenTelemetry metrics/traces exporter target.
-	OtelEndpoint string `json:"otelEndpoint,omitempty"`
-	// NodeProblemDetector enables standalone node-problem-detector daemon on the VM.
-	NodeProblemDetector bool `json:"nodeProblemDetector,omitempty"`
 	// CustomBootstrapScript holds arbitrary bash or systemd bootstrap commands appended to cloud-init.
 	CustomBootstrapScript string `json:"customBootstrapScript,omitempty"`
 	// RunnerConcurrency specifies the max concurrent containers executed by runner.

@@ -61,8 +61,6 @@ type CloudInitConfig struct {
 	DockerConfigJSON       string
 	RegistryMirrors        []string
 	ImageMirrors           map[string]string
-	OtelEndpoint           string
-	NodeProblemDetector    bool
 	CustomBootstrapScript  string
 	IdleGracePeriodSeconds int `json:"idleGracePeriodSeconds,omitempty"`
 	RunnerConcurrency      int `json:"runnerConcurrency,omitempty"`
@@ -505,7 +503,7 @@ nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
   done
 ) &
 
-{{if or .NodeProblemDetector (not .UseNativeDLAMI)}}
+{{if not .UseNativeDLAMI}}
 # Container runtime: containerd, pinned nerdctl, and the stargz snapshotter for lazy pulls
 CLOUDVM_NERDCTL_VERSION="2.4.1"
 CLOUDVM_NERDCTL_SHA256="f6bbf02fd8a299cbcbc71a0bad113c1b63b3f33689bbb7d51b0fa98c6d361d5e"
@@ -655,136 +653,6 @@ for i in $(seq 1 30); do
 done
 {{end}}
 cloudvm_mark container_runtime
-
-{{if .OtelEndpoint}}
-# Configure OpenTelemetry host metrics forwarding
-echo "[cloudvm-bootstrap] Configuring OpenTelemetry metrics forwarder for {{.OtelEndpoint}}..."
-cat << 'OTEL_EOF' > /usr/local/bin/cloudvm-otel-forwarder.sh
-#!/usr/bin/env bash
-ENDPOINT="{{.OtelEndpoint}}"
-if [[ "$ENDPOINT" != http://* && "$ENDPOINT" != https://* ]]; then
-  TARGET_URL="http://${ENDPOINT}/v1/metrics"
-else
-  TARGET_URL="${ENDPOINT}/v1/metrics"
-fi
-
-while true; do
-  TIMESTAMP_NS=$(date +%s%N 2>/dev/null || echo "$(date +%s)000000000")
-  MEM_TOTAL=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-  MEM_AVAIL=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-  MEM_USED_KB=$(( MEM_TOTAL - MEM_AVAIL ))
-  if [ "$MEM_USED_KB" -lt 0 ]; then MEM_USED_KB=0; fi
-  LOAD_1M=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
-
-  read -r -d '' PAYLOAD << JSON_EOF
-{
-  "resourceMetrics": [
-    {
-      "resource": {
-        "attributes": [
-          {"key": "host.name", "value": {"stringValue": "$(hostname)"}},
-          {"key": "k8s.pod.name", "value": {"stringValue": "{{.PodName}}"}},
-          {"key": "service.name", "value": {"stringValue": "cloudvm-host"}}
-        ]
-      },
-      "scopeMetrics": [
-        {
-          "metrics": [
-            {
-              "name": "system.memory.usage",
-              "unit": "By",
-              "gauge": {
-                "dataPoints": [
-                  {"timeUnixNano": "${TIMESTAMP_NS}", "asInt": "$(( MEM_USED_KB * 1024 ))"}
-                ]
-              }
-            },
-            {
-              "name": "system.cpu.load_average.1m",
-              "unit": "1",
-              "gauge": {
-                "dataPoints": [
-                  {"timeUnixNano": "${TIMESTAMP_NS}", "asDouble": ${LOAD_1M:-0}}
-                ]
-              }
-            }
-          ]
-        }
-      }
-    }
-  ]
-}
-JSON_EOF
-
-  curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$TARGET_URL" --connect-timeout 2 --max-time 5 >/dev/null 2>&1 || true
-  sleep 15
-done
-OTEL_EOF
-chmod +x /usr/local/bin/cloudvm-otel-forwarder.sh
-
-cat << 'SERVICE_EOF' > /etc/systemd/system/cloudvm-otel.service
-[Unit]
-Description=CloudVM OpenTelemetry Host Metrics Forwarder
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment="OTEL_EXPORTER_OTLP_ENDPOINT={{.OtelEndpoint}}"
-ExecStart=/usr/local/bin/cloudvm-otel-forwarder.sh
-Restart=always
-RestartSec=15
-
-[Install]
-WantedBy=multi-user.target
-SERVICE_EOF
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl enable --now cloudvm-otel.service 2>/dev/null || true
-fi
-if ! systemctl is-active --quiet cloudvm-otel.service 2>/dev/null; then
-  nohup /usr/local/bin/cloudvm-otel-forwarder.sh > /var/log/cloudvm-otel.log 2>&1 &
-fi
-{{end}}
-
-{{if .NodeProblemDetector}}
-# Node Problem Detector (NPD) standalone mode
-echo "[cloudvm-bootstrap] Launching node-problem-detector standalone container..."
-mkdir -p /etc/node-problem-detector
-cat << 'NPD_GPU_EOF' > /etc/node-problem-detector/gpu-monitor.json
-{
-  "plugin": "kmsg",
-  "logPath": "/dev/kmsg",
-  "lookback": "5m",
-  "bufferSize": 10,
-  "source": "gpu-monitor",
-  "conditions": [
-    {
-      "type": "GPUProblem",
-      "reason": "GPUHealthy",
-      "message": "NVIDIA GPUs are functioning normally"
-    }
-  ],
-  "rules": [
-    {
-      "type": "permanent",
-      "condition": "GPUProblem",
-      "reason": "GPUFallenOffBus",
-      "pattern": ".*(GPU has fallen off the bus|RmInitAdapter failed|NVRM: Xid.*: (79|92)).*"
-    },
-    {
-      "type": "permanent",
-      "condition": "GPUProblem",
-      "reason": "GPUECCUncorrectableError",
-      "pattern": ".*(NVRM: Xid.*: (48|63|64)).*"
-    }
-  ]
-}
-NPD_GPU_EOF
-
-nerdctl run -d   --name node-problem-detector   --restart always   --net=host   --privileged   -v /dev:/dev   -v /dev/kmsg:/dev/kmsg   -v /var/log:/var/log:ro   -v /etc/node-problem-detector:/config/custom:ro   registry.k8s.io/node-problem-detector/node-problem-detector:v0.8.20   --enable-k8s-exporter=false   --address=0.0.0.0   --port=20256   --config.system-log-monitor=/config/kernel-monitor.json,/config/custom/gpu-monitor.json || true
-{{end}}
 
 {{if .UseNativeDLAMI}}
 # 5. Native DLAMI Mode (Fast PyTorch/Ray cold start ~20-30s)

@@ -1078,8 +1078,6 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		RunAsGroup:            spec.RunAsGroup,
 		DockerConfigJSON:      spec.DockerConfigJSON,
 		RegistryMirrors:       spec.RegistryMirrors,
-		OtelEndpoint:          spec.OtelEndpoint,
-		NodeProblemDetector:   spec.NodeProblemDetector,
 		CustomBootstrapScript: spec.CustomBootstrapScript,
 		RunnerConcurrency:     spec.RunnerConcurrency,
 		DisableLazyPulls:      spec.DisableLazyPulls,

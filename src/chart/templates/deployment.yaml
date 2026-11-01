@@ -154,10 +154,6 @@ spec:
             - name: REGISTRY_MIRRORS
               value: {{ join "," .Values.registryMirrors | quote }}
             {{- end }}
-            {{- if .Values.otelEndpoint }}
-            - name: OTEL_ENDPOINT
-              value: {{ .Values.otelEndpoint | quote }}
-            {{- end }}
             {{- if .Values.otlpLogsEndpoint }}
             - name: CLOUDVM_OTLP_LOGS_ENDPOINT
               value: {{ .Values.otlpLogsEndpoint | quote }}
@@ -165,10 +161,6 @@ spec:
             {{- if .Values.otlpTracesEndpoint }}
             - name: CLOUDVM_OTLP_TRACES_ENDPOINT
               value: {{ .Values.otlpTracesEndpoint | quote }}
-            {{- end }}
-            {{- if and .Values.nodeProblemDetector .Values.nodeProblemDetector.enabled }}
-            - name: ENABLE_NPD
-              value: "true"
             {{- end }}
             {{- if eq (toString .Values.lazyImagePulls) "false" }}
             - name: LAZY_IMAGE_PULLS

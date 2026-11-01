@@ -225,12 +225,6 @@ func run() error {
 	if mirrors := os.Getenv("REGISTRY_MIRRORS"); mirrors != "" {
 		server.SetRegistryMirrors(parseCommaList(mirrors))
 	}
-	if otel := os.Getenv("OTEL_ENDPOINT"); otel != "" {
-		server.SetOtelEndpoint(otel)
-	}
-	if npd := os.Getenv("ENABLE_NPD"); npd == "true" || npd == "1" {
-		server.SetEnableNPD(true)
-	}
 	if script := os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT"); script != "" {
 		server.SetCustomBootstrapScript(script)
 	}
