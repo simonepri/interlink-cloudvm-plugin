@@ -1,5 +1,6 @@
 // Tests that served Nodes carry what Karpenter expects (providerID, labels, the unregistered taint, GPU capacity,
-// Ready once the VM is up) and that Nodes follow their claims' lifecycle without reasserting taints.
+// Ready once the VM is up) and that Nodes follow their claims' lifecycle without reasserting taints or erasing the
+// conditions and labels other controllers write.
 
 package main
 
@@ -289,5 +290,73 @@ func TestNodeIsNotReadyWhenClaimIsUnhealthy(t *testing.T) {
 		if c.Type == corev1.NodeReady && c.Reason != reasonVMUnhealthy {
 			t.Fatalf("Ready reason = %q, want %q", c.Reason, reasonVMUnhealthy)
 		}
+	}
+}
+
+// TestNodeKeepsOtherWritersConditionsAndLabels checks that the agent's status heartbeats, claim-driven status changes
+// and a restart of the agent keep the conditions and labels other controllers wrote, such as node-problem-detector's
+// GPU conditions and GPU feature discovery's labels, while the agent still updates its own Ready condition.
+func TestNodeKeepsOtherWritersConditionsAndLabels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	kube := fake.NewClientset()
+	claims := newFakeClaims(gpuClaim("vm-x", nodeclaim.StateLaunching))
+	m := testManager(claims, kube)
+	m.Sync(ctx)
+	waitFor(t, "node creation", func() bool { return getNode(t, kube, "vm-x") != nil })
+
+	external := map[string]string{
+		"nvidia.com/gpu.product":                      "NVIDIA-A10G",
+		"feature.node.kubernetes.io/pci-10de.present": "true",
+	}
+	n := getNode(t, kube, "vm-x")
+	for k, v := range external {
+		n.Labels[k] = v
+	}
+	n, err := kube.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type: "GPUProblem", Status: corev1.ConditionTrue, Reason: "XidError", Message: "Xid 79 on GPU 0",
+	})
+	if _, err := kube.CoreV1().Nodes().UpdateStatus(ctx, n, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	keeps := func(n *corev1.Node) bool {
+		for k, v := range external {
+			if n.Labels[k] != v {
+				t.Errorf("label %s = %q, want %q", k, n.Labels[k], v)
+				return false
+			}
+		}
+		for _, c := range n.Status.Conditions {
+			if c.Type == "GPUProblem" && c.Status == corev1.ConditionTrue && c.Reason == "XidError" {
+				return true
+			}
+		}
+		t.Errorf("conditions = %v, want the external GPUProblem condition", n.Status.Conditions)
+		return false
+	}
+
+	// The claim turns Running, which replaces the agent's status, and several heartbeats follow.
+	claims.set(gpuClaim("vm-x", nodeclaim.StateRunning))
+	m.Sync(ctx)
+	waitFor(t, "Ready=True", func() bool { return readyStatus(getNode(t, kube, "vm-x")) == corev1.ConditionTrue })
+	time.Sleep(200 * time.Millisecond)
+	if !keeps(getNode(t, kube, "vm-x")) {
+		t.Fatal("a status update erased another writer's condition or label")
+	}
+
+	// A restarted agent serves the existing Node again.
+	m.stopAll()
+	claims.set(gpuClaim("vm-x", nodeclaim.StateUnhealthy))
+	m = testManager(claims, kube)
+	m.Sync(ctx)
+	defer m.stopAll()
+	waitFor(t, "Ready=False", func() bool { return readyStatus(getNode(t, kube, "vm-x")) == corev1.ConditionFalse })
+	time.Sleep(200 * time.Millisecond)
+	if !keeps(getNode(t, kube, "vm-x")) {
+		t.Fatal("the restarted agent erased another writer's condition or label")
 	}
 }
