@@ -353,7 +353,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	pc, err := node.NewPodController(node.PodControllerConfig{
 		PodClient:         a.cfg.Kube.CoreV1(),
-		PodInformer:       podInformer,
+		PodInformer:       controllerPodInformer{podInformer},
 		EventRecorder:     broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "cloudvm-node-agent"}),
 		Provider:          a.Pods,
 		SecretInformer:    getSecretInformer{client: a.cfg.Kube},

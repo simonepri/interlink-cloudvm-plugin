@@ -1,5 +1,5 @@
 // Tests that pod statuses carry the runtime's container IDs and init container states as a kubelet reports them, and
-// that pod and host IP fieldRefs reach the plugin unresolved.
+// that pod and host IP fieldRefs stay hidden from the pod controller and reach the plugin unresolved.
 
 package main
 
@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/cache"
 
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -50,6 +51,40 @@ func TestApplyStatusReportsContainerIDsAndInitContainers(t *testing.T) {
 	}
 }
 
+func TestPodControllerSeesNoPodIPFieldRefs(t *testing.T) {
+	ipRef := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.hostIP"}}
+	plain := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "plain", Namespace: "team-a"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Env: []corev1.EnvVar{{Name: "A", Value: "b"}}}}}}
+	withIP := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ip", Namespace: "team-a"},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: "init", Env: []corev1.EnvVar{{Name: "HOST_IP", ValueFrom: ipRef}}}},
+			Containers:     []corev1.Container{{Name: "main", Env: []corev1.EnvVar{{Name: "A", Value: "b"}, {Name: "HOST_IP", ValueFrom: ipRef}}}},
+		}}
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, pod := range []*corev1.Pod{plain, withIP} {
+		if err := indexer.Add(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lister := controllerPodLister{corev1listers.NewPodLister(indexer)}
+	got, err := lister.Pods("team-a").Get("ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Spec.InitContainers[0].Env) != 0 || len(got.Spec.Containers[0].Env) != 1 || got.Spec.Containers[0].Env[0].Name != "A" {
+		t.Fatalf("the pod controller sees %+v, want the host IP variables gone", got.Spec)
+	}
+	if len(withIP.Spec.Containers[0].Env) != 2 {
+		t.Fatal("hiding the variables changed the informer's copy")
+	}
+	if same, _ := lister.Pods("team-a").Get("plain"); same != plain {
+		t.Fatal("a pod without host IP variables is not copied")
+	}
+	if all, err := lister.List(labels.Everything()); err != nil || len(all) != 2 {
+		t.Fatalf("list = %v, %v", all, err)
+	}
+}
+
 func TestCreateKeepsPodIPFieldRefsForThePlugin(t *testing.T) {
 	ipRef := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}
 	orig := &corev1.Pod{
@@ -66,7 +101,7 @@ func TestCreateKeepsPodIPFieldRefsForThePlugin(t *testing.T) {
 	p.SetPodCache(corev1listers.NewPodLister(indexer), func() bool { return true })
 
 	resolved := orig.DeepCopy()
-	resolved.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "NAME", Value: "p"}, {Name: "POD_IP", Value: ""}}
+	resolved.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "NAME", Value: "p"}}
 	got := p.withHostIPFieldRefs(resolved).Spec.Containers[0].Env
 	if len(got) != 2 || got[0].Value != "p" || got[0].ValueFrom != nil || got[1].ValueFrom == nil || got[1].ValueFrom.FieldRef.FieldPath != "status.podIP" {
 		t.Fatalf("env = %+v, want NAME resolved and POD_IP left to the plugin", got)
