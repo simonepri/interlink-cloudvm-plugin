@@ -3,8 +3,11 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/pelletier/go-toml"
 )
 
 func TestStargzConfigTOML_MirrorsDockerHubPulls(t *testing.T) {
@@ -118,5 +121,70 @@ func TestServerDefaults_LazyImagePullsEnv(t *testing.T) {
 		if got := s.BuildCloudInitConfig(&InstanceSpec{}).DisableLazyPulls; got != disabled {
 			t.Errorf("LAZY_IMAGE_PULLS=%q: BuildCloudInitConfig DisableLazyPulls=%v, want %v", env, got, disabled)
 		}
+	}
+}
+
+// stargzSnapshotterConfig mirrors the fields of the stargz snapshotter's config that operators tune and the plugin
+// writes, with the snapshotter's own TOML tags.
+type stargzSnapshotterConfig struct {
+	MaxConcurrency     int64 `toml:"max_concurrency"`
+	PrefetchTimeoutSec int64 `toml:"prefetch_timeout_sec"`
+	PrefetchAsyncSize  int64 `toml:"prefetch_async_size"`
+	Blob               struct {
+		ChunkSize            int64 `toml:"chunk_size"`
+		PrefetchChunkSize    int64 `toml:"prefetch_chunk_size"`
+		ForceSingleRangeMode bool  `toml:"force_single_range_mode"`
+	} `toml:"blob"`
+	Resolver struct {
+		Host map[string]struct {
+			Mirrors []struct {
+				Host     string `toml:"host"`
+				Insecure bool   `toml:"insecure"`
+			} `toml:"mirrors"`
+		} `toml:"host"`
+	} `toml:"resolver"`
+}
+
+// TestStargzConfigTOML_ParsesWithOperatorTables loads the rendered config with go-toml v1, the parser the pinned
+// snapshotter loads its config with, so a table the operator and the plugin both declared would fail here as it
+// would fail the snapshotter's start. The plugin writes only entries of the Docker Hub mirrors array, which join any
+// mirrors the operator lists.
+func TestStargzConfigTOML_ParsesWithOperatorTables(t *testing.T) {
+	cfg := CloudInitConfig{
+		StargzConfig: `max_concurrency = 16
+prefetch_timeout_sec = 120
+prefetch_async_size = 0
+
+[blob]
+chunk_size = 67108864
+prefetch_chunk_size = 134217728
+force_single_range_mode = true
+
+[[resolver.host."docker.io".mirrors]]
+host = "operator.example.com"
+`,
+		RegistryMirrors: []string{"https://mirror.gcr.io", "http://cache.example.internal:5000"},
+	}
+	tree, err := toml.Load(cfg.StargzConfigTOML())
+	if err != nil {
+		t.Fatalf("rendered config is not valid TOML: %v\n%s", err, cfg.StargzConfigTOML())
+	}
+	var got stargzSnapshotterConfig
+	if err := tree.Unmarshal(&got); err != nil {
+		t.Fatalf("unmarshal rendered config: %v", err)
+	}
+	if got.MaxConcurrency != 16 || got.PrefetchTimeoutSec != 120 || got.PrefetchAsyncSize != 0 {
+		t.Errorf("top-level tuning = %+v", got)
+	}
+	if got.Blob.ChunkSize != 67108864 || got.Blob.PrefetchChunkSize != 134217728 || !got.Blob.ForceSingleRangeMode {
+		t.Errorf("[blob] = %+v", got.Blob)
+	}
+	var hosts []string
+	for _, m := range got.Resolver.Host["docker.io"].Mirrors {
+		hosts = append(hosts, fmt.Sprintf("%s insecure=%v", m.Host, m.Insecure))
+	}
+	want := []string{"operator.example.com insecure=false", "mirror.gcr.io insecure=false", "cache.example.internal:5000 insecure=true"}
+	if strings.Join(hosts, ",") != strings.Join(want, ",") {
+		t.Errorf("docker.io mirrors = %v, want %v", hosts, want)
 	}
 }

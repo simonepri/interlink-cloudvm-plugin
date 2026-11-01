@@ -242,8 +242,10 @@ func (c *CloudInitConfig) RegistryMirrorsJSON() string {
 }
 
 // StargzConfigTOML returns the stargz snapshotter config: the operator's StargzConfig, such as fetch and prefetch
-// tuning, then the Docker Hub mirrors normal pulls use for lazy fetches. Fetches authenticate through the host docker
-// config, whose ECR credential helper mints a fresh token for each fetch.
+// tuning, then the Docker Hub mirrors normal pulls use for lazy fetches. The plugin writes only entries of the
+// [[resolver.host."docker.io".mirrors]] array, which join any the operator lists, so the operator may declare any
+// table without a duplicate that would stop the snapshotter. Fetches authenticate through the host docker config,
+// whose ECR credential helper mints a fresh token for each fetch.
 func (c *CloudInitConfig) StargzConfigTOML() string {
 	var b strings.Builder
 	if extra := strings.TrimSpace(c.StargzConfig); extra != "" {

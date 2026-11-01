@@ -17,6 +17,7 @@ require (
 	github.com/aws/smithy-go v1.28.7
 	github.com/hashicorp/yamux v0.1.2
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/pelletier/go-toml v1.9.5
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/simonepri/interlink-cloudvm-plugin/nodeclaim v0.0.0
