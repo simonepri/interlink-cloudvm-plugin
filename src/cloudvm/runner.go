@@ -44,10 +44,6 @@ type StartContainerRequest struct {
 	SecretVolumes    []SecretVolume    `json:"secretVolumes,omitempty"`
 	// AWSCredentials is set when the pod's service account has an IAM role; the runner then serves its credentials.
 	AWSCredentials *PodAWSCredentials `json:"awsCredentials,omitempty"`
-	// NodeName is the Kubernetes node the pod is bound to.
-	NodeName string `json:"nodeName,omitempty"`
-	// PodLabels are the pod's labels; a profiled worker's runner exposes the ones its profiler reads to it.
-	PodLabels map[string]string `json:"podLabels,omitempty"`
 }
 
 // ContainerStatusResult encapsulates container execution telemetry from the in-VM runner.

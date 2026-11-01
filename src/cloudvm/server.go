@@ -70,10 +70,7 @@ type Server struct {
 	completedStore        *CompletedStore
 	tombstoneStore        *TombstoneStore
 	registryMirrors       []string
-	otelEndpoint          string
-	enableNPD             bool
 	disableLazyPulls      bool
-	profiling             *WorkerProfiling
 	customBootstrapScript string
 	runnerConcurrency     int
 	launchTimeout         time.Duration
@@ -181,8 +178,6 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 		}
 	}
 	s.registryMirrors = regMirrors
-	s.otelEndpoint = os.Getenv("OTEL_ENDPOINT")
-	s.enableNPD = os.Getenv("ENABLE_NPD") == "true" || os.Getenv("ENABLE_NPD") == "1"
 	s.disableLazyPulls = os.Getenv("LAZY_IMAGE_PULLS") == "false" || os.Getenv("LAZY_IMAGE_PULLS") == "0"
 	s.customBootstrapScript = os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT")
 	if raw := os.Getenv("MAX_RUNNER_CONCURRENCY"); raw != "" {
@@ -280,27 +275,6 @@ func (s *Server) SetRegistryMirrors(mirrors []string) {
 	s.registryMirrors = mirrors
 }
 
-// SetOtelEndpoint configures default OpenTelemetry collector endpoint.
-func (s *Server) SetOtelEndpoint(endpoint string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.otelEndpoint = endpoint
-}
-
-// SetProfiling makes every VM the plugin launches run parca-agent with profiling; nil leaves VMs unprofiled.
-func (s *Server) SetProfiling(profiling *WorkerProfiling) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.profiling = profiling
-}
-
-// SetEnableNPD enables or disables Node Problem Detector on provisioned VMs.
-func (s *Server) SetEnableNPD(enabled bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.enableNPD = enabled
-}
-
 // SetCustomBootstrapScript sets a custom bootstrap script appended to cloud-init.
 func (s *Server) SetCustomBootstrapScript(script string) {
 	s.mu.Lock()
@@ -345,24 +319,6 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 	if len(mirrors) == 0 && s != nil {
 		s.mu.RLock()
 		mirrors = s.registryMirrors
-		s.mu.RUnlock()
-	}
-	otel := spec.OtelEndpoint
-	if otel == "" && s != nil {
-		s.mu.RLock()
-		otel = s.otelEndpoint
-		s.mu.RUnlock()
-	}
-	npd := spec.NodeProblemDetector
-	if !npd && s != nil {
-		s.mu.RLock()
-		npd = s.enableNPD
-		s.mu.RUnlock()
-	}
-	profiling := spec.Profiling
-	if profiling == nil && s != nil {
-		s.mu.RLock()
-		profiling = s.profiling
 		s.mu.RUnlock()
 	}
 	script := spec.CustomBootstrapScript
@@ -410,12 +366,9 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		RunAsGroup:            spec.RunAsGroup,
 		DockerConfigJSON:      spec.DockerConfigJSON,
 		RegistryMirrors:       mirrors,
-		OtelEndpoint:          otel,
-		NodeProblemDetector:   npd,
 		CustomBootstrapScript: script,
 		RunnerConcurrency:     rc,
 		DisableLazyPulls:      spec.DisableLazyPulls || (s != nil && s.disableLazyPulls),
-		Profiling:             profiling,
 	}
 }
 
@@ -782,17 +735,8 @@ func (s *Server) applyServerDefaults(spec *InstanceSpec) {
 	if len(spec.RegistryMirrors) == 0 && len(s.registryMirrors) > 0 {
 		spec.RegistryMirrors = s.registryMirrors
 	}
-	if spec.OtelEndpoint == "" && s.otelEndpoint != "" {
-		spec.OtelEndpoint = s.otelEndpoint
-	}
-	if !spec.NodeProblemDetector && s.enableNPD {
-		spec.NodeProblemDetector = true
-	}
 	if s.disableLazyPulls {
 		spec.DisableLazyPulls = true
-	}
-	if spec.Profiling == nil && s.profiling != nil {
-		spec.Profiling = s.profiling
 	}
 	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
 		spec.CustomBootstrapScript = s.customBootstrapScript
@@ -1113,8 +1057,6 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Namespace:        spec.PodNamespace,
 		PodName:          spec.PodName,
 		ContainerName:    cName,
-		NodeName:         pod.Spec.NodeName,
-		PodLabels:        pod.Metadata.Labels,
 		Image:            spec.TargetContainerImage,
 		Command:          spec.Command,
 		Args:             spec.Args,
@@ -1252,8 +1194,6 @@ func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus 
 		Namespace:        spec.PodNamespace,
 		PodName:          spec.PodName,
 		ContainerName:    cName,
-		NodeName:         pod.Spec.NodeName,
-		PodLabels:        pod.Metadata.Labels,
 		Image:            spec.TargetContainerImage,
 		Command:          spec.Command,
 		Args:             spec.Args,

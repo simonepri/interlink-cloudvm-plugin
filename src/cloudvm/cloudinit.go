@@ -61,8 +61,6 @@ type CloudInitConfig struct {
 	DockerConfigJSON       string
 	RegistryMirrors        []string
 	ImageMirrors           map[string]string
-	OtelEndpoint           string
-	NodeProblemDetector    bool
 	CustomBootstrapScript  string
 	IdleGracePeriodSeconds int `json:"idleGracePeriodSeconds,omitempty"`
 	RunnerConcurrency      int `json:"runnerConcurrency,omitempty"`
@@ -71,8 +69,6 @@ type CloudInitConfig struct {
 	NodeClaim bool `json:"nodeClaim,omitempty"`
 	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
-	// Profiling runs parca-agent on a tunnel worker, uploading through the tunnel; nil leaves the VM unprofiled.
-	Profiling *WorkerProfiling `json:"-"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -172,34 +168,6 @@ func stripPythonComments(src string) string {
 		}
 	}
 	return strings.Join(kept, "\n")
-}
-
-// profilesSocket is where the tunnel agent accepts the host profiler's connections to the gateway's profiles relay.
-const profilesSocket = "/run/cloudvm-profiles/profiles.sock"
-
-// ProfilesSocket returns the Unix socket the host profiler uploads through.
-func (c *CloudInitConfig) ProfilesSocket() string {
-	return profilesSocket
-}
-
-// ParcaAgentFlags returns the parca-agent flags of the worker's systemd unit: uploads through the tunnel agent's socket,
-// the process variables that carry pod metadata, and the operator's flags, with systemd's % specifiers escaped.
-func (c *CloudInitConfig) ParcaAgentFlags() string {
-	if c.Profiling == nil {
-		return ""
-	}
-	flags := []string{
-		"--config-path=/etc/parca-agent/parca-agent.yaml",
-		"--remote-store-address=unix://" + profilesSocket,
-		"--remote-store-insecure",
-		"--http-address=127.0.0.1:7071",
-		"--instrument-cuda-launch=${CLOUDVM_CUDA_LAUNCH}",
-	}
-	for _, v := range c.Profiling.EnvVars() {
-		flags = append(flags, "--include-env-var="+v)
-	}
-	flags = append(flags, c.Profiling.Args...)
-	return strings.ReplaceAll(strings.Join(flags, " "), "%", "%%")
 }
 
 // RunnerBindAddress returns the interface the in-VM runner listens on: loopback when only the tunnel agent may reach it.
@@ -535,7 +503,7 @@ nohup /usr/local/bin/spot-monitor.sh > /var/log/spot-monitor.log 2>&1 &
   done
 ) &
 
-{{if or .NodeProblemDetector (not .UseNativeDLAMI)}}
+{{if not .UseNativeDLAMI}}
 # Container runtime: containerd, pinned nerdctl, and the stargz snapshotter for lazy pulls
 CLOUDVM_NERDCTL_VERSION="2.4.1"
 CLOUDVM_NERDCTL_SHA256="f6bbf02fd8a299cbcbc71a0bad113c1b63b3f33689bbb7d51b0fa98c6d361d5e"
@@ -686,136 +654,6 @@ done
 {{end}}
 cloudvm_mark container_runtime
 
-{{if .OtelEndpoint}}
-# Configure OpenTelemetry host metrics forwarding
-echo "[cloudvm-bootstrap] Configuring OpenTelemetry metrics forwarder for {{.OtelEndpoint}}..."
-cat << 'OTEL_EOF' > /usr/local/bin/cloudvm-otel-forwarder.sh
-#!/usr/bin/env bash
-ENDPOINT="{{.OtelEndpoint}}"
-if [[ "$ENDPOINT" != http://* && "$ENDPOINT" != https://* ]]; then
-  TARGET_URL="http://${ENDPOINT}/v1/metrics"
-else
-  TARGET_URL="${ENDPOINT}/v1/metrics"
-fi
-
-while true; do
-  TIMESTAMP_NS=$(date +%s%N 2>/dev/null || echo "$(date +%s)000000000")
-  MEM_TOTAL=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-  MEM_AVAIL=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-  MEM_USED_KB=$(( MEM_TOTAL - MEM_AVAIL ))
-  if [ "$MEM_USED_KB" -lt 0 ]; then MEM_USED_KB=0; fi
-  LOAD_1M=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
-
-  read -r -d '' PAYLOAD << JSON_EOF
-{
-  "resourceMetrics": [
-    {
-      "resource": {
-        "attributes": [
-          {"key": "host.name", "value": {"stringValue": "$(hostname)"}},
-          {"key": "k8s.pod.name", "value": {"stringValue": "{{.PodName}}"}},
-          {"key": "service.name", "value": {"stringValue": "cloudvm-host"}}
-        ]
-      },
-      "scopeMetrics": [
-        {
-          "metrics": [
-            {
-              "name": "system.memory.usage",
-              "unit": "By",
-              "gauge": {
-                "dataPoints": [
-                  {"timeUnixNano": "${TIMESTAMP_NS}", "asInt": "$(( MEM_USED_KB * 1024 ))"}
-                ]
-              }
-            },
-            {
-              "name": "system.cpu.load_average.1m",
-              "unit": "1",
-              "gauge": {
-                "dataPoints": [
-                  {"timeUnixNano": "${TIMESTAMP_NS}", "asDouble": ${LOAD_1M:-0}}
-                ]
-              }
-            }
-          ]
-        }
-      }
-    }
-  ]
-}
-JSON_EOF
-
-  curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$TARGET_URL" --connect-timeout 2 --max-time 5 >/dev/null 2>&1 || true
-  sleep 15
-done
-OTEL_EOF
-chmod +x /usr/local/bin/cloudvm-otel-forwarder.sh
-
-cat << 'SERVICE_EOF' > /etc/systemd/system/cloudvm-otel.service
-[Unit]
-Description=CloudVM OpenTelemetry Host Metrics Forwarder
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment="OTEL_EXPORTER_OTLP_ENDPOINT={{.OtelEndpoint}}"
-ExecStart=/usr/local/bin/cloudvm-otel-forwarder.sh
-Restart=always
-RestartSec=15
-
-[Install]
-WantedBy=multi-user.target
-SERVICE_EOF
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl enable --now cloudvm-otel.service 2>/dev/null || true
-fi
-if ! systemctl is-active --quiet cloudvm-otel.service 2>/dev/null; then
-  nohup /usr/local/bin/cloudvm-otel-forwarder.sh > /var/log/cloudvm-otel.log 2>&1 &
-fi
-{{end}}
-
-{{if .NodeProblemDetector}}
-# Node Problem Detector (NPD) standalone mode
-echo "[cloudvm-bootstrap] Launching node-problem-detector standalone container..."
-mkdir -p /etc/node-problem-detector
-cat << 'NPD_GPU_EOF' > /etc/node-problem-detector/gpu-monitor.json
-{
-  "plugin": "kmsg",
-  "logPath": "/dev/kmsg",
-  "lookback": "5m",
-  "bufferSize": 10,
-  "source": "gpu-monitor",
-  "conditions": [
-    {
-      "type": "GPUProblem",
-      "reason": "GPUHealthy",
-      "message": "NVIDIA GPUs are functioning normally"
-    }
-  ],
-  "rules": [
-    {
-      "type": "permanent",
-      "condition": "GPUProblem",
-      "reason": "GPUFallenOffBus",
-      "pattern": ".*(GPU has fallen off the bus|RmInitAdapter failed|NVRM: Xid.*: (79|92)).*"
-    },
-    {
-      "type": "permanent",
-      "condition": "GPUProblem",
-      "reason": "GPUECCUncorrectableError",
-      "pattern": ".*(NVRM: Xid.*: (48|63|64)).*"
-    }
-  ]
-}
-NPD_GPU_EOF
-
-nerdctl run -d   --name node-problem-detector   --restart always   --net=host   --privileged   -v /dev:/dev   -v /dev/kmsg:/dev/kmsg   -v /var/log:/var/log:ro   -v /etc/node-problem-detector:/config/custom:ro   registry.k8s.io/node-problem-detector/node-problem-detector:v0.8.20   --enable-k8s-exporter=false   --address=0.0.0.0   --port=20256   --config.system-log-monitor=/config/kernel-monitor.json,/config/custom/gpu-monitor.json || true
-{{end}}
-
 {{if .UseNativeDLAMI}}
 # 5. Native DLAMI Mode (Fast PyTorch/Ray cold start ~20-30s)
 echo "[cloudvm-bootstrap] Launching workload in native DLAMI environment..."
@@ -889,9 +727,6 @@ RUNNER_EOF
 chmod 700 /usr/local/bin/cloudvm-runner.py
 if command -v python3 >/dev/null 2>&1; then
   CLOUDVM_RUNNER_BIND="{{.RunnerBindAddress}}" CLOUDVM_RUNNER_CONCURRENCY="{{if .RunnerConcurrency}}{{.RunnerConcurrency}}{{end}}" \
-{{- if and .Profiling .TunnelEndpoint}}
-    CLOUDVM_PROFILING=1 CLOUDVM_PROFILING_POD_LABELS="{{.Profiling.PodLabelList}}" \
-{{- end}}
     nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
 cloudvm_mark runner
@@ -923,59 +758,7 @@ CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CL
   CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" CLOUDVM_TUNNEL_CIDRS="{{.TunnelCIDRList}}" \
   CLOUDVM_TRANSPARENT_PORT="{{if .TunnelServiceCIDRs}}{{.TransparentProxyPort}}{{else}}0{{end}}" CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1" \
   CLOUDVM_LOG_FILES="bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log,{{.SpotWatcherLogFile}}" \
-{{- if .Profiling}}
-  CLOUDVM_PROFILES_SOCKET="{{.ProfilesSocket}}" \
-{{- end}}
   nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
-{{if .Profiling}}
-# 5c. Continuous profiling: the pinned, checksum-verified parca-agent profiles every process on the VM and uploads through
-# the tunnel agent's socket; on GPU workers it also reads the CUDA probes of the ParcaGPU library the runner mounts.
-CLOUDVM_PARCA_AGENT_VERSION="0.50.0"
-CLOUDVM_PARCA_AGENT_SHA256="b27f1e844fb7e27c918021e0f8118381f3a95e13deddfadd8f9f56b36c103ad1"
-CLOUDVM_PARCAGPU_VERSION="0.3.4"
-CLOUDVM_PARCAGPU_SHA256="e7af75c58b654a243767df50d979b0d2678d5f170d345589befff6be82970a3e"
-# cloudvm_install URL SHA256 DEST downloads a file, verifies its checksum, and installs it executable at DEST.
-cloudvm_install() {
-  curl -fsSL --retry 5 "$1" -o "$3.tmp" && echo "$2  $3.tmp" | sha256sum -c - >/dev/null && chmod 0755 "$3.tmp" && mv "$3.tmp" "$3" && return 0
-  rm -f "$3.tmp"
-  return 1
-}
-CLOUDVM_CUDA_LAUNCH=false
-if command -v nvidia-smi >/dev/null 2>&1; then
-  mkdir -p /opt/cloudvm/parcagpu
-  if cloudvm_install "https://github.com/parca-dev/parcagpu/releases/download/v${CLOUDVM_PARCAGPU_VERSION}/libparcagpucupti-amd64.so" "$CLOUDVM_PARCAGPU_SHA256" /opt/cloudvm/parcagpu/libparcagpucupti.so; then
-    CLOUDVM_CUDA_LAUNCH=true
-  else
-    echo "[cloudvm-bootstrap] Warning: ParcaGPU install failed; CUDA kernels go unprofiled" >&2
-  fi
-fi
-if cloudvm_install "https://github.com/parca-dev/parca-agent/releases/download/v${CLOUDVM_PARCA_AGENT_VERSION}/parca-agent_${CLOUDVM_PARCA_AGENT_VERSION}_Linux_x86_64" "$CLOUDVM_PARCA_AGENT_SHA256" /usr/local/bin/parca-agent; then
-  mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug || true
-  mkdir -p /etc/parca-agent
-  cat << 'PARCA_EOF' > /etc/parca-agent/parca-agent.yaml
-{{.Profiling.Config}}PARCA_EOF
-  echo "CLOUDVM_CUDA_LAUNCH=$CLOUDVM_CUDA_LAUNCH" > /etc/parca-agent/env
-  cat << 'PARCA_EOF' > /etc/systemd/system/parca-agent.service
-[Unit]
-Description=parca-agent continuous profiler
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-EnvironmentFile=/etc/parca-agent/env
-ExecStart=/usr/local/bin/parca-agent {{.ParcaAgentFlags}}
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-PARCA_EOF
-  systemctl daemon-reload
-  systemctl enable --now parca-agent.service || echo "[cloudvm-bootstrap] Warning: parca-agent did not start; the VM goes unprofiled" >&2
-else
-  echo "[cloudvm-bootstrap] Warning: parca-agent install failed; the VM goes unprofiled" >&2
-fi
-{{end}}
 {{end}}
 
 

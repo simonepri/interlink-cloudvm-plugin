@@ -1190,8 +1190,6 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 	srv := NewServer(mockProv, "test-cluster")
 
 	srv.SetRegistryMirrors([]string{"mirror1.example.com", "mirror2.example.com"})
-	srv.SetOtelEndpoint("otel-collector:4317")
-	srv.SetEnableNPD(true)
 	srv.SetCustomBootstrapScript("echo global-bootstrap")
 	srv.SetRunnerConcurrency(16)
 
@@ -1213,12 +1211,6 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 	if len(spec1.RegistryMirrors) != 2 || spec1.RegistryMirrors[0] != "mirror1.example.com" {
 		t.Errorf("expected inherited RegistryMirrors, got: %v", spec1.RegistryMirrors)
 	}
-	if spec1.OtelEndpoint != "otel-collector:4317" {
-		t.Errorf("expected inherited OtelEndpoint, got: %s", spec1.OtelEndpoint)
-	}
-	if !spec1.NodeProblemDetector {
-		t.Errorf("expected NodeProblemDetector to be true")
-	}
 	if spec1.CustomBootstrapScript != "echo global-bootstrap" {
 		t.Errorf("expected inherited CustomBootstrapScript, got: %s", spec1.CustomBootstrapScript)
 	}
@@ -1226,12 +1218,10 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 		t.Errorf("expected inherited RunnerConcurrency 16, got: %d", spec1.RunnerConcurrency)
 	}
 
-	// 2. Pod with custom annotations should override server generic daemon options
+	// 2. Pod annotations cannot override server bootstrap options
 	mockProv2 := NewMockProvider()
 	srv2 := NewServer(mockProv2, "test-cluster")
 	srv2.SetRegistryMirrors([]string{"mirror1.example.com", "mirror2.example.com"})
-	srv2.SetOtelEndpoint("otel-collector:4317")
-	srv2.SetEnableNPD(false)
 	srv2.SetCustomBootstrapScript("echo global-bootstrap")
 	srv2.SetRunnerConcurrency(16)
 
@@ -1245,10 +1235,6 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 				"namespace": "default",
 				"uid": "uid-daemon-2",
 				"annotations": {
-					"cloudvm.vk.io/registry-mirrors": "override.mirror.io,backup.mirror.io",
-					"cloudvm.vk.io/otel-endpoint": "custom-otel:4317",
-					"cloudvm.vk.io/enable-npd": "true",
-					"cloudvm.vk.io/custom-bootstrap-script": "echo pod-bootstrap",
 					"cloudvm.vk.io/runner-concurrency": "32"
 				}
 			}
@@ -1264,14 +1250,8 @@ func TestServer_GenericDaemonOptionsPropagation(t *testing.T) {
 	if spec2 == nil {
 		t.Fatalf("expected LastSpec to be populated for pod 2")
 	}
-	if len(spec2.RegistryMirrors) != 2 || spec2.RegistryMirrors[0] != "override.mirror.io" {
-		t.Errorf("expected overridden RegistryMirrors, got: %v", spec2.RegistryMirrors)
-	}
-	if spec2.OtelEndpoint != "custom-otel:4317" {
-		t.Errorf("expected overridden OtelEndpoint, got: %s", spec2.OtelEndpoint)
-	}
-	if spec2.CustomBootstrapScript != "echo pod-bootstrap" {
-		t.Errorf("expected overridden CustomBootstrapScript, got: %s", spec2.CustomBootstrapScript)
+	if spec2.CustomBootstrapScript != "echo global-bootstrap" {
+		t.Errorf("expected server CustomBootstrapScript, got: %s", spec2.CustomBootstrapScript)
 	}
 	if spec2.RunnerConcurrency != 32 {
 		t.Errorf("expected overridden RunnerConcurrency 32, got: %d", spec2.RunnerConcurrency)

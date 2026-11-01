@@ -164,10 +164,6 @@ type InstanceSpec struct {
 	SecretVolumes []SecretVolume `json:"-"`
 	// RegistryMirrors specifies custom container registry mirror URLs.
 	RegistryMirrors []string `json:"registryMirrors,omitempty"`
-	// OtelEndpoint specifies the OpenTelemetry metrics/traces exporter target.
-	OtelEndpoint string `json:"otelEndpoint,omitempty"`
-	// NodeProblemDetector enables standalone node-problem-detector daemon on the VM.
-	NodeProblemDetector bool `json:"nodeProblemDetector,omitempty"`
 	// CustomBootstrapScript holds arbitrary bash or systemd bootstrap commands appended to cloud-init.
 	CustomBootstrapScript string `json:"customBootstrapScript,omitempty"`
 	// RunnerConcurrency specifies the max concurrent containers executed by runner.
@@ -178,8 +174,6 @@ type InstanceSpec struct {
 	NodeClaim bool `json:"nodeClaim,omitempty"`
 	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
-	// Profiling runs parca-agent on the VM with this config; nil leaves the VM unprofiled.
-	Profiling *WorkerProfiling `json:"-"`
 }
 
 // Instance represents an active or terminating cloud VM instance.

@@ -175,18 +175,6 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 
 	// KMS token encryption is controlled exclusively by provider configuration
 
-	var registryMirrors []string
-	if rawMirrors := pod.Metadata.Annotations["cloudvm.vk.io/registry-mirrors"]; rawMirrors != "" {
-		for _, m := range strings.Split(rawMirrors, ",") {
-			if trimmed := strings.TrimSpace(m); trimmed != "" {
-				registryMirrors = append(registryMirrors, trimmed)
-			}
-		}
-	}
-	otelEndpoint := pod.Metadata.Annotations["cloudvm.vk.io/otel-endpoint"]
-	enableNPD := pod.Metadata.Annotations["cloudvm.vk.io/enable-npd"] == "true" || pod.Metadata.Annotations["cloudvm.vk.io/node-problem-detector"] == "true"
-	customBootstrapScript := pod.Metadata.Annotations["cloudvm.vk.io/custom-bootstrap-script"]
-
 	runnerConcurrency := 0
 	rawConcurrency := pod.Metadata.Annotations["cloudvm.vk.io/runner-concurrency"]
 	if rawConcurrency == "" && pod.Spec.NodeSelector != nil {
@@ -330,10 +318,6 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		CPUMillicores:          cpuMillicores,
 		MemoryBytes:            memoryBytes,
 		ClusterTag:             defaultClusterTag,
-		RegistryMirrors:        registryMirrors,
-		OtelEndpoint:           otelEndpoint,
-		NodeProblemDetector:    enableNPD,
-		CustomBootstrapScript:  customBootstrapScript,
 		RunnerConcurrency:      runnerConcurrency,
 		SubnetIDs:              subnetIDs,
 		CandidateInstanceTypes: candidateInstanceTypes,
