@@ -300,6 +300,8 @@ type PodSpecWrapper struct {
 	RestartPolicy      corev1.RestartPolicy `json:"restartPolicy,omitempty"`
 	HostPID            bool                 `json:"hostPID,omitempty"`
 	HostIPC            bool                 `json:"hostIPC,omitempty"`
+	// RuntimeClassName names the RuntimeClass the pod's containers run with; workers run NVIDIA runtime classes only.
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 	// AutomountServiceAccountToken false keeps the service account token out of the pod's containers.
 	AutomountServiceAccountToken *bool                         `json:"automountServiceAccountToken,omitempty"`
 	ImagePullSecrets             []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`

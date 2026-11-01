@@ -122,6 +122,12 @@ transferCost:
         - {from: "us-central1", usdPerGB: 0.12}
 
 registryMirrors: []
+# RuntimeClass names that run like the NVIDIA container runtime; empty means nvidia, nvidia-cdi and nvidia-legacy. Pods
+# with any other runtimeClassName, such as gVisor or Kata, are refused with a RuntimeClassUnsupported event.
+nvidiaRuntimeClasses: []
+# Namespaces whose DaemonSet pods with an NVIDIA runtime class see the GPUs their NVIDIA_VISIBLE_DEVICES names, such as
+# all, without requesting nvidia.com/gpu, like a GPU monitoring exporter; empty means none.
+allGPUsNamespaces: []
 # OTLP/HTTP collector URL that receives worker bootstrap, runner, and container logs; empty disables forwarding.
 otlpLogsEndpoint: ""
 # OTLP/HTTP collector URL that receives the plugin and node agent lifecycle traces; empty disables tracing.

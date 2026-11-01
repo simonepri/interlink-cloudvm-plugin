@@ -55,6 +55,7 @@ type Server struct {
 	nodeRegions    map[string]string // virtual node name -> region its pods launch in when the node has no region label
 	// regionalNamespaces are the namespaces whose pods run only on regional VMs, the only pods those VMs run.
 	regionalNamespaces    map[string]bool
+	admission             PodAdmission
 	nodeRegionLookup      NodeRegionLookup // region labels of cluster nodes; nil without cluster access
 	reconciler            *Reconciler
 	nodePool              *NodePool
@@ -195,8 +196,16 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	} else {
 		log.Printf("[cloudvm] Ignoring REGIONAL_NAMESPACES: %v", err)
 	}
+	s.admission = PodAdmissionFromEnv()
 	s.lifecycle = NewLifecycle(NewLifecycleMetrics(), s.podEventRecorder)
 	return s
+}
+
+// SetPodAdmission replaces the runtime class settings that pod creates are checked against.
+func (s *Server) SetPodAdmission(a PodAdmission) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.admission = a
 }
 
 // parseNodeRegions reads NODE_REGIONS, a JSON object from virtual node name to the region its pods launch in.
@@ -255,19 +264,23 @@ func (s *Server) launchRegion(pod *Pod) (string, error) {
 
 // recordNoRegionEvent posts a warning on a pod that was refused for lack of a launch region.
 func (s *Server) recordNoRegionEvent(ctx context.Context, pod *Pod, cause error) {
+	s.recordPodWarning(ctx, pod, "CloudVMRegionUnknown", cause.Error())
+}
+
+// recordPodWarning posts a warning event on the pod.
+func (s *Server) recordPodWarning(ctx context.Context, pod *Pod, reason, msg string) {
 	s.mu.RLock()
 	recorder := s.eventRecorder
 	s.mu.RUnlock()
 	if recorder == nil {
 		return
 	}
-	msg := cause.Error()
 	if len(msg) > maxPodEventMessage {
 		msg = msg[:maxPodEventMessage]
 	}
 	eventCtx, cancel := context.WithTimeout(ctx, podEventTimeout)
 	defer cancel()
-	if err := recorder.RecordPodEvent(eventCtx, pod.Metadata.Namespace, pod.Metadata.Name, pod.Metadata.UID, corev1.EventTypeWarning, "CloudVMRegionUnknown", msg); err != nil {
+	if err := recorder.RecordPodEvent(eventCtx, pod.Metadata.Namespace, pod.Metadata.Name, pod.Metadata.UID, corev1.EventTypeWarning, reason, msg); err != nil {
 		log.Printf("[cloudvm] Warning: %v", err)
 	}
 }
@@ -842,6 +855,16 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
+	admission := s.admission
+	s.mu.RUnlock()
+	if refusal := admission.Refusal(pod); refusal != nil {
+		log.Printf("[cloudvm] Refusing pod %s/%s: %v", sanitizeLog(pod.Metadata.Namespace), sanitizeLog(pod.Metadata.Name), refusal) //nolint:gosec // sanitized
+		s.recordPodWarning(r.Context(), pod, refusal.Reason, refusal.Message)
+		http.Error(w, refusal.Error(), http.StatusBadRequest)
+		return
+	}
+
 	injectRayProxyEnv(pod)
 	freeRayFixedPorts(pod)
 
@@ -891,6 +914,15 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	spec.Runtime = runtime
 	spec.Env, spec.Command, spec.Args = mainEnv.Vars, mainEnv.Command, mainEnv.Args
+	visibleGPUs, ignoredGPUs := admission.VisibleGPUs(pod, spec.Env, spec.NumGPUs)
+	if !isClaimPod {
+		if visibleGPUs != "" {
+			ignoredGPUs = fmt.Sprintf("the pod runs without GPUs: %s=%s exposes GPUs the pod does not request only on NodeClaim nodes", envNVIDIAVisibleDevices, visibleGPUs)
+		}
+		if ignoredGPUs != "" {
+			s.recordPodWarning(r.Context(), pod, reasonNVIDIAVisibleDevicesIgnored, ignoredGPUs)
+		}
+	}
 	if DetectPodAWSRole(podEnv) != nil {
 		spec.Env = stripWebhookCredentialEnv(spec.Env)
 	}
@@ -1049,6 +1081,15 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[cloudvm] Refusing pod %s/%s on claim node %s: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(pod.Spec.NodeName), err) //nolint:gosec // sanitized
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
+		}
+		if visibleGPUs != "" {
+			var devErr error
+			if gpus, devErr = visibleGPUDevices(visibleGPUs, node.Capacity.GPUs); devErr != nil {
+				ignoredGPUs = fmt.Sprintf("the pod runs without GPUs: %s=%s on VM %s: %v", envNVIDIAVisibleDevices, visibleGPUs, node.InstanceID, devErr)
+			}
+		}
+		if ignoredGPUs != "" {
+			s.recordPodWarning(r.Context(), pod, reasonNVIDIAVisibleDevicesIgnored, ignoredGPUs)
 		}
 		finalResp = s.startOnNode(r.Context(), node, gpus, tpus, spec, pod, awsCreds, cpuLimitMilli, memLimitBytes)
 		w.WriteHeader(http.StatusOK)
@@ -2069,9 +2110,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // specContainerStatuses reports the workload status under the name of every container in the pod spec, because interLink
 // matches remote statuses to in-cluster statuses by container name and appends any name it does not know.
-// The VM runs the first container as the pod's workload, and every other regular container mirrors its state without
-// a container ID. Init containers report what the runner reported for them; without a report they are waiting while
-// the workload waits, and completed otherwise.
+// The VM runs the pod's one regular container as its workload; create refuses a pod with more, so any other regular
+// container here mirrors the workload's state without a container ID. Init containers report what the runner reported
+// for them; without a report they are waiting while the workload waits, and completed otherwise.
 func specContainerStatuses(spec statusPodSpec, workload ContainerStatus, runner *ContainerStatusResult) (containers, initContainers []ContainerStatus) {
 	specContainers := spec.Containers
 	if len(specContainers) == 0 {
