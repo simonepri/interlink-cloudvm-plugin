@@ -135,7 +135,10 @@ func TestAgentRunsDaemonSetPods(t *testing.T) {
 	daemon := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-proxy-x1", Namespace: "system", UID: "uid-daemon",
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "node-proxy", UID: "ds-1"}}},
-		Spec: corev1.PodSpec{NodeName: "vm-a", Containers: []corev1.Container{{Name: "proxy", Image: "proxy"}}},
+		Spec: corev1.PodSpec{NodeName: "vm-a", Containers: []corev1.Container{{Name: "proxy", Image: "proxy", Env: []corev1.EnvVar{
+			{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.podIP"}}},
+			{Name: "HOST_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "status.hostIP"}}},
+		}}}},
 	}
 	if _, err := kube.CoreV1().Pods("system").Create(ctx, daemon, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -146,6 +149,13 @@ func TestAgentRunsDaemonSetPods(t *testing.T) {
 		_, created := plugin.created["uid-daemon"]
 		return created && plugin.polled["uid-daemon"]
 	})
+	// A pod whose env names its pod or host IP reaches the plugin with those fieldRefs, which the plugin resolves.
+	plugin.mu.Lock()
+	env := plugin.created["uid-daemon"].Pod.Spec.Containers[0].Env
+	plugin.mu.Unlock()
+	if len(env) != 2 || env[0].ValueFrom == nil || env[0].ValueFrom.FieldRef.FieldPath != "status.podIP" || env[1].ValueFrom == nil || env[1].ValueFrom.FieldRef.FieldPath != "status.hostIP" {
+		t.Errorf("create env = %+v, want the pod and host IP fieldRefs", env)
+	}
 
 	if err := kube.CoreV1().Pods("system").Delete(ctx, daemon.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)

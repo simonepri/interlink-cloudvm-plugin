@@ -61,12 +61,12 @@ func (p *PodProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !p.nodes.Serves(pod.Spec.NodeName) {
 		return fmt.Errorf("node %s is not served by this agent", pod.Spec.NodeName)
 	}
-	pod = p.withHostIPFieldRefs(pod)
+	forPlugin := p.withHostIPFieldRefs(pod)
 	secrets := imagePullSecrets(ctx, p.kube, pod)
-	err := p.plugin.Create(ctx, pod, secrets)
+	err := p.plugin.Create(ctx, forPlugin, secrets)
 	if isRefusal(err) {
 		if claim, getErr := p.nodes.cfg.Claims.Get(ctx, pod.Spec.NodeName); getErr == nil && p.DeleteDepartedPods(ctx, claim) > 0 {
-			err = p.plugin.Create(ctx, pod, secrets)
+			err = p.plugin.Create(ctx, forPlugin, secrets)
 		}
 	}
 	if err != nil {
@@ -246,8 +246,8 @@ func (p *PodProvider) PollStatus(ctx context.Context) {
 // when it is created.
 var hostIPFields = map[string]bool{"status.podIP": true, "status.hostIP": true, "status.podIPs": true, "status.hostIPs": true}
 
-// withHostIPFieldRefs returns the pod with the fieldRefs to its pod and host IP that the pod controller resolved to
-// empty values put back from the pod informer's copy, so the plugin sets them to the worker's address.
+// withHostIPFieldRefs returns the pod with the fieldRefs to its pod and host IP, which the pod controller never sees,
+// put back from the pod informer's copy, so the plugin sets them to the worker's address.
 func (p *PodProvider) withHostIPFieldRefs(pod *corev1.Pod) *corev1.Pod {
 	p.mu.Lock()
 	bound := p.bound
