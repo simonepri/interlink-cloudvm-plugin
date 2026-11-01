@@ -178,8 +178,6 @@ type InstanceSpec struct {
 	NodeClaim bool `json:"nodeClaim,omitempty"`
 	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
-	// Profiling runs parca-agent on the VM with this config; nil leaves the VM unprofiled.
-	Profiling *WorkerProfiling `json:"-"`
 }
 
 // Instance represents an active or terminating cloud VM instance.

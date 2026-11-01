@@ -174,26 +174,6 @@ spec:
             - name: LAZY_IMAGE_PULLS
               value: "false"
             {{- end }}
-            {{- if .Values.profiling.endpoint }}
-            - name: CLOUDVM_PROFILES_ENDPOINT
-              value: {{ .Values.profiling.endpoint | quote }}
-            {{- if .Values.profiling.insecure }}
-            - name: CLOUDVM_PROFILES_INSECURE
-              value: "true"
-            {{- end }}
-            {{- if .Values.profiling.tokenSecret.name }}
-            - name: CLOUDVM_PROFILES_TOKEN_FILE
-              value: /etc/cloudvm-profiles/token/{{ .Values.profiling.tokenSecret.key }}
-            {{- end }}
-            {{- if .Values.profiling.agentConfig }}
-            - name: CLOUDVM_PROFILES_AGENT_CONFIG
-              value: /etc/cloudvm-profiles/agent/parca-agent.yaml
-            {{- end }}
-            {{- if .Values.profiling.agentArgs }}
-            - name: CLOUDVM_PROFILES_AGENT_ARGS
-              value: {{ join "," .Values.profiling.agentArgs | quote }}
-            {{- end }}
-            {{- end }}
             {{- if .Values.customBootstrapScript }}
             - name: CUSTOM_BOOTSTRAP_SCRIPT
               value: {{ .Values.customBootstrapScript | quote }}
@@ -218,27 +198,7 @@ spec:
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath | default "/var/lib/cloudvm" }}
-            {{- if and .Values.profiling.endpoint .Values.profiling.tokenSecret.name }}
-            - name: profiles-token
-              mountPath: /etc/cloudvm-profiles/token
-              readOnly: true
-            {{- end }}
-            {{- if and .Values.profiling.endpoint .Values.profiling.agentConfig }}
-            - name: profiles-agent
-              mountPath: /etc/cloudvm-profiles/agent
-              readOnly: true
-            {{- end }}
       volumes:
-        {{- if and .Values.profiling.endpoint .Values.profiling.tokenSecret.name }}
-        - name: profiles-token
-          secret:
-            secretName: {{ .Values.profiling.tokenSecret.name }}
-        {{- end }}
-        {{- if and .Values.profiling.endpoint .Values.profiling.agentConfig }}
-        - name: profiles-agent
-          configMap:
-            name: {{ include "interlink-cloudvm-plugin.fullname" . }}-profiling
-        {{- end }}
         - name: data
         {{- if and .Values.persistence.enabled (not $isPostgres) }}
           persistentVolumeClaim:

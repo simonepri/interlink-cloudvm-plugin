@@ -563,11 +563,6 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 		_ = listener.Close()
 		return nil, err
 	}
-	profilesRelay, err := configureWorkerProfiling(server)
-	if err != nil {
-		_ = listener.Close()
-		return nil, err
-	}
 	config := TunnelGatewayConfig{
 		Listener:           listener,
 		Registry:           registry,
@@ -581,7 +576,6 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 		DirectTCPNetworks:  directTCPNetworks,
 		WorkerNamespace:    server.WorkerNamespace,
 		OnTCPRefusal:       metrics.RecordTCPRefusal,
-		ProfilesRelay:      profilesRelay,
 	}
 	if podWatch != nil {
 		config.PodNamespaces = podWatch
@@ -614,24 +608,4 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 	}
 	log.Printf("[cloudvm-tunnel] Gateway listening on %s; workers dial %s (connect timeout %v)", listenAddr, endpoint, connectTimeout) //nolint:gosec // configuration values
 	return gateway, nil
-}
-
-// configureWorkerProfiling turns on parca-agent on every VM when CLOUDVM_PROFILES_ENDPOINT names a Parca server, and
-// returns the relay that forwards the workers' uploads to it; it returns nil when profiling is off.
-func configureWorkerProfiling(server *Server) (*ProfilesRelay, error) {
-	endpoint := strings.TrimSpace(os.Getenv("CLOUDVM_PROFILES_ENDPOINT"))
-	if endpoint == "" {
-		return nil, nil
-	}
-	relay, err := NewProfilesRelay(endpoint, os.Getenv("CLOUDVM_PROFILES_INSECURE") == "true", strings.TrimSpace(os.Getenv("CLOUDVM_PROFILES_TOKEN_FILE")))
-	if err != nil {
-		return nil, err
-	}
-	profiling, err := LoadWorkerProfiling(strings.TrimSpace(os.Getenv("CLOUDVM_PROFILES_AGENT_CONFIG")), parseCommaList(os.Getenv("CLOUDVM_PROFILES_AGENT_ARGS")))
-	if err != nil {
-		return nil, err
-	}
-	server.SetProfiling(profiling)
-	log.Printf("[cloudvm-profiles] Workers run parca-agent and upload profiles through the tunnel to %s", endpoint) //nolint:gosec // configuration value
-	return relay, nil
 }
