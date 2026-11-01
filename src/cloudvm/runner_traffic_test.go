@@ -4,10 +4,13 @@ package main
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -228,5 +231,169 @@ func TestRenderCloudInit_ConfiguresTheTrafficMeter(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// renderTestRuleset renders the traffic table for a VM with private, regional, storage and IPv6 peers, a tunnel
+// address of each IP version, and owners at the given cgroup paths.
+func renderTestRuleset(t *testing.T, owners map[string][]string) string {
+	t.Helper()
+	meter := writeTrafficMeter(t)
+	probe := `import ipaddress, json, runpy, sys
+m = runpy.run_path(sys.argv[1])
+nets = [(ipaddress.ip_network(n), 'private') for n in m['TRAFFIC_PRIVATE']]
+nets += [(ipaddress.ip_network(n), p) for n, p in (('3.0.0.0/15', 'aws/us-east-1'), ('3.0.0.0/16', 'aws/us-east-1/storage'),
+         ('3.1.0.0/16', 'aws/eu-south-2'), ('3.2.0.7/32', 'aws/eu-south-2'), ('2600:1f18::/33', 'aws/us-east-1'))]
+peers = ['tunnel', 'private', 'internet', 'unclassified', 'aws/eu-south-2', 'aws/us-east-1', 'aws/us-east-1/storage']
+print(m['render_traffic_ruleset'](peers, m['partition_networks'](nets), ['eth0'], ['172.20.0.10', '2001:db8::10'], 41641,
+      'internet', json.loads(sys.argv[2]), [13128, 13129]), end='')`
+	if owners == nil {
+		owners = map[string][]string{}
+	}
+	ownersJSON, err := json.Marshal(owners)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("python3", "-I", "-c", probe, meter, string(ownersJSON)) //nolint:gosec // script written by the test
+	cmd.Env = append(os.Environ(), "CLOUDVM_TRAFFIC_PROVIDER=aws", "CLOUDVM_TRAFFIC_REGION=eu-south-2", "CLOUDVM_TRAFFIC_HOME=aws/us-east-1")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// nft sends an interval map's elements in the same message that creates the map, so the kernel refuses them with "No
+// such file or directory" unless every chain they jump to already exists.
+func TestRunnerScript_TrafficRulesetAddsChainsBeforeTheMapsThatJumpToThem(t *testing.T) {
+	added := map[string]bool{}
+	// chainsAtMap holds the chains that existed when each map was added.
+	chainsAtMap := map[string]map[string]bool{}
+	for _, line := range strings.Split(renderTestRuleset(t, nil), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] != "add" {
+			continue
+		}
+		switch fields[1] {
+		case "chain":
+			added[fields[4]] = true
+		case "map":
+			chainsAtMap[fields[4]] = maps.Clone(added)
+		case "element":
+			for _, target := range regexp.MustCompile(`goto (\w+)`).FindAllStringSubmatch(line, -1) {
+				if !chainsAtMap[fields[4]][target[1]] {
+					t.Errorf("map %s jumps to chain %s, which the ruleset adds after the map", fields[4], target[1])
+				}
+			}
+		}
+	}
+}
+
+// TestRunnerScript_TrafficRulesetPassesNftCheck loads the rendered table into the kernel in check mode with nft from
+// PATH, skipping when there is none or it cannot reach netfilter, or with CLOUDVM_TEST_NFT, such as "sudo -n nft",
+// which must work.
+func TestRunnerScript_TrafficRulesetPassesNftCheck(t *testing.T) {
+	nft := strings.Fields(os.Getenv("CLOUDVM_TEST_NFT"))
+	required := len(nft) > 0
+	if !required {
+		nft = []string{"nft"}
+	}
+	if _, err := exec.LookPath(nft[0]); err != nil && !required {
+		t.Skipf("%s not available", nft[0])
+	}
+	// Owner rules match cgroups by path, which nft resolves on the host, so they use cgroups every systemd host has.
+	owners := map[string][]string{}
+	for _, p := range []string{"system.slice", "user.slice"} {
+		if _, err := os.Stat(filepath.Join("/sys/fs/cgroup", p)); err == nil {
+			owners["o_"+strings.TrimSuffix(p, ".slice")] = []string{p}
+		}
+	}
+	for name, o := range map[string]map[string][]string{"VM counters": nil, "pod counters": owners} {
+		if name == "pod counters" && len(owners) == 0 {
+			continue
+		}
+		ruleset := renderTestRuleset(t, o)
+		cmd := exec.Command(nft[0], append(nft[1:], "--check", "-f", "-")...) //nolint:gosec // nft from the test environment
+		cmd.Stdin = strings.NewReader(ruleset)
+		out, err := cmd.CombinedOutput()
+		if err != nil && !required && strings.Contains(string(out), "Operation not permitted") {
+			t.Skipf("nft cannot reach the kernel's netfilter: %s", out)
+		}
+		if err != nil {
+			t.Errorf("nft refuses the %s ruleset: %v\n%s", name, err, out)
+		}
+	}
+}
+
+func TestRunnerScript_TrafficMeterReportsWhyItIsDown(t *testing.T) {
+	meter := writeTrafficMeter(t)
+	nft := filepath.Join(t.TempDir(), "nft")
+	if err := os.WriteFile(nft, []byte("#!/bin/sh\necho 'Error: Could not process rule: No such file or directory' >&2\nexit 1\n"), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	probe := `import json, runpy, sys
+m = runpy.run_path(sys.argv[1])['TrafficMeter']()
+m.apply()
+print(json.dumps(m.report()))`
+	cmd := exec.Command("python3", "-I", "-c", probe, meter) //nolint:gosec // script written by the test
+	cmd.Env = append(os.Environ(), "CLOUDVM_NFT="+nft, "CLOUDVM_TRAFFIC_REGION=eu-south-2", "CLOUDVM_CGROUP_ROOT="+t.TempDir())
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var report TrafficReport
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
+		t.Fatalf("decode %q: %v", out, err)
+	}
+	if report.Up == nil || *report.Up || !strings.Contains(report.Error, "No such file or directory") {
+		t.Errorf("report = %s, want the meter down with nft's error", lines[len(lines)-1])
+	}
+}
+
+func TestRunnerScript_NetworkBytesCountOnlyDeviceBackedNICs(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+	dir := t.TempDir()
+	runner := filepath.Join(dir, "runner.py")
+	if err := os.WriteFile(runner, []byte(runnerScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A pod's byte crosses its veth, the bridge and the NIC; a tunnel's byte crosses tailscale0 and then the NIC.
+	nics := map[string]struct {
+		device bool
+		rx, tx int64
+	}{
+		"ens5": {true, 1000, 300}, "ens6": {true, 20, 7}, "lo": {false, 5000, 5000}, "veth1a2b": {false, 900, 250},
+		"cni0": {false, 900, 250}, "docker0": {false, 40, 40}, "tailscale0": {false, 100, 50},
+	}
+	for name, n := range nics {
+		stats := filepath.Join(dir, "net", name, "statistics")
+		if err := os.MkdirAll(stats, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if n.device {
+			if err := os.MkdirAll(filepath.Join(dir, "net", name, "device"), 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for file, v := range map[string]int64{"rx_bytes": n.rx, "tx_bytes": n.tx} {
+			if err := os.WriteFile(filepath.Join(stats, file), []byte(strconv.FormatInt(v, 10)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	probe := `import runpy, sys
+print(*runpy.run_path(sys.argv[1])['get_network_bytes']())`
+	cmd := exec.Command("python3", "-I", "-c", probe, runner) //nolint:gosec // script written by the test
+	cmd.Env = append(os.Environ(), "CLOUDVM_SYS_NET="+filepath.Join(dir, "net"))
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if got := lines[len(lines)-1]; got != "1020 307" {
+		t.Errorf("network bytes = %q, want the ens5 and ens6 totals 1020 307", got)
 	}
 }

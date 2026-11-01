@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 const gib = int64(1) << 30
@@ -101,12 +102,16 @@ func TestTransferMeter_CountsDeltasAndResets(t *testing.T) {
 	report := func(tx int64) *TrafficReport {
 		return &TrafficReport{Peers: map[string]TrafficBytes{"aws/us-east-1": {Tx: tx}}}
 	}
-	meter.Record(testTransferVM, report(1*gib))
-	meter.Record(testTransferVM, report(1*gib)) // the same reading through another poll counts once
-	meter.Record(testTransferVM, report(3*gib))
-	meter.Record(testTransferVM, report(1*gib)) // the runner restarted its counters
+	vm := testTransferVM
+	vm.BootID = "boot-1"
+	meter.Record(vm, report(1*gib))
+	meter.Record(vm, report(1*gib)) // the same reading through another poll counts once
+	meter.Record(vm, report(3*gib))
+	meter.Record(vm, report(2*gib)) // an older reading answered after a newer one adds nothing
+	vm.BootID = "boot-2"
+	meter.Record(vm, report(1*gib)) // the VM rebooted and its counters started over
 	meter.Record(TransferVM{Provider: "aws", Region: "eu-south-2", InstanceType: "g6e.xlarge"}, report(9*gib))
-	meter.Record(testTransferVM, nil)
+	meter.Record(vm, nil)
 	approx(t, "transmit bytes", counterValue(m.transferBytes.WithLabelValues("aws", "eu-south-2", "g6e.xlarge", "transmit", "home_region", "direct")), float64(4*gib))
 	approx(t, "transmit cost", counterValue(m.transferCost.WithLabelValues("aws", "eu-south-2", "transmit", "home_region", "direct", "aws", "eu-south-2")), 4*0.02)
 }
@@ -137,6 +142,19 @@ func TestTransferMeter_DropsSeriesOfGonePods(t *testing.T) {
 	// A pod that comes back starts from its reading again instead of a stale baseline.
 	meter.Record(testTransferVM, podReport)
 	approx(t, "returning pod bytes", counterValue(m.podTransferBytes.WithLabelValues("ray", "worker-0", "uid-1", "aws", "eu-south-2", "transmit", "internet")), float64(1*gib))
+}
+
+func TestTransferMeter_ReportsWhetherTheMeterIsUp(t *testing.T) {
+	meter, m, _ := newTestTransferMeter(t)
+	up := func() float64 {
+		return testutil.ToFloat64(m.trafficMeterUp.WithLabelValues("aws", "eu-south-2", "g6e.xlarge", "i-1"))
+	}
+	down := false
+	meter.Record(testTransferVM, &TrafficReport{Up: &down, Error: "cannot install the traffic table"})
+	approx(t, "meter up while it cannot start", up(), 0)
+	// Runners that predate the field report bytes only while their meter runs.
+	meter.Record(testTransferVM, &TrafficReport{Peers: map[string]TrafficBytes{"internet": {Tx: 1}}})
+	approx(t, "meter up while it counts", up(), 1)
 }
 
 func TestClassifyTrafficPeer_TunnelWithoutHome(t *testing.T) {
