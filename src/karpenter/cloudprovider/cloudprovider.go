@@ -27,6 +27,7 @@ import (
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -72,6 +73,7 @@ var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
 
 // New returns a CloudProvider that reads NodeClasses through kubeClient and launches VMs through api.
 func New(kubeClient client.Client, api nodeclaim.API, cfg *Config, clk clock.Clock) *CloudProvider {
+	registerMetrics(crmetrics.Registry)
 	return &CloudProvider{
 		kubeClient:  kubeClient,
 		api:         api,
@@ -127,7 +129,7 @@ func (c *CloudProvider) instanceTypesFor(ctx context.Context, nodeClass *v1alpha
 	if err != nil {
 		return nil, err
 	}
-	return c.instanceTypes(catalog, nodeClass, nodePool)
+	return c.instanceTypes(ctx, catalog, nodeClass, nodePool)
 }
 
 // Create launches one VM for a launchable offering compatible with the NodeClaim, spread among the cheapest ones. When

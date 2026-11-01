@@ -4,6 +4,7 @@ package cloudprovider
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"regexp"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -27,18 +29,58 @@ var (
 	familyGenDigits = regexp.MustCompile(`^[a-z]+(\d+)`)
 )
 
+type gpuClassKey struct {
+	class        string
+	capacityType string
+}
+
 // instanceTypes builds Karpenter instance types from the catalog, keeping only offerings inside the NodeClass
-// footprint, pricing each with the transfer cost of nodePool's VMs in its region, and marking offerings the plugin
-// recently refused for lack of capacity as unavailable.
-func (c *CloudProvider) instanceTypes(catalog *nodeclaim.Catalog, nodeClass *v1alpha1.CloudVMNodeClass, nodePool string) ([]*cloudprovider.InstanceType, error) {
+// footprint, pricing each with the transfer cost of nodePool's VMs in its region, dropping offerings exceeding the
+// NodePool's price cap, and marking offerings the plugin recently refused for lack of capacity as unavailable.
+func (c *CloudProvider) instanceTypes(ctx context.Context, catalog *nodeclaim.Catalog, nodeClass *v1alpha1.CloudVMNodeClass, nodePool string) ([]*cloudprovider.InstanceType, error) {
 	footprint := map[string]v1alpha1.FootprintRegion{}
 	for _, r := range nodeClass.Spec.Footprint {
 		footprint[r.Region] = r
 	}
 	transfer := c.transferPricerFor(catalog, nodePool)
+	priceCap := c.config.PriceCapProfileFor(nodePool)
+
+	cheapestPerGPU := map[gpuClassKey]float64{}
+	if priceCap.MaxPriceAboveCheapestPercent != nil {
+		for i := range catalog.InstanceTypes {
+			src := &catalog.InstanceTypes[i]
+			if src.GPUCount <= 0 {
+				continue
+			}
+			class := c.config.GPUClassFor(src.GPUModel, src.GPUMemoryGB)
+			if class == "" {
+				continue
+			}
+			for _, o := range src.Offerings {
+				fr, ok := footprint[o.Region]
+				if !ok || fr.Provider != src.Provider {
+					continue
+				}
+				zone := offeringZone(o)
+				if len(fr.Zones) > 0 && !slices.Contains(fr.Zones, zone) {
+					continue
+				}
+				if o.CapacityType != karpv1.CapacityTypeSpot && o.CapacityType != karpv1.CapacityTypeOnDemand {
+					continue
+				}
+				offeringPrice := o.PricePerHour + transfer.perHour(src.Provider, o.Region)
+				pricePerGPU := offeringPrice / float64(src.GPUCount)
+				key := gpuClassKey{class: class, capacityType: o.CapacityType}
+				if cur, ok := cheapestPerGPU[key]; !ok || pricePerGPU < cur {
+					cheapestPerGPU[key] = pricePerGPU
+				}
+			}
+		}
+	}
+
 	out := make([]*cloudprovider.InstanceType, 0, len(catalog.InstanceTypes))
 	for i := range catalog.InstanceTypes {
-		it, err := c.instanceType(&catalog.InstanceTypes[i], footprint, transfer)
+		it, err := c.instanceType(ctx, &catalog.InstanceTypes[i], footprint, transfer, nodePool, priceCap, cheapestPerGPU)
 		if err != nil {
 			return nil, err
 		}
@@ -49,7 +91,10 @@ func (c *CloudProvider) instanceTypes(catalog *nodeclaim.Catalog, nodeClass *v1a
 	return out, nil
 }
 
-func (c *CloudProvider) instanceType(src *nodeclaim.InstanceType, footprint map[string]v1alpha1.FootprintRegion, transfer transferPricer) (*cloudprovider.InstanceType, error) {
+func (c *CloudProvider) instanceType(ctx context.Context, src *nodeclaim.InstanceType, footprint map[string]v1alpha1.FootprintRegion, transfer transferPricer, nodePool string, priceCap PriceCapProfile, cheapestPerGPU map[gpuClassKey]float64) (*cloudprovider.InstanceType, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	offerings := cloudprovider.Offerings{}
 	zones, regions, capacityTypes := sets.New[string](), sets.New[string](), sets.New[string]()
 	for _, o := range src.Offerings {
@@ -64,6 +109,46 @@ func (c *CloudProvider) instanceType(src *nodeclaim.InstanceType, footprint map[
 		if o.CapacityType != karpv1.CapacityTypeSpot && o.CapacityType != karpv1.CapacityTypeOnDemand {
 			continue
 		}
+		offeringPrice := o.PricePerHour + transfer.perHour(src.Provider, o.Region)
+		if priceCap.Enabled() && src.GPUCount > 0 {
+			pricePerGPU := offeringPrice / float64(src.GPUCount)
+			dropped := false
+			var reason string
+			var limit float64
+			if priceCap.MaxPricePerGPUHour != nil && pricePerGPU > *priceCap.MaxPricePerGPUHour+1e-9 {
+				dropped = true
+				reason = "maxPricePerGPUHour"
+				limit = *priceCap.MaxPricePerGPUHour
+			}
+			if !dropped && priceCap.MaxPriceAboveCheapestPercent != nil {
+				class := c.config.GPUClassFor(src.GPUModel, src.GPUMemoryGB)
+				if class != "" {
+					key := gpuClassKey{class: class, capacityType: o.CapacityType}
+					if minPrice, ok := cheapestPerGPU[key]; ok {
+						capPrice := minPrice * (1.0 + *priceCap.MaxPriceAboveCheapestPercent/100.0)
+						if pricePerGPU > capPrice+1e-9 {
+							dropped = true
+							reason = "maxPriceAboveCheapestPercent"
+							limit = capPrice * float64(src.GPUCount)
+						}
+					}
+				}
+			}
+			if dropped {
+				log.FromContext(ctx).V(1).Info("dropping offering exceeding price cap",
+					"nodepool", nodePool,
+					"instance-type", src.Name,
+					"zone", zone,
+					"capacity-type", o.CapacityType,
+					"price", offeringPrice,
+					"reason", reason,
+					"limit", limit,
+				)
+				OfferingsDropped.WithLabelValues(nodePool).Inc()
+				continue
+			}
+		}
+
 		zones.Insert(zone)
 		regions.Insert(o.Region)
 		capacityTypes.Insert(o.CapacityType)
@@ -73,7 +158,7 @@ func (c *CloudProvider) instanceType(src *nodeclaim.InstanceType, footprint map[
 				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, o.CapacityType),
 			),
-			Price:     o.PricePerHour + transfer.perHour(src.Provider, o.Region),
+			Price:     offeringPrice,
 			Available: o.Available && !c.unavailable.IsUnavailable(src.Name, zone, o.CapacityType),
 		})
 	}

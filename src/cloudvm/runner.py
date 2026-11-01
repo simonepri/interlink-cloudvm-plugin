@@ -425,6 +425,7 @@ def remote_layer_count(img):
         # HACK(simonepri): nerdctl image inspect matches a name@digest reference only to an image stored with the tag
         # latest, so it cannot find one pulled by digest; the digest alone finds it. No upstream issue tracks this:
         # https://github.com/containerd/nerdctl/blob/v2.4.1/pkg/cmd/image/inspect.go#L141-L145
+        # TODO(simonepri): file the upstream nerdctl issue for this bug and link it here.
         res = subprocess.run([CONTAINER_CLI, *snapshotter_args(), 'image', 'inspect', '--format', '{{json .RootFS.Layers}}', img.rpartition('@')[2]],
                              capture_output=True, text=True)
         # A reference naming several stored images prints a line for each.

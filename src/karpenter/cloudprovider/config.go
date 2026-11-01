@@ -21,6 +21,9 @@ type Config struct {
 	// TransferCost adds each offering's expected data transfer with the home region to its price, so Karpenter ranks
 	// and consolidates offerings by what they cost with their transfer.
 	TransferCost TransferCost `json:"transferCost,omitzero"`
+	// PriceCap bounds the offering prices a NodePool considers, dropping offerings above the cap before Karpenter
+	// sees them.
+	PriceCap PriceCap `json:"priceCap,omitzero"`
 	// DataCost is the flat per-hour adder TransferCost replaced; it is accepted so older configs load, and ignored.
 	DataCost json.RawMessage `json:"dataCost,omitempty"`
 	// NodePoolSelector restricts the provider to NodePools whose labels match; empty matches every CloudVM NodePool.
@@ -112,6 +115,40 @@ func (p TransferProfile) validate(field string) error {
 		return fmt.Errorf("%s: GB per hour must not be negative", field)
 	}
 	return nil
+}
+
+// PriceCap bounds the offering prices a NodePool considers, dropping offerings above the cap before Karpenter sees
+// them.
+type PriceCap struct {
+	// Default is the price cap profile for NodePools that NodePools does not list.
+	Default PriceCapProfile `json:"default,omitzero"`
+	// NodePools holds the price cap profile of each named NodePool; an entry replaces Default for that NodePool.
+	NodePools map[string]PriceCapProfile `json:"nodePools,omitempty"`
+}
+
+// PriceCapProfile holds the price cap rules for one NodePool.
+type PriceCapProfile struct {
+	// MaxPricePerGPUHour is an absolute dollar limit on an offering's price per GPU-hour.
+	MaxPricePerGPUHour *float64 `json:"maxPricePerGPUHour,omitempty"`
+	// MaxPriceAboveCheapestPercent is a relative percentage cap above the cheapest offering of the same GPU class
+	// and capacity type in the NodePool's footprint. The reference price is the cheapest offering price per GPU-hour
+	// (including transfer cost) for that GPU class and capacity type across the NodePool's footprint.
+	MaxPriceAboveCheapestPercent *float64 `json:"maxPriceAboveCheapestPercent,omitempty"`
+}
+
+func (p PriceCapProfile) validate(field string) error {
+	if p.MaxPricePerGPUHour != nil && *p.MaxPricePerGPUHour < 0 {
+		return fmt.Errorf("%s.maxPricePerGPUHour: must not be negative", field)
+	}
+	if p.MaxPriceAboveCheapestPercent != nil && *p.MaxPriceAboveCheapestPercent < 0 {
+		return fmt.Errorf("%s.maxPriceAboveCheapestPercent: must not be negative", field)
+	}
+	return nil
+}
+
+// Enabled reports whether any price cap is configured in this profile.
+func (p PriceCapProfile) Enabled() bool {
+	return p.MaxPricePerGPUHour != nil || p.MaxPriceAboveCheapestPercent != nil
 }
 
 // Duration is a time.Duration that reads from a YAML string such as "60s".
@@ -234,6 +271,14 @@ func (c *Config) complete() error {
 	if c.TransferCost.MinMeasuredVMs < 0 {
 		return fmt.Errorf("transferCost.minMeasuredVMs: must not be negative")
 	}
+	if err := c.PriceCap.Default.validate("priceCap.default"); err != nil {
+		return err
+	}
+	for name, p := range c.PriceCap.NodePools {
+		if err := p.validate("priceCap.nodePools[" + name + "]"); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -264,6 +309,14 @@ func (c *Config) TransferProfileFor(nodePool string) TransferProfile {
 		return p
 	}
 	return c.TransferCost.Default
+}
+
+// PriceCapProfileFor returns the configured price cap profile of a NodePool.
+func (c *Config) PriceCapProfileFor(nodePool string) PriceCapProfile {
+	if p, ok := c.PriceCap.NodePools[nodePool]; ok {
+		return p
+	}
+	return c.PriceCap.Default
 }
 
 // DeprecatedDataCost reports whether the config sets the ignored dataCost field.
