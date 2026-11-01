@@ -75,6 +75,21 @@ config:
     #     expectedLifetime: 6h
     #     homeTransmitGBPerHour: 1
     minMeasuredVMs: 5
+  # priceCap bounds the offering prices a NodePool considers, dropping offerings exceeding either cap form before
+  # Karpenter sees them. A nodePools entry replaces default for that NodePool. Two forms are supported:
+  # - maxPricePerGPUHour: an absolute dollar limit on an offering's price per GPU-hour.
+  # - maxPriceAboveCheapestPercent: a relative cap above the cheapest offering of the same GPU class and capacity
+  #   type in the NodePool's footprint. The reference price is the cheapest offering price per GPU-hour (including
+  #   transfer cost) for that GPU class and capacity type across the NodePool's footprint.
+  # Offerings are compared against the computed price (base price + data transfer cost). Price cap is off by default.
+  priceCap:
+    default: {}
+    #   maxPricePerGPUHour: 2.50
+    #   maxPriceAboveCheapestPercent: 20
+    nodePools: {}
+    #   cloudvm-gpu:
+    #     maxPricePerGPUHour: 3.00
+    #     maxPriceAboveCheapestPercent: 25
   # nodePoolSelector limits this controller to CloudVM NodePools with these labels; empty serves them all.
   nodePoolSelector: {}
   # offeringSpread lets each claim of a scale-up launch with one of the maxOfferings cheapest compatible offerings

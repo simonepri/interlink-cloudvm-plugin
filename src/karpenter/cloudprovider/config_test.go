@@ -52,6 +52,13 @@ transferCost:
     batch:
       homeTransmitGBPerHour: 2.5
   minMeasuredVMs: 5
+priceCap:
+  default:
+    maxPricePerGPUHour: 2.50
+  nodePools:
+    gpu-capped:
+      maxPricePerGPUHour: 1.50
+      maxPriceAboveCheapestPercent: 20
 dataCost:
   homeRegion: us-east-1
   defaultUSDPerHour: 0.02
@@ -96,6 +103,14 @@ nodePoolSelector:
 	if cfg.TransferCost.MinMeasuredVMs != 5 {
 		t.Errorf("minMeasuredVMs = %d", cfg.TransferCost.MinMeasuredVMs)
 	}
+	defCap := cfg.PriceCapProfileFor("unknown")
+	if defCap.MaxPricePerGPUHour == nil || *defCap.MaxPricePerGPUHour != 2.50 || defCap.MaxPriceAboveCheapestPercent != nil {
+		t.Errorf("default price cap = %+v", defCap)
+	}
+	gpuCap := cfg.PriceCapProfileFor("gpu-capped")
+	if gpuCap.MaxPricePerGPUHour == nil || *gpuCap.MaxPricePerGPUHour != 1.50 || gpuCap.MaxPriceAboveCheapestPercent == nil || *gpuCap.MaxPriceAboveCheapestPercent != 20 {
+		t.Errorf("gpu-capped price cap = %+v", gpuCap)
+	}
 	// The flat dataCost adder is ignored, but an old config that sets it still loads.
 	if !cfg.DeprecatedDataCost() {
 		t.Error("the deprecated dataCost is not reported")
@@ -104,17 +119,19 @@ nodePoolSelector:
 
 func TestLoadConfigRejectsInvalid(t *testing.T) {
 	for name, body := range map[string]string{
-		"conflicting model": "gpuClasses: [{class: a, models: [L4]}, {class: b, models: [l4]}]",
-		"negative memory":   "gpuClasses: [{class: a, models: [l4], memoryGB: -1}]",
-		"negative pulls":    "transferCost: {default: {imagePullGB: -1}}",
-		"negative rate":     "transferCost: {nodePools: {a: {homeReceiveGBPerHour: -1}}}",
-		"negative measured": "transferCost: {minMeasuredVMs: -1}",
-		"unknown field":     "gpuClass: []",
-		"bad duration":      "catalogTTL: soon",
-		"bad selector":      `nodePoolSelector: {"bad key!": x}`,
-		"negative spread":   "offeringSpread: {priceTolerance: -0.1}",
-		"negative offers":   "offeringSpread: {maxOfferings: -1}",
-		"negative attempts": "launchFallback: {maxAttempts: -1}",
+		"conflicting model":    "gpuClasses: [{class: a, models: [L4]}, {class: b, models: [l4]}]",
+		"negative memory":      "gpuClasses: [{class: a, models: [l4], memoryGB: -1}]",
+		"negative pulls":       "transferCost: {default: {imagePullGB: -1}}",
+		"negative rate":        "transferCost: {nodePools: {a: {homeReceiveGBPerHour: -1}}}",
+		"negative measured":    "transferCost: {minMeasuredVMs: -1}",
+		"negative price cap":   "priceCap: {default: {maxPricePerGPUHour: -1}}",
+		"negative percent cap": "priceCap: {nodePools: {a: {maxPriceAboveCheapestPercent: -5}}}",
+		"unknown field":        "gpuClass: []",
+		"bad duration":         "catalogTTL: soon",
+		"bad selector":         `nodePoolSelector: {"bad key!": x}`,
+		"negative spread":      "offeringSpread: {priceTolerance: -0.1}",
+		"negative offers":      "offeringSpread: {maxOfferings: -1}",
+		"negative attempts":    "launchFallback: {maxAttempts: -1}",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := LoadConfig(writeConfig(t, body)); err == nil {

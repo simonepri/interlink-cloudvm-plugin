@@ -57,7 +57,6 @@ require (
 	github.com/onsi/gomega v1.40.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
@@ -108,6 +107,7 @@ require (
 
 require (
 	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_model v0.6.2
 	github.com/samber/lo v1.53.0
 	github.com/simonepri/interlink-cloudvm-plugin/nodeclaim v0.0.0
 	go.opentelemetry.io/otel v1.47.0
