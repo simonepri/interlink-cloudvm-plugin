@@ -424,16 +424,21 @@ def remote_layer_count(img):
     try:
         res = subprocess.run([CONTAINER_CLI, *snapshotter_args(), 'image', 'inspect', '--format', '{{json .RootFS.Layers}}', img],
                              capture_output=True, text=True)
-        diff_ids = json.loads(res.stdout) if res.returncode == 0 else []
+        # A reference naming several stored images prints a line for each.
+        lines = res.stdout.split() if res.returncode == 0 else []
+        if not lines:
+            raise ValueError(res.stderr.strip() or 'no layers listed')
+        diff_ids = json.loads(lines[0]) or []
         count, chain = 0, ''
-        for diff_id in diff_ids or []:
+        for diff_id in diff_ids:
             chain = diff_id if not chain else 'sha256:' + hashlib.sha256(f"{chain} {diff_id}".encode()).hexdigest()
             info = subprocess.run([SNAPSHOT_CLI, '--namespace', 'default', 'snapshots', '--snapshotter', 'stargz', 'info', chain],
                                   capture_output=True, text=True)
             if info.returncode == 0 and 'containerd.io/snapshot/remote' in (json.loads(info.stdout).get('Labels') or {}):
                 count += 1
-        return count, len(diff_ids or [])
-    except Exception:
+        return count, len(diff_ids)
+    except Exception as e:
+        print(f"[cloudvm-runner] cannot count remote layers of {img}: {e}", flush=True)
         return 0, 0
 
 def split_image_ref(ref):

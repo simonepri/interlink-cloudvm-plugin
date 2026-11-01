@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -292,9 +293,9 @@ answered.on_fin()
 		"[cloudvm-tunnel-agent] refused 0\n",
 		"[cloudvm-tunnel-agent] refused 12 (2 more since the last report)\n",
 		"[cloudvm-tunnel-agent] other kind\n",
-		"no process holds the udp socket at ('127.0.0.1', 40000); the gateway refuses its stream as pod unattributed\n",
+		"cannot tell which pod holds the udp socket at ('127.0.0.1', 40000)\n",
 		"pod unattributed\n",
-		"gateway closed the stream to 10.1.2.3:6379 for pod uid-a before sending any data",
+		"gateway closed the stream to 10.1.2.3:6379 for pod uid-a before any data",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("agent output lacks %q:\n%s", want, out)
@@ -321,5 +322,131 @@ True
 `, burstablePod)
 	if out != want {
 		t.Errorf("records =\n%s\nwant\n%s", out, want)
+	}
+}
+
+// A pod's client CONNECTs to a cluster hostname through the real agent: the agent resolves the name through the
+// gateway's DNS stream as that pod and tunnels the connection under the pod, so the gateway authorizes it by the pod
+// the client runs in rather than refusing it as unattributed or failing to resolve it on the VM.
+func TestTunnelTCP_PythonAgentConnectsAPodToAClusterHostname(t *testing.T) {
+	f := newTunnelFixture(t, time.Minute)
+	const instanceID, token = "i-python-hostname", "hostname-token"
+	f.addNode(instanceID, "eu-west-1", token)
+	f.gateway.directTCPNetworks, _ = ParseDirectTCPNetworks("127.0.0.0/8")
+	_, refusals := isolateNamespaces(f, instanceID, "team-a")
+	var mu sync.Mutex
+	var named []string
+	f.gateway.podOnWorker = func(id, pod string) (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		named = append(named, pod)
+		return "team-a", id == instanceID && pod == burstablePod
+	}
+	cluster := startFakeResolver(t, map[string][]netip.Addr{
+		"head-svc.team-a.svc.cluster.local.": {netip.MustParseAddr("127.0.0.1")},
+	})
+	f.gateway.clusterDNSServers = []string{cluster.addr}
+
+	clientPort := freePort(t)
+	root := writeProcFixture(t, []procSocket{
+		{proto: "tcp", local: loopbackHex, port: clientPort, inode: 6001, pid: 201,
+			cgroup: "0::/kubepods/burstable/pod" + burstablePod + "/" + strings.Repeat("ab", 32) + "\n"},
+	})
+	agentProxyPort := freePort(t)
+	resolvConf := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(resolvConf, []byte("nameserver 127.0.0.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startPythonAgent(t, f, instanceID, token, fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort),
+		"CLOUDVM_PROC_ROOT="+root, "CLOUDVM_TUNNEL_CIDRS=127.0.0.0/8",
+		fmt.Sprintf("CLOUDVM_DNS_LISTEN=127.0.0.1:%d", freePort(t)), "CLOUDVM_DNS_RESOLV_CONF="+resolvConf)
+	echo := startEchoServer(t)
+	_, echoPort, _ := net.SplitHostPort(echo)
+
+	status, conn, reader := connectFrom(t, clientPort, fmt.Sprintf("127.0.0.1:%d", agentProxyPort),
+		"head-svc.team-a.svc.cluster.local:"+echoPort)
+	if status != http.StatusOK {
+		select {
+		case reason := <-refusals:
+			t.Fatalf("CONNECT status %d, gateway refused the stream: %s", status, reason)
+		default:
+			t.Fatalf("CONNECT status %d", status)
+		}
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(reader, got); err != nil || string(got) != "ping" {
+		t.Fatalf("echo = %q, %v", got, err)
+	}
+	if !cluster.wasAsked("head-svc.team-a.svc.cluster.local.") {
+		t.Error("the gateway's cluster resolver was not asked for the hostname")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(named) == 0 || named[len(named)-1] != burstablePod {
+		t.Errorf("streams named pods %v, want %q", named, burstablePod)
+	}
+}
+
+func TestTunnelAgent_AttributesItsOwnAndOtherVMSocketsToTheVM(t *testing.T) {
+	out := runAgentPython(t, `
+import os, tempfile
+root = tempfile.mkdtemp()
+os.makedirs(os.path.join(root, "net"))
+with open(os.path.join(root, "net", "udp"), "w") as f:
+    f.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+    for i, (port, inode) in enumerate([(40001, 7001), (40002, 7002)]):
+        f.write("%4d: 0100007F:%04X 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 %d 2 0\n" % (i, port, inode))
+for name in ("tcp", "tcp6", "udp6"):
+    open(os.path.join(root, "net", name), "w").write("header\n")
+for pid, inode, cgroup in [(str(os.getpid()), 7001, "0::/system.slice/cloud-final.service\n"),
+                           ("300", 7002, "0::/kubepods/burstable/podnot-a-uid/abc\n")]:
+    os.makedirs(os.path.join(root, pid, "fd"), exist_ok=True)
+    os.symlink("socket:[%d]" % inode, os.path.join(root, pid, "fd", "9"))
+    with open(os.path.join(root, pid, "cgroup"), "w") as f:
+        f.write(cgroup)
+r = agent.PodResolver(root)
+print("agent", repr(r.pod_of("udp", ("127.0.0.1", 40001))))
+print("unmapped pod", repr(r.pod_of("udp", ("127.0.0.1", 40002))))
+`)
+	if want := "agent ''\nunmapped pod None\n"; out != want {
+		t.Errorf("attribution =\n%s\nwant\n%s", out, want)
+	}
+}
+
+func TestTunnelAgent_ResolvesConnectHostnamesAsTheClientsPod(t *testing.T) {
+	out := runAgentPython(t, `
+import asyncio, socket, struct
+calls = []
+class Pods(object):
+    def pod_of(self, proto, peer):
+        calls.append(proto)
+        return "uid-a"
+class Session(object):
+    streams = {}
+    def open_dns_stream(self, query, pod):
+        print("dns stream for pod", pod, "after", len(calls), "attribution")
+        q = agent.dns_question(query)
+        reply = query[:2] + b"\x81\x80" + struct.pack("!HHHH", 1, 1, 0, 0) + query[12:q[2]]
+        reply += b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 30, 4) + socket.inet_aton("10.1.2.3")
+        stream = agent.DNSStream(1)
+        stream.received = reply
+        stream.done.set()
+        return stream
+async def main():
+    proxy = agent.TCPProxy(tunnel_networks=agent.parse_networks("10.0.0.0/8"), pods=Pods())
+    proxy.session = Session()
+    attribution = []
+    def pod():
+        if not attribution:
+            attribution.append(asyncio.ensure_future(proxy.attribute("tcp", ("127.0.0.1", 1))))
+        return attribution[0]
+    print(await proxy.route("head-svc.team-a.svc.cluster.local:6379", pod))
+asyncio.run(main())
+`)
+	if want := "dns stream for pod uid-a after 1 attribution\n(True, '[10.1.2.3]:6379')\n"; out != want {
+		t.Errorf("route =\n%s\nwant\n%s", out, want)
 	}
 }
