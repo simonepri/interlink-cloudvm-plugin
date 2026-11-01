@@ -41,6 +41,7 @@ func main() {
 
 	ctx, op := operator.NewOperator()
 	undecorated := cloudprovider.New(op.GetClient(), api, cfg, op.Clock)
+	undecorated.SetEventRecorder(op.EventRecorder)
 	if endpoint := os.Getenv("CLOUDVM_OTLP_TRACES_ENDPOINT"); endpoint != "" {
 		tp, err := lifecycletrace.NewProvider(ctx, endpoint, "cloudvm-karpenter")
 		if err != nil {

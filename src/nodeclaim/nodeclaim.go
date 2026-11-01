@@ -88,6 +88,8 @@ const (
 	ReasonUnauthorized         = "Unauthorized"
 	ReasonForbidden            = "Forbidden"
 	ReasonInternal             = "Internal"
+	// ReasonUserDataTooLarge refuses a launch whose rendered boot script is larger than the cloud accepts.
+	ReasonUserDataTooLarge = "UserDataTooLarge"
 )
 
 // CauseQuota is the cause of an InsufficientCapacity error that a cloud quota, rather than a shortage of capacity,
