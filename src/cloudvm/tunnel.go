@@ -19,6 +19,10 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
+// errNoTunnelSession reports a runner call to a VM whose worker has no reverse tunnel session, such as one still
+// booting; the call never left the plugin.
+var errNoTunnelSession = errors.New("no active reverse tunnel session")
+
 // DefaultYamuxConfig returns a tuned Yamux configuration for reverse tunnel gateway and workers.
 // Configures keepalive ping interval of 30 seconds and an 8 MiB receive window per stream, matching the agent's
 // STREAM_WINDOW, so one stream can carry about 60 MiB/s across a 130 ms link while a stalled one buffers at most 8 MiB.
@@ -180,6 +184,27 @@ func (r *SessionRegistry) Await(instanceID string, recentLoss, wait time.Duratio
 		case <-registered:
 		case <-deadline.C:
 			return r.Get(instanceID)
+		}
+	}
+}
+
+// AwaitRegistration returns once the instance has an active session, wait passed, or ctx ended.
+func (r *SessionRegistry) AwaitRegistration(ctx context.Context, instanceID string, wait time.Duration) {
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	for {
+		r.mu.RLock()
+		registered := r.registered
+		r.mu.RUnlock()
+		if r.Has(instanceID) {
+			return
+		}
+		select {
+		case <-registered:
+		case <-deadline.C:
+			return
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -694,7 +719,7 @@ func (t *TunnelContainerRunner) StartContainer(ctx context.Context, node *CloudV
 		if t.fallback != nil {
 			return t.fallback.StartContainer(ctx, node, req)
 		}
-		return fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+		return fmt.Errorf("%w for instance %s", errNoTunnelSession, node.InstanceID)
 	}
 
 	payload, err := json.Marshal(req)
@@ -734,7 +759,7 @@ func (t *TunnelContainerRunner) GetStatus(ctx context.Context, node *CloudVMNode
 		if t.fallback != nil {
 			return t.fallback.GetStatus(ctx, node, podUID)
 		}
-		return nil, fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+		return nil, fmt.Errorf("%w for instance %s", errNoTunnelSession, node.InstanceID)
 	}
 
 	url := fmt.Sprintf("http://clvm-tunnel/containers/status?podUID=%s", podUID)
@@ -773,7 +798,7 @@ func (t *TunnelContainerRunner) StopContainer(ctx context.Context, node *CloudVM
 		if t.fallback != nil {
 			return t.fallback.StopContainer(ctx, node, podUID)
 		}
-		return fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+		return fmt.Errorf("%w for instance %s", errNoTunnelSession, node.InstanceID)
 	}
 
 	url := fmt.Sprintf("http://clvm-tunnel/containers/stop?podUID=%s", podUID)
@@ -808,7 +833,7 @@ func (t *TunnelContainerRunner) ListContainers(ctx context.Context, node *CloudV
 		if t.fallback != nil {
 			return t.fallback.ListContainers(ctx, node)
 		}
-		return nil, fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+		return nil, fmt.Errorf("%w for instance %s", errNoTunnelSession, node.InstanceID)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://clvm-tunnel/containers/list", nil)
@@ -846,7 +871,7 @@ func (t *TunnelContainerRunner) GetHostStats(ctx context.Context, node *CloudVMN
 		if t.fallback != nil {
 			return t.fallback.GetHostStats(ctx, node)
 		}
-		return nil, fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+		return nil, fmt.Errorf("%w for instance %s", errNoTunnelSession, node.InstanceID)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://clvm-tunnel/host/stats", nil)

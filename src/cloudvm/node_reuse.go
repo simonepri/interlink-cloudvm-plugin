@@ -88,6 +88,7 @@ func markSpinDown(node *CloudVMNode, reason SpinDownReason) {
 	}
 	node.Cordoned = true
 	node.SpinDownReason = reason
+	node.SpinDownAt = time.Now()
 	idleMetrics.spinDowns.WithLabelValues(string(reason)).Inc()
 	log.Printf("[cloudvm] Marked node %s for spin-down: %s", sanitizeLog(node.InstanceID), reason) //nolint:gosec // sanitized
 }
