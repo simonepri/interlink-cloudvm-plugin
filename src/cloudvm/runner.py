@@ -720,6 +720,13 @@ def shm_flag(mem_bytes):
         pass
     return '--shm-size=16g'
 
+def process_args(command, args):
+    """Returns the run flags and arguments after the image that give a container the kubelet's process: a command
+    replaces the image's ENTRYPOINT and drops its CMD, and args replace its CMD."""
+    if not command:
+        return [], args
+    return [f"--entrypoint={command[0]}"], [*command[1:], *args]
+
 def container_plan(pod_uid, req, c, name, paths, main):
     """Returns how to run one container: its images to try, and a function that builds its run command once the
     image is pulled."""
@@ -728,10 +735,12 @@ def container_plan(pod_uid, req, c, name, paths, main):
     env = {str(k): str(v) for k, v in (c.get('env') or {}).items()}
     if isinstance(req.get('awsCredentials'), dict):
         env.update(credentials_env(set_pod_credentials(pod_uid, req['awsCredentials'])))
-    args = fill_host_ip(c.get('hostIPEnv') or [], env, [str(a) for a in (c.get('command') or [])] + [str(a) for a in (c.get('args') or [])])
+    command = [str(a) for a in (c.get('command') or [])]
+    argv = fill_host_ip(c.get('hostIPEnv') or [], env, command + [str(a) for a in (c.get('args') or [])])
+    entrypoint, args = process_args(argv[:len(command)], argv[len(command):])
     global_flags, pod_flags = pod_cgroup_flags(req)
     sec = c.get('security') or {'runAsUser': c.get('runAsUser'), 'runAsGroup': c.get('runAsGroup')}
-    flags = [*pod_flags, *security_flags(sec)]
+    flags = [*pod_flags, *security_flags(sec), *entrypoint]
     if not req.get('hostIPC'):
         flags.append(shm_flag(c.get('memoryBytes', 0)))
     for domain in cluster_dns_search(str(req.get('namespace') or '')):
