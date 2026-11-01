@@ -166,6 +166,10 @@ spec:
             - name: LAZY_IMAGE_PULLS
               value: "false"
             {{- end }}
+            {{- if .Values.stargzConfig }}
+            - name: STARGZ_CONFIG
+              value: {{ .Values.stargzConfig | quote }}
+            {{- end }}
             {{- if .Values.customBootstrapScript }}
             - name: CUSTOM_BOOTSTRAP_SCRIPT
               value: {{ .Values.customBootstrapScript | quote }}

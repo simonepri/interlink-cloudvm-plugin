@@ -387,6 +387,7 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		CustomBootstrapScript: spec.CustomBootstrapScript,
 		RunnerConcurrency:     spec.RunnerConcurrency,
 		DisableLazyPulls:      spec.DisableLazyPulls,
+		StargzConfig:          spec.StargzConfig,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate gcp startup script: %w", err)

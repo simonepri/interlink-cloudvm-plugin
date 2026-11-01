@@ -76,6 +76,9 @@ otlpLogsEndpoint: ""
 otlpTracesEndpoint: ""
 # Pulls eStargz images lazily through the stargz snapshotter on workers; false pulls every image in full.
 lazyImagePulls: true
+# TOML that opens each worker's stargz snapshotter config, such as max_concurrency, prefetch_timeout_sec, or a [blob]
+# table with chunk_size; empty keeps the snapshotter defaults.
+stargzConfig: ""
 customBootstrapScript: ""
 
 service:

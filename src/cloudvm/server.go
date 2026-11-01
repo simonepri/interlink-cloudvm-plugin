@@ -71,6 +71,7 @@ type Server struct {
 	tombstoneStore        *TombstoneStore
 	registryMirrors       []string
 	disableLazyPulls      bool
+	stargzConfig          string
 	customBootstrapScript string
 	runnerConcurrency     int
 	launchTimeout         time.Duration
@@ -179,6 +180,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	}
 	s.registryMirrors = regMirrors
 	s.disableLazyPulls = os.Getenv("LAZY_IMAGE_PULLS") == "false" || os.Getenv("LAZY_IMAGE_PULLS") == "0"
+	s.stargzConfig = os.Getenv("STARGZ_CONFIG")
 	s.customBootstrapScript = os.Getenv("CUSTOM_BOOTSTRAP_SCRIPT")
 	if raw := os.Getenv("MAX_RUNNER_CONCURRENCY"); raw != "" {
 		if c, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && c > 0 {
@@ -327,6 +329,12 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		script = s.customBootstrapScript
 		s.mu.RUnlock()
 	}
+	stargzConfig := spec.StargzConfig
+	if stargzConfig == "" && s != nil {
+		s.mu.RLock()
+		stargzConfig = s.stargzConfig
+		s.mu.RUnlock()
+	}
 	return &CloudInitConfig{
 		PodName:               spec.PodName,
 		PodNamespace:          spec.PodNamespace,
@@ -369,6 +377,7 @@ func (s *Server) BuildCloudInitConfig(spec *InstanceSpec) *CloudInitConfig {
 		CustomBootstrapScript: script,
 		RunnerConcurrency:     rc,
 		DisableLazyPulls:      spec.DisableLazyPulls || (s != nil && s.disableLazyPulls),
+		StargzConfig:          stargzConfig,
 	}
 }
 
@@ -737,6 +746,9 @@ func (s *Server) applyServerDefaults(spec *InstanceSpec) {
 	}
 	if s.disableLazyPulls {
 		spec.DisableLazyPulls = true
+	}
+	if spec.StargzConfig == "" && s.stargzConfig != "" {
+		spec.StargzConfig = s.stargzConfig
 	}
 	if spec.CustomBootstrapScript == "" && s.customBootstrapScript != "" {
 		spec.CustomBootstrapScript = s.customBootstrapScript

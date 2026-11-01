@@ -174,6 +174,8 @@ type InstanceSpec struct {
 	NodeClaim bool `json:"nodeClaim,omitempty"`
 	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
+	// StargzConfig is TOML that opens the stargz snapshotter config, ahead of the Docker Hub mirrors the plugin adds.
+	StargzConfig string `json:"stargzConfig,omitempty"`
 }
 
 // Instance represents an active or terminating cloud VM instance.
