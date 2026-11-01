@@ -30,6 +30,10 @@ const (
 	// LabelNVIDIAGPUPresent is "true" on types with NVIDIA GPUs, the label NVIDIA's GPU feature discovery sets on GPU
 	// nodes, so DaemonSets that select GPU nodes by it, such as GPU exporters, also select CloudVM GPU Nodes.
 	LabelNVIDIAGPUPresent = "nvidia.com/gpu.present"
+	// LabelNVIDIAPCIPresent is "true" on types with NVIDIA GPUs, the label node feature discovery sets on nodes with
+	// an NVIDIA PCI device. The NVIDIA GPU operator resets LabelNVIDIAGPUPresent to "false" on every node without it,
+	// which would take GPU Nodes out of the DaemonSets that select them.
+	LabelNVIDIAPCIPresent = "feature.node.kubernetes.io/pci-10de.present"
 )
 
 // AnnotationNodeClassHash records the launch-settings hash of the NodeClass a NodeClaim launched with.
@@ -50,6 +54,7 @@ var derivedLabels = []string{
 	LabelInstanceGPUCount,
 	LabelInstanceGPUMemory,
 	LabelNVIDIAGPUPresent,
+	LabelNVIDIAPCIPresent,
 }
 
 func init() {
