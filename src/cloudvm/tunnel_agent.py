@@ -45,7 +45,7 @@ LOG_READ_CHUNK = 64 * 1024
 LOG_POLL_SECONDS = 1
 CONTAINER_POLL_SECONDS = 5
 CONTAINER_PREFIX = "cloudvm-"
-DEFAULT_LOG_FILES = "bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log"
+DEFAULT_LOG_FILES = "bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log,tunnel=/var/log/cloudvm-tunnel-agent.log"
 # The bootstrap appends "<phase> <epoch seconds>" here as each boot phase ends.
 DEFAULT_BOOT_MARKS = "/run/cloudvm/boot-marks"
 MAX_BOOT_MARKS = 16
@@ -64,6 +64,11 @@ HOT_PIDS = 64
 # Answers to the allow-listed external hostnames come from the RFC 2544 benchmarking range the bootstrap redirects.
 SYNTHETIC_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 SYNTHETIC_TTL = 60
+# Bounds how often the agent logs failures of one kind, such as connections it cannot attribute to a pod.
+FAILURE_LOG_INTERVAL = 10
+# A runtime container is cloudvm-<pod UID> for a pod's main container and cloudvm-<pod UID>-init-<index>-<name> for
+# its init containers.
+CONTAINER_NAME = re.compile(r"^(?P<pod>.+?)(?:-init-\d+(?:-(?P<container>.+))?)?$")
 
 
 def log(msg):
@@ -71,11 +76,32 @@ def log(msg):
     sys.stderr.flush()
 
 
+class FailureLog(object):
+    """Logs failures that may repeat for every connection at most once per FAILURE_LOG_INTERVAL for each kind, with
+    how many of that kind it held back since the last line."""
+
+    def __init__(self, interval=FAILURE_LOG_INTERVAL, clock=time.monotonic):
+        self.interval, self.clock = interval, clock
+        self.last, self.held = {}, {}
+
+    def __call__(self, kind, msg):
+        now = self.clock()
+        if kind in self.last and now - self.last[kind] < self.interval:
+            self.held[kind] = self.held.get(kind, 0) + 1
+            return
+        held = self.held.pop(kind, 0)
+        self.last[kind] = now
+        log(msg + (" (%d more since the last report)" % held if held else ""))
+
+
+log_failure = FailureLog()
+
+
 class Stream(object):
     """One Yamux stream bridged to a TCP connection: a gateway-opened stream dials the runner or the target its tcp
     header names on this host, and an agent-opened stream carries a connection accepted by the local CONNECT proxy."""
 
-    def __init__(self, session, sid, local=None):
+    def __init__(self, session, sid, local=None, target="", pod=""):
         self.session = session
         self.sid = sid
         self.inbound = asyncio.Queue()
@@ -84,6 +110,8 @@ class Stream(object):
         self.window_open.set()
         self.task = None
         self.local = local
+        self.target, self.pod = target, pod
+        self.received = 0
 
     def grow_window(self, delta):
         self.send_window += delta
@@ -91,10 +119,22 @@ class Stream(object):
             self.window_open.set()
 
     def on_data(self, payload):
+        self.received += len(payload)
         self.inbound.put_nowait(payload)
 
     def on_fin(self):
+        self.ended_by_gateway("closed")
         self.inbound.put_nowait(None)
+
+    def on_reset(self):
+        self.ended_by_gateway("reset")
+
+    def ended_by_gateway(self, how):
+        """Logs an agent-opened stream the gateway ended before sending any data, as it ends one it refuses or cannot
+        connect; the gateway logs why."""
+        if self.local is not None and not self.received:
+            log_failure("stream_ended", "gateway %s the stream to %s%s before sending any data; it refuses streams it "
+                        "may not connect and logs why" % (how, self.target, " for pod " + self.pod if self.pod else ""))
 
     async def run(self):
         if self.local is not None:
@@ -266,7 +306,7 @@ class Session(object):
 
         The caller starts the stream once it has answered its client.
         """
-        stream = Stream(self, self.next_sid, local=(local_reader, local_writer))
+        stream = Stream(self, self.next_sid, local=(local_reader, local_writer), target=target, pod=pod)
         self.next_sid += 2
         self.streams[stream.sid] = stream
         self.send(T_WINDOW, F_SYN, stream.sid, STREAM_WINDOW - INITIAL_WINDOW)
@@ -336,6 +376,8 @@ class Session(object):
             stream.on_data(payload)
         if flags & F_RST:
             self.streams.pop(sid, None)
+            if isinstance(stream, Stream):
+                stream.on_reset()
             if stream.task is not None:
                 stream.task.cancel()
         elif flags & F_FIN:
@@ -516,13 +558,22 @@ def now_rfc3339():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def log_record(source, message, time_str=None, pod=None, fd=None):
+def log_record(source, message, time_str=None, pod=None, fd=None, container=None):
     rec = {"time": time_str or now_rfc3339(), "src": source, "msg": message[:MAX_LOG_MESSAGE]}
     if pod:
         rec["pod"] = pod
+    if container:
+        rec["container"] = container
     if fd:
         rec["fd"] = fd
     return (json.dumps(rec) + "\n").encode()
+
+
+def container_identity(name):
+    """Returns the pod UID and, for an init container, the Kubernetes container name of a runtime container's name;
+    the name is "" for a pod's main container."""
+    match = CONTAINER_NAME.match(name[len(CONTAINER_PREFIX):])
+    return match.group("pod"), match.group("container") or ""
 
 
 class LogCollector(object):
@@ -618,17 +669,17 @@ class LogCollector(object):
             *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             limit=LOG_READ_CHUNK)
         try:
-            pod = name[len(CONTAINER_PREFIX):]
+            pod, container = container_identity(name)
             await asyncio.gather(
-                self.pipe_container(proc.stdout, name, pod, "stdout", since, queue),
-                self.pipe_container(proc.stderr, name, pod, "stderr", since, queue))
+                self.pipe_container(proc.stdout, name, pod, container, "stdout", since, queue),
+                self.pipe_container(proc.stderr, name, pod, container, "stderr", since, queue))
             if await proc.wait() == 0:
                 self.finished.add(name)  # the container exited and its output is complete
         finally:
             if proc.returncode is None:
                 proc.kill()
 
-    async def pipe_container(self, reader, name, pod, fd, since, queue):
+    async def pipe_container(self, reader, name, pod, container, fd, since, queue):
         since_key = since and log_time_key(since)
         while True:
             try:
@@ -640,7 +691,7 @@ class LogCollector(object):
             ts, _, text = line.decode("utf-8", "replace").rstrip("\r\n").partition(" ")
             if since_key and log_time_key(ts) <= since_key:
                 continue  # --since repeats sent records: Docker the last one, nerdctl its whole second
-            await queue.put((log_record("container", text, ts, pod, fd), self.commit_since(name, ts)))
+            await queue.put((log_record("container", text, ts, pod, fd, container), self.commit_since(name, ts)))
 
 
 def log_time_key(ts):
@@ -736,9 +787,13 @@ class TCPProxy(object):
         try:
             pod = await asyncio.get_event_loop().run_in_executor(None, self.pods.pod_of, proto, peer)
         except (OSError, ValueError) as e:
-            log("cannot attribute %s connection from %s: %s" % (proto, peer, e))
+            log_failure("attribution_error", "cannot attribute %s connection from %s: %s" % (proto, peer, e))
             pod = None
-        return UNATTRIBUTED_POD if pod is None else pod
+        if pod is None:
+            log_failure("unattributed", "no process holds the %s socket at %s; the gateway refuses its stream as pod %s"
+                        % (proto, peer, UNATTRIBUTED_POD))
+            return UNATTRIBUTED_POD
+        return pod
 
     async def route(self, target):
         host, _, port = target.rpartition(":")
@@ -791,6 +846,8 @@ class TCPProxy(object):
             return
         pod = await self.attribute("tcp", writer.get_extra_info("peername")) if route is not None else ""
         session = self.session
+        if route is not None and session is None:
+            log_failure("no_session", "no tunnel session for the connection to %s; answering 502" % route[1])
         if route is None or session is None:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             writer.close()
@@ -811,6 +868,8 @@ class TCPProxy(object):
             target = None
         pod = await self.attribute("tcp", writer.get_extra_info("peername")) if target is not None else ""
         session = self.session
+        if target is not None and session is None:
+            log_failure("no_session", "no tunnel session for the redirected connection to %s; closing it" % target)
         if target is None or session is None:
             writer.close()
             return
@@ -891,10 +950,13 @@ class DNSForwarder(asyncio.DatagramProtocol):
                     break
                 except OSError as e:
                     log("DNS %s: %s" % (upstream, e))
-        elif session is not None:
-            pod = await self.proxy.attribute("udp", addr)
+        else:
+            pod = await self.proxy.attribute("udp", addr) if session is not None else ""
             session = self.proxy.session
-            if session is not None:
+            name = question[0] if question is not None else "a malformed query"
+            if session is None:
+                log_failure("dns_no_session", "no tunnel session to resolve %s; answering SERVFAIL" % name)
+            else:
                 stream = session.open_dns_stream(query, pod)
                 try:
                     await asyncio.wait_for(stream.done.wait(), DNS_TIMEOUT)
@@ -902,6 +964,9 @@ class DNSForwarder(asyncio.DatagramProtocol):
                 except asyncio.TimeoutError:
                     pass
                 session.streams.pop(stream.sid, None)
+                if len(reply) < 12:
+                    log_failure("dns_unanswered", "gateway gave no answer for %s%s; answering SERVFAIL"
+                                % (name, " from pod " + pod if pod else ""))
         if len(reply) < 12:  # SERVFAIL
             reply = query[:2] + bytes([0x80 | query[2] & 0x79, 0x82]) + b"\0\1\0\0\0\0\0\0" + query[12:end]
         self.transport.sendto(reply, addr)

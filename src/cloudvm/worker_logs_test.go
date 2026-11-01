@@ -122,6 +122,7 @@ func TestWorkerLogs_DialerStreamReachesCollectorAndKubectlLogs(t *testing.T) {
 		enc := json.NewEncoder(w)
 		_ = enc.Encode(WorkerLogRecord{Source: WorkerLogSourceBootstrap, Message: "bootstrap step 1"})
 		_, _ = fmt.Fprintf(w, "%s\n", strings.Repeat("x", maxWorkerLogLine+10)) // overlong lines are skipped
+		_ = enc.Encode(WorkerLogRecord{Time: "2026-10-26T09:59:00Z", Source: WorkerLogSourceContainer, PodUID: "uid-1", Container: "wait-gcs-ready", Stream: "stdout", Message: "waiting for GCS"})
 		_ = enc.Encode(WorkerLogRecord{Time: "2026-10-26T10:00:00.5Z", Source: WorkerLogSourceContainer, PodUID: "uid-1", Stream: "stderr", Message: "hello from the container"})
 		<-ctx.Done()
 		return nil
@@ -151,6 +152,15 @@ func TestWorkerLogs_DialerStreamReachesCollectorAndKubectlLogs(t *testing.T) {
 	out := getLogs(t, f.server, GetLogsRequest{Namespace: "team-a", PodName: "job-1", PodUID: "uid-1", Opts: GetLogsOptions{Timestamps: true}})
 	if out != "2026-10-26T10:00:00.5Z hello from the container\n" {
 		t.Errorf("kubectl logs = %q", out)
+	}
+	if out := getLogs(t, f.server, GetLogsRequest{PodUID: "uid-1", ContainerName: "worker"}); out != "hello from the container\n" {
+		t.Errorf("kubectl logs -c worker = %q, want only the main container's output", out)
+	}
+	if out := getLogs(t, f.server, GetLogsRequest{PodUID: "uid-1", ContainerName: "wait-gcs-ready"}); out != "waiting for GCS\n" {
+		t.Errorf("kubectl logs -c wait-gcs-ready = %q, want the init container's output", out)
+	}
+	if rec, _ := collector.find("waiting for GCS"); rec.attrs["k8s.container.name"] != "wait-gcs-ready" || rec.attrs["k8s.pod.uid"] != "uid-1" {
+		t.Errorf("init container record attributes = %v", rec.attrs)
 	}
 }
 

@@ -680,7 +680,7 @@ func TestRenderCloudInit_TunnelWorker(t *testing.T) {
 			`CLOUDVM_DIRECT_CIDRS="10.137.0.0/16,10.138.0.0/16"`,
 			`CLOUDVM_TUNNEL_CIDRS="10.112.0.0/12"`,
 			`CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1"`,
-			"spot=/var/log/cloudvm-spot-watcher.log",
+			"tunnel=/var/log/cloudvm-tunnel-agent.log,spot=/var/log/cloudvm-spot-watcher.log",
 			"cloudvm_fetch_script " + scriptSHA256(spotWatcherScript) + " /usr/local/bin/cloudvm-spot-watcher.py",
 			"instance-identity/pkcs7",
 			`CLOUDVM_RUNNER_BIND="127.0.0.1"`,

@@ -260,3 +260,66 @@ print(p.tunnel_target("%s:8443"), sorted(p.synthetic_names))
 		t.Errorf("routes =\n%s\nwant\n%s", out, wantOut)
 	}
 }
+
+func TestTunnelAgent_LogsUnattributedAndRefusedStreamsAtABoundedRate(t *testing.T) {
+	out := runAgentPython(t, `
+import asyncio, sys
+sys.stderr = sys.stdout
+now = [0.0]
+limited = agent.FailureLog(interval=10, clock=lambda: now[0])
+for t in (0, 1, 2):
+    now[0] = t
+    limited("refused", "refused %d" % t)
+now[0] = 12
+limited("refused", "refused 12")
+limited("other", "other kind")
+
+agent.log_failure = agent.FailureLog()
+class Unknown(object):
+    def pod_of(self, proto, peer):
+        return None
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+proxy = agent.TCPProxy(pods=Unknown())
+print("pod", loop.run_until_complete(proxy.attribute("udp", ("127.0.0.1", 40000))))
+refused = agent.Stream(None, 3, local=(None, None), target="10.1.2.3:6379", pod="uid-a")
+refused.on_fin()
+answered = agent.Stream(None, 5, local=(None, None), target="10.1.2.3:6380", pod="uid-a")
+answered.on_data(b"+OK")
+answered.on_fin()
+`)
+	for _, want := range []string{
+		"[cloudvm-tunnel-agent] refused 0\n",
+		"[cloudvm-tunnel-agent] refused 12 (2 more since the last report)\n",
+		"[cloudvm-tunnel-agent] other kind\n",
+		"no process holds the udp socket at ('127.0.0.1', 40000); the gateway refuses its stream as pod unattributed\n",
+		"pod unattributed\n",
+		"gateway closed the stream to 10.1.2.3:6379 for pod uid-a before sending any data",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("agent output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"refused 1\n", "refused 2\n", "10.1.2.3:6380"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("agent output has %q:\n%s", unwanted, out)
+		}
+	}
+}
+
+func TestTunnelAgent_LabelsContainerLogsWithTheirPodAndInitContainer(t *testing.T) {
+	out := runAgentPython(t, fmt.Sprintf(`
+import json
+for name in ["cloudvm-%[1]s", "cloudvm-%[1]s-init-1-wait-gcs-ready"]:
+    pod, container = agent.container_identity(name)
+    print(json.dumps(json.loads(agent.log_record("container", "m", "t", pod, "stdout", container)), sort_keys=True))
+print("tunnel=/var/log/cloudvm-tunnel-agent.log" in agent.DEFAULT_LOG_FILES)
+`, burstablePod))
+	want := fmt.Sprintf(`{"fd": "stdout", "msg": "m", "pod": "%[1]s", "src": "container", "time": "t"}
+{"container": "wait-gcs-ready", "fd": "stdout", "msg": "m", "pod": "%[1]s", "src": "container", "time": "t"}
+True
+`, burstablePod)
+	if out != want {
+		t.Errorf("records =\n%s\nwant\n%s", out, want)
+	}
+}

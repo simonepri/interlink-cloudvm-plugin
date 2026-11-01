@@ -14,7 +14,9 @@ const (
 	transparentProxyPort = 13129
 )
 
-// injectRayProxyEnv adds the gRPC proxy settings to every container of a KubeRay pod, keeping values the pod sets.
+// injectRayProxyEnv adds the gRPC proxy settings to every container of a KubeRay pod, init containers included, keeping
+// values the pod sets. KubeRay's wait-gcs-ready init container dials the head pod over gRPC as the Ray node does, and
+// only the proxy carries that connection through the tunnel when the worker has no route to the cluster's pod network.
 // Only gRPC traffic uses the proxy; plain HTTP clients are unaffected.
 func injectRayProxyEnv(pod *Pod) {
 	if _, ok := pod.Metadata.Labels[rayNodeTypeLabel]; !ok {
@@ -25,8 +27,13 @@ func injectRayProxyEnv(pod *Pod) {
 		{Name: "grpc_proxy", Value: fmt.Sprintf("http://127.0.0.1:%d", tcpProxyPort)},
 		{Name: "no_grpc_proxy", Value: "127.0.0.1,localhost"},
 	}
-	for i := range pod.Spec.Containers {
-		c := &pod.Spec.Containers[i]
+	containers := make([]*ContainerSpec, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
+	for _, list := range [][]ContainerSpec{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for i := range list {
+			containers = append(containers, &list[i])
+		}
+	}
+	for _, c := range containers {
 		have := make(map[string]bool, len(c.Env))
 		for _, e := range c.Env {
 			have[e.Name] = true

@@ -373,3 +373,41 @@ func TestServer_CreateRunsThePodLikeAKubeletAndRefreshesItsToken(t *testing.T) {
 		t.Fatal("expected deletion to stop refreshing the token")
 	}
 }
+
+// KubeRay's wait-gcs-ready init container polls the head pod over gRPC before the Ray node starts; the init container
+// must reach the tunnel's CONNECT proxy the same way the Ray node does, or it waits forever on a worker with no route to
+// the cluster's pod network.
+func TestServer_CreateGivesKubeRayInitContainersTheRayProxyEnv(t *testing.T) {
+	srv := NewServer(NewMockProvider(), "test-cluster")
+	runner := NewMockContainerRunner()
+	srv.SetContainerRunner(runner)
+	kube := fakeKube{mapSecretResolver{}, mapConfigMapResolver{"team-a/kube-root-ca.crt": {"ca.crt": []byte("CA")}}, &fakeTokenIssuer{}}
+	srv.SetSecretResolver(kube)
+	var pod Pod
+	if err := json.Unmarshal(credentialPodJSON("uid-ray", nil), &pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Metadata.Labels = map[string]string{rayNodeTypeLabel: "worker"}
+	pod.Spec.InitContainers = []ContainerSpec{{Name: "wait-gcs-ready", Image: "rayproject/ray:2.44.0",
+		Command: []string{"/bin/bash", "-lc", "--"}, Args: []string{"until ray health-check --address $FQ_RAY_IP:6379; do sleep 5; done"},
+		Env: []EnvVar{{Name: "FQ_RAY_IP", Value: "raycluster-head-svc.team-a.svc.cluster.local"}}}}
+	body, _ := json.Marshal(pod)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/create returned %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req := runner.GetStartRequest("uid-ray")
+	if req == nil || len(req.InitContainers) != 1 {
+		t.Fatalf("start request = %+v", req)
+	}
+	for _, name := range []string{"RAY_grpc_enable_http_proxy", "grpc_proxy", "no_grpc_proxy"} {
+		if got, want := req.InitContainers[0].Env[name], req.Env[name]; got == "" || got != want {
+			t.Errorf("init container %s = %q, want the Ray node's %q", name, got, want)
+		}
+	}
+	if got := req.InitContainers[0].Env["grpc_proxy"]; got != "http://127.0.0.1:13128" {
+		t.Errorf("init container grpc_proxy = %q, want the agent's CONNECT proxy", got)
+	}
+}

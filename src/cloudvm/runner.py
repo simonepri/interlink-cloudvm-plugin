@@ -304,8 +304,10 @@ def container_id(name):
         pass
     return ''
 
-def init_container_name(pod_uid, index):
-    return f"cloudvm-{pod_uid}-init-{index}"
+def init_container_name(pod_uid, index, name):
+    """Names an init container's runtime container after its pod, its position and its Kubernetes name, which the
+    tunnel agent reads back to label its log records for kubectl logs -c."""
+    return f"cloudvm-{pod_uid}-init-{index}-{re.sub(r'[^a-z0-9-]', '-', str(name or '').lower())}"
 
 def pod_init_states(pod_uid):
     with init_states_guard:
@@ -367,7 +369,7 @@ def run_init_containers(uid, req, cmds):
     """Runs each init container to completion in order. A failed one fails the pod under restartPolicy Never and is
     otherwise run again after an exponential back-off, as the kubelet does. Returns whether every one succeeded."""
     for i, cmd in enumerate(cmds):
-        name = init_container_name(uid, i)
+        name = init_container_name(uid, i, req['initContainers'][i].get('name'))
         delay = RESTART_BACKOFF_START
         restarts = 0
         while True:
@@ -730,7 +732,7 @@ def plan_pod(pod_uid, req):
     with get_pod_lock(pod_uid):
         pod_fs_groups[pod_uid] = fs_group
     inits = req.get('initContainers') or []
-    plans = [container_plan(pod_uid, req, c, init_container_name(pod_uid, i), paths, False) for i, c in enumerate(inits)]
+    plans = [container_plan(pod_uid, req, c, init_container_name(pod_uid, i, c.get('name')), paths, False) for i, c in enumerate(inits)]
     with init_states_guard:
         init_states[pod_uid] = [{'name': str(c.get('name') or ''), 'reason': 'PodInitializing'} for c in inits]
     plans.append(container_plan(pod_uid, req, req, f"cloudvm-{pod_uid}", paths, True))
