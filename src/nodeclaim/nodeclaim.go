@@ -44,9 +44,8 @@ const (
 	TaintUnregistered = "karpenter.sh/unregistered"
 )
 
-// IsDaemonSetOwner reports whether an owner reference with this apiVersion and kind names a DaemonSet. A claim VM
-// never runs a DaemonSet pod: the DaemonSet controller creates one for every Node whose taints it tolerates, and a claim
-// VM serves the namespace of the workload it was launched for.
+// IsDaemonSetOwner reports whether an owner reference with this apiVersion and kind names a DaemonSet. A claim VM runs
+// DaemonSet pods of any namespace beside its workload, but only a workload pod binds the namespace the VM serves.
 func IsDaemonSetOwner(apiVersion, kind string) bool {
 	group, _, _ := strings.Cut(apiVersion, "/")
 	return group == "apps" && kind == "DaemonSet"

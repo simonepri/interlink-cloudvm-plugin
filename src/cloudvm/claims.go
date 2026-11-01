@@ -55,6 +55,8 @@ type claimPod struct {
 	Name      string `json:"name"`
 	GPUs      []int  `json:"gpus,omitempty"`
 	TPUs      []int  `json:"tpus,omitempty"`
+	// DaemonSet marks a pod a DaemonSet owns, which never binds the VM's namespace.
+	DaemonSet bool `json:"daemonSet,omitempty"`
 }
 
 // claimRecord is the persisted state of one NodeClaim's VM.
@@ -172,24 +174,17 @@ func (s *Server) claimForPod(pod *Pod) (*CloudVMNode, bool) {
 }
 
 // allocateClaimPod places a pod on its claim's VM. The scheduler already fitted the pod's requests against the Node's
-// allocatable, so only GPU and TPU devices are assigned here; the VM refuses pods of a second namespace and DaemonSet
-// pods, so a DaemonSet pod never takes the VM's namespace from the workload it was launched for. When the VM lacks
-// free devices, the pods that no longer exist are released first, since the scheduler counted only existing ones.
+// allocatable, so only GPU and TPU devices are assigned here. The VM serves the namespace of its first workload pod and
+// refuses workload pods of any other; a DaemonSet pod of any namespace runs on it like on a kubelet's node and never
+// binds or changes that namespace. When the VM lacks free devices, the pods that no longer exist are released first,
+// since the scheduler counted only existing ones.
 func (s *Server) allocateClaimPod(ctx context.Context, node *CloudVMNode, pod *Pod, spec *InstanceSpec, req ResourceVector) (*CloudVMNode, []int, []int, error) {
-	if pod.Metadata.DaemonSetOwned() {
-		return nil, nil, nil, fmt.Errorf("%w: claim VMs do not run DaemonSet pods", errClaimPodRefused)
-	}
 	if node == nil {
 		return nil, nil, nil, fmt.Errorf("%w: its NodeClaim has no VM", errClaimPodRefused)
 	}
-	if regional := s.claimIsRegional(node.ClaimName); regional != s.regionalNamespaces[spec.PodNamespace] {
-		if regional {
-			return nil, nil, nil, fmt.Errorf("%w: regional VM %s runs pods of the regional namespaces only", errClaimPodRefused, node.InstanceID)
-		}
-		return nil, nil, nil, fmt.Errorf("%w: pods of regional namespace %q run only on regional VMs", errClaimPodRefused, spec.PodNamespace)
-	}
-	if owner, ok := s.nodePool.InstanceNamespace(node.InstanceID); ok && owner != spec.PodNamespace {
-		return nil, nil, nil, fmt.Errorf("%w: VM %s runs pods of namespace %q only", errClaimPodRefused, node.InstanceID, owner)
+	daemonSet := pod.Metadata.DaemonSetOwned()
+	if err := s.checkClaimPodNamespace(node, spec.PodNamespace, daemonSet); err != nil {
+		return nil, nil, nil, err
 	}
 	request := AllocationRequest{
 		Resources: ResourceVector{GPUs: req.GPUs, TPUs: req.TPUs},
@@ -197,6 +192,7 @@ func (s *Server) allocateClaimPod(ctx context.Context, node *CloudVMNode, pod *P
 		Namespace: spec.PodNamespace,
 		PodName:   spec.PodName,
 		ClaimName: node.ClaimName,
+		DaemonSet: daemonSet,
 	}
 	alloc, err := s.nodePool.AllocatePod(request)
 	if err != nil && s.releaseDepartedClaimPods(ctx, node) > 0 {
@@ -207,6 +203,25 @@ func (s *Server) allocateClaimPod(ctx context.Context, node *CloudVMNode, pod *P
 	}
 	s.persistClaimPods(alloc.Node)
 	return alloc.Node, alloc.GPUs, alloc.TPUs, nil
+}
+
+// checkClaimPodNamespace refuses a workload pod whose namespace the claim's VM does not serve: a pod of a regional
+// namespace off a regional VM or the reverse, or a pod of a namespace other than the one the VM is bound to. A
+// DaemonSet pod passes, since it never binds the VM's namespace.
+func (s *Server) checkClaimPodNamespace(node *CloudVMNode, namespace string, daemonSet bool) error {
+	if daemonSet {
+		return nil
+	}
+	if regional := s.claimIsRegional(node.ClaimName); regional != s.regionalNamespaces[namespace] {
+		if regional {
+			return fmt.Errorf("%w: regional VM %s runs pods of the regional namespaces only", errClaimPodRefused, node.InstanceID)
+		}
+		return fmt.Errorf("%w: pods of regional namespace %q run only on regional VMs", errClaimPodRefused, namespace)
+	}
+	if owner, ok := s.nodePool.InstanceNamespace(node.InstanceID); ok && owner != namespace {
+		return fmt.Errorf("%w: VM %s runs pods of namespace %q only", errClaimPodRefused, node.InstanceID, owner)
+	}
+	return nil
 }
 
 // claimIsRegional reports whether the claim's taints mark its VM as a regional VM.
@@ -263,7 +278,7 @@ func (s *Server) persistClaimPods(node *CloudVMNode) {
 	pods := make(map[string]claimPod, len(node.ActivePods))
 	for uid, a := range node.ActivePods {
 		if !a.Completed {
-			pods[uid] = claimPod{Namespace: a.PodNamespace, Name: a.PodName, GPUs: a.AssignedGPUs, TPUs: a.AssignedTPUs}
+			pods[uid] = claimPod{Namespace: a.PodNamespace, Name: a.PodName, GPUs: a.AssignedGPUs, TPUs: a.AssignedTPUs, DaemonSet: a.DaemonSet}
 		}
 	}
 	namespace := node.Namespace
@@ -273,7 +288,7 @@ func (s *Server) persistClaimPods(node *CloudVMNode) {
 	defer s.claims.mu.Unlock()
 	rec, ok := s.claims.store.get(node.ClaimName)
 	if !ok || (namespace == rec.Namespace && maps.EqualFunc(pods, rec.Pods, func(a, b claimPod) bool {
-		return a.Namespace == b.Namespace && a.Name == b.Name && slices.Equal(a.GPUs, b.GPUs) && slices.Equal(a.TPUs, b.TPUs)
+		return a.Namespace == b.Namespace && a.Name == b.Name && a.DaemonSet == b.DaemonSet && slices.Equal(a.GPUs, b.GPUs) && slices.Equal(a.TPUs, b.TPUs)
 	})) {
 		return
 	}
@@ -571,7 +586,7 @@ func (s *Server) registerClaimNode(rec *claimRecord, token string) {
 	node.ClaimName = rec.Request.Name
 	node.CreatedAt = rec.CreatedAt
 	for uid, p := range rec.Pods {
-		node.AssignPod(&PodAllocation{PodUID: uid, PodNamespace: p.Namespace, PodName: p.Name, AssignedGPUs: p.GPUs, AssignedTPUs: p.TPUs, StartedAt: rec.CreatedAt})
+		node.AssignPod(&PodAllocation{PodUID: uid, PodNamespace: p.Namespace, PodName: p.Name, AssignedGPUs: p.GPUs, AssignedTPUs: p.TPUs, StartedAt: rec.CreatedAt, DaemonSet: p.DaemonSet})
 	}
 	inst := &Instance{
 		ID: rec.InstanceID, Provider: rec.Provider, Region: rec.Region, InstanceType: rec.InstanceType, IP: rec.IP,

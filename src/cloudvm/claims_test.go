@@ -189,7 +189,16 @@ func TestClaimPodsShareTheClaimVM(t *testing.T) {
 	}
 }
 
-func TestClaimRefusesDaemonSetPods(t *testing.T) {
+// daemonSetPod returns a pod that a DaemonSet of namespace owns, bound to node.
+func daemonSetPod(node, namespace, name string) Pod {
+	return Pod{
+		Metadata: PodMeta{Name: name, Namespace: namespace, UID: "uid-" + name,
+			OwnerReferences: []OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "node-proxy"}}},
+		Spec: PodSpecWrapper{NodeName: node, Containers: []ContainerSpec{{Name: "proxy", Image: "proxy"}}},
+	}
+}
+
+func TestClaimRunsDaemonSetPodsWithoutBindingTheNamespace(t *testing.T) {
 	mock := NewMockProvider()
 	s, client, url := newClaimServer(t, mock)
 	claim, err := client.Create(context.Background(), claimRequest("nc-ds", "g5.12xlarge"))
@@ -197,20 +206,17 @@ func TestClaimRefusesDaemonSetPods(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	_, _, instanceID, _ := nodeclaim.ParseProviderID(claim.ProviderID)
+	runner := s.runner.(*MockContainerRunner)
 
-	daemon := Pod{
-		Metadata: PodMeta{Name: "node-proxy-x1", Namespace: "system", UID: "uid-daemon",
-			OwnerReferences: []OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "node-proxy"}}},
-		Spec: PodSpecWrapper{NodeName: "nc-ds", Containers: []ContainerSpec{{Name: "proxy", Image: "proxy"}}},
+	// A DaemonSet pod that arrives before the workload runs, but leaves the VM unbound.
+	if code := postClaimPod(t, url, daemonSetPod("nc-ds", "system", "proxy-1")); code != http.StatusOK {
+		t.Fatalf("DaemonSet pod: HTTP %d, want 200", code)
 	}
-	if code := postClaimPod(t, url, daemon); code != http.StatusConflict {
-		t.Fatalf("DaemonSet pod: HTTP %d, want 409", code)
+	if runner.GetStartRequest("uid-proxy-1") == nil {
+		t.Fatal("the DaemonSet pod did not start on the claim VM")
 	}
 	if ns, ok := s.nodePool.InstanceNamespace(instanceID); ok {
-		t.Fatalf("a refused DaemonSet pod bound the VM to namespace %q", ns)
-	}
-	if runner := s.runner.(*MockContainerRunner); runner.GetStartRequest("uid-daemon") != nil {
-		t.Fatal("the DaemonSet pod started on the claim VM")
+		t.Fatalf("a DaemonSet pod bound the VM to namespace %q", ns)
 	}
 
 	if code := createClaimPod(t, url, "nc-ds", "team-a", "w1", 1); code != http.StatusOK {
@@ -219,8 +225,35 @@ func TestClaimRefusesDaemonSetPods(t *testing.T) {
 	if ns, _ := s.nodePool.InstanceNamespace(instanceID); ns != "team-a" {
 		t.Fatalf("VM namespace = %q, want the workload's team-a", ns)
 	}
+
+	// DaemonSet pods of other namespaces share the bound VM and leave its namespace alone; workload pods do not.
+	if code := postClaimPod(t, url, daemonSetPod("nc-ds", "monitoring", "exporter-1")); code != http.StatusOK {
+		t.Fatalf("DaemonSet pod of another namespace: HTTP %d, want 200", code)
+	}
+	if ns, _ := s.nodePool.InstanceNamespace(instanceID); ns != "team-a" {
+		t.Fatalf("VM namespace after a DaemonSet pod = %q, want team-a", ns)
+	}
 	if code := createClaimPod(t, url, "nc-ds", "team-b", "w2", 0); code != http.StatusConflict {
-		t.Fatalf("pod of a second namespace: HTTP %d, want 409", code)
+		t.Fatalf("workload pod of a second namespace: HTTP %d, want 409", code)
+	}
+	if ns, ok := s.PodNamespaceOnWorker(instanceID, "uid-exporter-1"); !ok || ns != "monitoring" {
+		t.Fatalf("PodNamespaceOnWorker(exporter) = %q, %v, want monitoring", ns, ok)
+	}
+
+	// The claim record keeps which pods are DaemonSet pods, so a restart does not let one bind the VM.
+	rec, _ := s.claims.store.get("nc-ds")
+	if !rec.Pods["uid-proxy-1"].DaemonSet || rec.Pods["uid-w1"].DaemonSet || rec.Namespace != "team-a" {
+		t.Fatalf("claim record pods = %+v, namespace %q", rec.Pods, rec.Namespace)
+	}
+	restarted := NewServer(mock, s.clusterTag)
+	restarted.RecoverClaims()
+	restarted.nodePool.Release("uid-w1")
+	if ns, _ := restarted.nodePool.InstanceNamespace(instanceID); ns != "team-a" {
+		t.Fatalf("recovered VM namespace = %q, want team-a", ns)
+	}
+	node, _ := restarted.nodePool.Node(instanceID)
+	if !node.ActivePods["uid-exporter-1"].DaemonSet {
+		t.Fatalf("recovered DaemonSet pod = %+v", node.ActivePods["uid-exporter-1"])
 	}
 }
 

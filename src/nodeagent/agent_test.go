@@ -118,7 +118,7 @@ func TestAgentRunsPodsOnServedNodes(t *testing.T) {
 	}
 }
 
-func TestAgentHoldsDaemonSetPodsPending(t *testing.T) {
+func TestAgentRunsDaemonSetPods(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	kube := fake.NewClientset()
@@ -140,50 +140,21 @@ func TestAgentHoldsDaemonSetPodsPending(t *testing.T) {
 	if _, err := kube.CoreV1().Pods("system").Create(ctx, daemon, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	var held *corev1.Pod
-	waitFor(t, "daemonset pod held Pending", func() bool {
-		p, err := kube.CoreV1().Pods("system").Get(ctx, daemon.Name, metav1.GetOptions{})
-		held = p
-		return err == nil && p.Status.Phase == corev1.PodPending && p.Status.Reason == ReasonDaemonSetPod
-	})
-
-	// The workload pod of another namespace still runs on the VM the DaemonSet pod is bound to.
-	workload := testPod("w1", "vm-a")
-	workload.Spec.ImagePullSecrets, workload.Spec.Containers[0].Env = nil, nil
-	if _, err := kube.CoreV1().Pods("team-a").Create(ctx, workload, metav1.CreateOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, "workload create and status poll", func() bool {
+	waitFor(t, "daemonset pod create and status poll", func() bool {
 		plugin.mu.Lock()
 		defer plugin.mu.Unlock()
-		_, created := plugin.created["uid-w1"]
-		return created && plugin.polled["uid-w1"]
+		_, created := plugin.created["uid-daemon"]
+		return created && plugin.polled["uid-daemon"]
 	})
-	time.Sleep(100 * time.Millisecond) // several status intervals
-	plugin.mu.Lock()
-	_, daemonCreated := plugin.created["uid-daemon"]
-	daemonPolled := plugin.polled["uid-daemon"]
-	plugin.mu.Unlock()
-	if daemonCreated || daemonPolled {
-		t.Fatalf("the plugin saw the DaemonSet pod: created %v, polled %v", daemonCreated, daemonPolled)
-	}
-	if p, err := kube.CoreV1().Pods("system").Get(ctx, daemon.Name, metav1.GetOptions{}); err != nil || p.ResourceVersion != held.ResourceVersion {
-		t.Fatalf("the DaemonSet pod changed after it was held: %v", err)
-	}
 
 	if err := kube.CoreV1().Pods("system").Delete(ctx, daemon.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "daemonset pod forgotten", func() bool {
-		_, err := agent.Pods.GetPod(ctx, "system", daemon.Name)
-		return err != nil
+	waitFor(t, "daemonset pod delete", func() bool {
+		plugin.mu.Lock()
+		defer plugin.mu.Unlock()
+		return slices.Contains(plugin.deleted, "uid-daemon")
 	})
-	plugin.mu.Lock()
-	deleted := slices.Clone(plugin.deleted)
-	plugin.mu.Unlock()
-	if slices.Contains(deleted, "uid-daemon") {
-		t.Fatalf("the agent sent the DaemonSet pod to the plugin's /delete: %v", deleted)
-	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)

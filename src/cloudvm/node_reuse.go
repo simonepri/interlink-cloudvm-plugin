@@ -92,9 +92,10 @@ func markSpinDown(node *CloudVMNode, reason SpinDownReason) {
 	log.Printf("[cloudvm] Marked node %s for spin-down: %s", sanitizeLog(node.InstanceID), reason) //nolint:gosec // sanitized
 }
 
-// isIdle reports whether every pod the node ran has finished or left; a node that never ran a pod is not idle.
+// isIdle reports whether every pod the node ran has finished or left, apart from DaemonSet pods; a node that never ran
+// a workload pod is not idle.
 func (node *CloudVMNode) isIdle() bool {
-	return node.IdleSince != nil && node.ActivePodCount() == 0
+	return node.IdleSince != nil && node.workloadPodCount() == 0
 }
 
 // reusableLocked reports whether an idle node may take a new pod: within its grace period, with the containers of
@@ -103,9 +104,12 @@ func (np *NodePool) reusableLocked(node *CloudVMNode, now time.Time) bool {
 	if np.idleGracePeriod <= 0 || now.Sub(*node.IdleSince) > np.idleGracePeriod || node.UnknownCoTenants {
 		return false
 	}
-	// A finished pod that Kubernetes has not deleted yet still has its container on the VM.
-	if len(node.ActivePods) > 0 {
-		return false
+	// A finished pod that Kubernetes has not deleted yet still has its container on the VM. DaemonSet pods stay: they
+	// are the node's own agents, which the plugin never evicts.
+	for _, alloc := range node.ActivePods {
+		if !alloc.DaemonSet {
+			return false
+		}
 	}
 	if reason := np.reuse.spinDownReason(node, now); reason != "" {
 		markSpinDown(node, reason)
