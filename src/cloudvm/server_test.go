@@ -1813,13 +1813,13 @@ func TestServer_HandleStatus_RunnerStartFailureIsTerminal(t *testing.T) {
 func TestInjectRayProxyEnv(t *testing.T) {
 	ray := &Pod{
 		Metadata: PodMeta{Labels: map[string]string{"ray.io/node-type": "worker"}},
-		Spec: PodSpecWrapper{Containers: []ContainerSpec{
+		Spec: PodSpecWrapper{InitContainers: []ContainerSpec{{Name: "wait-gcs-ready"}}, Containers: []ContainerSpec{
 			{Name: "a"},
 			{Name: "b", Env: []EnvVar{{Name: "grpc_proxy", Value: "http://custom:1"}}},
 		}},
 	}
 	injectRayProxyEnv(ray)
-	for _, c := range ray.Spec.Containers {
+	for _, c := range append(ray.Spec.InitContainers, ray.Spec.Containers...) {
 		got := map[string]string{}
 		for _, e := range c.Env {
 			got[e.Name] = e.Value

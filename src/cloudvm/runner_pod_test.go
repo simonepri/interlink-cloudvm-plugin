@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -115,9 +116,14 @@ func flagPairs(args []string) map[string]bool {
 func TestRunnerScript_RunsPodLikeAKubelet(t *testing.T) {
 	p := newPodRunnerHarness(t)
 	hostDir := filepath.Join(t.TempDir(), "host", "logs")
-	if err := os.WriteFile(filepath.Join(p.state, "exit-cloudvm-uid-1-init-0"), []byte("1\n0\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(p.state, "exit-cloudvm-uid-1-init-0-migrate"), []byte("1\n0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	resolvConf := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(resolvConf, []byte("nameserver 127.0.0.153\nsearch svc.cluster.local cluster.local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.env = append(p.env, "CLOUDVM_RESOLV_CONF="+resolvConf)
 	defer p.start()()
 
 	gid := int64(os.Getgid())
@@ -151,7 +157,7 @@ func TestRunnerScript_RunsPodLikeAKubelet(t *testing.T) {
 	}
 	waitStatus(t, p.runnerHarness, "uid-1", func(r ContainerStatusResult) bool { return r.Running })
 
-	if got, want := p.file("order"), "cloudvm-uid-1-init-0\ncloudvm-uid-1-init-0\ncloudvm-uid-1-init-1\ncloudvm-uid-1\n"; got != want {
+	if got, want := p.file("order"), "cloudvm-uid-1-init-0-migrate\ncloudvm-uid-1-init-0-migrate\ncloudvm-uid-1-init-1-warm\ncloudvm-uid-1\n"; got != want {
 		t.Fatalf("run order = %q, want the failed init container retried, then the next one, then the main container: %q", got, want)
 	}
 	args := p.runArgs("cloudvm-uid-1")
@@ -177,8 +183,13 @@ func TestRunnerScript_RunsPodLikeAKubelet(t *testing.T) {
 			t.Errorf("main container run has the old default %q", unwanted)
 		}
 	}
-	if init1 := flagPairs(p.runArgs("cloudvm-uid-1-init-1")); !init1["--user=1000:2000"] || !init1["--cgroup-parent=/kubepods/burstable/poduid-1"] || init1["--privileged"] {
-		t.Errorf("init container runs with its own security context in the pod's cgroup, got %v", p.runArgs("cloudvm-uid-1-init-1"))
+	// An init container shares the main container's network and resolver settings, so it reaches what the main one does.
+	init0 := p.runArgs("cloudvm-uid-1-init-0-migrate")
+	if got, want := regexpDNSSearch.FindAllString(strings.Join(init0, " "), -1), regexpDNSSearch.FindAllString(strings.Join(args, " "), -1); len(want) == 0 || !reflect.DeepEqual(got, want) || !flagPairs(init0)["--net=host"] {
+		t.Errorf("init container network flags = %v, want --net=host and the main container's DNS search %v", init0, want)
+	}
+	if init1 := flagPairs(p.runArgs("cloudvm-uid-1-init-1-warm")); !init1["--user=1000:2000"] || !init1["--cgroup-parent=/kubepods/burstable/poduid-1"] || init1["--privileged"] {
+		t.Errorf("init container runs with its own security context in the pod's cgroup, got %v", p.runArgs("cloudvm-uid-1-init-1-warm"))
 	}
 	if info, err := os.Stat(hostDir); err != nil || !info.IsDir() {
 		t.Errorf("DirectoryOrCreate must create the host directory: %v", err)
@@ -215,7 +226,7 @@ func TestRunnerScript_RunsPodLikeAKubelet(t *testing.T) {
 
 	resp = p.do(http.MethodPost, "/containers/stop?podUID=uid-1", "")
 	_ = resp.Body.Close()
-	for _, gone := range []string{filepath.Join(p.podDirs, "uid-1"), filepath.Join(p.filesDir, "uid-1"), filepath.Join(p.state, "exists-cloudvm-uid-1-init-0")} {
+	for _, gone := range []string{filepath.Join(p.podDirs, "uid-1"), filepath.Join(p.filesDir, "uid-1"), filepath.Join(p.state, "exists-cloudvm-uid-1-init-0-migrate")} {
 		if _, err := os.Stat(gone); !os.IsNotExist(err) {
 			t.Errorf("stop must remove %s, stat: %v", gone, err)
 		}
@@ -271,7 +282,7 @@ func TestRunnerScript_RunsAsTheImageUserUnlessTheSpecSetsOne(t *testing.T) {
 
 func TestRunnerScript_FailedInitContainerFailsAPodThatNeverRestarts(t *testing.T) {
 	p := newPodRunnerHarness(t)
-	if err := os.WriteFile(filepath.Join(p.state, "exit-cloudvm-u-init-0"), []byte("3\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(p.state, "exit-cloudvm-u-init-0-setup"), []byte("3\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	defer p.start()()
@@ -284,7 +295,7 @@ func TestRunnerScript_FailedInitContainerFailsAPodThatNeverRestarts(t *testing.T
 	if st.Status != "dead" || len(st.InitContainers) != 1 || st.InitContainers[0].ExitCode != 3 || st.InitContainers[0].Reason != "Error" {
 		t.Fatalf("status = %+v", st)
 	}
-	if order := p.file("order"); order != "cloudvm-u-init-0\n" {
+	if order := p.file("order"); order != "cloudvm-u-init-0-setup\n" {
 		t.Fatalf("run order = %q, want only the failed init container", order)
 	}
 }

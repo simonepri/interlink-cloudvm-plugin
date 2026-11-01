@@ -166,7 +166,8 @@ async def main():
     await asyncio.sleep(0)
 asyncio.run(main())
 `)
-	if want := "closed without a session True\ntunnel 172.20.0.10:80 ''\ntunnel profiles.example.com:80 ''\n"; out != want {
+	if want := "[cloudvm-tunnel-agent] no tunnel session for the redirected connection to 172.20.0.10:80; closing it\n" +
+		"closed without a session True\ntunnel 172.20.0.10:80 ''\ntunnel profiles.example.com:80 ''\n"; out != want {
 		t.Fatalf("agent printed %q, want %q", out, want)
 	}
 }

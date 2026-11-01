@@ -27,6 +27,7 @@ const (
 const (
 	WorkerLogSourceBootstrap = "bootstrap"
 	WorkerLogSourceRunner    = "runner"
+	WorkerLogSourceTunnel    = "tunnel"
 	WorkerLogSourceContainer = "container"
 	WorkerLogSourceSpot      = "spot"
 )
@@ -35,10 +36,12 @@ const (
 type WorkerLogRecord struct {
 	// Time is an RFC 3339 timestamp; the plugin uses its receive time when it is missing or invalid.
 	Time string `json:"time,omitempty"`
-	// Source is bootstrap, runner, container, or spot.
+	// Source is bootstrap, runner, tunnel, container, or spot.
 	Source string `json:"src"`
 	// PodUID identifies the pod whose container wrote a container record.
 	PodUID string `json:"pod,omitempty"`
+	// Container is the name of the init container that wrote a container record; empty for the pod's main container.
+	Container string `json:"container,omitempty"`
 	// Stream is stdout or stderr for container records.
 	Stream  string `json:"fd,omitempty"`
 	Message string `json:"msg"`
@@ -115,7 +118,7 @@ func (s *Server) recordWorkerLog(forwarder *OTLPLogForwarder, instanceID string,
 		pod = s.solePod(instanceID)
 	}
 	if rec.Source == WorkerLogSourceContainer && rec.PodUID != "" {
-		s.podLogs.Append(rec.PodUID, PodLogLine{Time: ts, Stream: rec.Stream, Text: rec.Message})
+		s.podLogs.Append(rec.PodUID, PodLogLine{Time: ts, Container: rec.Container, Stream: rec.Stream, Text: rec.Message})
 	}
 	if forwarder == nil {
 		return
@@ -126,6 +129,9 @@ func (s *Server) recordWorkerLog(forwarder *OTLPLogForwarder, instanceID string,
 	}
 	if rec.PodUID != "" {
 		attrs["k8s.pod.uid"] = rec.PodUID
+	}
+	if rec.Container != "" {
+		attrs["k8s.container.name"] = rec.Container
 	}
 	forwarder.Enqueue(LogEntry{
 		Resource: LogResource{
@@ -160,9 +166,11 @@ func (s *Server) solePod(instanceID string) PodAllocation {
 
 // PodLogLine is one line of container output kept for kubectl logs.
 type PodLogLine struct {
-	Time   time.Time
-	Stream string
-	Text   string
+	Time time.Time
+	// Container names the init container that wrote the line; empty for the pod's main container.
+	Container string
+	Stream    string
+	Text      string
 }
 
 type podLog struct {
@@ -260,7 +268,26 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	if req.Opts.Previous {
 		return
 	}
-	_, _ = io.WriteString(w, renderPodLogs(s.podLogs.Lines(req.PodUID), req.Opts, time.Now()))
+	_, _ = io.WriteString(w, renderPodLogs(containerLines(s.podLogs.Lines(req.PodUID), req.ContainerName), req.Opts, time.Now()))
+}
+
+// containerLines returns the lines of the init container named container when the pod has output from one by that
+// name, and otherwise the main container's lines, which carry no container name.
+func containerLines(lines []PodLogLine, container string) []PodLogLine {
+	want := ""
+	for _, l := range lines {
+		if container != "" && l.Container == container {
+			want = container
+			break
+		}
+	}
+	kept := lines[:0:0]
+	for _, l := range lines {
+		if l.Container == want {
+			kept = append(kept, l)
+		}
+	}
+	return kept
 }
 
 // renderPodLogs applies kubectl's since, tail, timestamps, and byte-limit options to buffered lines.

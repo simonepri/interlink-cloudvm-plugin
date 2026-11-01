@@ -324,8 +324,9 @@ class TrafficMeter:
         except OSError:
             return
         for name in res.stdout.split():
-            uid = name.removeprefix('cloudvm-')
-            self.add_pod(uid, '', '')
+            # Init containers, cloudvm-<uid>-init-<index>-<name>, belong to the pod their main container meters.
+            if '-init-' not in name:
+                self.add_pod(name.removeprefix('cloudvm-'), '', '')
 
     def prefix(self, owner):
         """Returns the counter name prefix of an owner: pods take numbered slots, because the kernel may keep a counter
