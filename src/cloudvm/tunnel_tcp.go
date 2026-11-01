@@ -18,12 +18,16 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // WorkerTCPStreamKind names a stream that carries one plain TCP connection to the target in its header.
 const WorkerTCPStreamKind = "tcp"
 
 const tcpDialTimeout = 10 * time.Second
+
+// kubernetesAPIServiceName is the name of the Service in the default namespace that fronts the cluster's API server.
+const kubernetesAPIServiceName = "kubernetes"
 
 // minDirectTCPPort keeps direct forwarding off well-known ports, such as the API servers the gateway itself reaches.
 const minDirectTCPPort = 1024
@@ -175,8 +179,10 @@ func (g *TunnelGateway) inServiceNetworks(host string) bool {
 }
 
 // allowService refuses a stream from a pod of namespace source to a Service ClusterIP unless the Service lies in source,
-// among the shared Services or the destinations of source, or is one that a Service of source stands in for, and exposes
-// port. Unlike pod addresses, Services may expose ports below 1024: a ClusterIP reaches only the Service's own endpoints.
+// among the shared Services or the destinations of source, is one that a Service of source stands in for, or is the
+// Kubernetes API Service, which every pod of a cluster reaches and whose RBAC authorizes each pod's own token, and
+// exposes port. Unlike pod addresses, Services may expose ports below 1024: a ClusterIP reaches only the Service's own
+// endpoints.
 func (g *TunnelGateway) allowService(source, host, port string) error {
 	if g.services == nil || !g.services.HasSynced() {
 		return refuse("unsynced", "the service watch has not synced")
@@ -185,7 +191,7 @@ func (g *TunnelGateway) allowService(source, host, port string) error {
 	if !ok {
 		return refuse("unknown_target", "no service holds %s", host)
 	}
-	if svc.Namespace != source && !g.sharedServices[svc.Namespace+"/"+svc.Name] &&
+	if svc.Namespace != source && !isKubernetesAPIService(svc) && !g.sharedServices[svc.Namespace+"/"+svc.Name] &&
 		!g.destinations.AllowsService(source, svc.Namespace, svc.Name) &&
 		(g.regionalServices == nil || !g.regionalServices.StandsInFor(source, svc.Namespace, svc.Name)) {
 		return refuse("namespace_mismatch", "namespace %s may not reach service %s/%s", source, svc.Namespace, svc.Name)
@@ -194,6 +200,11 @@ func (g *TunnelGateway) allowService(source, host, port string) error {
 		return refuse("direct_forbidden", "service %s/%s does not expose tcp port %s", svc.Namespace, svc.Name, port)
 	}
 	return nil
+}
+
+// isKubernetesAPIService reports whether svc is default/kubernetes, the Service of the cluster's API server.
+func isKubernetesAPIService(svc ClusterService) bool {
+	return svc.Namespace == metav1.NamespaceDefault && svc.Name == kubernetesAPIServiceName
 }
 
 func sameNamespace(source, dest string) error {
