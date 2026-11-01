@@ -343,13 +343,6 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		}
 	}
 
-	// Put UID first so truncation never cuts off uniqueness.
-	tokenBase := fmt.Sprintf("cvm-%s-%s-%s", req.PodUID, req.PodNamespace, req.PodName)
-	if len(tokenBase) > 64 {
-		tokenBase = tokenBase[:64]
-	}
-	clientToken := tokenBase
-
 	// Target capacity is 1 instance (1 pod = 1 VM)
 	targetCapacity := int32(1)
 
@@ -383,8 +376,7 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 	}
 
 	input := &ec2.CreateFleetInput{
-		Type:        ec2types.FleetTypeInstant,
-		ClientToken: aws.String(clientToken),
+		Type: ec2types.FleetTypeInstant,
 		TargetCapacitySpecification: &ec2types.TargetCapacitySpecificationRequest{
 			TotalTargetCapacity:       aws.Int32(targetCapacity),
 			DefaultTargetCapacityType: targetCapType,
@@ -403,6 +395,13 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 			},
 		},
 	}
+
+	attemptKey := fleetAttemptKey(req.Region, req.PodUID)
+	clientToken, err := fleetClientToken(input, fleetAttempts.current(attemptKey))
+	if err != nil {
+		return nil, err
+	}
+	input.ClientToken = aws.String(clientToken)
 
 	limiter := getFleetRateLimiter(req.Region)
 	initBackoff, maxBackoff, maxRetries := getFleetRetryParams()
@@ -439,6 +438,13 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 			break
 		}
 
+		if isIdempotentParameterMismatch(lastErr) {
+			// Nothing launched for this request, and repeating the token can only fail again.
+			fleetAttempts.advance(attemptKey)
+			log.Printf("[aws] CreateFleet client token %s for %s in %s was already used with other parameters; the next launch uses a new token", //nolint:gosec // sanitized
+				clientToken, sanitizeLog(req.PodUID), sanitizeLog(req.Region))
+			return nil, fmt.Errorf("%w: %w", errFleetTokenReused, lastErr)
+		}
 		if !isRequestLimitExceeded(lastErr) {
 			return nil, fmt.Errorf("ec2:CreateFleet call failed: %w", lastErr)
 		}
@@ -485,6 +491,12 @@ func LaunchFleetWithClient(ctx context.Context, client EC2FleetClient, req *Flee
 		}
 	}
 
+	if len(resp.Instances) == 0 {
+		// EC2 answered that nothing launched, so the next attempt asks again under a new token.
+		fleetAttempts.advance(attemptKey)
+	} else {
+		fleetAttempts.forget(attemptKey)
+	}
 	return resp, nil
 }
 
@@ -932,53 +944,27 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 	if pinned {
 		zone = spec.Zone
 	}
-	overrides, err := p.offeredFleetOverrides(ctx, client, region, zone, instanceTypes, subnetIDs)
+	launched, err := findLaunchedInstance(ctx, client, spec.ClusterTag, spec.PodUID, zone, instanceTypes)
 	if err != nil {
-		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "no_capacity")
+		return nil, err
+	}
+	var inst *Instance
+	if launched != nil {
+		log.Printf("[aws] Reusing instance %s that an earlier launch of %s/%s started in %s", //nolint:gosec // sanitized
+			sanitizeLog(aws.ToString(launched.InstanceId)), sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), sanitizeLog(region))
+		inst = &Instance{
+			ID:           aws.ToString(launched.InstanceId),
+			Provider:     ProviderAWS,
+			Region:       region,
+			InstanceType: string(launched.InstanceType),
+			State:        StateRunning,
+			CreatedAt:    aws.ToTime(launched.LaunchTime),
+			Metadata:     map[string]string{},
+		}
+	} else if inst, err = p.launchFleet(ctx, client, spec, region, capType, zone, instanceTypes, subnetIDs, ltID, ltName, groups, encodedUserData); err != nil {
 		return nil, err
 	}
 
-	req := &FleetRequest{
-		Region:             region,
-		TargetCapacity:     1,
-		InstanceTypes:      instanceTypes,
-		SubnetIDs:          subnetIDs,
-		ClusterTag:         spec.ClusterTag,
-		PodName:            spec.PodName,
-		PodNamespace:       spec.PodNamespace,
-		PodUID:             spec.PodUID,
-		CostCenter:         spec.CostCenter,
-		JobID:              spec.JobID,
-		UserData:           encodedUserData,
-		LaunchTemplateID:   ltID,
-		LaunchTemplateName: ltName,
-		LaunchTemplates:    groups,
-		MarketType:         spec.MarketType,
-		MaxPrice:           spec.MaxPrice,
-		PricePolicy:        spec.PricePolicy,
-		AllocationStrategy: func() FleetAllocationStrategy {
-			if spec.PricePolicy == "capacity-optimized" || strings.ToLower(os.Getenv("AWS_FLEET_ALLOCATION_STRATEGY")) == "capacity-optimized" {
-				return StrategyCapacityOptimized
-			}
-			return StrategyPriceCapacityOptimized
-		}(),
-		RunnerAuthToken: spec.RunnerAuthToken,
-	}
-
-	resp, err := LaunchFleetWithClient(ctx, client, req, overrides)
-	if err != nil {
-		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, ClassifyAWSError(err))
-		return nil, fmt.Errorf("launch fleet failed: %w", err)
-	}
-	if len(resp.Instances) == 0 {
-		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "no_capacity")
-		if len(resp.Errors) > 0 {
-			return nil, fmt.Errorf("%w in %s (fleet errors: %s)", errNoInstancesLaunched, region, strings.Join(resp.Errors, "; "))
-		}
-		return nil, fmt.Errorf("%w in %s", errNoInstancesLaunched, region)
-	}
-
-	inst := resp.Instances[0]
 	if inst.Metadata == nil {
 		inst.Metadata = make(map[string]string)
 	}
@@ -1031,6 +1017,57 @@ func (p *AWSProvider) launchInRegion(ctx context.Context, spec *InstanceSpec, re
 	GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "ok")
 	GlobalFleetTracker.RecordLaunchDuration("aws", region, spec.InstanceType, capType, time.Since(startTime))
 	return inst, nil
+}
+
+// launchFleet asks EC2 Fleet for one instance of the offered instance types in region.
+func (p *AWSProvider) launchFleet(ctx context.Context, client EC2FleetClient, spec *InstanceSpec, region, capType, zone string, instanceTypes, subnetIDs []string, ltID, ltName string, groups []fleetTemplateGroup, encodedUserData string) (*Instance, error) {
+	overrides, err := p.offeredFleetOverrides(ctx, client, region, zone, instanceTypes, subnetIDs)
+	if err != nil {
+		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "no_capacity")
+		return nil, err
+	}
+
+	req := &FleetRequest{
+		Region:             region,
+		TargetCapacity:     1,
+		InstanceTypes:      instanceTypes,
+		SubnetIDs:          subnetIDs,
+		ClusterTag:         spec.ClusterTag,
+		PodName:            spec.PodName,
+		PodNamespace:       spec.PodNamespace,
+		PodUID:             spec.PodUID,
+		CostCenter:         spec.CostCenter,
+		JobID:              spec.JobID,
+		UserData:           encodedUserData,
+		LaunchTemplateID:   ltID,
+		LaunchTemplateName: ltName,
+		LaunchTemplates:    groups,
+		MarketType:         spec.MarketType,
+		MaxPrice:           spec.MaxPrice,
+		PricePolicy:        spec.PricePolicy,
+		AllocationStrategy: func() FleetAllocationStrategy {
+			if spec.PricePolicy == "capacity-optimized" || strings.ToLower(os.Getenv("AWS_FLEET_ALLOCATION_STRATEGY")) == "capacity-optimized" {
+				return StrategyCapacityOptimized
+			}
+			return StrategyPriceCapacityOptimized
+		}(),
+		RunnerAuthToken: spec.RunnerAuthToken,
+	}
+
+	resp, err := LaunchFleetWithClient(ctx, client, req, overrides)
+	if err != nil {
+		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, ClassifyAWSError(err))
+		return nil, fmt.Errorf("launch fleet failed: %w", err)
+	}
+	if len(resp.Instances) == 0 {
+		GlobalFleetTracker.RecordLaunchAttempt("aws", region, spec.InstanceType, capType, "no_capacity")
+		if len(resp.Errors) > 0 {
+			return nil, fmt.Errorf("%w in %s (fleet errors: %s)", errNoInstancesLaunched, region, strings.Join(resp.Errors, "; "))
+		}
+		return nil, fmt.Errorf("%w in %s", errNoInstancesLaunched, region)
+	}
+
+	return resp.Instances[0], nil
 }
 
 // renderFleetUserData renders the VM cloud-init for region and returns it gzip-compressed and base64-encoded.

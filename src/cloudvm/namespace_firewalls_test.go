@@ -61,6 +61,9 @@ type firewallRegionMock struct {
 func (m *firewallRegionMock) client() *mockEC2FleetClient {
 	c := m.regionMock.client()
 	c.describeInstancesFn = func(_ context.Context, in *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
+		if len(in.InstanceIds) == 0 {
+			return &ec2.DescribeInstancesOutput{}, nil
+		}
 		inst := ec2types.Instance{InstanceId: aws.String(in.InstanceIds[0]), PrivateIpAddress: aws.String("10.0.0.7")}
 		for _, g := range m.bootedGroups {
 			inst.SecurityGroups = append(inst.SecurityGroups, ec2types.GroupIdentifier{GroupId: aws.String(g)})

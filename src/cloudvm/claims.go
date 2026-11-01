@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	// claimPodUIDPrefix prefixes the UID a claim's launch uses in place of a pod UID, which keeps CreateFleet client
-	// tokens and runner tokens stable across retries of the same claim.
+	// claimPodUIDPrefix prefixes the UID a claim's launch uses in place of a pod UID, which keeps runner tokens and the
+	// VM's PodUID tag stable across retries of the same claim.
 	claimPodUIDPrefix = "nodeclaim-"
 	// claimSyncInterval is how often the claim loop checks readiness, heartbeats idle VMs and persists allocations.
 	claimSyncInterval = 15 * time.Second
