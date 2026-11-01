@@ -201,7 +201,8 @@ func TestFleetTracker_SpotSpendUsesSpotPrice(t *testing.T) {
 	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 	labels := `{accelerator="gpu",capacity_type="spot",gpu_model="A10G 24GB",instance_type="g5.xlarge",provider="aws",region="us-west-2"}`
-	if !strings.Contains(body, "cloudvm_spend_usd_per_hour"+labels+" 0.4024") {
+	spendLabels := `{accelerator="gpu",capacity_type="spot",component="compute",gpu_model="A10G 24GB",instance_type="g5.xlarge",provider="aws",region="us-west-2"}`
+	if !strings.Contains(body, "cloudvm_spend_usd_per_hour"+spendLabels+" 0.4024") {
 		t.Errorf("spot spend is not the zone's spot price:\n%s", body)
 	}
 	// The baseline stays at the g5.xlarge on-demand catalog rate.

@@ -28,15 +28,17 @@ var (
 )
 
 // instanceTypes builds Karpenter instance types from the catalog, keeping only offerings inside the NodeClass
-// footprint and marking offerings the plugin recently refused for lack of capacity as unavailable.
-func (c *CloudProvider) instanceTypes(catalog *nodeclaim.Catalog, nodeClass *v1alpha1.CloudVMNodeClass) ([]*cloudprovider.InstanceType, error) {
+// footprint, pricing each with the transfer cost of nodePool's VMs in its region, and marking offerings the plugin
+// recently refused for lack of capacity as unavailable.
+func (c *CloudProvider) instanceTypes(catalog *nodeclaim.Catalog, nodeClass *v1alpha1.CloudVMNodeClass, nodePool string) ([]*cloudprovider.InstanceType, error) {
 	footprint := map[string]v1alpha1.FootprintRegion{}
 	for _, r := range nodeClass.Spec.Footprint {
 		footprint[r.Region] = r
 	}
+	transfer := c.transferPricerFor(catalog, nodePool)
 	out := make([]*cloudprovider.InstanceType, 0, len(catalog.InstanceTypes))
 	for i := range catalog.InstanceTypes {
-		it, err := c.instanceType(&catalog.InstanceTypes[i], footprint)
+		it, err := c.instanceType(&catalog.InstanceTypes[i], footprint, transfer)
 		if err != nil {
 			return nil, err
 		}
@@ -47,7 +49,7 @@ func (c *CloudProvider) instanceTypes(catalog *nodeclaim.Catalog, nodeClass *v1a
 	return out, nil
 }
 
-func (c *CloudProvider) instanceType(src *nodeclaim.InstanceType, footprint map[string]v1alpha1.FootprintRegion) (*cloudprovider.InstanceType, error) {
+func (c *CloudProvider) instanceType(src *nodeclaim.InstanceType, footprint map[string]v1alpha1.FootprintRegion, transfer transferPricer) (*cloudprovider.InstanceType, error) {
 	offerings := cloudprovider.Offerings{}
 	zones, regions, capacityTypes := sets.New[string](), sets.New[string](), sets.New[string]()
 	for _, o := range src.Offerings {
@@ -71,7 +73,7 @@ func (c *CloudProvider) instanceType(src *nodeclaim.InstanceType, footprint map[
 				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, o.CapacityType),
 			),
-			Price:     o.PricePerHour + c.config.DataCostFor(o.Region),
+			Price:     o.PricePerHour + transfer.perHour(src.Provider, o.Region),
 			Available: o.Available && !c.unavailable.IsUnavailable(src.Name, zone, o.CapacityType),
 		})
 	}

@@ -69,12 +69,23 @@ type TransferVM struct {
 	Region       string
 	InstanceType string
 	InstanceID   string
+	// NodePool is the Karpenter NodePool of a NodeClaim VM, whose transfer profile the VM's traffic feeds.
+	NodePool string
 }
 
 type meteredVM struct {
 	last map[string]int64
 	seen time.Time
 	pods map[string]time.Time
+	// profile is the VM's traffic with the home region, for its NodePool's transfer profile.
+	profile vmTransferProfile
+	// costs are the VM's priced transfer per minute over the last transferSpendWindow.
+	costs []minuteCost
+}
+
+type minuteCost struct {
+	minute int64
+	usd    float64
 }
 
 // TransferMeter accumulates traffic report deltas into metrics. Reports are cumulative, so the same reading arriving
@@ -86,6 +97,8 @@ type TransferMeter struct {
 	now     func() time.Time
 	vms     map[string]*meteredVM
 	swept   time.Time
+	// finished holds the profiles of each NodePool's VMs that stopped reporting, newest last.
+	finished map[string][]vmTransferProfile
 }
 
 // GlobalTransferMeter records the traffic every runner reports.
@@ -93,7 +106,7 @@ var GlobalTransferMeter = NewTransferMeter(GlobalMetrics, GlobalTransferCost)
 
 // NewTransferMeter creates a meter that exports to metrics and prices with cost.
 func NewTransferMeter(metrics *ObservabilityMetrics, cost *TransferCostModel) *TransferMeter {
-	return &TransferMeter{metrics: metrics, cost: cost, now: time.Now, vms: make(map[string]*meteredVM)}
+	return &TransferMeter{metrics: metrics, cost: cost, now: time.Now, vms: make(map[string]*meteredVM), finished: make(map[string][]vmTransferProfile)}
 }
 
 // Record adds the traffic in report since the VM's previous report.
@@ -107,11 +120,19 @@ func (t *TransferMeter) Record(vm TransferVM, report *TrafficReport) {
 	state := t.vms[vm.InstanceID]
 	if state == nil {
 		state = &meteredVM{last: make(map[string]int64), pods: make(map[string]time.Time)}
+		state.profile.first = now
 		t.vms[vm.InstanceID] = state
 	}
 	state.seen = now
 	loc := TransferLocation{Provider: vm.Provider, Region: vm.Region}
 	home, hasHome := t.cost.Home()
+	if vm.NodePool != "" {
+		state.profile.nodePool = vm.NodePool
+	}
+	state.profile.last = now
+	// Only VMs outside the home region pay to reach it, so only theirs describe what an offering's region adds.
+	remote := hasHome && loc != home
+	state.profile.remote = remote
 
 	for peer, b := range report.Peers {
 		class, path, peerLoc, priced := classifyTrafficPeer(peer, loc, home, hasHome)
@@ -124,11 +145,15 @@ func (t *TransferMeter) Record(vm TransferVM, report *TrafficReport) {
 				continue
 			}
 			t.metrics.AddTransferBytes(vm.Provider, vm.Region, vm.InstanceType, d.direction, class, path, float64(delta))
+			if remote && peerLoc == home && priced {
+				state.profile.addHome(d.direction, delta)
+			}
 			if !priced {
 				continue
 			}
 			if usd, charged, ok := t.price(loc, peerLoc, home, hasHome, d.direction, delta); ok {
 				t.metrics.AddTransferCost(vm.Provider, vm.Region, d.direction, class, path, charged.Provider, charged.Region, usd)
+				state.addCost(now, usd)
 			}
 		}
 	}
@@ -150,6 +175,9 @@ func (t *TransferMeter) Record(vm TransferVM, report *TrafficReport) {
 				if owner == trafficOwnerPulls {
 					if d.direction == directionReceive {
 						t.metrics.AddImagePullBytes(vm.Provider, vm.Region, vm.InstanceType, class, float64(delta))
+						if remote && priced && peerLoc == home {
+							state.profile.pullBytes += delta
+						}
 					}
 					continue
 				}
@@ -273,6 +301,7 @@ func (t *TransferMeter) sweep(now time.Time) {
 			for uid := range v.pods {
 				t.metrics.DeletePodTransfer(uid)
 			}
+			t.retire(v.profile)
 			delete(t.vms, id)
 		}
 	}

@@ -1,4 +1,4 @@
-{{/* Provider configuration file: GPU class mapping, data cost, NodePool selector and catalog cache settings. */}}
+{{/* Provider configuration file: GPU class mapping, transfer cost, NodePool selector and catalog cache settings. */}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

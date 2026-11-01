@@ -117,9 +117,11 @@ func TestGetSupportedNodeClasses(t *testing.T) {
 func TestGetInstanceTypesFiltersFootprintAndDerivesLabels(t *testing.T) {
 	cfg := &Config{
 		GPUClasses: []GPUClass{{Class: "l4", Models: []string{"L4"}, MemoryGB: 24}},
-		DataCost:   DataCost{HomeRegion: "us-east-1", DefaultUSDPerHour: 0.05, PerRegionUSDPerHour: map[string]float64{"eu-west-1": 0.20}},
+		// 10 GB an hour to the home region at eu-west-1's 0.02 per GB adds 0.20 to its offerings.
+		TransferCost: TransferCost{Default: TransferProfile{HomeTransmitGBPerHour: 10}},
 	}
 	h := newHarness(t, cfg)
+	h.api.catalog.Transfer = testTransfer()
 	its, err := h.cp.GetInstanceTypes(context.Background(), testNodePool(nil))
 	if err != nil {
 		t.Fatal(err)
@@ -193,7 +195,7 @@ func TestGetInstanceTypesFiltersFootprintAndDerivesLabels(t *testing.T) {
 	}
 	gcp := findType(t, its, "g2-standard-8")
 	if got := gcp.Offerings[0].Price; got != 0.30 {
-		t.Errorf("gcp price = %v, want 0.25 + 0.05 default data cost", got)
+		t.Errorf("gcp price = %v, want 0.25 + 10 GB an hour at 0.005", got)
 	}
 }
 
@@ -371,15 +373,16 @@ func TestCreateHonorsRegionRequirement(t *testing.T) {
 	}
 }
 
-func TestCreateCountsDataCostInChoice(t *testing.T) {
-	// eu-west-1 spot is 0.30 vs us-east-1 spot 0.40, but a 0.20 data adder makes the home region cheaper.
-	h := newHarness(t, &Config{DataCost: DataCost{HomeRegion: "us-east-1", PerRegionUSDPerHour: map[string]float64{"eu-west-1": 0.20}}})
+func TestCreateCountsTransferCostInChoice(t *testing.T) {
+	// eu-west-1 spot is 0.30 vs us-east-1 spot 0.40, but sending 10 GB an hour home adds 0.20 to eu-west-1.
+	h := newHarness(t, &Config{TransferCost: TransferCost{Default: TransferProfile{HomeTransmitGBPerHour: 10}}})
+	h.api.catalog.Transfer = testTransfer()
 	nc := testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.2xlarge"))
 	if _, err := h.cp.Create(context.Background(), nc); err != nil {
 		t.Fatal(err)
 	}
 	if got := h.api.creates[0].Region; got != "us-east-1" {
-		t.Fatalf("launched in %s, want us-east-1 after the data cost adder", got)
+		t.Fatalf("launched in %s, want us-east-1 after the transfer cost", got)
 	}
 }
 

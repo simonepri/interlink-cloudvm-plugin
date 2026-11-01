@@ -767,7 +767,10 @@ func (s *Server) SyncClaims(ctx context.Context) {
 				return
 			}
 			if stats != nil {
-				GlobalTransferMeter.Record(TransferVM{Provider: string(node.Provider), Region: node.Region, InstanceType: node.InstanceType, InstanceID: node.InstanceID}, stats.Traffic)
+				GlobalTransferMeter.Record(TransferVM{
+					Provider: string(node.Provider), Region: node.Region, InstanceType: node.InstanceType, InstanceID: node.InstanceID,
+					NodePool: rec.Request.Labels[karpenterNodePoolLabel],
+				}, stats.Traffic)
 			}
 			s.claims.mu.Lock()
 			s.claims.heartbeats[rec.InstanceID] = time.Now()
