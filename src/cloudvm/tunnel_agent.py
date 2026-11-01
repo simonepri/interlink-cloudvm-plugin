@@ -133,8 +133,7 @@ class Stream(object):
         """Logs an agent-opened stream the gateway ended before sending any data, as it ends one it refuses or cannot
         connect; the gateway logs why."""
         if self.local is not None and not self.received:
-            log_failure("stream_ended", "gateway %s the stream to %s%s before sending any data; it refuses streams it "
-                        "may not connect and logs why" % (how, self.target, " for pod " + self.pod if self.pod else ""))
+            log_failure("stream_ended", "gateway %s the stream to %s%s before any data, as on a refusal" % (how, self.target, " for pod " + self.pod if self.pod else ""))
 
     async def run(self):
         if self.local is not None:
@@ -401,12 +400,13 @@ def proc_address(raw):
 
 
 def pod_of_cgroup(text):
-    """Returns the UID of the pod whose cgroup a /proc/<pid>/cgroup file names, or "" for a process outside every pod."""
+    """Returns the UID of the pod whose cgroup a /proc/<pid>/cgroup file names, "" for a process outside every pod, or
+    None for a process under the pods' cgroup whose pod the path does not name."""
     for line in text.splitlines():
         match = POD_CGROUP.search(line)
         if match:
             return match.group(1).replace("_", "-").lower()
-    return ""
+    return None if "kubepods" in text else ""
 
 
 class PodResolver(object):
@@ -427,7 +427,9 @@ class PodResolver(object):
 
     def pod_of(self, proto, peer):
         """Returns the pod UID of the process holding the local proto ("tcp" or "udp") socket with address peer, "" for
-        a process of the VM itself, or None when no process can be found."""
+        a process of the VM itself, the agent included, or None when no process can be found or the process runs under
+        the pods' cgroup without naming its pod. A socket no process holds stays unattributed rather than VM-owned,
+        because the gateway would otherwise grant a pod whose process exited the worker's namespace."""
         inode = self.socket_inode(proto, peer)
         if inode is None:
             return None
@@ -444,6 +446,8 @@ class PodResolver(object):
                 with open(os.path.join(self.proc_root, pid, "cgroup")) as f:
                     pod = pod_of_cgroup(f.read())
             except OSError:
+                return None
+            if pod is None:
                 return None
             self.remember(self.by_pid, pid, pod, now)
         self.remember(self.by_inode, inode, pod, now)
@@ -504,8 +508,11 @@ class PodResolver(object):
         return False, len(fds)
 
     def socket_pid(self, inode):
-        """Returns the PID of a process holding the socket inode, checking the recently matched processes first."""
+        """Returns the PID of a process holding the socket inode, checking the agent itself, whose resolver queries its
+        own DNS forwarder, and the recently matched processes first."""
         link = "socket:[%s]" % inode
+        if self.holds(self.own_pid, link)[0]:
+            return self.own_pid
         with self.lock:
             hot = list(reversed(self.hot))
         for pid in hot:
@@ -752,11 +759,12 @@ class TCPProxy(object):
     """Local HTTP CONNECT proxy: tunnels targets in the tunnel networks (without any, those outside the direct
     networks) and connects the rest itself."""
 
-    def __init__(self, direct_networks=(), tunnel_networks=(), pods=None):
+    def __init__(self, direct_networks=(), tunnel_networks=(), pods=None, cluster_domain="cluster.local"):
         self.session = None
         self.direct_networks = list(direct_networks)
         self.tunnel_networks = list(tunnel_networks)
         self.pods = pods
+        self.cluster_domain = cluster_domain.strip(".").lower()
         self.synthetic_names, self.synthetic_ips, self.external_addresses = {}, {}, set()
 
     def set_destinations(self, synthetic_hosts, external_addresses):
@@ -790,12 +798,14 @@ class TCPProxy(object):
             log_failure("attribution_error", "cannot attribute %s connection from %s: %s" % (proto, peer, e))
             pod = None
         if pod is None:
-            log_failure("unattributed", "no process holds the %s socket at %s; the gateway refuses its stream as pod %s"
-                        % (proto, peer, UNATTRIBUTED_POD))
+            log_failure("unattributed_" + proto, "cannot tell which pod holds the %s socket at %s" % (proto, peer))
             return UNATTRIBUTED_POD
         return pod
 
-    async def route(self, target):
+    async def route(self, target, pod=None):
+        """Returns whether to tunnel target and the host:port to dial. A cluster hostname resolves through the gateway
+        as a query of the pod whose awaitable pod() attributes the connection; others resolve on the VM while pod()
+        attributes it."""
         host, _, port = target.rpartition(":")
         name = host.strip("[]").lower().rstrip(".")
         if name in self.synthetic_names:
@@ -805,8 +815,13 @@ class TCPProxy(object):
         except ValueError:
             if not self.tunnel_networks:
                 return True, target
-            info = await asyncio.get_event_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-            ip = ipaddress.ip_address(info[0][4][0])
+            if name.endswith("." + self.cluster_domain):
+                ip = await self.resolve_cluster_name(name, await pod() if pod else "")
+            else:
+                if pod:
+                    pod()
+                info = await asyncio.get_event_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                ip = ipaddress.ip_address(info[0][4][0])
             target = "[%s]:%s" % (ip, port)
         if str(ip) in self.synthetic_ips:
             return True, self.tunnel_target("%s:%s" % (ip, port))
@@ -815,6 +830,24 @@ class TCPProxy(object):
         if any(ip in network for network in self.direct_networks):
             return False, target
         return not self.tunnel_networks or any(ip in network for network in self.tunnel_networks), target
+
+    async def resolve_cluster_name(self, name, pod):
+        """Returns the first IPv4 address the gateway's cluster resolver gives name, asked for pod, so the answer is the
+        one that pod's own DNS query would get."""
+        session = self.session
+        if session is None:
+            raise OSError("no tunnel session to resolve %s" % name)
+        stream = session.open_dns_stream(dns_query(name), pod)
+        try:
+            await asyncio.wait_for(stream.done.wait(), DNS_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            session.streams.pop(stream.sid, None)
+        addresses = dns_addresses(stream.received)
+        if not addresses:
+            raise OSError("the cluster resolver has no address for %s" % name)
+        return ipaddress.ip_address(addresses[0])
 
     async def connect_direct(self, target, reader, writer):
         host, _, port = target.rpartition(":")
@@ -835,16 +868,24 @@ class TCPProxy(object):
             writer.close()
             return
         parts = head.split(b"\r\n", 1)[0].split()
+        peer, attribution = writer.get_extra_info("peername"), []
+
+        def client_pod():
+            # Attributes the connection once, as soon as a resolution needs it or starts: the client may give up and
+            # close its socket while its target resolves, after which no process holds it.
+            if not attribution:
+                attribution.append(asyncio.ensure_future(self.attribute("tcp", peer)))
+            return attribution[0]
         route = None
         if len(parts) >= 2 and parts[0] == b"CONNECT":
             try:
-                route = await self.route(parts[1].decode())
+                route = await self.route(parts[1].decode(), client_pod)
             except (OSError, ValueError) as e:
-                log("CONNECT %s: %s" % (parts[1], e))
+                log_failure("connect_unrouted", "CONNECT %s: %s; answering 502" % (parts[1].decode("ascii", "replace"), e))
         if route is not None and not route[0]:
             await self.connect_direct(route[1], reader, writer)
             return
-        pod = await self.attribute("tcp", writer.get_extra_info("peername")) if route is not None else ""
+        pod = await client_pod() if route is not None else ""
         session = self.session
         if route is not None and session is None:
             log_failure("no_session", "no tunnel session for the connection to %s; answering 502" % route[1])
@@ -902,6 +943,46 @@ def dns_question(query):
         return None
     qtype, = struct.unpack("!H", query[i + 1:i + 3])
     return ".".join(labels).lower(), qtype, i + 5
+
+
+def dns_query(name, qtype=1):
+    """Encodes a recursive query for name of type qtype, A by default."""
+    qname = b"".join(bytes([len(l)]) + l.encode("ascii") for l in name.strip(".").split(".")) + b"\0"
+    return struct.pack("!HHHHHH", random.getrandbits(16), 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", qtype, 1)
+
+
+def skip_dns_name(msg, i):
+    """Returns where the possibly compressed name at offset i of msg ends."""
+    while i < len(msg):
+        n = msg[i]
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        if n == 0:
+            return i + 1
+        i += 1 + n
+    raise ValueError("truncated name")
+
+
+def dns_addresses(reply):
+    """Returns the IPv4 addresses in the answer section of a DNS reply, or [] for a malformed or failed reply."""
+    try:
+        _, flags, qdcount, ancount = struct.unpack("!HHHH", reply[:8])
+        if flags & 0xF:
+            return []
+        i = 12
+        for _ in range(qdcount):
+            i = skip_dns_name(reply, i) + 4
+        addresses = []
+        for _ in range(ancount):
+            i = skip_dns_name(reply, i)
+            rtype, _, _, length = struct.unpack("!HHIH", reply[i:i + 10])
+            i += 10
+            if rtype == 1 and length == 4:
+                addresses.append(socket.inet_ntoa(reply[i:i + 4]))
+            i += length
+        return addresses
+    except (struct.error, ValueError, IndexError, OSError):
+        return []
 
 
 def synthetic_reply(query, end, qtype, addr):
@@ -1079,7 +1160,8 @@ def main():
     cfg["proxy"] = TCPProxy(
         parse_networks(os.environ.get("CLOUDVM_DIRECT_CIDRS", "")),
         parse_networks(os.environ.get("CLOUDVM_TUNNEL_CIDRS", "")),
-        PodResolver(proc_root) if os.path.exists(os.path.join(proc_root, "net", "tcp")) else None)
+        PodResolver(proc_root) if os.path.exists(os.path.join(proc_root, "net", "tcp")) else None,
+        os.environ.get("CLOUDVM_CLUSTER_DOMAIN", "cluster.local"))
     max_backoff = float(os.environ.get("CLOUDVM_TUNNEL_MAX_BACKOFF", "30"))
     backoff = 0.5
     loop = asyncio.new_event_loop()
