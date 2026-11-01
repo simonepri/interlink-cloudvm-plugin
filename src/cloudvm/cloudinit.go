@@ -69,6 +69,8 @@ type CloudInitConfig struct {
 	NodeClaim bool `json:"nodeClaim,omitempty"`
 	// DisableLazyPulls leaves the stargz snapshotter off the VM, so every image pulls in full.
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
+	// StargzConfig is TOML that opens the stargz snapshotter config, ahead of the Docker Hub mirrors the plugin adds.
+	StargzConfig string `json:"stargzConfig,omitempty"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -239,10 +241,14 @@ func (c *CloudInitConfig) RegistryMirrorsJSON() string {
 	return string(b)
 }
 
-// StargzConfigTOML returns the stargz snapshotter config: its lazy fetches try the Docker Hub mirrors normal pulls use,
-// and authenticate through the host docker config, whose ECR credential helper mints a fresh token for each fetch.
+// StargzConfigTOML returns the stargz snapshotter config: the operator's StargzConfig, such as fetch and prefetch
+// tuning, then the Docker Hub mirrors normal pulls use for lazy fetches. Fetches authenticate through the host docker
+// config, whose ECR credential helper mints a fresh token for each fetch.
 func (c *CloudInitConfig) StargzConfigTOML() string {
 	var b strings.Builder
+	if extra := strings.TrimSpace(c.StargzConfig); extra != "" {
+		b.WriteString(extra + "\n")
+	}
 	for _, m := range c.RegistryMirrors {
 		if !strings.Contains(m, "://") {
 			m = "https://" + m

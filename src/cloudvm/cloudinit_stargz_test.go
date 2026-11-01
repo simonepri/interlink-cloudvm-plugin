@@ -1,5 +1,5 @@
-// Tests that the boot script runs the stargz snapshotter as containerd's lazy pull proxy with the Docker Hub mirrors and
-// host credentials normal pulls use, and that LAZY_IMAGE_PULLS=false leaves it off so every image pulls in full.
+// Tests that the boot script runs the stargz snapshotter as containerd's lazy pull proxy with the operator's config, the
+// Docker Hub mirrors and host credentials normal pulls use, and that LAZY_IMAGE_PULLS=false leaves it off.
 package main
 
 import (
@@ -30,15 +30,51 @@ host = "registry.example.com/v2-proxy"
 	}
 }
 
+func TestStargzConfigTOML_OpensWithOperatorConfig(t *testing.T) {
+	cfg := CloudInitConfig{
+		StargzConfig:    "\nmax_concurrency = 16\n\n[blob]\nchunk_size = 67108864\n\n",
+		RegistryMirrors: []string{"https://mirror.gcr.io"},
+	}
+	want := `max_concurrency = 16
+
+[blob]
+chunk_size = 67108864
+[[resolver.host."docker.io".mirrors]]
+host = "mirror.gcr.io"
+`
+	if got := cfg.StargzConfigTOML(); got != want {
+		t.Errorf("StargzConfigTOML:\n%s\nwant:\n%s", got, want)
+	}
+	if got := (&CloudInitConfig{StargzConfig: "max_concurrency = 16"}).StargzConfigTOML(); got != "max_concurrency = 16\n" {
+		t.Errorf("without mirrors the config should be the operator's alone, got %q", got)
+	}
+}
+
+func TestServerDefaults_StargzConfigEnv(t *testing.T) {
+	t.Setenv("STARGZ_CONFIG", "max_concurrency = 16")
+	s := NewServer(NewMockProvider(), "test-cluster")
+	spec := &InstanceSpec{}
+	s.applyServerDefaults(spec)
+	if spec.StargzConfig != "max_concurrency = 16" {
+		t.Errorf("applyServerDefaults StargzConfig=%q, want the STARGZ_CONFIG value", spec.StargzConfig)
+	}
+	if got := s.BuildCloudInitConfig(&InstanceSpec{}).StargzConfig; got != "max_concurrency = 16" {
+		t.Errorf("BuildCloudInitConfig StargzConfig=%q, want the STARGZ_CONFIG value", got)
+	}
+	if got := s.BuildCloudInitConfig(&InstanceSpec{StargzConfig: "max_concurrency = 4"}).StargzConfig; got != "max_concurrency = 4" {
+		t.Errorf("BuildCloudInitConfig StargzConfig=%q, want the spec's own value", got)
+	}
+}
+
 func TestRenderCloudInit_RunsStargzSnapshotterForLazyPulls(t *testing.T) {
-	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", PodUID: "uid", RunnerAuthToken: "tok", RegistryMirrors: []string{"https://mirror.gcr.io"}})
+	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", PodUID: "uid", RunnerAuthToken: "tok", RegistryMirrors: []string{"https://mirror.gcr.io"}, StargzConfig: "max_concurrency = 16"})
 	if err != nil {
 		t.Fatalf("render cloud-init: %v", err)
 	}
 	for _, want := range []string{
 		`CLOUDVM_STARGZ_VERSION="0.18.2"`,
 		`CLOUDVM_STARGZ_SHA256="515a3c3af0012f192ace31fb79e910597977c77227e976680aeaaef6e9ae50a9"`,
-		"cat << 'STARGZ_EOF' > /etc/containerd-stargz-grpc/config.toml\n[[resolver.host.\"docker.io\".mirrors]]\nhost = \"mirror.gcr.io\"\nSTARGZ_EOF\n",
+		"cat << 'STARGZ_EOF' > /etc/containerd-stargz-grpc/config.toml\nmax_concurrency = 16\n[[resolver.host.\"docker.io\".mirrors]]\nhost = \"mirror.gcr.io\"\nSTARGZ_EOF\n",
 		"[proxy_plugins.stargz]\n  type = \"snapshot\"\n  address = \"/run/containerd-stargz-grpc/containerd-stargz-grpc.sock\"\n  [proxy_plugins.stargz.exports]\n    root = \"/var/lib/containerd-stargz-grpc\"\n",
 		"    enable_remote_snapshot_annotations = \"true\"\nCONTAINERD_EOF",
 		"Wants=stargz-snapshotter.service\\nAfter=stargz-snapshotter.service",
