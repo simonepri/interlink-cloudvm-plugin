@@ -19,10 +19,16 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"k8s.io/apimachinery/pkg/api/resource"
+
+	"k8s.io/client-go/rest"
 )
 
 func TestMain(m *testing.M) {
 	cleanTempStores()
+	// No test may reach a real cluster: every client the plugin builds gets its config here, and here it gets none.
+	_ = os.Setenv("KUBECONFIG", "/nonexistent")
+	_ = os.Unsetenv("KUBERNETES_SERVICE_HOST")
+	kubeConfig = func(bool) (*rest.Config, error) { return nil, errors.New("tests have no Kubernetes cluster") }
 	// Most tests create pods without a node; this entry gives the empty node name a region.
 	_ = os.Setenv("NODE_REGIONS", `{"":"us-east-1"}`)
 	code := m.Run()

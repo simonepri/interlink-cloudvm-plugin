@@ -12,7 +12,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
@@ -63,7 +62,7 @@ func NewNodeWatch(client kubernetes.Interface) *NodeWatch {
 
 // NewInClusterNodeWatch creates a watch from the in-cluster service account.
 func NewInClusterNodeWatch() (*NodeWatch, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := kubeConfig(false)
 	if err != nil {
 		return nil, fmt.Errorf("unable to load in-cluster config: %w", err)
 	}

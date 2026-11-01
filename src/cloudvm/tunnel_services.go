@@ -11,7 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -99,7 +98,7 @@ func NewServiceWatch(client kubernetes.Interface, regionalNamespaces ...map[stri
 // NewInClusterServiceWatch creates a watch from the in-cluster service account that keeps the stand-ins of the given
 // regional namespaces.
 func NewInClusterServiceWatch(regionalNamespaces map[string]bool) (*ServiceWatch, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := kubeConfig(false)
 	if err != nil {
 		return nil, fmt.Errorf("unable to load in-cluster config: %w", err)
 	}

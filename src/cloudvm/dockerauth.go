@@ -7,15 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 // SecretResolver abstracts retrieval of Kubernetes Secret data payloads.
@@ -36,18 +32,9 @@ func NewKubeSecretResolver(client kubernetes.Interface) *KubeSecretResolver {
 
 // NewKubeSecretResolverFromConfig creates a SecretResolver from in-cluster config or KUBECONFIG.
 func NewKubeSecretResolverFromConfig() (*KubeSecretResolver, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := kubeConfig(true)
 	if err != nil {
-		kubeconfig := os.Getenv("KUBECONFIG")
-		if kubeconfig == "" {
-			if home, _ := os.UserHomeDir(); home != "" {
-				kubeconfig = filepath.Join(home, ".kube", "config")
-			}
-		}
-		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, fmt.Errorf("unable to load kubernetes config: %w", err)
-		}
+		return nil, err
 	}
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
