@@ -554,34 +554,53 @@ def record_heartbeat():
     except Exception:
         pass
 
+SYS_NET = os.environ.get("CLOUDVM_SYS_NET", '/sys/class/net')
+
+def read_boot_id():
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+# The VM's NIC counters restart with each boot, which the plugin tells apart from readings that arrive out of order.
+BOOT_ID = read_boot_id()
+
 def get_network_bytes():
+    """Returns the bytes received and sent by the VM's device-backed NICs, which carry its traffic on the wire. Virtual
+    interfaces, such as veth pairs, bridges, and tunnels, have no device and would count the same bytes again."""
     rx_bytes = 0
     tx_bytes = 0
     try:
-        with open('/proc/net/dev', 'r') as f:
-            for line in f:
-                if ':' not in line:
-                    continue
-                iface, data = line.split(':', 1)
-                iface = iface.strip()
-                if iface == 'lo':
-                    continue
-                fields = data.split()
-                if len(fields) >= 9:
-                    rx_bytes += int(fields[0])
-                    tx_bytes += int(fields[8])
-    except Exception:
-        pass
+        names = os.listdir(SYS_NET)
+    except OSError:
+        return 0, 0
+    for name in names:
+        base = os.path.join(SYS_NET, name)
+        if not os.path.exists(os.path.join(base, 'device')):
+            continue
+        try:
+            with open(os.path.join(base, 'statistics', 'rx_bytes')) as f:
+                rx = int(f.read())
+            with open(os.path.join(base, 'statistics', 'tx_bytes')) as f:
+                tx = int(f.read())
+        except (OSError, ValueError):
+            continue
+        rx_bytes += rx
+        tx_bytes += tx
     return rx_bytes, tx_bytes
 
 class NoTrafficMeter:
-    """Stands in for the traffic meter when the runner starts without it."""
+    """Stands in for a traffic meter the runner cannot import, reporting the meter down."""
+
+    def __init__(self, error):
+        self.error = error
 
     def run(self):
         pass
 
     def report(self, pod_uid=None):
-        return None
+        return {'up': False, 'error': self.error}
 
     def add_pod(self, uid, namespace, name):
         pass
@@ -589,12 +608,12 @@ class NoTrafficMeter:
     def remove_pod(self, uid):
         pass
 
-# Workers fetch the traffic meter next to the runner; a runner started without it counts only NIC totals.
+# The bootstrap fetches the traffic meter next to the runner; without it the VM reports only its NIC totals.
 try:
     import cloudvm_traffic_meter
     traffic_meter = cloudvm_traffic_meter.TrafficMeter()
-except ImportError:
-    traffic_meter = NoTrafficMeter()
+except ImportError as e:
+    traffic_meter = NoTrafficMeter(f"cannot import the traffic meter: {e}")
 
 def set_pod_credentials(pod_uid, creds):
     """Records the role credentials the plugin sent for the pod, keeping those that expire last, and returns the
@@ -832,6 +851,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 "status": "ok",
                 "networkRxBytes": rx_bytes,
                 "networkTxBytes": tx_bytes,
+                "bootId": BOOT_ID,
             }
             traffic = traffic_meter.report()
             if traffic is not None:
@@ -862,7 +882,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             rx_bytes, tx_bytes = get_network_bytes()
             traffic = traffic_meter.report(pod_uid)
             def reply_status(**fields):
-                resp = dict(fields, podUID=pod_uid, networkRxBytes=rx_bytes, networkTxBytes=tx_bytes,
+                resp = dict(fields, podUID=pod_uid, networkRxBytes=rx_bytes, networkTxBytes=tx_bytes, bootId=BOOT_ID,
                             timings=pod_timing(pod_uid), initContainers=pod_init_states(pod_uid))
                 if traffic is not None:
                     resp["traffic"] = traffic

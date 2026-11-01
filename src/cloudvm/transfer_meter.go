@@ -3,6 +3,7 @@
 package main
 
 import (
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ type TrafficReport struct {
 	Peers      map[string]TrafficBytes `json:"peers"`
 	Owners     map[string]TrafficOwner `json:"owners,omitempty"`
 	Classified bool                    `json:"classified"`
+	// Up is false when the meter could not start, and Error says why; runners that predate it leave both unset.
+	Up    *bool  `json:"up,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // Peer classes relative to a VM, which label the transfer metrics.
@@ -71,12 +75,17 @@ type TransferVM struct {
 	InstanceID   string
 	// NodePool is the Karpenter NodePool of a NodeClaim VM, whose transfer profile the VM's traffic feeds.
 	NodePool string
+	// BootID identifies the boot whose counters the report holds; the counters restart with each boot.
+	BootID string
 }
 
 type meteredVM struct {
 	last map[string]int64
-	seen time.Time
-	pods map[string]time.Time
+	boot string
+	// meterError is why the VM's meter is down, logged once per change.
+	meterError string
+	seen       time.Time
+	pods       map[string]time.Time
 	// profile is the VM's traffic with the home region, for its NodePool's transfer profile.
 	profile vmTransferProfile
 	// costs are the VM's priced transfer per minute over the last transferSpendWindow.
@@ -124,6 +133,23 @@ func (t *TransferMeter) Record(vm TransferVM, report *TrafficReport) {
 		t.vms[vm.InstanceID] = state
 	}
 	state.seen = now
+	if vm.BootID != "" {
+		if state.boot != "" && state.boot != vm.BootID {
+			state.last = make(map[string]int64)
+		}
+		state.boot = vm.BootID
+	}
+	up := report.Up == nil || *report.Up
+	t.metrics.SetTrafficMeterUp(vm.Provider, vm.Region, vm.InstanceType, vm.InstanceID, up)
+	if !up {
+		if state.meterError != report.Error {
+			log.Printf("[cloudvm-traffic] The traffic meter of %s is down: %s", sanitizeLog(vm.InstanceID), sanitizeLog(report.Error)) //nolint:gosec // sanitized
+		}
+		state.meterError = report.Error
+		t.sweep(now)
+		return
+	}
+	state.meterError = ""
 	loc := TransferLocation{Provider: vm.Provider, Region: vm.Region}
 	home, hasHome := t.cost.Home()
 	if vm.NodePool != "" {
@@ -267,15 +293,14 @@ func classLocation(class string, loc, home TransferLocation, hasHome bool) (Tran
 	return TransferLocation{}, false
 }
 
+// delta returns the bytes a counter gained since its highest reading in the current boot. A lower reading is an older
+// one that arrived late, since the runner answers concurrent requests in any order.
 func (v *meteredVM) delta(key string, cur int64) int64 {
 	prev, ok := v.last[key]
-	v.last[key] = cur
-	switch {
-	case !ok:
-		return cur
-	case cur < prev:
-		return cur
+	if ok && cur <= prev {
+		return 0
 	}
+	v.last[key] = cur
 	return cur - prev
 }
 
@@ -301,6 +326,7 @@ func (t *TransferMeter) sweep(now time.Time) {
 			for uid := range v.pods {
 				t.metrics.DeletePodTransfer(uid)
 			}
+			t.metrics.DeleteTrafficMeterUp(id)
 			t.retire(v.profile)
 			delete(t.vms, id)
 		}

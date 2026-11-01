@@ -2002,8 +2002,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 										if instID == "" && tgt.inst != nil {
 											instID = tgt.inst.ID
 										}
-										GlobalFleetTracker.RecordNetworkTraffic(prov, reg, itype, instID, cResult.NetworkRxBytes, cResult.NetworkTxBytes)
-										GlobalTransferMeter.Record(TransferVM{Provider: prov, Region: reg, InstanceType: itype, InstanceID: instID}, cResult.Traffic)
+										GlobalFleetTracker.RecordNetworkTraffic(prov, reg, itype, instID, cResult.BootID, cResult.NetworkRxBytes, cResult.NetworkTxBytes)
+										GlobalTransferMeter.Record(TransferVM{Provider: prov, Region: reg, InstanceType: itype, InstanceID: instID, BootID: cResult.BootID}, cResult.Traffic)
 									}
 									switch {
 									case cResult.Running:

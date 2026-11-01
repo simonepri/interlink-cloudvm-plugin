@@ -18,6 +18,7 @@ type FleetTracker struct {
 	instanceAges    map[string]time.Time // instanceID -> lastSampleTime
 	lastNetworkRx   map[string]int64     // instanceID -> lastCumulativeRxBytes
 	lastNetworkTx   map[string]int64     // instanceID -> lastCumulativeTxBytes
+	lastBootID      map[string]string    // instanceID -> boot ID of the last NIC reading
 	defaultProvider string
 	defaultRegion   string
 	spotPrices      func(region, zone, instanceType string) (float64, bool)
@@ -51,6 +52,7 @@ func NewFleetTracker(metrics *ObservabilityMetrics, catalog *HardwareCatalog) *F
 		instanceAges:    make(map[string]time.Time),
 		lastNetworkRx:   make(map[string]int64),
 		lastNetworkTx:   make(map[string]int64),
+		lastBootID:      make(map[string]string),
 		defaultProvider: defProv,
 		defaultRegion:   defReg,
 	}
@@ -337,6 +339,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 			delete(f.instanceAges, id)
 			delete(f.lastNetworkRx, id)
 			delete(f.lastNetworkTx, id)
+			delete(f.lastBootID, id)
 		}
 	}
 
@@ -379,8 +382,10 @@ func (f *FleetTracker) RecordNetworkBytes(provider, region, itype string, rxDelt
 	f.metrics.AddNetworkBytes(provider, region, accelerator, itype, rxDelta, txDelta)
 }
 
-// RecordNetworkTraffic records delta network bytes from cumulative readings for an instance.
-func (f *FleetTracker) RecordNetworkTraffic(provider, region, itype, instanceID string, cumulativeRx, cumulativeTx int64) {
+// RecordNetworkTraffic records the bytes an instance's NICs gained since their highest reading in the same boot,
+// bootID, which runners that predate it leave empty. A lower reading in the same boot is an older one that arrived late,
+// since the runner answers the status requests of a VM's pods concurrently and in any order, so it adds nothing.
+func (f *FleetTracker) RecordNetworkTraffic(provider, region, itype, instanceID, bootID string, cumulativeRx, cumulativeTx int64) {
 	if f.metrics == nil {
 		return
 	}
@@ -388,37 +393,24 @@ func (f *FleetTracker) RecordNetworkTraffic(provider, region, itype, instanceID 
 	defer f.mu.Unlock()
 
 	accelerator, _ := f.resolveAccelerator(itype)
-
-	var deltaRx, deltaTx int64
-	if lastRx, ok := f.lastNetworkRx[instanceID]; ok {
-		if cumulativeRx >= lastRx {
-			deltaRx = cumulativeRx - lastRx
-		} else {
-			deltaRx = cumulativeRx
+	if instanceID != "" && bootID != "" {
+		if last, ok := f.lastBootID[instanceID]; ok && last != bootID {
+			delete(f.lastNetworkRx, instanceID)
+			delete(f.lastNetworkTx, instanceID)
 		}
-	} else if cumulativeRx > 0 {
-		deltaRx = cumulativeRx
+		f.lastBootID[instanceID] = bootID
 	}
-
-	if lastTx, ok := f.lastNetworkTx[instanceID]; ok {
-		if cumulativeTx >= lastTx {
-			deltaTx = cumulativeTx - lastTx
-		} else {
-			deltaTx = cumulativeTx
+	gain := func(last map[string]int64, cumulative int64) int64 {
+		prev, ok := last[instanceID]
+		if ok && cumulative <= prev {
+			return 0
 		}
-	} else if cumulativeTx > 0 {
-		deltaTx = cumulativeTx
+		if instanceID != "" {
+			last[instanceID] = cumulative
+		}
+		return cumulative - prev
 	}
-
-	if instanceID != "" {
-		if cumulativeRx > 0 {
-			f.lastNetworkRx[instanceID] = cumulativeRx
-		}
-		if cumulativeTx > 0 {
-			f.lastNetworkTx[instanceID] = cumulativeTx
-		}
-	}
-
+	deltaRx, deltaTx := gain(f.lastNetworkRx, cumulativeRx), gain(f.lastNetworkTx, cumulativeTx)
 	if deltaRx > 0 || deltaTx > 0 {
 		f.metrics.AddNetworkBytes(provider, region, accelerator, itype, float64(deltaRx), float64(deltaTx))
 	}
@@ -426,5 +418,5 @@ func (f *FleetTracker) RecordNetworkTraffic(provider, region, itype, instanceID 
 
 // CollectFleetTelemetry records telemetry such as network bytes for a given instance.
 func (f *FleetTracker) CollectFleetTelemetry(provider, region, itype, instanceID string, rxBytes, txBytes int64) {
-	f.RecordNetworkTraffic(provider, region, itype, instanceID, rxBytes, txBytes)
+	f.RecordNetworkTraffic(provider, region, itype, instanceID, "", rxBytes, txBytes)
 }

@@ -153,6 +153,10 @@ def render_traffic_ruleset(peers, ranges, nics, tunnel_ips, mesh_port, fallback,
     lines = [f"add table {t}"]
     levels = sorted({p.count('/') + 1 for paths in owners.values() for p in paths})
     for d in ('tx', 'rx'):
+        # nft sends an interval map's elements with the map itself, so the chains they jump to must come first.
+        for chain in [f"{d}_{traffic_name(peer)}" for peer in peers] + [f"{d}_pod_tunnel"]:
+            lines.append(f"add chain {t} {chain}")
+            lines.append(f"flush chain {t} {chain}")
         for peer in peers:
             lines.append(f"add counter {t} {d}_{traffic_name(peer)}")
         for prefix in owners:
@@ -168,9 +172,6 @@ def render_traffic_ruleset(peers, ranges, nics, tunnel_ips, mesh_port, fallback,
             lines.append(f"flush map {t} peers{v}_{d}")
             lines.append(f"add set {t} tunnel{v} {{ type ipv{v}_addr; }}")
             lines.append(f"flush set {t} tunnel{v}")
-        for chain in [f"{d}_{traffic_name(peer)}" for peer in peers] + [f"{d}_pod_tunnel"]:
-            lines.append(f"add chain {t} {chain}")
-            lines.append(f"flush chain {t} {chain}")
     lines.append(f"add chain {t} out {{ type filter hook output priority 300; policy accept; }}")
     lines.append(f"add chain {t} in {{ type filter hook input priority 300; policy accept; }}")
     lines.append(f"flush chain {t} out")
@@ -222,6 +223,8 @@ class TrafficMeter:
     def __init__(self):
         self.lock = threading.Lock()
         self.enabled = bool(TRAFFIC_REGION) and shutil.which(NFT_CLI) is not None
+        # error says why the meter is off, which its report carries so that the plugin can tell.
+        self.error = '' if self.enabled else ('no region to classify peers against' if not TRAFFIC_REGION else f"{NFT_CLI} not found")
         self.cgroups = os.path.exists(os.path.join(TRAFFIC_CGROUP_ROOT, 'cgroup.controllers'))
         self.ranges = partition_networks([(ipaddress.ip_network(n), 'private') for n in TRAFFIC_PRIVATE])
         self.loaded = False
@@ -265,6 +268,8 @@ class TrafficMeter:
             # A table that never loaded means the kernel or nft cannot meter; a later refusal keeps the previous table.
             print(f"[cloudvm-runner] cannot update the traffic meter: {res.stderr.strip()}", flush=True)
             self.enabled = self.applied
+            if not self.applied:
+                self.error = f"cannot install the traffic table: {res.stderr.strip()}"
             return False
         self.applied = True
         self.levels = {p.count('/') + 1 for paths in owners.values() for p in paths}
@@ -407,11 +412,11 @@ class TrafficMeter:
         return {'peers': peers, 'owners': owners}
 
     def report(self, pod_uid=None):
-        """Returns the cumulative bytes per peer and per owner, or None while the meter is off. With pod_uid only that
-        pod and the image pulls are listed."""
+        """Returns the cumulative bytes per peer and per owner, or why the meter is off. With pod_uid only that pod and the
+        image pulls are listed."""
         with self.lock:
             if not self.enabled:
-                return None
+                return {'up': False, 'error': self.error}
             at, cached = self.cache
             if cached is None or time.time() - at > TRAFFIC_CACHE_SECONDS:
                 cached = self.read_locked()
@@ -422,6 +427,7 @@ class TrafficMeter:
                     else:
                         cached.setdefault('owners', {}).setdefault(uid, final)
                 cached['classified'] = self.loaded
+                cached['up'] = True
                 self.cache = (time.time(), cached)
         if pod_uid is None:
             return cached

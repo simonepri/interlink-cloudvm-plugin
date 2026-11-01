@@ -67,6 +67,7 @@ type ObservabilityMetrics struct {
 	imagePullBytes   *prometheus.CounterVec
 	podTransferBytes *prometheus.CounterVec
 	podTransferCost  *prometheus.CounterVec
+	trafficMeterUp   *prometheus.GaugeVec
 
 	// Legacy compatibility metrics (kept for 1 release)
 	legacySpotPrice      *prometheus.GaugeVec
@@ -257,6 +258,11 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 			Help: "Bytes a pod's own sockets sent or received on its cloud VM's NICs by peer class, and through the tunnel agent's proxies under peer tunnel",
 		}, []string{"namespace", "pod", "pod_uid", "provider", "region", "direction", "peer"}),
 
+		trafficMeterUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cloudvm_traffic_meter_up",
+			Help: "1 while a cloud VM's traffic meter counts its bytes by peer and pod, 0 when the meter could not start",
+		}, []string{"provider", "region", "instance_type", "instance_id"}),
+
 		podTransferCost: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cloudvm_pod_transfer_cost_usd_total",
 			Help: "Estimated USD a pod's direct data transfer costs at list rates; bytes no rate covers are left out",
@@ -327,6 +333,7 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.imagePullBytes,
 		m.podTransferBytes,
 		m.podTransferCost,
+		m.trafficMeterUp,
 	)
 
 	return m
@@ -675,6 +682,20 @@ func (m *ObservabilityMetrics) AddPodTransfer(namespace, pod, podUID, provider, 
 }
 
 // DeletePodTransfer drops every transfer series of a pod that is gone.
+// SetTrafficMeterUp records whether the traffic meter of a VM runs.
+func (m *ObservabilityMetrics) SetTrafficMeterUp(provider, region, instanceType, instanceID string, up bool) {
+	v := 0.0
+	if up {
+		v = 1
+	}
+	m.trafficMeterUp.WithLabelValues(provider, region, instanceType, instanceID).Set(v)
+}
+
+// DeleteTrafficMeterUp drops the meter state of a VM that stopped reporting.
+func (m *ObservabilityMetrics) DeleteTrafficMeterUp(instanceID string) {
+	m.trafficMeterUp.DeletePartialMatch(prometheus.Labels{"instance_id": instanceID})
+}
+
 func (m *ObservabilityMetrics) DeletePodTransfer(podUID string) {
 	m.podTransferBytes.DeletePartialMatch(prometheus.Labels{"pod_uid": podUID})
 	m.podTransferCost.DeletePartialMatch(prometheus.Labels{"pod_uid": podUID})

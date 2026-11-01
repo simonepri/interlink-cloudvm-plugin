@@ -141,18 +141,21 @@ func TestFleetTracker_NetworkMetrics(t *testing.T) {
 	tracker := NewFleetTracker(metrics, cat)
 
 	// 1. Initial cumulative reading: 1000 RX, 2000 TX
-	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", 1000, 2000)
+	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", "boot-1", 1000, 2000)
 
 	// 2. Second cumulative reading: 1500 RX (+500), 2800 TX (+800)
-	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", 1500, 2800)
+	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", "boot-1", 1500, 2800)
 
-	// 3. Counter reset (e.g. reboot): 300 RX (+300), 400 TX (+400)
-	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", 300, 400)
+	// 3. An older reading of the same boot that arrived late adds nothing
+	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", "boot-1", 1200, 2500)
 
-	// 4. CollectFleetTelemetry delegation
+	// 4. Counters of a new boot start over: 300 RX (+300), 400 TX (+400)
+	tracker.RecordNetworkTraffic("aws", "us-west-2", "g5.xlarge", "i-net-1", "boot-2", 300, 400)
+
+	// 5. CollectFleetTelemetry delegation
 	tracker.CollectFleetTelemetry("aws", "us-west-2", "g5.xlarge", "i-net-2", 5000, 10000)
 
-	// 5. Direct delta recording
+	// 6. Direct delta recording
 	tracker.RecordNetworkBytes("gcp", "us-central1", "a2-highgpu-1g", 1024, 2048)
 
 	rec := httptest.NewRecorder()
@@ -165,7 +168,7 @@ func TestFleetTracker_NetworkMetrics(t *testing.T) {
 	if !strings.Contains(body, "cloudvm_network_transmit_bytes_total") {
 		t.Fatalf("expected cloudvm_network_transmit_bytes_total in metrics output")
 	}
-	// For i-net-1: initial=1000 + delta=500 + reset=300 = 1800 RX; initial=2000 + delta=800 + reset=400 = 3200 TX
+	// For i-net-1: initial=1000 + delta=500 + new boot=300 = 1800 RX; initial=2000 + delta=800 + new boot=400 = 3200 TX
 	// Total for aws us-west-2 g5.xlarge: 1800 + 5000 (i-net-2) = 6800 RX, 3200 + 10000 = 13200 TX
 	if !strings.Contains(body, `cloudvm_network_receive_bytes_total{accelerator="gpu",instance_type="g5.xlarge",provider="aws",region="us-west-2"} 6800`) {
 		t.Errorf("expected 6800 RX bytes for aws g5.xlarge, got metrics:\n%s", body)

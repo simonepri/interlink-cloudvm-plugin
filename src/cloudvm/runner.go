@@ -88,6 +88,8 @@ type ContainerStatusResult struct {
 	FinishedAt     time.Time `json:"finishedAt,omitempty"`
 	NetworkRxBytes int64     `json:"networkRxBytes,omitempty"`
 	NetworkTxBytes int64     `json:"networkTxBytes,omitempty"`
+	// BootID identifies the boot of the VM whose counters the readings are; older runners send none.
+	BootID string `json:"bootId,omitempty"`
 	// Timings tells when the runner reached each step of the container's start; older runners send none.
 	Timings *RunnerTimings `json:"timings,omitempty"`
 	// Traffic is the VM's traffic meter reading with only this pod's and the image pulls' owners; runners without a
@@ -129,6 +131,8 @@ type RunnerTimings struct {
 type HostStatsResult struct {
 	NetworkRxBytes int64 `json:"networkRxBytes"`
 	NetworkTxBytes int64 `json:"networkTxBytes"`
+	// BootID identifies the boot of the VM whose counters the readings are; older runners send none.
+	BootID string `json:"bootId,omitempty"`
 	// Traffic is the VM's traffic meter reading with every owner; runners without a meter send none.
 	Traffic *TrafficReport `json:"traffic,omitempty"`
 }

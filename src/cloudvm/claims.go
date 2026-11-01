@@ -772,7 +772,7 @@ func (s *Server) SyncClaims(ctx context.Context) {
 			if stats != nil {
 				GlobalTransferMeter.Record(TransferVM{
 					Provider: string(node.Provider), Region: node.Region, InstanceType: node.InstanceType, InstanceID: node.InstanceID,
-					NodePool: rec.Request.Labels[karpenterNodePoolLabel],
+					BootID: stats.BootID, NodePool: rec.Request.Labels[karpenterNodePoolLabel],
 				}, stats.Traffic)
 			}
 			s.claims.mu.Lock()
