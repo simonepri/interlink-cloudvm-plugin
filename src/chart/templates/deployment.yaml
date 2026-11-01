@@ -160,6 +160,14 @@ spec:
             - name: REGISTRY_MIRRORS
               value: {{ join "," .Values.registryMirrors | quote }}
             {{- end }}
+            {{- if .Values.nvidiaRuntimeClasses }}
+            - name: NVIDIA_RUNTIME_CLASSES
+              value: {{ join "," .Values.nvidiaRuntimeClasses | quote }}
+            {{- end }}
+            {{- if .Values.allGPUsNamespaces }}
+            - name: ALL_GPUS_NAMESPACES
+              value: {{ join "," .Values.allGPUsNamespaces | quote }}
+            {{- end }}
             {{- if .Values.otlpLogsEndpoint }}
             - name: CLOUDVM_OTLP_LOGS_ENDPOINT
               value: {{ .Values.otlpLogsEndpoint | quote }}
