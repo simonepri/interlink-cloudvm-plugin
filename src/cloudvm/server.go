@@ -47,6 +47,7 @@ type inFlightCreate struct {
 type Server struct {
 	mu             sync.RWMutex
 	stopRetryDelay time.Duration // pause between container stop attempts; zero uses defaultStopRetryDelay
+	podStarts      *podStarts    // whether each pod's container start may have reached its VM
 	providers      map[ProviderType]Provider
 	defaultProv    Provider
 	instances      map[string]*Instance // key: UID and namespace/podName -> *Instance
@@ -198,6 +199,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	}
 	s.admission = PodAdmissionFromEnv()
 	s.lifecycle = NewLifecycle(NewLifecycleMetrics(), s.podEventRecorder)
+	s.podStarts = newPodStarts()
 	return s
 }
 
@@ -1170,7 +1172,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	gpus, tpus := s.nodePool.RegisterAndAllocate(newNode, reqVec, spec.PodUID, spec.PodNamespace, spec.PodName)
 
 	startReq := newStartRequest(spec, pod, gpus, tpus, awsCreds, reqVec.CPU.MilliValue(), reqVec.Memory.Value())
-	startErr := s.runner.StartContainer(r.Context(), newNode, startReq)
+	startErr := s.startContainer(r.Context(), newNode, startReq)
 	if startErr != nil {
 		log.Printf("[cloudvm] Initial StartContainer call returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
 		go s.retryStartContainer(context.WithoutCancel(r.Context()), newNode, startReq) //nolint:gosec // detached background retry outlives HTTP request
@@ -1313,7 +1315,7 @@ func newStartRequest(spec *InstanceSpec, pod *Pod, gpus, tpus []int, awsCreds *P
 // boots, and records the pod's instance.
 func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus []int, spec *InstanceSpec, pod *Pod, awsCreds *PodAWSCredentials, cpuLimitMilli, memLimitBytes int64) *CreateStruct {
 	startReq := newStartRequest(spec, pod, gpus, tpus, awsCreds, cpuLimitMilli, memLimitBytes)
-	startErr := s.runner.StartContainer(ctx, node, startReq)
+	startErr := s.startContainer(ctx, node, startReq)
 	if startErr != nil {
 		log.Printf("[cloudvm] Initial StartContainer call for bin-pack slice returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
 		go s.retryStartContainer(context.WithoutCancel(ctx), node, startReq) //nolint:gosec // detached background retry outlives HTTP request
@@ -1360,7 +1362,8 @@ func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus 
 
 // A container stop that the in-VM runner itself refuses is retried stopRunnerAttempts times; one that fails on the
 // way, such as a dropped tunnel stream or a timeout, is retried up to stopAttempts times within stopBudget, with a
-// back-off that doubles from the retry delay up to stopMaxRetryDelay.
+// back-off that doubles from the retry delay up to stopMaxRetryDelay. A stop that finds no tunnel session waits for the
+// VM's worker to register one within stopBudget without using up an attempt.
 const (
 	stopRunnerAttempts    = 3
 	stopAttempts          = 8
@@ -1369,9 +1372,11 @@ const (
 	stopMaxRetryDelay     = 30 * time.Second
 )
 
-// stopContainerWithRetry removes a pod's container, retrying a failed attempt because stopping is idempotent and a
-// slow or briefly unreachable runner usually succeeds on the next try. It runs on a context of its own, so the end of
-// the request that asked for the stop, such as a virtual kubelet that stopped waiting, cannot fail the cleanup.
+// stopContainerWithRetry removes a deleted pod's container, retrying a failed attempt because stopping is idempotent
+// and a slow or briefly unreachable runner usually succeeds on the next try. A pod whose start request never reached
+// the VM has no container, so it returns at once when the VM has no tunnel session. It runs on a context of its own, so
+// the end of the request that asked for the stop, such as a virtual kubelet that stopped waiting, cannot fail the
+// cleanup.
 func (s *Server) stopContainerWithRetry(ctx context.Context, node *CloudVMNode, uid string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopBudget)
 	defer cancel()
@@ -1379,11 +1384,26 @@ func (s *Server) stopContainerWithRetry(ctx context.Context, node *CloudVMNode, 
 	if delay <= 0 {
 		delay = defaultStopRetryDelay
 	}
-	refused := 0
+	refused, waited := 0, false
 	var err error
-	for attempt := 1; attempt <= stopAttempts; attempt++ {
+	for attempt := 1; attempt <= stopAttempts; {
 		if err = s.runner.StopContainer(ctx, node, uid); err == nil {
 			return nil
+		}
+		if errors.Is(err, errNoTunnelSession) {
+			if s.podStarts.delete(uid) {
+				log.Printf("[cloudvm] Pod %s never started on node %s, which has no tunnel session yet; nothing to remove", sanitizeLog(uid), sanitizeLog(node.InstanceID)) //nolint:gosec // sanitized
+				return nil
+			}
+			if !waited {
+				log.Printf("[cloudvm] Node %s has no tunnel session to remove the container of pod %s; waiting up to %v for its worker to register one", sanitizeLog(node.InstanceID), sanitizeLog(uid), stopBudget) //nolint:gosec // sanitized
+				waited = true
+			}
+			if !s.awaitTunnel(ctx, node.InstanceID, delay) {
+				return err
+			}
+			delay = min(delay*2, stopMaxRetryDelay)
+			continue
 		}
 		if errors.Is(err, errRunnerRefused) {
 			refused++
@@ -1398,8 +1418,24 @@ func (s *Server) stopContainerWithRetry(ctx context.Context, node *CloudVMNode, 
 		case <-time.After(delay):
 		}
 		delay = min(delay*2, stopMaxRetryDelay)
+		attempt++
 	}
 	return err
+}
+
+// awaitTunnel waits up to wait for the instance's worker to register a tunnel session, returning early when it does,
+// and reports false once ctx ends.
+func (s *Server) awaitTunnel(ctx context.Context, instanceID string, wait time.Duration) bool {
+	if t := s.tunnelConfig(); t != nil {
+		t.Registry.AwaitRegistration(ctx, instanceID, wait)
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(wait):
+		return true
+	}
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -1476,6 +1512,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	delete(s.completedPods, podName)
 	podCredentials := s.podCredentials
 	s.mu.Unlock()
+	// The pod is tombstoned, so no start request of it is sent from here on.
+	s.podStarts.delete(uid)
+	defer s.podStarts.forget(uid)
 	s.lifecycle.PodDeleted(uid)
 	if podCredentials != nil {
 		podCredentials.Forget(uid)
@@ -1503,7 +1542,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		remainingPods = s.nodePool.Release(uid)
 		log.Printf("[cloudvm] Released resources for pod %s from node %s (remaining active pods: %d)", sanitizeLog(uid), sanitizeLog(node.InstanceID), remainingPods) //nolint:gosec // sanitized
 		if node.ClaimName != "" {
-			// Only deleting its NodeClaim terminates a claim's VM.
+			// A claim's VM outlives its last pod; the claim loop decides when it terminates.
 			s.persistClaimPods(node)
 			w.WriteHeader(http.StatusOK)
 			return
@@ -2266,6 +2305,22 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+// startContainer sends the pod's start request to its VM's runner, unless the pod was deleted, and records whether the
+// request may have reached the runner.
+func (s *Server) startContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) error {
+	deleted := func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.isTombstonedLocked(req.PodUID)
+	}
+	if !s.podStarts.begin(req.PodUID, deleted) {
+		return errPodDeleted
+	}
+	err := s.runner.StartContainer(ctx, node, req)
+	s.podStarts.end(req.PodUID, !errors.Is(err, errNoTunnelSession))
+	return err
+}
+
 func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) {
 	launchedAt := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, s.startRetryTimeout())
@@ -2334,7 +2389,7 @@ func (s *Server) retryStartContainer(ctx context.Context, node *CloudVMNode, req
 				}
 			}
 
-			err := s.runner.StartContainer(ctx, node, req)
+			err := s.startContainer(ctx, node, req)
 			if err == nil {
 				log.Printf("[cloudvm] Successfully started container for pod %s/%s on node %s", req.Namespace, req.PodName, node.InstanceID)
 				return

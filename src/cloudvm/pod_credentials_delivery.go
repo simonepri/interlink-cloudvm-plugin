@@ -67,7 +67,7 @@ func (t *TunnelContainerRunner) PushPodCredentials(ctx context.Context, node *Cl
 		if pusher, isPusher := t.fallback.(PodCredentialsPusher); isPusher {
 			return pusher.PushPodCredentials(ctx, node, podUID, creds)
 		}
-		return fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+		return fmt.Errorf("%w for instance %s", errNoTunnelSession, node.InstanceID)
 	}
 	return postRunnerJSON(ctx, t.clientForSession(session), "http://clvm-tunnel"+podCredentialsPath(podUID), node.RunnerAuthToken, creds)
 }
@@ -109,7 +109,7 @@ func (t *TunnelContainerRunner) PushPodVolumeFiles(ctx context.Context, node *Cl
 		if pusher, isPusher := t.fallback.(PodVolumeFilesPusher); isPusher {
 			return pusher.PushPodVolumeFiles(ctx, node, podUID, files)
 		}
-		return fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+		return fmt.Errorf("%w for instance %s", errNoTunnelSession, node.InstanceID)
 	}
 	return postRunnerJSON(ctx, t.clientForSession(session), "http://clvm-tunnel"+podVolumeFilesPath(podUID), node.RunnerAuthToken, files)
 }

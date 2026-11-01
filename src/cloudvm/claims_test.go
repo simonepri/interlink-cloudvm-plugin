@@ -601,10 +601,10 @@ func (w *claimPodWatch) set(uids ...string) {
 	}
 }
 
-// deleteClaimPod posts an interLink delete request for the pod, as the node agent does when the pod leaves its Node.
-func deleteClaimPod(t *testing.T, url, namespace, name string) {
+// deleteClaimPod posts an interLink delete request for the team-a pod, as the node agent does when the pod leaves its Node.
+func deleteClaimPod(t *testing.T, url, name string) {
 	t.Helper()
-	body, _ := json.Marshal(map[string]any{"pod": Pod{Metadata: PodMeta{Name: name, Namespace: namespace, UID: "uid-" + name}}})
+	body, _ := json.Marshal(map[string]any{"pod": Pod{Metadata: PodMeta{Name: name, Namespace: "team-a", UID: "uid-" + name}}})
 	req, _ := http.NewRequest(http.MethodDelete, url+"/delete", bytes.NewReader(body))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -655,7 +655,7 @@ func TestClaimPodDeleteFreesItsDevices(t *testing.T) {
 		t.Fatalf("create p2 while p1 holds the only GPU: HTTP %d, want 409", code)
 	}
 
-	deleteClaimPod(t, url, "team-a", "p1")
+	deleteClaimPod(t, url, "p1")
 	if code := createClaimPod(t, url, "nc-free", "team-a", "p2", 1); code != http.StatusOK {
 		t.Fatalf("create p2 after p1 was deleted: HTTP %d, want 200", code)
 	}
@@ -842,7 +842,7 @@ func TestClaimPodDeleteRetriesSlowContainerStop(t *testing.T) {
 	if code := createClaimPod(t, url, "nc-slow", "team-a", "p1", 0); code != http.StatusOK {
 		t.Fatalf("create pod: HTTP %d", code)
 	}
-	deleteClaimPod(t, url, "team-a", "p1")
+	deleteClaimPod(t, url, "p1")
 	if got := mustGet(t, client, "nc-slow"); got.State == nodeclaim.StateUnhealthy {
 		t.Fatalf("claim state = %s after a stop that succeeded on retry", got.State)
 	}
@@ -862,9 +862,59 @@ func TestClaimReportsUnhealthyWhenContainerCannotBeRemoved(t *testing.T) {
 	if code := createClaimPod(t, url, "nc-stuck", "team-a", "p1", 0); code != http.StatusOK {
 		t.Fatalf("create pod: HTTP %d", code)
 	}
-	deleteClaimPod(t, url, "team-a", "p1")
+	deleteClaimPod(t, url, "p1")
 	if got := mustGet(t, client, "nc-stuck"); got.State != nodeclaim.StateUnhealthy {
 		t.Fatalf("claim state = %s, want %s so the node agent makes the Node NotReady", got.State, nodeclaim.StateUnhealthy)
+	}
+}
+
+func TestClaimVMThatCannotRemoveAContainerIsTerminated(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		workloads int
+	}{
+		{"once no workload pod runs on it", 0},
+		{"within the timeout while workload pods run on it", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := NewMockProvider()
+			s, client, url := newClaimServer(t, mock)
+			s.SetContainerRunner(&flakyStopRunner{MockContainerRunner: NewMockContainerRunner(), failures: 1 << 30})
+			s.stopRetryDelay = time.Millisecond
+			ctx := context.Background()
+			claim, err := client.Create(ctx, claimRequest("nc-poisoned", "g5.xlarge"))
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			_, _, instanceID, _ := nodeclaim.ParseProviderID(claim.ProviderID)
+			for i := range tc.workloads + 1 {
+				if code := createClaimPod(t, url, "nc-poisoned", "team-a", fmt.Sprint("p", i), 0); code != http.StatusOK {
+					t.Fatalf("create pod: HTTP %d", code)
+				}
+			}
+			deleteClaimPod(t, url, "p0")
+			if got := mustGet(t, client, "nc-poisoned"); got.State != nodeclaim.StateUnhealthy {
+				t.Fatalf("claim state = %s, want %s", got.State, nodeclaim.StateUnhealthy)
+			}
+
+			s.SyncClaims(ctx)
+			if tc.workloads > 0 {
+				if inst, _ := mock.Status(ctx, instanceID); inst.State == StateTerminated {
+					t.Fatal("the VM was terminated under its workload pods before the timeout")
+				}
+				node, _ := s.nodePool.Node(instanceID)
+				s.nodePool.mu.Lock()
+				node.SpinDownAt = time.Now().Add(-claimUnhealthyTimeout)
+				s.nodePool.mu.Unlock()
+				s.SyncClaims(ctx)
+			}
+			if inst, _ := mock.Status(ctx, instanceID); inst.State != StateTerminated {
+				t.Fatalf("VM state = %s, want %s", inst.State, StateTerminated)
+			}
+			if _, err := client.Get(ctx, "nc-poisoned"); !nodeclaim.IsNotFound(err) {
+				t.Fatalf("Get after termination: %v, want not found so Karpenter replaces the claim", err)
+			}
+		})
 	}
 }
 

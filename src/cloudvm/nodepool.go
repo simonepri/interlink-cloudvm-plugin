@@ -47,6 +47,7 @@ type CloudVMNode struct {
 	IdleSince               *time.Time     `json:"idleSince,omitempty"`
 	Cordoned                bool           `json:"cordoned,omitempty"`
 	SpinDownReason          SpinDownReason `json:"spinDownReason,omitempty"`
+	SpinDownAt              time.Time      `json:"spinDownAt,omitzero"`
 	GPUType                 string         `json:"gpuType,omitempty"`
 	UnknownCoTenants        bool           `json:"unknownCoTenants,omitempty"`
 	UnknownCoTenantsRetries int            `json:"unknownCoTenantsRetries,omitempty"`
@@ -872,5 +873,6 @@ func (np *NodePool) Uncordon(instanceID string) {
 	if node, exists := np.nodes[instanceID]; exists && node != nil {
 		node.Cordoned = false
 		node.SpinDownReason = ""
+		node.SpinDownAt = time.Time{}
 	}
 }

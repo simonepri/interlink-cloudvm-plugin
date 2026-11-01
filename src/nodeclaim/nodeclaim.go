@@ -72,7 +72,8 @@ const (
 	// StateRunning means the VM's tunnel is connected and its runner takes pods.
 	StateRunning State = "Running"
 	// StateUnhealthy means the VM is up but cannot take pods safely, such as after it failed to remove a pod's
-	// container. The node agent reports its Node NotReady so the scheduler stops using it and Karpenter replaces it.
+	// container. The node agent reports its Node NotReady so the scheduler stops using it, and the plugin terminates the
+	// VM once no workload pod runs on it, or ten minutes after it turned unhealthy.
 	StateUnhealthy State = "Unhealthy"
 	// StateTerminating means termination was requested and the cloud has not confirmed it. A claim whose VM is gone
 	// is neither listed nor found.

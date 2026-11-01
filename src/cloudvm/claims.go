@@ -1,5 +1,5 @@
 // VM-per-NodeClaim API: launches one VM for each Karpenter NodeClaim, persists the claims, places the pods bound to a
-// claim's Node on its VM, keeps idle claim VMs alive, and terminates a VM only when its claim is deleted.
+// claim's Node on its VM, keeps idle claim VMs alive, and terminates a VM when its claim is deleted or the VM fails.
 package main
 
 import (
@@ -31,6 +31,9 @@ const (
 	claimHeartbeatInterval = time.Minute
 	// claimReadyTimeout bounds how long a claim VM may take to become ready when no tunnel connect timeout applies.
 	claimReadyTimeout = 10 * time.Minute
+	// claimUnhealthyTimeout bounds how long a claim VM that failed to remove a pod's container keeps running its
+	// workload pods before it is terminated.
+	claimUnhealthyTimeout = 10 * time.Minute
 	// claimProbeConcurrency bounds parallel runner calls of one claim loop pass.
 	claimProbeConcurrency = 32
 	// claimTerminateTimeout bounds the cloud call that terminates a claim's VM.
@@ -722,7 +725,7 @@ func (s *Server) RunClaimSync(ctx context.Context) {
 	}
 }
 
-// SyncClaims terminates claim VMs that stayed unready past the timeout, records the container storage size of claims that lack it,
+// SyncClaims terminates claim VMs that stayed unready past the timeout or failed to remove a pod's container, records the container storage size of claims that lack it,
 // calls the runner of every claim VM that has not heard from the plugin for a minute, which marks VMs without a tunnel
 // ready and keeps idle VMs alive, releases the pods on each VM that no longer exist and persists the rest, and prunes
 // expired memory of deleted claims and unavailable offerings.
@@ -741,6 +744,9 @@ func (s *Server) SyncClaims(ctx context.Context) {
 		}
 		s.releaseDepartedClaimPods(ctx, node)
 		s.persistClaimPods(node)
+		if s.endUnhealthyClaim(ctx, rec, node, now) {
+			continue
+		}
 		if rec.EphemeralStorage == "" {
 			s.fillClaimContainerStorage(ctx, rec)
 		}
@@ -794,6 +800,23 @@ func (s *Server) SyncClaims(ctx context.Context) {
 		}
 	}
 	s.claims.mu.Unlock()
+}
+
+// endUnhealthyClaim terminates a claim VM that failed to remove a pod's container, which takes no pods again, as soon
+// as no workload pod runs on it and at the latest claimUnhealthyTimeout after the failure, and reports whether it did.
+// The claim then disappears from the API, so Karpenter deletes its NodeClaim and launches a replacement.
+func (s *Server) endUnhealthyClaim(ctx context.Context, rec *claimRecord, node *CloudVMNode, now time.Time) bool {
+	s.nodePool.mu.RLock()
+	failed, failedAt, workloads := node.SpinDownReason == SpinDownCleanupFailed, node.SpinDownAt, node.workloadPodCount()
+	s.nodePool.mu.RUnlock()
+	if !failed || (workloads > 0 && now.Sub(failedAt) < claimUnhealthyTimeout) {
+		return false
+	}
+	log.Printf("[cloudvm] VM %s of claim %s failed to remove a pod's container and runs %d workload pods; terminating it", sanitizeLog(rec.InstanceID), sanitizeLog(rec.Request.Name), workloads) //nolint:gosec // sanitized
+	if _, err := s.deleteClaim(ctx, rec.Request.Name); err != nil {
+		log.Printf("[cloudvm] Error terminating unhealthy claim VM %s: %v", sanitizeLog(rec.InstanceID), err) //nolint:gosec // sanitized
+	}
+	return true
 }
 
 // claimAPIError is an API failure with the HTTP status and reason the contract names.
