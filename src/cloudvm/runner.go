@@ -233,6 +233,9 @@ func (h *HTTPContainerRunner) GetStatus(ctx context.Context, node *CloudVMNode, 
 	return &result, nil
 }
 
+// errRunnerRefused marks an error the in-VM runner itself reported, as opposed to one on the way to it.
+var errRunnerRefused = errors.New("in-VM runner error")
+
 func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNode, podUID string) error {
 	baseEndpoint, err := h.endpoint(node, "/containers/stop")
 	if err != nil {
@@ -253,7 +256,7 @@ func (h *HTTPContainerRunner) StopContainer(ctx context.Context, node *CloudVMNo
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("in-VM runner error (%d) stopping container %s", resp.StatusCode, podUID)
+		return fmt.Errorf("%w (%d) stopping container %s", errRunnerRefused, resp.StatusCode, podUID)
 	}
 	return nil
 }

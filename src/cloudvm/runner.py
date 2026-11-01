@@ -422,12 +422,15 @@ def remote_layer_count(img):
     layer it could not mount remotely is downloaded and unpacked like any other, so the pull succeeds either way.
     """
     try:
-        res = subprocess.run([CONTAINER_CLI, *snapshotter_args(), 'image', 'inspect', '--format', '{{json .RootFS.Layers}}', img],
+        # HACK(simonepri): nerdctl image inspect matches a name@digest reference only to an image stored with the tag
+        # latest, so it cannot find one pulled by digest; the digest alone finds it. No upstream issue tracks this:
+        # https://github.com/containerd/nerdctl/blob/v2.4.1/pkg/cmd/image/inspect.go#L141-L145
+        res = subprocess.run([CONTAINER_CLI, *snapshotter_args(), 'image', 'inspect', '--format', '{{json .RootFS.Layers}}', img.rpartition('@')[2]],
                              capture_output=True, text=True)
         # A reference naming several stored images prints a line for each.
         lines = res.stdout.split() if res.returncode == 0 else []
         if not lines:
-            raise ValueError(res.stderr.strip() or 'no layers listed')
+            raise ValueError(res.stderr.strip())
         diff_ids = json.loads(lines[0]) or []
         count, chain = 0, ''
         for diff_id in diff_ids:

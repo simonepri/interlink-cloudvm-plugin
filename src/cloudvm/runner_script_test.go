@@ -509,7 +509,10 @@ state="$FAKE_NERDCTL_STATE"
 [ "$1" = --snapshotter=stargz ] && shift
 case "$1" in
   pull) exit 0 ;;
-  image) printf '["sha256:aaaa","sha256:bbbb"]\n'; exit 0 ;;
+  image)
+    # Like nerdctl, inspect finds no image by a name@digest reference.
+    case "${@: -1}" in *@*) echo "level=fatal msg=\"no such image: ${@: -1}\"" >&2; exit 1 ;; esac
+    printf '["sha256:aaaa","sha256:bbbb"]\n'; exit 0 ;;
   run) touch "$state/created"; exit 0 ;;
   inspect)
     if [ -f "$state/created" ]; then
@@ -535,11 +538,12 @@ func TestRunnerScript_LazyPullReportsOnlyRemoteMounts(t *testing.T) {
 	// Layer snapshots are named by chain ID: the second is the SHA-256 of "<first chain ID> <second diff ID>".
 	const secondChain = "sha256:2c4d8760379f05d0ad1ed610712309f0114e7345e6e6a351494cff030ffdf197"
 	for _, tc := range []struct {
-		name, remote string
-		want         bool
+		name, image, remote string
+		want                bool
 	}{
-		{"remote mount", secondChain, true},
-		{"local unpack", "", false},
+		{"remote mount", "ghcr.io/example/app:1", secondChain, true},
+		{"local unpack", "ghcr.io/example/app:1", "", false},
+		{"remote mount of an image pinned by digest", "ghcr.io/example/app@sha256:" + strings.Repeat("80d4", 16), secondChain, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newRunnerHarness(t)
@@ -559,7 +563,7 @@ func TestRunnerScript_LazyPullReportsOnlyRemoteMounts(t *testing.T) {
 			h.env = append(h.env, "CLOUDVM_STARGZ_SOCKET="+sock)
 			defer h.start()()
 
-			resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"lazy","image":"ghcr.io/example/app:1"}`)
+			resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"lazy","image":"`+tc.image+`"}`)
 			_ = resp.Body.Close()
 			waitStatus(t, h, "lazy", func(r ContainerStatusResult) bool { return r.Timings != nil && !r.Timings.PullFinishedAt.IsZero() })
 			if got := h.status("lazy").Timings.LazyPull; got != tc.want {

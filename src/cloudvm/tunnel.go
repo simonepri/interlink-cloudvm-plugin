@@ -792,7 +792,7 @@ func (t *TunnelContainerRunner) StopContainer(ctx context.Context, node *CloudVM
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("in-VM runner error (%d) stopping container %s", resp.StatusCode, podUID)
+		return fmt.Errorf("%w (%d) stopping container %s", errRunnerRefused, resp.StatusCode, podUID)
 	}
 	return nil
 }

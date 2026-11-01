@@ -8,6 +8,7 @@ import asyncio
 import base64
 import collections
 import datetime
+import errno
 import ipaddress
 import json
 import os
@@ -409,27 +410,115 @@ def pod_of_cgroup(text):
     return None if "kubepods" in text else ""
 
 
+NETLINK_SOCK_DIAG = 4
+SOCK_DIAG_BY_FAMILY = 20
+NLMSG_ERROR = 2
+INET_DIAG_CGROUP_ID = 21
+INET_DIAG_MSG_SIZE = 72
+
+
+def diag_cgroup_id(proto, local, remote):
+    """Returns the ID of the cgroup v2 that created the proto socket with address local connected to remote, from the
+    kernel's sock_diag netlink interface, or None when the kernel reports no cgroup ID (Linux before 5.7). Raises
+    LookupError when no such socket exists and OSError when the interface is unavailable."""
+    family = socket.AF_INET6 if ":" in local[0] else socket.AF_INET
+
+    def packed(address):
+        return socket.inet_pton(family, address[0].split("%")[0]).ljust(16, b"\0")
+    # A TCP lookup names the socket's own address first; a UDP lookup takes the two the other way round.
+    first, second = (local, remote) if proto == "tcp" else (remote, local)
+    sockid = struct.pack("!HH", int(first[1]), int(second[1])) + packed(first) + packed(second) + struct.pack(
+        "=III", 0, 0xFFFFFFFF, 0xFFFFFFFF)
+    request = struct.pack("=BBBBI", family, socket.IPPROTO_TCP if proto == "tcp" else socket.IPPROTO_UDP, 0, 0,
+                          0xFFFFFFFF) + sockid
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_SOCK_DIAG) as nl:
+        nl.settimeout(1)
+        nl.sendto(struct.pack("=IHHII", 16 + len(request), SOCK_DIAG_BY_FAMILY, 1, 1, 0) + request, (0, 0))
+        return parse_diag_cgroup_id(nl.recv(65536))
+
+
+def parse_diag_cgroup_id(reply):
+    """Returns the INET_DIAG_CGROUP_ID attribute of a sock_diag reply, or None when it has none."""
+    length, kind = struct.unpack("=IH", reply[:6])
+    if kind == NLMSG_ERROR:
+        code = -struct.unpack("=i", reply[16:20])[0]
+        if code == errno.ENOENT:
+            raise LookupError("no such socket")
+        raise OSError(code, os.strerror(code))
+    i = 16 + INET_DIAG_MSG_SIZE
+    while i + 4 <= length:
+        size, attr = struct.unpack("=HH", reply[i:i + 4])
+        if size < 4:
+            break
+        if attr == INET_DIAG_CGROUP_ID:
+            return struct.unpack("=Q", reply[i + 4:i + 12])[0]
+        i += (size + 3) & ~3
+    return None
+
+
+class CgroupPods(object):
+    """Maps a cgroup v2 ID, the inode of the cgroup's directory, to the pod whose cgroup it is."""
+
+    def __init__(self, root):
+        self.root = root
+        self.paths = {}
+        self.lock = threading.Lock()
+
+    def pod_of(self, cgroup_id):
+        """Returns the pod UID of the cgroup, "" for a cgroup outside the pods' cgroup, or None for one under it that
+        names no pod. A cgroup the last scan missed, such as a new container's, triggers a rescan."""
+        with self.lock:
+            path = self.paths.get(cgroup_id)
+            if path is None:
+                self.paths = self.scan()
+                path = self.paths.get(cgroup_id)
+        return "" if path is None else pod_of_cgroup("0::/" + path)
+
+    def scan(self):
+        paths = {}
+        top = os.path.join(self.root, "kubepods")
+        for directory, subdirs, _ in os.walk(top):
+            try:
+                paths[os.stat(directory).st_ino] = os.path.relpath(directory, self.root)
+            except OSError:
+                subdirs[:] = []
+        return paths
+
+
 class PodResolver(object):
-    """Attributes a local socket to the pod whose process holds it: /proc/net gives the socket's inode, /proc/<pid>/fd
-    the process holding that inode, and /proc/<pid>/cgroup the process's pod.
+    """Attributes a local socket to the pod whose process created it. The kernel's sock_diag interface names the
+    cgroup that created the socket, whatever process holds it now; on kernels without it, /proc/net gives the socket's
+    inode, /proc/<pid>/fd the process holding that inode, and /proc/<pid>/cgroup the process's pod.
 
     Containers share the VM's network, so the socket, not its address, tells pods apart. Lookups run on executor
     threads; the caches and the recently matched processes, which are checked before a full scan, sit behind a lock.
     """
 
-    def __init__(self, proc_root="/proc"):
+    def __init__(self, proc_root="/proc", cgroup_root="/sys/fs/cgroup", diag=diag_cgroup_id):
         self.proc_root = proc_root
         self.own_pid = str(os.getpid())
         self.lock = threading.Lock()
         self.by_inode = {}
         self.by_pid = {}
         self.hot = collections.OrderedDict()
+        self.cgroups = CgroupPods(cgroup_root) if os.path.exists(os.path.join(cgroup_root, "cgroup.controllers")) else None
+        self.diag = diag
 
-    def pod_of(self, proto, peer):
-        """Returns the pod UID of the process holding the local proto ("tcp" or "udp") socket with address peer, "" for
-        a process of the VM itself, the agent included, or None when no process can be found or the process runs under
-        the pods' cgroup without naming its pod. A socket no process holds stays unattributed rather than VM-owned,
-        because the gateway would otherwise grant a pod whose process exited the worker's namespace."""
+    def pod_of(self, proto, peer, remote=None):
+        """Returns the pod UID of the process holding the local proto ("tcp" or "udp") socket with address peer, which
+        is connected to or sends to remote, "" for a process of the VM itself, the agent included, or None when no
+        process can be found or the process runs under the pods' cgroup without naming its pod. A socket no process
+        holds stays unattributed rather than VM-owned, because the gateway would otherwise grant a pod whose process
+        exited the worker's namespace."""
+        if remote is not None and self.cgroups is not None and self.diag is not None:
+            try:
+                cgroup_id = self.diag(proto, peer, remote)
+                if cgroup_id is None:
+                    self.diag = None  # the kernel reports no cgroup IDs; the /proc scan attributes every later socket
+            except (LookupError, OSError, ValueError, AttributeError, struct.error):
+                cgroup_id = None  # the /proc scan below tells a socket that is gone from one the kernel did not find
+            if cgroup_id is not None:
+                return self.cgroups.pod_of(cgroup_id)
         inode = self.socket_inode(proto, peer)
         if inode is None:
             return None
@@ -787,13 +876,13 @@ class TCPProxy(object):
         name = self.synthetic_ips.get(host.strip("[]"))
         return "%s:%s" % (name, port) if name else target
 
-    async def attribute(self, proto, peer):
-        """Returns the pod whose process holds the local socket at peer: "" for the VM's own processes and when
-        attribution is off, and UNATTRIBUTED_POD when no process can be found."""
+    async def attribute(self, proto, peer, remote=None):
+        """Returns the pod whose process holds the local socket at peer, which talks to remote: "" for the VM's own
+        processes and when attribution is off, and UNATTRIBUTED_POD when no process can be found."""
         if self.pods is None or not peer:
             return ""
         try:
-            pod = await asyncio.get_event_loop().run_in_executor(None, self.pods.pod_of, proto, peer)
+            pod = await asyncio.get_event_loop().run_in_executor(None, self.pods.pod_of, proto, peer, remote)
         except (OSError, ValueError) as e:
             log_failure("attribution_error", "cannot attribute %s connection from %s: %s" % (proto, peer, e))
             pod = None
@@ -868,13 +957,13 @@ class TCPProxy(object):
             writer.close()
             return
         parts = head.split(b"\r\n", 1)[0].split()
-        peer, attribution = writer.get_extra_info("peername"), []
+        peer, own, attribution = writer.get_extra_info("peername"), writer.get_extra_info("sockname"), []
 
         def client_pod():
             # Attributes the connection once, as soon as a resolution needs it or starts: the client may give up and
             # close its socket while its target resolves, after which no process holds it.
             if not attribution:
-                attribution.append(asyncio.ensure_future(self.attribute("tcp", peer)))
+                attribution.append(asyncio.ensure_future(self.attribute("tcp", peer, own)))
             return attribution[0]
         route = None
         if len(parts) >= 2 and parts[0] == b"CONNECT":
@@ -903,11 +992,16 @@ class TCPProxy(object):
         """Tunnels a connection the bootstrap's REDIRECT rule sent here to the address its client dialed, or to the
         hostname whose synthetic address it dialed."""
         try:
-            target = self.tunnel_target(original_destination(writer.get_extra_info("socket")))
+            original = original_destination(writer.get_extra_info("socket"))
+            target = self.tunnel_target(original)
         except OSError as e:
             log("redirected connection without a destination: %s" % e)
             target = None
-        pod = await self.attribute("tcp", writer.get_extra_info("peername")) if target is not None else ""
+        pod = ""
+        if target is not None:
+            # The client's socket is connected to the address it dialed, which the REDIRECT rule rewrote.
+            dialed = original.rpartition(":")
+            pod = await self.attribute("tcp", writer.get_extra_info("peername"), (dialed[0], int(dialed[2])))
         session = self.session
         if target is not None and session is None:
             log_failure("no_session", "no tunnel session for the redirected connection to %s; closing it" % target)
@@ -1032,7 +1126,7 @@ class DNSForwarder(asyncio.DatagramProtocol):
                 except OSError as e:
                     log("DNS %s: %s" % (upstream, e))
         else:
-            pod = await self.proxy.attribute("udp", addr) if session is not None else ""
+            pod = await self.proxy.attribute("udp", addr, self.transport.get_extra_info("sockname")) if session is not None else ""
             session = self.proxy.session
             name = question[0] if question is not None else "a malformed query"
             if session is None:
@@ -1160,7 +1254,8 @@ def main():
     cfg["proxy"] = TCPProxy(
         parse_networks(os.environ.get("CLOUDVM_DIRECT_CIDRS", "")),
         parse_networks(os.environ.get("CLOUDVM_TUNNEL_CIDRS", "")),
-        PodResolver(proc_root) if os.path.exists(os.path.join(proc_root, "net", "tcp")) else None,
+        PodResolver(proc_root, os.environ.get("CLOUDVM_CGROUP_ROOT", "/sys/fs/cgroup"))
+        if os.path.exists(os.path.join(proc_root, "net", "tcp")) else None,
         os.environ.get("CLOUDVM_CLUSTER_DOMAIN", "cluster.local"))
     max_backoff = float(os.environ.get("CLOUDVM_TUNNEL_MAX_BACKOFF", "30"))
     backoff = 0.5
