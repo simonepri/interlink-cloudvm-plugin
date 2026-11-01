@@ -15,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
 // The mechanisms through which a pod's service account receives an IAM role on EKS.
@@ -148,7 +147,7 @@ func NewPodCredentials(client kubernetes.Interface, exchanger PodRoleExchanger) 
 
 // NewInClusterPodCredentials creates a PodCredentials from the in-cluster service account.
 func NewInClusterPodCredentials(exchanger PodRoleExchanger) (*PodCredentials, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := kubeConfig(false)
 	if err != nil {
 		return nil, fmt.Errorf("unable to load in-cluster config: %w", err)
 	}

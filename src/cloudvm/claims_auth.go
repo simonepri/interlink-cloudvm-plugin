@@ -17,7 +17,6 @@ import (
 	authnv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/nodeclaim"
 )
@@ -62,7 +61,7 @@ func newClaimAuthenticator(client kubernetes.Interface, audience string, allowed
 // claimAuthenticatorFromEnv builds the authenticator from NODECLAIM_API_AUDIENCE (default nodeclaim.DefaultTokenAudience)
 // and NODECLAIM_API_ALLOWED_USERS with the in-cluster client; outside a cluster it returns nil, which refuses every call.
 func claimAuthenticatorFromEnv() *claimAuthenticator {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := kubeConfig(false)
 	if err != nil {
 		log.Printf("[cloudvm] NodeClaim API refuses every call: no in-cluster config to review tokens: %v", err)
 		return nil

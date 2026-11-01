@@ -12,7 +12,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
 // PodEventRecorder posts an event on a pod.
@@ -33,7 +32,7 @@ func NewKubePodEventRecorder(client kubernetes.Interface) *KubePodEventRecorder 
 // NewInClusterPodEventRecorder creates a recorder from the in-cluster service account. It never reads a kubeconfig,
 // so a plugin running outside a cluster posts no events.
 func NewInClusterPodEventRecorder() (*KubePodEventRecorder, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := kubeConfig(false)
 	if err != nil {
 		return nil, fmt.Errorf("unable to load in-cluster config: %w", err)
 	}

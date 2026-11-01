@@ -16,7 +16,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -72,7 +71,7 @@ func NewPodWatch(client kubernetes.Interface) *PodWatch {
 // NewInClusterPodWatch creates a watch from the in-cluster service account. It never reads a kubeconfig, so a plugin
 // running outside a cluster has no watch and the reconciler never judges pod existence.
 func NewInClusterPodWatch() (*PodWatch, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := kubeConfig(false)
 	if err != nil {
 		return nil, fmt.Errorf("unable to load in-cluster config: %w", err)
 	}
