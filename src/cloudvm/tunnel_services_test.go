@@ -1,5 +1,5 @@
-// Tests the gateway's forwarding of worker streams to Service ClusterIPs: namespace and shared-Service authorization,
-// exposed ports, and the Service watch's ClusterIP index.
+// Tests the gateway's forwarding of worker streams to Service ClusterIPs: namespace, shared-Service and Kubernetes API
+// authorization, exposed ports, and the Service watch's ClusterIP index.
 package main
 
 import (
@@ -74,6 +74,8 @@ func TestTunnelTCP_WorkerReachesServicesOfItsNamespaceAndSharedOnes(t *testing.T
 	}{
 		{"own namespace", true, &ClusterService{Namespace: "team-a", Name: "api", Ports: []int32{port}}, ""},
 		{"shared service", true, &ClusterService{Namespace: "s3-system", Name: "s3-gateway", Ports: []int32{port}}, ""},
+		{"the Kubernetes API", true, &ClusterService{Namespace: "default", Name: "kubernetes", Ports: []int32{port}}, ""},
+		{"another service of the default namespace", true, &ClusterService{Namespace: "default", Name: "api", Ports: []int32{port}}, "namespace_mismatch"},
 		{"another namespace", true, &ClusterService{Namespace: "team-b", Name: "api", Ports: []int32{port}}, "namespace_mismatch"},
 		{"unshared service of a shared namespace", true, &ClusterService{Namespace: "s3-system", Name: "admin", Ports: []int32{port}}, "namespace_mismatch"},
 		{"port the service does not expose", true, &ClusterService{Namespace: "team-a", Name: "api", Ports: []int32{1}}, "direct_forbidden"},

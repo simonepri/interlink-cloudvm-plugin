@@ -120,7 +120,7 @@ func (r *KubeSecretResolver) APIServerService(ctx context.Context) (string, int3
 		return "", 0, c.err
 	}
 	c.fetched = time.Now()
-	svc, err := r.client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
+	svc, err := r.client.CoreV1().Services(metav1.NamespaceDefault).Get(ctx, kubernetesAPIServiceName, metav1.GetOptions{})
 	if err == nil && (svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == corev1.ClusterIPNone || len(svc.Spec.Ports) == 0) {
 		err = errors.New("it has no ClusterIP or port")
 	}
