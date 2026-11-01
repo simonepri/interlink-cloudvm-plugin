@@ -72,6 +72,10 @@ type CloudInitConfig struct {
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
 	// StargzConfig is TOML that opens the stargz snapshotter config, ahead of the Docker Hub mirrors the plugin adds.
 	StargzConfig string `json:"stargzConfig,omitempty"`
+	// Provider is the VM's cloud, "aws" or "gcp", which the traffic meter classifies peers against.
+	Provider string `json:"provider,omitempty"`
+	// TransferHome is the provider/region the cluster runs in; empty takes the transfer cost model's home.
+	TransferHome string `json:"transferHome,omitempty"`
 }
 
 // IsKMSEncrypted reports whether the runner token is encrypted via AWS KMS.
@@ -136,6 +140,25 @@ func (c *CloudInitConfig) RunnerScriptSHA256() string {
 func (c *CloudInitConfig) SpotWatcherScriptSHA256() string {
 	return scriptSHA256(spotWatcherScript)
 }
+
+// TrafficHome returns the provider/region of the cluster the traffic meter tells home_region peers by.
+func (c *CloudInitConfig) TrafficHome() string {
+	if c.TransferHome != "" {
+		return c.TransferHome
+	}
+	return GlobalTransferCost.HomeKey()
+}
+
+// TrafficMeshPort returns the UDP port tailnet workers carry the tunnel on, or 0 when the worker joins no tailnet.
+func (c *CloudInitConfig) TrafficMeshPort() int {
+	if c.TunnelTransport == string(TunnelTransportRouter) || c.TunnelTransport == string(TunnelTransportPublic) || c.MeshAuthKey == "" && c.MeshAuthKeyCiphertext == "" {
+		return 0
+	}
+	return tailscaleWireGuardPort
+}
+
+// tailscaleWireGuardPort is the UDP port tailscaled listens on by default.
+const tailscaleWireGuardPort = 41641
 
 // TunnelCIDRList returns the comma-separated networks the worker's agent sends through the tunnel.
 func (c *CloudInitConfig) TunnelCIDRList() string {
@@ -368,6 +391,9 @@ iptables -A CLOUDVM_RUNNER -s 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -s 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || true
 iptables -A CLOUDVM_RUNNER -j DROP 2>/dev/null || true
+
+# The runner's traffic meter splits bytes by peer and pod with nftables; without nft the VM reports only its NIC totals.
+command -v nft >/dev/null 2>&1 || dnf install -y nftables || yum install -y nftables || apt-get install -y nftables || echo "[cloudvm-bootstrap] Warning: no nftables; traffic is not split by peer" >&2
 
 if command -v iptables-save >/dev/null 2>&1; then
   mkdir -p /etc/iptables
@@ -733,6 +759,7 @@ cloudvm_fetch_script() {
   exit 1
 }
 cloudvm_fetch_script {{.RunnerScriptSHA256}} /usr/local/bin/cloudvm-runner.py
+cloudvm_fetch_script {{.TrafficMeterScriptSHA256}} /usr/local/bin/cloudvm_traffic_meter.py
 {{else}}
 cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
 {{.RunnerScript}}
@@ -741,6 +768,9 @@ RUNNER_EOF
 chmod 700 /usr/local/bin/cloudvm-runner.py
 if command -v python3 >/dev/null 2>&1; then
   CLOUDVM_RUNNER_BIND="{{.RunnerBindAddress}}" CLOUDVM_RUNNER_CONCURRENCY="{{if .RunnerConcurrency}}{{.RunnerConcurrency}}{{end}}" \
+    CLOUDVM_TRAFFIC_PROVIDER="{{.Provider}}" CLOUDVM_TRAFFIC_REGION="{{.Region}}" CLOUDVM_TRAFFIC_HOME="{{.TrafficHome}}" \
+    CLOUDVM_TRAFFIC_TUNNEL_HOST="{{.TunnelHost}}" CLOUDVM_TRAFFIC_TUNNEL_IP="{{.TunnelGatewayIP}}" CLOUDVM_TRAFFIC_MESH_PORT="{{.TrafficMeshPort}}" \
+    CLOUDVM_TRAFFIC_PROXY_PORTS="{{if .TunnelEndpoint}}{{.TrafficProxyPorts}}{{end}}" \
     nohup python3 /usr/local/bin/cloudvm-runner.py > /var/log/cloudvm-runner.log 2>&1 &
 fi
 cloudvm_mark runner

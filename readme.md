@@ -316,6 +316,13 @@ cloudvm_spot_placement_score"]:::central
   - `cloudvm_fill_gpus{min_gpu_memory_gb, gpus, provider, region, gpu_model, capacity_type}`: GPUs a plan takes from one region, GPU model, and capacity type.
   - `cloudvm_fill_limited{min_gpu_memory_gb, gpus, reason}`: 1 when a plan falls short, with `reason` `quota`, `no_quota_data`, or `capacity`.
 
+**Data transfer.** Tunnel workers fetch a traffic meter that the runner loads. The meter installs nftables counters on the VM's physical NICs and sorts every packet by peer: the tunnel gateway (or tailnet WireGuard port), a private address, a cloud region or a region's S3 from the published AWS (`ip-ranges.json`) and Google Cloud (`cloud.json`) address ranges, or the internet. The ranges download at boot; until they load, unmatched bytes count as `unclassified`. Counters keyed by the sending or receiving socket's cgroup split the same bytes by pod, and by image pulls (containerd and the stargz snapshotter). A pod's connections to the tunnel agent's loopback proxies count as its `tunnel` traffic. Peer classes are relative to the VM: `same_region`, `home_region` (the cluster's region, `transferCost.homeProvider` and `homeRegion`), `home_storage` (S3 in the home region), `cross_region`, `internet` (the internet or another cloud), and `unclassified`. Costs use the `transferCost.rates` tables in the chart values, then the AWS Price List API, and follow the sender: a VM's transmit at its own region's rate, and bytes received from the home region at the home region's rate. Bytes no rate covers are counted but not priced.
+
+  - `cloudvm_network_transfer_bytes_total{provider, region, instance_type, direction, peer, path}`: VM bytes by `direction` (`receive` or `transmit`), peer class, and `path` (`tunnel` or `direct`).
+  - `cloudvm_transfer_cost_usd_total{provider, region, direction, peer, path, charged_provider, charged_region}`: Estimated USD at list rates, labeled with the region that pays.
+  - `cloudvm_image_pull_receive_bytes_total{provider, region, instance_type, peer}`: Bytes received for image pulls.
+  - `cloudvm_pod_network_transfer_bytes_total{namespace, pod, pod_uid, provider, region, direction, peer}` and `cloudvm_pod_transfer_cost_usd_total{...}`: The same per pod; a pod's series go away 15 minutes after its last report.
+
 ---
 
 ### 7. Cost Allocation (OpenCost)

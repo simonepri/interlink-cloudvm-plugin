@@ -60,6 +60,13 @@ type ObservabilityMetrics struct {
 	networkRxBytes       *prometheus.CounterVec
 	networkTxBytes       *prometheus.CounterVec
 
+	// Data transfer by peer, and its estimated cost
+	transferBytes    *prometheus.CounterVec
+	transferCost     *prometheus.CounterVec
+	imagePullBytes   *prometheus.CounterVec
+	podTransferBytes *prometheus.CounterVec
+	podTransferCost  *prometheus.CounterVec
+
 	// Legacy compatibility metrics (kept for 1 release)
 	legacySpotPrice      *prometheus.GaugeVec
 	legacyOnDemandPrice  *prometheus.GaugeVec
@@ -229,6 +236,31 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 			Help: "Total cumulative network bytes transmitted across cloud VM instances",
 		}, networkLabels),
 
+		transferBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_network_transfer_bytes_total",
+			Help: "Bytes cloud VMs sent (transmit) or received (receive) on their NICs, by peer class relative to the VM (same_region, home_region, home_storage for the home region's object storage, cross_region, internet, unclassified) and path (tunnel or direct)",
+		}, []string{"provider", "region", "instance_type", "direction", "peer", "path"}),
+
+		transferCost: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_transfer_cost_usd_total",
+			Help: "Estimated USD cloud VM data transfer costs at list rates, billed to the sending side named by charged_provider and charged_region; bytes no rate covers are left out",
+		}, []string{"provider", "region", "direction", "peer", "path", "charged_provider", "charged_region"}),
+
+		imagePullBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_image_pull_receive_bytes_total",
+			Help: "Bytes cloud VMs received for image pulls (containerd and the stargz snapshotter), by peer class",
+		}, []string{"provider", "region", "instance_type", "peer"}),
+
+		podTransferBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_pod_network_transfer_bytes_total",
+			Help: "Bytes a pod's own sockets sent or received on its cloud VM's NICs by peer class, and through the tunnel agent's proxies under peer tunnel",
+		}, []string{"namespace", "pod", "pod_uid", "provider", "region", "direction", "peer"}),
+
+		podTransferCost: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudvm_pod_transfer_cost_usd_total",
+			Help: "Estimated USD a pod's direct data transfer costs at list rates; bytes no rate covers are left out",
+		}, []string{"namespace", "pod", "pod_uid", "provider", "region", "direction", "peer"}),
+
 		// Legacy metrics
 		legacySpotPrice: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_spot_price_usd_per_hour",
@@ -289,6 +321,11 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 		m.instanceSeconds,
 		m.networkRxBytes,
 		m.networkTxBytes,
+		m.transferBytes,
+		m.transferCost,
+		m.imagePullBytes,
+		m.podTransferBytes,
+		m.podTransferCost,
 	)
 
 	return m
@@ -603,4 +640,41 @@ func (m *ObservabilityMetrics) AddNetworkTransmitBytes(provider, region, acceler
 func (m *ObservabilityMetrics) AddNetworkBytes(provider, region, accelerator, instanceType string, rxBytes, txBytes float64) {
 	m.AddNetworkReceiveBytes(provider, region, accelerator, instanceType, rxBytes)
 	m.AddNetworkTransmitBytes(provider, region, accelerator, instanceType, txBytes)
+}
+
+// AddTransferBytes counts bytes a VM moved in direction ("receive" or "transmit") with a peer class over path.
+func (m *ObservabilityMetrics) AddTransferBytes(provider, region, instanceType, direction, peer, path string, bytes float64) {
+	if bytes > 0 {
+		m.transferBytes.WithLabelValues(provider, region, instanceType, direction, peer, path).Add(bytes)
+	}
+}
+
+// AddTransferCost adds the estimated USD of a VM's transfer, billed to the charged provider and region.
+func (m *ObservabilityMetrics) AddTransferCost(provider, region, direction, peer, path, chargedProvider, chargedRegion string, usd float64) {
+	if usd > 0 {
+		m.transferCost.WithLabelValues(provider, region, direction, peer, path, chargedProvider, chargedRegion).Add(usd)
+	}
+}
+
+// AddImagePullBytes counts bytes a VM received for image pulls from a peer class.
+func (m *ObservabilityMetrics) AddImagePullBytes(provider, region, instanceType, peer string, bytes float64) {
+	if bytes > 0 {
+		m.imagePullBytes.WithLabelValues(provider, region, instanceType, peer).Add(bytes)
+	}
+}
+
+// AddPodTransfer counts bytes a pod moved in direction with a peer class and their estimated USD cost, when priced.
+func (m *ObservabilityMetrics) AddPodTransfer(namespace, pod, podUID, provider, region, direction, peer string, bytes, usd float64) {
+	if bytes > 0 {
+		m.podTransferBytes.WithLabelValues(namespace, pod, podUID, provider, region, direction, peer).Add(bytes)
+	}
+	if usd > 0 {
+		m.podTransferCost.WithLabelValues(namespace, pod, podUID, provider, region, direction, peer).Add(usd)
+	}
+}
+
+// DeletePodTransfer drops every transfer series of a pod that is gone.
+func (m *ObservabilityMetrics) DeletePodTransfer(podUID string) {
+	m.podTransferBytes.DeletePartialMatch(prometheus.Labels{"pod_uid": podUID})
+	m.podTransferCost.DeletePartialMatch(prometheus.Labels{"pod_uid": podUID})
 }

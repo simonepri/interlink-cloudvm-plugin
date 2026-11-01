@@ -1045,6 +1045,7 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 		PodUID:                spec.PodUID,
 		NodeClaim:             spec.NodeClaim,
 		Region:                region,
+		Provider:              "aws",
 		InstanceType:          spec.InstanceType,
 		NumGPUs:               spec.NumGPUs,
 		AssignedGPUs:          spec.AssignedGPUs,

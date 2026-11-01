@@ -1,6 +1,7 @@
 """In-VM container runner: serves the plugin's create, status, logs, and delete calls by driving the VM's containerd through nerdctl.
 
 The bootstrap sets CLOUDVM_RUNNER_BIND and CLOUDVM_RUNNER_CONCURRENCY; the plugin reaches it through the tunnel agent.
+Status and host stats carry the readings of the traffic meter (cloudvm_traffic_meter.py) when the bootstrap installed it.
 It also serves each pod whose service account has an IAM role the credentials the plugin sends for it on a loopback endpoint.
 """
 import base64
@@ -248,6 +249,28 @@ def get_network_bytes():
         pass
     return rx_bytes, tx_bytes
 
+class NoTrafficMeter:
+    """Stands in for the traffic meter on workers that did not receive it."""
+
+    def run(self):
+        pass
+
+    def report(self, pod_uid=None):
+        return None
+
+    def add_pod(self, uid, namespace, name):
+        pass
+
+    def remove_pod(self, uid):
+        pass
+
+# Tunnel workers fetch the traffic meter next to the runner; others count only NIC totals.
+try:
+    import cloudvm_traffic_meter
+    traffic_meter = cloudvm_traffic_meter.TrafficMeter()
+except ImportError:
+    traffic_meter = NoTrafficMeter()
+
 def set_pod_credentials(pod_uid, creds):
     """Records the role credentials the plugin sent for the pod, keeping those that expire last, and returns the
     secret that authorizes the pod's container at the credential endpoint."""
@@ -389,6 +412,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 "networkRxBytes": rx_bytes,
                 "networkTxBytes": tx_bytes,
             }
+            traffic = traffic_meter.report()
+            if traffic is not None:
+                resp["traffic"] = traffic
             self.reply(200, json.dumps(resp))
             return
 
@@ -420,6 +446,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             pod_uid = params.get('podUID', [''])[0]
             container_name = f"cloudvm-{pod_uid}"
             rx_bytes, tx_bytes = get_network_bytes()
+            traffic = traffic_meter.report(pod_uid)
             # A recorded start failure wins over inspect: a failed run can leave the container in "created".
             with get_pod_lock(pod_uid):
                 failure = start_failures.get(pod_uid)
@@ -437,6 +464,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                     "networkTxBytes": tx_bytes,
                     "timings": pod_timing(pod_uid),
                 }
+                if traffic is not None:
+                    resp["traffic"] = traffic
                 self.reply(200, json.dumps(resp))
                 return
             try:
@@ -476,6 +505,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "networkTxBytes": tx_bytes,
                         "timings": pod_timing(pod_uid),
                     }
+                    if traffic is not None:
+                        resp["traffic"] = traffic
                     self.reply(200, json.dumps(resp))
                     return
             except Exception:
@@ -496,6 +527,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         "networkTxBytes": tx_bytes,
                         "timings": pod_timing(pod_uid),
                     }
+                    if traffic is not None:
+                        resp["traffic"] = traffic
                     self.reply(200, json.dumps(resp))
                     return
 
@@ -530,6 +563,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             pod_uid = params.get('podUID', [''])[0]
             if pod_uid:
                 forget_pod_credentials(pod_uid)
+                traffic_meter.remove_pod(pod_uid)
                 plock = get_pod_lock(pod_uid)
                 with plock:
                     starting_pods.discard(pod_uid)
@@ -675,6 +709,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 run_cmd.extend(args)
 
             docker_cfg = req.get('dockerConfigJSON')
+            pod_namespace = str(req.get('namespace') or '')
+            pod_name = str(req.get('podName') or '')
 
             def run_async(uid, imgs, c, idx, auth_cfg):
                 # 1. Pull: try the mirrored reference, then the original, and back off exponentially while the pod stays Pending
@@ -732,6 +768,8 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         if res.returncode != 0:
                             err_msg = res.stderr.strip() or res.stdout.strip() or "container start failed"
                             start_failures[uid] = ("StartError", err_msg)
+                    if res.returncode == 0:
+                        traffic_meter.add_pod(uid, pod_namespace, pod_name)
                 except Exception as e:
                     with get_pod_lock(uid):
                         starting_pods.discard(uid)
@@ -748,5 +786,6 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 if __name__ == '__main__':
     if CREDENTIALS_ADDR:
         threading.Thread(target=serve_credentials, daemon=True).start()
+    threading.Thread(target=traffic_meter.run, daemon=True).start()
     server = http.server.ThreadingHTTPServer((os.environ.get("CLOUDVM_RUNNER_BIND", "127.0.0.1"), PORT), RunnerHandler)
     server.serve_forever()
