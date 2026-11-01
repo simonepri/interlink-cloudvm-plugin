@@ -132,11 +132,18 @@ func connectAndEcho(t *testing.T, proxyAddr, target string) {
 // environment, and waits until its session registers; it stops the agent when the test ends.
 func startPythonAgent(t *testing.T, f *tunnelFixture, instanceID, token string, env ...string) {
 	t.Helper()
+	startPythonAgentBehind(t, f, f.gateway.Addr().String(), instanceID, token, env...)
+}
+
+// startPythonAgentBehind runs the agent as startPythonAgent does, with its TLS terminator forwarding to backend, an
+// address that relays to the fixture's gateway.
+func startPythonAgentBehind(t *testing.T, f *tunnelFixture, backend, instanceID, token string, env ...string) {
+	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skip("python3 not available")
 	}
-	endpoint, caFile := startTLSTerminator(t, f.gateway.Addr().String())
+	endpoint, caFile := startTLSTerminator(t, backend)
 	dir := t.TempDir()
 	tokenFile := filepath.Join(dir, "runner-token")
 	if err := os.WriteFile(tokenFile, []byte(token+"\n"), 0o600); err != nil {

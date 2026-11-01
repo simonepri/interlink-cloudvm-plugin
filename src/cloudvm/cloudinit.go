@@ -791,6 +791,9 @@ cloudvm_fetch_script {{.SpotWatcherScriptSHA256}} /usr/local/bin/cloudvm-spot-wa
 CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" nohup python3 /usr/local/bin/cloudvm-spot-watcher.py >> {{.SpotWatcherLogPath}} 2>&1 < /dev/null &
 cloudvm_fetch_script {{.TunnelAgentScriptSHA256}} /usr/local/bin/cloudvm-tunnel-agent.py
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
+# The tunnel idles between requests; Linux would restart slow start after each pause, so a request of a few hundred KB
+# would take several round trips across regions instead of one.
+sysctl -qw net.ipv4.tcp_slow_start_after_idle=0 || echo "[cloudvm-bootstrap] WARNING: cannot keep the tunnel's congestion window across idle periods"
 {{if .TransparentProxy}}
 # Connections to cluster Services and allow-listed external hosts enter the agent, which tunnels them, so clients need no
 # proxy; the gateway stays direct.

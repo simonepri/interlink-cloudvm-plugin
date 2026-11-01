@@ -20,7 +20,8 @@ import (
 )
 
 // DefaultYamuxConfig returns a tuned Yamux configuration for reverse tunnel gateway and workers.
-// Configures keepalive ping interval of 30 seconds and a 2 MiB receive window per stream, matching the agent's STREAM_WINDOW.
+// Configures keepalive ping interval of 30 seconds and an 8 MiB receive window per stream, matching the agent's
+// STREAM_WINDOW, so one stream can carry about 60 MiB/s across a 130 ms link while a stalled one buffers at most 8 MiB.
 // A ping or frame may wait 60 seconds before the session is closed, so pings queued behind megabytes of stream data on a
 // slow cross-region link do not end a live session; with the 30-second interval, a dead link is found within the 90
 // seconds after which the agent's READ_IDLE_TIMEOUT gives up on its side.
@@ -29,7 +30,7 @@ func DefaultYamuxConfig() *yamux.Config {
 	cfg.EnableKeepAlive = true
 	cfg.KeepAliveInterval = 30 * time.Second
 	cfg.ConnectionWriteTimeout = 60 * time.Second
-	cfg.MaxStreamWindowSize = 2 * 1024 * 1024
+	cfg.MaxStreamWindowSize = 8 * 1024 * 1024
 	cfg.LogOutput = io.Discard
 	return cfg
 }
@@ -430,7 +431,6 @@ func (g *TunnelGateway) acceptLoop(ctx context.Context) {
 
 func (g *TunnelGateway) handleConnection(ctx context.Context, conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetReadBuffer(64 * 1024)
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}

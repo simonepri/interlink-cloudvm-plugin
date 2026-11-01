@@ -656,7 +656,6 @@ func (d *ReverseTunnelDialer) DialAndServeOnce(ctx context.Context, handler http
 	defer conn.Close()
 
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetReadBuffer(64 * 1024)
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
