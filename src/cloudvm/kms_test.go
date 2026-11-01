@@ -164,6 +164,7 @@ func TestCloudInit_KMSMode_ScriptGeneration(t *testing.T) {
 
 	t.Run("with KMSEncryptedToken true and KMSCiphertext", func(t *testing.T) {
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:    "tunnel.example.internal:443",
 			PodName:           "kms-worker",
 			PodNamespace:      "default",
 			Region:            "us-west-2",
@@ -209,6 +210,7 @@ func TestCloudInit_PlaintextMode_ScriptGeneration(t *testing.T) {
 	kmsCmdSnippet := "aws kms decrypt"
 
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:    "tunnel.example.internal:443",
 		PodName:           "plain-worker",
 		PodNamespace:      "default",
 		Region:            "us-east-1",
@@ -229,7 +231,7 @@ func TestCloudInit_PlaintextMode_ScriptGeneration(t *testing.T) {
 		t.Errorf("cloud-init missing plaintext token file write")
 	}
 	// Verify runner Python source loads token dynamically without hardcoding it
-	if !strings.Contains(script, `with open('/etc/cloudvm/runner-token', 'r') as f:`) {
+	if !strings.Contains(runnerScript, `with open('/etc/cloudvm/runner-token', 'r') as f:`) {
 		t.Errorf("cloud-init runner should load token from /etc/cloudvm/runner-token at runtime")
 	}
 }

@@ -418,6 +418,7 @@ func TestAWSFleetCandidateTypesAndSubnets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PodToInstanceSpec failed: %v", err)
 	}
+	spec.TunnelEndpoint = "tunnel.example.internal:443"
 
 	if len(spec.SubnetIDs) != 2 || spec.SubnetIDs[0] != "subnet-1" || spec.SubnetIDs[1] != "subnet-2" {
 		t.Fatalf("unexpected subnetIDs: %v", spec.SubnetIDs)
@@ -540,6 +541,7 @@ func TestAWSProvider_LaunchResolvesPrivateIP(t *testing.T) {
 	p.SetRegionClient("us-west-2", client)
 
 	spec := &InstanceSpec{
+		TunnelEndpoint:         "tunnel.example.internal:443",
 		PodName:                "smoke-test",
 		PodNamespace:           "default",
 		PodUID:                 "uid-1234",
@@ -1102,12 +1104,13 @@ func TestAWSProvider_ClusterFactsAndClientPool(t *testing.T) {
 
 	// Launch with NO LaunchTemplate and NO SubnetIDs specified in spec
 	spec := &InstanceSpec{
-		PodName:      "test-fact-pod",
-		PodNamespace: "default",
-		PodUID:       "uid-fact-1",
-		Region:       "us-west-2",
-		InstanceType: "g5.xlarge",
-		ClusterTag:   "prod-cluster",
+		TunnelEndpoint: "tunnel.example.internal:443",
+		PodName:        "test-fact-pod",
+		PodNamespace:   "default",
+		PodUID:         "uid-fact-1",
+		Region:         "us-west-2",
+		InstanceType:   "g5.xlarge",
+		ClusterTag:     "prod-cluster",
 	}
 
 	inst, err := p.Launch(context.Background(), spec)
@@ -1224,12 +1227,13 @@ func TestAWSProvider_LaunchUsesGPUTemplateForGPUPods(t *testing.T) {
 	}{{1, "g4dn.xlarge", "lt-gpu"}, {0, "g4dn.xlarge", "lt-gpu"}, {0, "m7i.large", "lt-cpu"}} {
 		capturedLT = ""
 		spec := &InstanceSpec{
-			PodName:      "gpu-pod",
-			PodNamespace: "default",
-			PodUID:       "uid-gpu",
-			Region:       "us-west-2",
-			InstanceType: tc.itype,
-			NumGPUs:      tc.gpus,
+			TunnelEndpoint: "tunnel.example.internal:443",
+			PodName:        "gpu-pod",
+			PodNamespace:   "default",
+			PodUID:         "uid-gpu",
+			Region:         "us-west-2",
+			InstanceType:   tc.itype,
+			NumGPUs:        tc.gpus,
 		}
 		if _, err := p.Launch(context.Background(), spec); err != nil {
 			t.Fatalf("Launch(gpus=%d) failed: %v", tc.gpus, err)

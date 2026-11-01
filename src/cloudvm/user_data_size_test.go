@@ -22,7 +22,7 @@ force_single_range_mode = true
 
 // userDataMargin is the room the largest production boot script must leave under the limit, so settings an operator
 // adds later, such as namespace tunnel redirects, do not break launches.
-const userDataMargin = 2048
+const userDataMargin = 6 * 1024
 
 // worstCaseProductionSpec is a GPU NodeClaim worker as production launches it: router tunnel transport, lazy pulls with
 // tuned stargz settings, a regional Docker Hub mirror, a KMS-enveloped runner token, and tunnelled Service and
@@ -68,17 +68,39 @@ func compressedUserData(t *testing.T, spec *InstanceSpec) int {
 
 func TestWorstCaseProductionUserDataFitsWithMargin(t *testing.T) {
 	spec := worstCaseProductionSpec(t)
-	size := compressedUserData(t, spec)
-	t.Logf("worst-case production user data: %d of %d bytes", size, maxUserDataBytes)
-	if size > maxUserDataBytes-userDataMargin {
-		t.Fatalf("worst-case production user data is %d bytes, leaving less than %d of the %d byte limit", size, userDataMargin, maxUserDataBytes)
+	for _, transport := range []TunnelTransport{TunnelTransportRouter, TunnelTransportTailnet, TunnelTransportPublic} {
+		variant := *spec
+		variant.TunnelTransport = string(transport)
+		if transport == TunnelTransportTailnet {
+			// Tailnet workers also carry the KMS-enveloped mesh key and install Tailscale.
+			variant.TunnelGatewayIP, variant.MeshAuthKeyCiphertext, variant.MeshTags = "", spec.KMSCiphertext, "tag:clvm-worker"
+		}
+		size := compressedUserData(t, &variant)
+		t.Logf("worst-case production user data over the %s transport: %d of %d bytes", transport, size, maxUserDataBytes)
+		if size > maxUserDataBytes-userDataMargin {
+			t.Errorf("worst-case production user data over the %s transport is %d bytes, leaving less than %d of the %d byte limit", transport, size, userDataMargin, maxUserDataBytes)
+		}
 	}
 	script, err := RenderCloudInit(&CloudInitConfig{TunnelEndpoint: spec.TunnelEndpoint, StargzConfig: spec.StargzConfig})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(script, "RUNNER_EOF") || !strings.Contains(script, "cloudvm_fetch_script") {
-		t.Fatal("tunnel workers must fetch the runner and traffic meter instead of carrying them in user data")
+	for _, sum := range []string{scriptSHA256(runnerScript), scriptSHA256(trafficMeterScript)} {
+		if !strings.Contains(script, "cloudvm_fetch_script "+sum) {
+			t.Fatalf("workers must fetch the script with sha256 %s", sum)
+		}
+	}
+	if strings.Contains(script, "def ") {
+		t.Fatal("workers must fetch the runner and traffic meter instead of carrying them in user data")
+	}
+}
+
+func TestContainerModeBootScriptWithoutTunnelEndpointIsRefused(t *testing.T) {
+	if _, err := RenderCloudInit(&CloudInitConfig{PodName: "p"}); err == nil || !strings.Contains(err.Error(), "no tunnel endpoint") {
+		t.Fatalf("err = %v, want a refusal naming the missing tunnel endpoint", err)
+	}
+	if _, err := RenderCloudInit(&CloudInitConfig{PodName: "p", UseNativeDLAMI: true}); err != nil {
+		t.Fatalf("native mode runs no runner and needs no tunnel endpoint: %v", err)
 	}
 }
 

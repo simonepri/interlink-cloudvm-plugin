@@ -64,6 +64,7 @@ func fleetInstanceType(params *ec2.CreateFleetInput) string {
 
 func spotClaimSpec(uid, region, itype string) *InstanceSpec {
 	return &InstanceSpec{
+		TunnelEndpoint:   "tunnel.example.internal:443",
 		PodName:          "cloudvm-spot-claim",
 		PodUID:           uid,
 		Region:           region,

@@ -577,7 +577,7 @@ func TestRenderCloudInit_RouterRoutesGatewayAroundDockerBridge(t *testing.T) {
 
 // The serial getty hangs up ttyS0 during boot; the mirror must keep writing to the console after that.
 func TestRenderCloudInit_ConsoleMirrorSurvivesHangup(t *testing.T) {
-	cfg := CloudInitConfig{PodName: "mirror", Region: "us-west-2", TargetContainerImage: "alpine"}
+	cfg := CloudInitConfig{TunnelEndpoint: "tunnel.example.internal:443", PodName: "mirror", Region: "us-west-2", TargetContainerImage: "alpine"}
 	script, err := RenderCloudInit(&cfg)
 	if err != nil {
 		t.Fatalf("render: %v", err)

@@ -118,6 +118,7 @@ func newTestProvider(t *testing.T) *AWSProvider {
 
 func fallbackSpec(candidates ...string) *InstanceSpec {
 	return &InstanceSpec{
+		TunnelEndpoint:         "tunnel.example.internal:443",
 		PodName:                "burst",
 		PodNamespace:           "research",
 		PodUID:                 "uid-burst",

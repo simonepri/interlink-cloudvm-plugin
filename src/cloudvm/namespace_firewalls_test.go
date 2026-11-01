@@ -161,7 +161,7 @@ func TestGCPLaunchTagsWorkerWithNamespaceTag(t *testing.T) {
 	p := NewGCPProvider("test-project", "europe-west4-a")
 	p.SetClient(client)
 	p.SetNamespaceFirewalls(map[string]map[string]string{"europe-west4": {"research": "clvm-ns-research"}})
-	spec := &InstanceSpec{PodName: "burst", PodNamespace: "research", PodUID: "uid-burst", Region: "europe-west4", MarketType: "spot"}
+	spec := &InstanceSpec{TunnelEndpoint: "tunnel.example.internal:443", PodName: "burst", PodNamespace: "research", PodUID: "uid-burst", Region: "europe-west4", MarketType: "spot"}
 	if _, err := p.Launch(context.Background(), spec); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestGCPLaunchWithoutNamespaceFirewallsSetsNoTags(t *testing.T) {
 	client := newMockGCPComputeService()
 	p := NewGCPProvider("test-project", "europe-west4-a")
 	p.SetClient(client)
-	spec := &InstanceSpec{PodName: "burst", PodNamespace: "research", PodUID: "uid-burst", Region: "europe-west4", MarketType: "spot"}
+	spec := &InstanceSpec{TunnelEndpoint: "tunnel.example.internal:443", PodName: "burst", PodNamespace: "research", PodUID: "uid-burst", Region: "europe-west4", MarketType: "spot"}
 	if _, err := p.Launch(context.Background(), spec); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}

@@ -70,7 +70,7 @@ func TestServerDefaults_StargzConfigEnv(t *testing.T) {
 }
 
 func TestRenderCloudInit_RunsStargzSnapshotterForLazyPulls(t *testing.T) {
-	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", PodUID: "uid", RunnerAuthToken: "tok", RegistryMirrors: []string{"https://mirror.gcr.io"}, StargzConfig: "max_concurrency = 16"})
+	script, err := RenderCloudInit(&CloudInitConfig{TunnelEndpoint: "tunnel.example.internal:443", PodName: "p", PodUID: "uid", RunnerAuthToken: "tok", RegistryMirrors: []string{"https://mirror.gcr.io"}, StargzConfig: "max_concurrency = 16"})
 	if err != nil {
 		t.Fatalf("render cloud-init: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestRenderCloudInit_RunsStargzSnapshotterForLazyPulls(t *testing.T) {
 }
 
 func TestRenderCloudInit_DisableLazyPullsLeavesStargzOff(t *testing.T) {
-	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", PodUID: "uid", RunnerAuthToken: "tok", DisableLazyPulls: true})
+	script, err := RenderCloudInit(&CloudInitConfig{TunnelEndpoint: "tunnel.example.internal:443", PodName: "p", PodUID: "uid", RunnerAuthToken: "tok", DisableLazyPulls: true})
 	if err != nil {
 		t.Fatalf("render cloud-init: %v", err)
 	}
