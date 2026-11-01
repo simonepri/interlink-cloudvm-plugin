@@ -822,6 +822,9 @@ func TestRenderCloudInit_RedirectsServiceNetworksToTheAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
+	if bridge := strings.Index(script, "DOCKER_BRIDGE_EOF"); bridge < 0 || bridge > strings.Index(script, "CLOUDVM_SERVICES") {
+		t.Error("script must remove a Docker bridge inside the service networks before redirecting them")
+	}
 	gateway := strings.Index(script, "iptables -t nat -A CLOUDVM_SERVICES -d 172.20.0.10 -j RETURN")
 	redirect := strings.Index(script, "iptables -t nat -A CLOUDVM_SERVICES -p tcp -d 172.20.0.0/16 -j REDIRECT --to-ports 13129")
 	if gateway < 0 || redirect < gateway {
@@ -939,6 +942,52 @@ func TestRenderCloudInit_FailsTheBootstrapWithoutTheMetadataGuard(t *testing.T) 
 			}
 			if err == nil || strings.Contains(string(out), "GUARD_PASSED") || !strings.Contains(string(out), tc.want) {
 				t.Fatalf("guard must stop the bootstrap with %q: %v\n%s", tc.want, err, out)
+			}
+		})
+	}
+}
+
+// The bootstrap names Docker's bridge network only when it overlaps a cluster Service network, so it stops Docker
+// exactly when the bridge would take an address the worker's pods dial.
+func TestRenderCloudInit_FindsADockerBridgeInsideTheServiceNetworks(t *testing.T) {
+	script, err := RenderCloudInit(&CloudInitConfig{
+		PodName: "p", Region: "us-west-2", TunnelEndpoint: "tunnel.example.com:443", TunnelTransport: "router",
+		TunnelGatewayIP: "172.17.0.10", TunnelServiceCIDRs: []string{"172.17.0.0/16"}, TargetContainerImage: "alpine",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(script, "<< 'DOCKER_BRIDGE_EOF'\n")
+	end := strings.Index(script, "\nDOCKER_BRIDGE_EOF\n")
+	if start < 0 || end < start {
+		t.Fatalf("no Docker bridge check in:\n%s", script)
+	}
+	program := script[start+len("<< 'DOCKER_BRIDGE_EOF'\n") : end]
+	for _, tc := range []struct{ name, address, want string }{
+		{"Docker's default bridge", "172.17.0.1/16", "172.17.0.0/16"},
+		{"a bridge outside the service networks", "10.200.0.1/24", ""},
+		{"no bridge and no Docker", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			ip := "#!/bin/sh\n"
+			if tc.address != "" {
+				ip += "echo '5: docker0    inet " + tc.address + " brd 172.17.255.255 scope global docker0'\n"
+			}
+			for name, body := range map[string]string{"ip": ip, "systemctl": "#!/bin/sh\nexit 1\n"} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("python3", "-I", "-", "172.17.0.0/16")
+			cmd.Stdin = strings.NewReader(program)
+			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("check failed: %v", err)
+			}
+			if got := strings.TrimSpace(string(out)); got != tc.want {
+				t.Fatalf("bridge network = %q, want %q", got, tc.want)
 			}
 		})
 	}
