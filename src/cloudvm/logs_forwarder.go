@@ -33,6 +33,10 @@ type LogResource struct {
 	Region     string
 	PodName    string
 	Namespace  string
+	// PodUID and Container name the pod and init container that wrote a container record. Carrying the pod UID on the
+	// resource also keeps a Kubernetes attributes processor from matching the record to the plugin's own pod.
+	PodUID    string
+	Container string
 }
 
 // LogEntry is one log record waiting for export.
@@ -269,6 +273,8 @@ func resourceAttributes(r LogResource) []otlpKeyValue {
 		{"cloudvm.region", r.Region},
 		{"k8s.pod.name", r.PodName},
 		{"k8s.namespace.name", r.Namespace},
+		{"k8s.pod.uid", r.PodUID},
+		{"k8s.container.name", r.Container},
 	} {
 		if kv[1] != "" {
 			attrs = append(attrs, otlpKeyValue{Key: kv[0], Value: otlpAnyValue{StringValue: kv[1]}})

@@ -444,6 +444,61 @@ func TestRunnerScript_StopRemovesContainer(t *testing.T) {
 	}
 }
 
+func TestRunnerScript_StopWaitsForTheAgentToShipTheContainersOutput(t *testing.T) {
+	h := newRunnerHarness(t)
+	stateDir := strings.TrimPrefix(h.env[len(h.env)-1], "FAKE_NERDCTL_STATE=")
+	binDir := filepath.Join(filepath.Dir(stateDir), "bin")
+	if err := os.WriteFile(filepath.Join(binDir, "nerdctl"), []byte(fakeRemovingNerdctl), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	drainDir := filepath.Join(filepath.Dir(stateDir), "log-drain")
+	if err := os.MkdirAll(drainDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.ReadFile(h.script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.script, []byte(strings.ReplaceAll(string(src), "/run/cloudvm/log-drain", drainDir)), 0o600); err != nil { //nolint:gosec // test-controlled script path
+		t.Fatal(err)
+	}
+	defer h.start()()
+
+	created := filepath.Join(stateDir, "created")
+	resp := h.do(http.MethodPost, "/containers/start", `{"podUID":"p","image":"busybox"}`)
+	_ = resp.Body.Close()
+	waitForWithin(t, 10*time.Second, "container run", func() bool { _, err := os.Stat(created); return err == nil })
+	drainFile := filepath.Join(drainDir, "cloudvm-p") // the agent follows the container
+	if err := os.WriteFile(drainFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stopped := make(chan int, 1)
+	go func() {
+		resp := h.do(http.MethodPost, "/containers/stop?podUID=p", "")
+		_ = resp.Body.Close()
+		stopped <- resp.StatusCode
+	}()
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(created); err != nil {
+		t.Fatal("the runner removed the container, and its output, before the agent shipped it")
+	}
+	if err := os.Remove(drainFile); err != nil { // the agent shipped the last line
+		t.Fatal(err)
+	}
+	select {
+	case code := <-stopped:
+		if code != http.StatusOK {
+			t.Fatalf("stop returned HTTP %d", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop kept waiting after the agent shipped the output")
+	}
+	if _, err := os.Stat(created); !os.IsNotExist(err) {
+		t.Fatalf("expected stop to remove the container, stat: %v", err)
+	}
+}
+
 func TestRunnerScript_ReportsStartTimings(t *testing.T) {
 	h := newRunnerHarness(t)
 	defer h.start()()

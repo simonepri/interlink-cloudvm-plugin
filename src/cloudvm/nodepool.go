@@ -335,6 +335,18 @@ type NodePool struct {
 	idleGracePeriod time.Duration
 	maxPodsPerNode  int
 	reuse           ReusePolicy
+	// departed remembers the identity of the most recently released pods, so their workers' last log lines, which can
+	// arrive after the release, still name the pod.
+	departed      map[string]departedPod
+	departedOrder []string
+}
+
+// maxDepartedPods bounds how many released pods NodePool.PodIdentity still recognizes.
+const maxDepartedPods = 4096
+
+type departedPod struct {
+	instanceID string
+	alloc      PodAllocation
 }
 
 // NewNodePool initializes a NodePool with a default idle grace period before node termination.
@@ -399,7 +411,43 @@ func (np *NodePool) RegisterNode(node *CloudVMNode) {
 func (np *NodePool) UnregisterNode(instanceID string) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
+	if node, ok := np.nodes[instanceID]; ok && node != nil {
+		for _, alloc := range node.ActivePods {
+			np.rememberDepartedLocked(instanceID, *alloc)
+		}
+	}
 	delete(np.nodes, instanceID)
+}
+
+// rememberDepartedLocked records a released pod's identity, forgetting the oldest beyond maxDepartedPods.
+func (np *NodePool) rememberDepartedLocked(instanceID string, alloc PodAllocation) {
+	if np.departed == nil {
+		np.departed = make(map[string]departedPod)
+	}
+	if _, ok := np.departed[alloc.PodUID]; !ok {
+		if len(np.departedOrder) >= maxDepartedPods {
+			delete(np.departed, np.departedOrder[0])
+			np.departedOrder = np.departedOrder[1:]
+		}
+		np.departedOrder = append(np.departedOrder, alloc.PodUID)
+	}
+	np.departed[alloc.PodUID] = departedPod{instanceID: instanceID, alloc: alloc}
+}
+
+// PodIdentity returns the allocation of a pod that runs, or recently ran, on the node instanceID; log records use it
+// to name the pod, including lines that arrive after the pod was deleted.
+func (np *NodePool) PodIdentity(instanceID, podUID string) (PodAllocation, bool) {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	if node, ok := np.nodes[instanceID]; ok && node != nil {
+		if alloc, active := node.ActivePods[podUID]; active {
+			return *alloc, true
+		}
+	}
+	if d, ok := np.departed[podUID]; ok && d.instanceID == instanceID {
+		return d.alloc, true
+	}
+	return PodAllocation{}, false
 }
 
 // AllocationRequest describes a pod to bin-pack into a warm node.
@@ -522,6 +570,9 @@ func (np *NodePool) Release(podUID string) int {
 	defer np.mu.Unlock()
 
 	for _, node := range np.nodes {
+		if alloc, ok := node.ActivePods[podUID]; ok {
+			np.rememberDepartedLocked(node.InstanceID, *alloc)
+		}
 		if node.ReleasePod(podUID) {
 			np.checkIdleLocked(node, time.Now())
 			return node.ActivePodCount()
