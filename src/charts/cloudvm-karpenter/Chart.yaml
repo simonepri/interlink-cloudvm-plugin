@@ -4,8 +4,8 @@ description: >-
   Second Karpenter controller with the CloudVM cloud provider; it launches one
   CloudVM VM per NodeClaim for NodePools that reference a CloudVMNodeClass
 type: application
-version: 0.43.2
-appVersion: 0.43.2
+version: 0.43.3
+appVersion: 0.43.3
 keywords:
   - kubernetes
   - karpenter
