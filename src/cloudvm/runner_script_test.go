@@ -537,7 +537,8 @@ func TestRunnerScript_GivesContainersTheNamespaceSearchList(t *testing.T) {
 
 var regexpDNSSearch = regexp.MustCompile(`--dns-search \S+`)
 
-// fakeStargzNerdctl pulls with the stargz snapshotter and reports two layers; fakeCtr labels the snapshot named in
+// fakeStargzNerdctl pulls with the stargz snapshotter and, like nerdctl, reports the layers' chain IDs as the image's
+// layers; fakeCtr serves the image config, whose diff IDs are aaaa and bbbb, and labels the snapshot named in
 // $state/remote as one the snapshotter mounted remotely.
 const fakeStargzNerdctl = `#!/usr/bin/env bash
 state="$FAKE_NERDCTL_STATE"
@@ -547,7 +548,11 @@ case "$1" in
   image)
     # Like nerdctl, inspect finds no image by a name@digest reference.
     case "${@: -1}" in *@*) echo "level=fatal msg=\"no such image: ${@: -1}\"" >&2; exit 1 ;; esac
-    printf '["sha256:aaaa","sha256:bbbb"]\n'; exit 0 ;;
+    case "$*" in
+      *--mode=native*) echo "sha256:cfg" ;;
+      *) printf '["sha256:aaaa","sha256:2c4d8760379f05d0ad1ed610712309f0114e7345e6e6a351494cff030ffdf197"]\n' ;;
+    esac
+    exit 0 ;;
   run) touch "$state/created"; exit 0 ;;
   inspect)
     if [ -f "$state/created" ]; then
@@ -562,6 +567,11 @@ esac
 const fakeCtr = `#!/usr/bin/env bash
 state="$FAKE_NERDCTL_STATE"
 name="${@: -1}"
+if [ "$3" = content ]; then
+  [ "$name" = sha256:cfg ] || exit 1
+  printf '{"rootfs":{"type":"layers","diff_ids":["sha256:aaaa","sha256:bbbb"]}}\n'
+  exit 0
+fi
 if grep -qxF "$name" "$state/remote" 2>/dev/null; then
   printf '{"Name":"%s","Labels":{"containerd.io/snapshot/remote":"remote snapshot"}}\n' "$name"
 else

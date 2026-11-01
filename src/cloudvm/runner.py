@@ -419,20 +419,25 @@ def remote_layer_count(img):
     """Counts the layers of img that the stargz snapshotter mounted remotely; 0 when it cannot tell.
 
     The snapshotter labels each layer snapshot it mounts from the registry, and names layer snapshots by chain ID. A
-    layer it could not mount remotely is downloaded and unpacked like any other, so the pull succeeds either way.
+    layer it could not mount remotely is downloaded and unpacked like any other, so the pull succeeds either way. The
+    diff IDs come from the image config in the content store: nerdctl's inspect reports the layers' chain IDs in their
+    place, since it turns the config's diff ID list into chain IDs in place before printing it.
     """
     try:
         # HACK(simonepri): nerdctl image inspect matches a name@digest reference only to an image stored with the tag
         # latest, so it cannot find one pulled by digest; the digest alone finds it. No upstream issue tracks this:
         # https://github.com/containerd/nerdctl/blob/v2.4.1/pkg/cmd/image/inspect.go#L141-L145
         # TODO(simonepri): file the upstream nerdctl issue for this bug and link it here.
-        res = subprocess.run([CONTAINER_CLI, *snapshotter_args(), 'image', 'inspect', '--format', '{{json .RootFS.Layers}}', img.rpartition('@')[2]],
-                             capture_output=True, text=True)
+        res = subprocess.run([CONTAINER_CLI, *snapshotter_args(), 'image', 'inspect', '--mode=native', '--format', '{{.ImageConfigDesc.Digest}}',
+                              img.rpartition('@')[2]], capture_output=True, text=True)
         # A reference naming several stored images prints a line for each.
         lines = res.stdout.split() if res.returncode == 0 else []
         if not lines:
             raise ValueError(res.stderr.strip())
-        diff_ids = json.loads(lines[0]) or []
+        config = subprocess.run([SNAPSHOT_CLI, '--namespace', 'default', 'content', 'get', lines[0]], capture_output=True, text=True)
+        if config.returncode != 0:
+            raise ValueError(config.stderr.strip())
+        diff_ids = (json.loads(config.stdout).get('rootfs') or {}).get('diff_ids') or []
         count, chain = 0, ''
         for diff_id in diff_ids:
             chain = diff_id if not chain else 'sha256:' + hashlib.sha256(f"{chain} {diff_id}".encode()).hexdigest()
