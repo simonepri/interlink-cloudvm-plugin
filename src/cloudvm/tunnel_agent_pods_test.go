@@ -20,10 +20,12 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// procSocket is one socket of a fixture /proc: its local address, given as /proc/net hex, and the process holding it.
+// procSocket is one socket of a fixture /proc: its local address, given as /proc/net hex, the loopback port it is
+// connected to, if any, and the process holding it.
 type procSocket struct {
 	proto, local string
 	port, inode  int
+	remotePort   int
 	pid          int
 	cgroup       string
 }
@@ -34,9 +36,13 @@ func writeProcFixture(t *testing.T, sockets []procSocket) string {
 	root := t.TempDir()
 	tables := map[string][]string{"tcp": nil, "tcp6": nil, "udp": nil}
 	for i, s := range sockets {
+		remote := strings.Repeat("0", len(s.local))
+		if s.remotePort != 0 {
+			remote = loopbackHex
+		}
 		tables[s.proto] = append(tables[s.proto], fmt.Sprintf(
-			"%4d: %s:%04X %s:0000 01 00000000:00000000 00:00000000 00000000  1000        0 %d 1 0000000000000000 20 4 30 10 -1",
-			i, s.local, s.port, strings.Repeat("0", len(s.local)), s.inode))
+			"%4d: %s:%04X %s:%04X 01 00000000:00000000 00:00000000 00000000  1000        0 %d 1 0000000000000000 20 4 30 10 -1",
+			i, s.local, s.port, remote, s.remotePort, s.inode))
 		if s.pid == 0 {
 			continue
 		}
@@ -159,14 +165,14 @@ func TestTunnelTCP_PythonAgentAuthorizesStreamsByTheirPod(t *testing.T) {
 	}
 
 	ports := []int{freePort(t), freePort(t), freePort(t), freePort(t)}
-	root := writeProcFixture(t, []procSocket{
-		{proto: "tcp", local: loopbackHex, port: ports[0], inode: 5001, pid: 101,
-			cgroup: "0::/kubepods/burstable/pod" + burstablePod + "/" + strings.Repeat("cd", 32) + "\n"},
-		{proto: "tcp", local: loopbackHex, port: ports[1], inode: 5002, pid: 102,
-			cgroup: "0::/kubepods/besteffort/pod" + besteffortPod + "/" + strings.Repeat("ef", 32) + "\n"},
-		{proto: "tcp", local: loopbackHex, port: ports[2], inode: 5003, pid: 103, cgroup: "0::/system.slice/cron.service\n"},
-	})
 	agentProxyPort := freePort(t)
+	root := writeProcFixture(t, []procSocket{
+		{proto: "tcp", local: loopbackHex, port: ports[0], remotePort: agentProxyPort, inode: 5001, pid: 101,
+			cgroup: "0::/kubepods/burstable/pod" + burstablePod + "/" + strings.Repeat("cd", 32) + "\n"},
+		{proto: "tcp", local: loopbackHex, port: ports[1], remotePort: agentProxyPort, inode: 5002, pid: 102,
+			cgroup: "0::/kubepods/besteffort/pod" + besteffortPod + "/" + strings.Repeat("ef", 32) + "\n"},
+		{proto: "tcp", local: loopbackHex, port: ports[2], remotePort: agentProxyPort, inode: 5003, pid: 103, cgroup: "0::/system.slice/cron.service\n"},
+	})
 	startPythonAgent(t, f, instanceID, token, fmt.Sprintf("CLOUDVM_TCP_PROXY_PORT=%d", agentProxyPort), "CLOUDVM_PROC_ROOT="+root)
 	agentProxy := fmt.Sprintf("127.0.0.1:%d", agentProxyPort)
 	echo := startEchoServer(t)
@@ -278,8 +284,8 @@ limited("other", "other kind")
 
 agent.log_failure = agent.FailureLog()
 class Unknown(object):
-    def pod_of(self, proto, peer, remote=None):
-        return None
+    def attribute(self, proto, peer, remote=None):
+        return None, "no socket in /proc/net/udp"
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 proxy = agent.TCPProxy(pods=Unknown())
@@ -294,7 +300,7 @@ answered.on_fin()
 		"[cloudvm-tunnel-agent] refused 0\n",
 		"[cloudvm-tunnel-agent] refused 12 (2 more since the last report)\n",
 		"[cloudvm-tunnel-agent] other kind\n",
-		"cannot tell which pod holds the udp socket at ('127.0.0.1', 40000)\n",
+		"cannot tell which pod holds the udp socket at ('127.0.0.1', 40000): no socket in /proc/net/udp\n",
 		"pod unattributed\n",
 		"gateway closed the stream to 10.1.2.3:6379 for pod uid-a before any data",
 	} {
@@ -349,11 +355,11 @@ func TestTunnelTCP_PythonAgentConnectsAPodToAClusterHostname(t *testing.T) {
 	f.gateway.clusterDNSServers = []string{cluster.addr}
 
 	clientPort := freePort(t)
+	agentProxyPort := freePort(t)
 	root := writeProcFixture(t, []procSocket{
-		{proto: "tcp", local: loopbackHex, port: clientPort, inode: 6001, pid: 201,
+		{proto: "tcp", local: loopbackHex, port: clientPort, remotePort: agentProxyPort, inode: 6001, pid: 201,
 			cgroup: "0::/kubepods/burstable/pod" + burstablePod + "/" + strings.Repeat("ab", 32) + "\n"},
 	})
-	agentProxyPort := freePort(t)
 	resolvConf := filepath.Join(t.TempDir(), "resolv.conf")
 	if err := os.WriteFile(resolvConf, []byte("nameserver 127.0.0.1\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -422,9 +428,9 @@ func TestTunnelAgent_ResolvesConnectHostnamesAsTheClientsPod(t *testing.T) {
 import asyncio, socket, struct
 calls = []
 class Pods(object):
-    def pod_of(self, proto, peer, remote=None):
+    def attribute(self, proto, peer, remote=None):
         calls.append(proto)
-        return "uid-a"
+        return "uid-a", ""
 class Session(object):
     streams = {}
     def open_dns_stream(self, query, pod):
@@ -458,14 +464,16 @@ import struct
 attrs = struct.pack("=HH", 8, 5) + b"\x00" * 4 + struct.pack("=HHQ", 12, agent.INET_DIAG_CGROUP_ID, 4026531835)
 body = b"\x00" * agent.INET_DIAG_MSG_SIZE + attrs
 print(agent.parse_diag_cgroup_id(struct.pack("=IHHII", 16 + len(body), agent.SOCK_DIAG_BY_FAMILY, 0, 1, 0) + body))
-old = b"\x00" * agent.INET_DIAG_MSG_SIZE
+old = b"\x00" * agent.INET_DIAG_INODE_OFFSET + struct.pack("=I", 4242)
 print(agent.parse_diag_cgroup_id(struct.pack("=IHHII", 16 + len(old), agent.SOCK_DIAG_BY_FAMILY, 0, 1, 0) + old))
-try:
-    agent.parse_diag_cgroup_id(struct.pack("=IHHIIi", 36, agent.NLMSG_ERROR, 0, 1, 0, -2) + b"\x00" * 16)
-except LookupError as e:
-    print("gone:", e)
+for reply in (struct.pack("=IHHIIi", 36, agent.NLMSG_ERROR, 0, 1, 0, -2) + b"\x00" * 16,
+              struct.pack("=IHHII", 16 + agent.INET_DIAG_MSG_SIZE, agent.SOCK_DIAG_BY_FAMILY, 0, 1, 0) + b"\x00" * agent.INET_DIAG_MSG_SIZE):
+    try:
+        agent.parse_diag_cgroup_id(reply)
+    except LookupError as e:
+        print("gone:", e)
 `)
-	if want := "4026531835\nNone\ngone: no such socket\n"; out != want {
+	if want := "4026531835\nNone\ngone: no such socket\ngone: the socket is closed\n"; out != want {
 		t.Errorf("parsed =\n%s\nwant\n%s", out, want)
 	}
 }
@@ -541,8 +549,47 @@ receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); receiver.bind(("127
 sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sender.sendto(b"q", receiver.getsockname())
 _, source = receiver.recvfrom(16)
 print("udp", agent.diag_cgroup_id("udp", source, receiver.getsockname()) == want)
+# A client that closed first leaves a TIME_WAIT socket, which has no cgroup; the lookup must not read as a kernel
+# without cgroup IDs, which would turn the kernel lookup off for every later socket.
+accepted, _ = server.accept()
+local, remote = client.getsockname(), client.getpeername()
+client.close(); accepted.recv(1); accepted.close()
+resolver = agent.PodResolver()
+resolver.pod_of("tcp", local, remote)
+print("time-wait keeps sock_diag", resolver.diag is not None)
 `)
-	if want := "tcp True\nudp True\n"; out != want {
+	if want := "tcp True\nudp True\ntime-wait keeps sock_diag True\n"; out != want {
 		t.Errorf("kernel lookups =\n%s\nwant\n%s", out, want)
+	}
+}
+
+// Sockets to different peers share local ports, so the /proc scan matches a TCP socket by both of its addresses, and an
+// unattributed socket comes with the reason each lookup failed.
+func TestTunnelAgent_ScanMatchesBothAddressesAndExplainsFailures(t *testing.T) {
+	out := runAgentPython(t, fmt.Sprintf(`
+import os, tempfile
+proc = tempfile.mkdtemp()
+os.makedirs(os.path.join(proc, "net"))
+for name in ("tcp6", "udp", "udp6"):
+    open(os.path.join(proc, "net", name), "w").write("header\n")
+# 10.0.0.5:40000 talks to 172.17.0.1:443 (inode 111, the pod) and to 52.0.0.9:443 (inode 222, a VM process).
+with open(os.path.join(proc, "net", "tcp"), "w") as f:
+    f.write("header\n"
+            "   0: 0500000A:9C40 09000034:01BB 01 00000000:00000000 00:00000000 00000000     0        0 222 1 0\n"
+            + "   1: 0500000A:9C40 010011AC:01BB 01 00000000:00000000 00:00000000 00000000     0        0 111 1 0\n"
+            + "   2: 0500000A:9C42 010011AC:01BB 01 00000000:00000000 00:00000000 00000000     0        0 333 1 0\n")
+for pid, inode, cgroup in (("10", 222, "0::/system.slice/agent.service"), ("20", 111, "0::/kubepods/burstable/pod%[1]s/" + "ab" * 32)):
+    os.makedirs(os.path.join(proc, pid, "fd"))
+    os.symlink("socket:[%%d]" %% inode, os.path.join(proc, pid, "fd", "3"))
+    open(os.path.join(proc, pid, "cgroup"), "w").write(cgroup + "\n")
+resolver = agent.PodResolver(proc, tempfile.mkdtemp(), None)
+print("pod", resolver.pod_of("tcp", ("10.0.0.5", 40000), ("172.17.0.1", 443)))
+print("vm", repr(resolver.pod_of("tcp", ("10.0.0.5", 40000), ("52.0.0.9", 443))))
+print(resolver.attribute("tcp", ("10.0.0.5", 40002), ("172.17.0.1", 443)))
+print(resolver.attribute("tcp", ("10.0.0.5", 40004), ("172.17.0.1", 443)))
+`, burstablePod))
+	want := "pod " + burstablePod + "\nvm ''\n(None, 'no process holds socket inode 333')\n(None, 'no socket in /proc/net/tcp')\n"
+	if out != want {
+		t.Errorf("attribution =\n%s\nwant\n%s", out, want)
 	}
 }

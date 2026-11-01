@@ -418,6 +418,8 @@ SOCK_DIAG_BY_FAMILY = 20
 NLMSG_ERROR = 2
 INET_DIAG_CGROUP_ID = 21
 INET_DIAG_MSG_SIZE = 72
+# Offset of idiag_inode in struct inet_diag_msg.
+INET_DIAG_INODE_OFFSET = 68
 
 
 def diag_cgroup_id(proto, local, remote):
@@ -441,7 +443,9 @@ def diag_cgroup_id(proto, local, remote):
 
 
 def parse_diag_cgroup_id(reply):
-    """Returns the INET_DIAG_CGROUP_ID attribute of a sock_diag reply, or None when it has none."""
+    """Returns the INET_DIAG_CGROUP_ID attribute of a sock_diag reply, or None when the kernel reports none. Raises
+    LookupError when no process holds the socket any more: the kernel then names no inode, and a socket in TIME_WAIT
+    has no cgroup on any kernel."""
     length, kind = struct.unpack("=IH", reply[:6])
     if kind == NLMSG_ERROR:
         code = -struct.unpack("=i", reply[16:20])[0]
@@ -456,6 +460,9 @@ def parse_diag_cgroup_id(reply):
         if attr == INET_DIAG_CGROUP_ID:
             return struct.unpack("=Q", reply[i + 4:i + 12])[0]
         i += (size + 3) & ~3
+    inode, = struct.unpack("=I", reply[16 + INET_DIAG_INODE_OFFSET:16 + INET_DIAG_INODE_OFFSET + 4])
+    if inode == 0:
+        raise LookupError("the socket is closed")
     return None
 
 
@@ -513,37 +520,46 @@ class PodResolver(object):
         process can be found or the process runs under the pods' cgroup without naming its pod. A socket no process
         holds stays unattributed rather than VM-owned, because the gateway would otherwise grant a pod whose process
         exited the worker's namespace."""
+        return self.attribute(proto, peer, remote)[0]
+
+    def attribute(self, proto, peer, remote=None):
+        """Returns pod_of's answer and, when it is None, why each way of finding the socket's process failed."""
+        why = []
         if remote is not None and self.cgroups is not None and self.diag is not None:
             try:
                 cgroup_id = self.diag(proto, peer, remote)
                 if cgroup_id is None:
                     self.diag = None  # the kernel reports no cgroup IDs; the /proc scan attributes every later socket
-            except (LookupError, OSError, ValueError, AttributeError, struct.error):
+                    why.append("sock_diag reports no cgroup IDs")
+            except (LookupError, OSError, ValueError, AttributeError, struct.error) as e:
                 cgroup_id = None  # the /proc scan below tells a socket that is gone from one the kernel did not find
+                why.append("sock_diag: %s" % e)
             if cgroup_id is not None:
-                return self.cgroups.pod_of(cgroup_id)
-        inode = self.socket_inode(proto, peer)
+                pod = self.cgroups.pod_of(cgroup_id)
+                return pod, "" if pod is not None else "cgroup %d names no pod" % cgroup_id
+        inode = self.socket_inode(proto, peer, remote if proto == "tcp" else None)
         if inode is None:
-            return None
+            return None, "; ".join(why + ["no socket in /proc/net/%s" % proto])
         now = time.monotonic()
         pod = self.cached(self.by_inode, inode, now)
         if pod is not None:
-            return pod
+            return pod, ""
         pid = self.socket_pid(inode)
         if pid is None:
-            return None
+            return None, "; ".join(why + ["no process holds socket inode %s" % inode])
         pod = self.cached(self.by_pid, pid, now)
         if pod is None:
             try:
                 with open(os.path.join(self.proc_root, pid, "cgroup")) as f:
-                    pod = pod_of_cgroup(f.read())
-            except OSError:
-                return None
+                    text = f.read()
+            except OSError as e:
+                return None, "; ".join(why + ["process %s: %s" % (pid, e)])
+            pod = pod_of_cgroup(text)
             if pod is None:
-                return None
+                return None, "; ".join(why + ["process %s runs in %s, which names no pod" % (pid, text.strip())])
             self.remember(self.by_pid, pid, pod, now)
         self.remember(self.by_inode, inode, pod, now)
-        return pod
+        return pod, ""
 
     def cached(self, cache, key, now):
         with self.lock:
@@ -559,11 +575,16 @@ class PodResolver(object):
                     cache.clear()
             cache[key] = (now + ATTRIBUTION_TTL, pod)
 
-    def socket_inode(self, proto, peer):
-        """Returns the inode of the socket bound to peer in /proc/net; a UDP socket may be bound to a wildcard address."""
+    def socket_inode(self, proto, peer, remote=None):
+        """Returns the inode of the socket bound to peer in /proc/net, and connected to remote when given, since sockets
+        to different peers share local ports; a UDP socket may be bound to a wildcard address."""
         ip, port = ipaddress.ip_address(peer[0].split("%")[0]), int(peer[1])
         if ip.version == 6 and ip.ipv4_mapped:
             ip = ip.ipv4_mapped
+        if remote is not None:
+            remote_ip, remote_port = ipaddress.ip_address(remote[0].split("%")[0]), int(remote[1])
+            if remote_ip.version == 6 and remote_ip.ipv4_mapped:
+                remote_ip = remote_ip.ipv4_mapped
         wildcard = None
         for name in (proto, proto + "6"):
             try:
@@ -576,6 +597,10 @@ class PodResolver(object):
                         local, _, local_port = fields[1].partition(":")
                         if int(local_port, 16) != port:
                             continue
+                        if remote is not None:
+                            rem, _, rem_port = fields[2].partition(":")
+                            if int(rem_port, 16) != remote_port or proc_address(rem) != remote_ip:
+                                continue
                         addr = proc_address(local)
                         if addr == ip:
                             return fields[9]
@@ -938,12 +963,13 @@ class TCPProxy(object):
         if self.pods is None or not peer:
             return ""
         try:
-            pod = await asyncio.get_event_loop().run_in_executor(None, self.pods.pod_of, proto, peer, remote)
+            pod, why = await asyncio.get_event_loop().run_in_executor(None, self.pods.attribute, proto, peer, remote)
         except (OSError, ValueError) as e:
             log_failure("attribution_error", "cannot attribute %s connection from %s: %s" % (proto, peer, e))
-            pod = None
+            return UNATTRIBUTED_POD
         if pod is None:
-            log_failure("unattributed_" + proto, "cannot tell which pod holds the %s socket at %s" % (proto, peer))
+            log_failure("unattributed_" + proto, "cannot tell which pod holds the %s socket at %s%s: %s"
+                        % (proto, peer, " connected to %s" % (remote,) if remote else "", why))
             return UNATTRIBUTED_POD
         return pod
 
