@@ -1,19 +1,24 @@
 """In-VM reverse tunnel agent: dials the plugin's tunnel gateway over TLS, bridges Yamux streams to the local runner and local ports, streams worker logs, and serves DNS.
 
+Attributes every connection it tunnels to the pod whose process opened it, through /proc, so the gateway authorizes it per pod.
+
 Implements the client half of the github.com/hashicorp/yamux framing on one asyncio loop (stdlib only, Python 3.7+).
 """
 import asyncio
 import base64
+import collections
 import datetime
 import ipaddress
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import ssl
 import struct
 import sys
+import threading
 import time
 
 VERSION = 0
@@ -44,6 +49,21 @@ DEFAULT_LOG_FILES = "bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cl
 # The bootstrap appends "<phase> <epoch seconds>" here as each boot phase ends.
 DEFAULT_BOOT_MARKS = "/run/cloudvm/boot-marks"
 MAX_BOOT_MARKS = 16
+# A process in a pod runs in the pod's cgroup, /kubepods/<qos>/pod<uid>/<container> or its systemd-slice spelling.
+POD_CGROUP = re.compile(
+    r"kubepods\b.*?[/-]pod([0-9a-fA-F]{8}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{12})"
+    r"(?:\.slice)?(?:/|$)")
+# The pod a stream names when the agent cannot tell which process opened its connection; the gateway refuses it.
+UNATTRIBUTED_POD = "unattributed"
+# How long the agent remembers which pod holds a socket or a process.
+ATTRIBUTION_TTL = 10
+MAX_ATTRIBUTION_CACHE = 4096
+# Bounds the file descriptors one attribution reads before it gives up, so a VM with huge fd tables stays responsive.
+MAX_ATTRIBUTION_FDS = 200000
+HOT_PIDS = 64
+# Answers to the allow-listed external hostnames come from the RFC 2544 benchmarking range the bootstrap redirects.
+SYNTHETIC_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+SYNTHETIC_TTL = 60
 
 
 def log(msg):
@@ -241,8 +261,8 @@ class Session(object):
         async with self.drain_lock:
             await self.writer.drain()
 
-    def open_tcp_stream(self, target, local_reader, local_writer):
-        """Opens a stream asking the gateway to connect to target, bridged to an accepted local connection.
+    def open_tcp_stream(self, target, local_reader, local_writer, pod=""):
+        """Opens a stream asking the gateway to connect to target for pod, bridged to an accepted local connection.
 
         The caller starts the stream once it has answered its client.
         """
@@ -250,19 +270,20 @@ class Session(object):
         self.next_sid += 2
         self.streams[stream.sid] = stream
         self.send(T_WINDOW, F_SYN, stream.sid, STREAM_WINDOW - INITIAL_WINDOW)
-        header = (json.dumps({"stream": TCP_STREAM_KIND, "version": 1, "target": target}) + "\n").encode()
+        header = stream_header({"stream": TCP_STREAM_KIND, "version": 1, "target": target}, pod)
         stream.send_window -= len(header)
         self.send(T_DATA, 0, stream.sid, len(header), header)
         return stream
 
-    def open_dns_stream(self, query):
+    def open_dns_stream(self, query, pod=""):
         stream = DNSStream(self.next_sid)
         self.next_sid += 2
         self.streams[stream.sid] = stream
         self.send(T_WINDOW, F_SYN, stream.sid, 0)
+        data = (stream_header({"stream": "dns", "version": 1}, pod) if pod else DNS_STREAM_HEADER) + query
         # HACK(simonepri): yamux marks the stream closed before it copies a FIN frame's payload, so the gateway can read EOF
         # and drop the query; send the FIN in its own frame. https://github.com/hashicorp/yamux/issues/184
-        self.send(T_DATA, 0, stream.sid, len(DNS_STREAM_HEADER + query), DNS_STREAM_HEADER + query)
+        self.send(T_DATA, 0, stream.sid, len(data), data)
         self.send(T_DATA, F_FIN, stream.sid, 0)
         return stream
 
@@ -319,6 +340,158 @@ class Session(object):
                 stream.task.cancel()
         elif flags & F_FIN:
             stream.on_fin()
+
+
+def stream_header(header, pod):
+    """Encodes the first line of an agent-opened stream, naming pod when the connection came from one."""
+    if pod:
+        header = dict(header, pod=pod)
+    return (json.dumps(header) + "\n").encode()
+
+
+def proc_address(raw):
+    """Decodes an address of /proc/net/{tcp,udp}{,6}, whose 32-bit words are in host byte order."""
+    data = bytes.fromhex(raw)
+    if sys.byteorder == "little":
+        data = b"".join(data[i:i + 4][::-1] for i in range(0, len(data), 4))
+    ip = ipaddress.ip_address(data)
+    return ip.ipv4_mapped or ip if ip.version == 6 else ip
+
+
+def pod_of_cgroup(text):
+    """Returns the UID of the pod whose cgroup a /proc/<pid>/cgroup file names, or "" for a process outside every pod."""
+    for line in text.splitlines():
+        match = POD_CGROUP.search(line)
+        if match:
+            return match.group(1).replace("_", "-").lower()
+    return ""
+
+
+class PodResolver(object):
+    """Attributes a local socket to the pod whose process holds it: /proc/net gives the socket's inode, /proc/<pid>/fd
+    the process holding that inode, and /proc/<pid>/cgroup the process's pod.
+
+    Containers share the VM's network, so the socket, not its address, tells pods apart. Lookups run on executor
+    threads; the caches and the recently matched processes, which are checked before a full scan, sit behind a lock.
+    """
+
+    def __init__(self, proc_root="/proc"):
+        self.proc_root = proc_root
+        self.own_pid = str(os.getpid())
+        self.lock = threading.Lock()
+        self.by_inode = {}
+        self.by_pid = {}
+        self.hot = collections.OrderedDict()
+
+    def pod_of(self, proto, peer):
+        """Returns the pod UID of the process holding the local proto ("tcp" or "udp") socket with address peer, "" for
+        a process of the VM itself, or None when no process can be found."""
+        inode = self.socket_inode(proto, peer)
+        if inode is None:
+            return None
+        now = time.monotonic()
+        pod = self.cached(self.by_inode, inode, now)
+        if pod is not None:
+            return pod
+        pid = self.socket_pid(inode)
+        if pid is None:
+            return None
+        pod = self.cached(self.by_pid, pid, now)
+        if pod is None:
+            try:
+                with open(os.path.join(self.proc_root, pid, "cgroup")) as f:
+                    pod = pod_of_cgroup(f.read())
+            except OSError:
+                return None
+            self.remember(self.by_pid, pid, pod, now)
+        self.remember(self.by_inode, inode, pod, now)
+        return pod
+
+    def cached(self, cache, key, now):
+        with self.lock:
+            entry = cache.get(key)
+        return entry[1] if entry and entry[0] > now else None
+
+    def remember(self, cache, key, pod, now):
+        with self.lock:
+            if len(cache) >= MAX_ATTRIBUTION_CACHE:
+                for k in [k for k, v in cache.items() if v[0] <= now]:
+                    del cache[k]
+                if len(cache) >= MAX_ATTRIBUTION_CACHE:
+                    cache.clear()
+            cache[key] = (now + ATTRIBUTION_TTL, pod)
+
+    def socket_inode(self, proto, peer):
+        """Returns the inode of the socket bound to peer in /proc/net; a UDP socket may be bound to a wildcard address."""
+        ip, port = ipaddress.ip_address(peer[0].split("%")[0]), int(peer[1])
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        wildcard = None
+        for name in (proto, proto + "6"):
+            try:
+                with open(os.path.join(self.proc_root, "net", name)) as f:
+                    next(f, None)
+                    for line in f:
+                        fields = line.split()
+                        if len(fields) < 10 or fields[9] == "0":
+                            continue
+                        local, _, local_port = fields[1].partition(":")
+                        if int(local_port, 16) != port:
+                            continue
+                        addr = proc_address(local)
+                        if addr == ip:
+                            return fields[9]
+                        if proto == "udp" and addr.is_unspecified and wildcard is None:
+                            wildcard = fields[9]
+            except (OSError, ValueError):
+                continue
+        return wildcard
+
+    def holds(self, pid, link):
+        fd_dir = os.path.join(self.proc_root, pid, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            return False, 0
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) == link:
+                    return True, len(fds)
+            except OSError:
+                pass
+        return False, len(fds)
+
+    def socket_pid(self, inode):
+        """Returns the PID of a process holding the socket inode, checking the recently matched processes first."""
+        link = "socket:[%s]" % inode
+        with self.lock:
+            hot = list(reversed(self.hot))
+        for pid in hot:
+            if self.holds(pid, link)[0]:
+                self.touch(pid)
+                return pid
+        try:
+            pids = [p for p in os.listdir(self.proc_root) if p.isdigit() and p != self.own_pid and p not in hot]
+        except OSError:
+            return None
+        budget = MAX_ATTRIBUTION_FDS
+        for pid in pids:
+            found, read = self.holds(pid, link)
+            if found:
+                self.touch(pid)
+                return pid
+            budget -= read
+            if budget <= 0:
+                log("gave up attributing socket %s after reading %d file descriptors" % (inode, MAX_ATTRIBUTION_FDS))
+                return None
+        return None
+
+    def touch(self, pid):
+        with self.lock:
+            self.hot.pop(pid, None)
+            self.hot[pid] = True
+            while len(self.hot) > HOT_PIDS:
+                self.hot.popitem(last=False)
 
 
 def is_own_address(host):
@@ -528,13 +701,50 @@ class TCPProxy(object):
     """Local HTTP CONNECT proxy: tunnels targets in the tunnel networks (without any, those outside the direct
     networks) and connects the rest itself."""
 
-    def __init__(self, direct_networks=(), tunnel_networks=()):
+    def __init__(self, direct_networks=(), tunnel_networks=(), pods=None):
         self.session = None
         self.direct_networks = list(direct_networks)
         self.tunnel_networks = list(tunnel_networks)
+        self.pods = pods
+        self.synthetic_names, self.synthetic_ips, self.external_addresses = {}, {}, set()
+
+    def set_destinations(self, synthetic_hosts, external_addresses):
+        """Takes the allow-listed external destinations from the gateway's handshake: the synthetic address of each
+        hostname, which the DNS forwarder answers, and the IPv4 host:port destinations."""
+        names = {}
+        for name, addr in (synthetic_hosts or {}).items():
+            try:
+                if ipaddress.ip_address(addr) in SYNTHETIC_NETWORK:
+                    names[str(name).lower().rstrip(".")] = addr
+            except ValueError:
+                log("ignoring synthetic address %r of %r" % (addr, name))
+        self.synthetic_names = names
+        self.synthetic_ips = {addr: name for name, addr in names.items()}
+        self.external_addresses = set(external_addresses or ())
+
+    def tunnel_target(self, target):
+        """Maps a synthetic address in target back to the hostname it answers for."""
+        host, _, port = target.rpartition(":")
+        name = self.synthetic_ips.get(host.strip("[]"))
+        return "%s:%s" % (name, port) if name else target
+
+    async def attribute(self, proto, peer):
+        """Returns the pod whose process holds the local socket at peer: "" for the VM's own processes and when
+        attribution is off, and UNATTRIBUTED_POD when no process can be found."""
+        if self.pods is None or not peer:
+            return ""
+        try:
+            pod = await asyncio.get_event_loop().run_in_executor(None, self.pods.pod_of, proto, peer)
+        except (OSError, ValueError) as e:
+            log("cannot attribute %s connection from %s: %s" % (proto, peer, e))
+            pod = None
+        return UNATTRIBUTED_POD if pod is None else pod
 
     async def route(self, target):
         host, _, port = target.rpartition(":")
+        name = host.strip("[]").lower().rstrip(".")
+        if name in self.synthetic_names:
+            return True, "%s:%s" % (name, port)
         try:
             ip = ipaddress.ip_address(host.strip("[]"))
         except ValueError:
@@ -543,6 +753,10 @@ class TCPProxy(object):
             info = await asyncio.get_event_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
             ip = ipaddress.ip_address(info[0][4][0])
             target = "[%s]:%s" % (ip, port)
+        if str(ip) in self.synthetic_ips:
+            return True, self.tunnel_target("%s:%s" % (ip, port))
+        if "%s:%s" % (ip, port) in self.external_addresses:
+            return True, "%s:%s" % (ip, port)
         if any(ip in network for network in self.direct_networks):
             return False, target
         return not self.tunnel_networks or any(ip in network for network in self.tunnel_networks), target
@@ -575,29 +789,32 @@ class TCPProxy(object):
         if route is not None and not route[0]:
             await self.connect_direct(route[1], reader, writer)
             return
+        pod = await self.attribute("tcp", writer.get_extra_info("peername")) if route is not None else ""
         session = self.session
         if route is None or session is None:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             writer.close()
             return
-        stream = session.open_tcp_stream(route[1], reader, writer)
+        stream = session.open_tcp_stream(route[1], reader, writer, pod)
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         stream.task = asyncio.ensure_future(stream.run())
 
 
     async def handle_redirected(self, reader, writer):
-        """Tunnels a connection the bootstrap's REDIRECT rule sent here to the address its client dialed."""
-        session = self.session
+        """Tunnels a connection the bootstrap's REDIRECT rule sent here to the address its client dialed, or to the
+        hostname whose synthetic address it dialed."""
         try:
-            target = original_destination(writer.get_extra_info("socket"))
+            target = self.tunnel_target(original_destination(writer.get_extra_info("socket")))
         except OSError as e:
             log("redirected connection without a destination: %s" % e)
             target = None
+        pod = await self.attribute("tcp", writer.get_extra_info("peername")) if target is not None else ""
+        session = self.session
         if target is None or session is None:
             writer.close()
             return
-        stream = session.open_tcp_stream(target, reader, writer)
+        stream = session.open_tcp_stream(target, reader, writer, pod)
         stream.task = asyncio.ensure_future(stream.run())
 
 
@@ -611,6 +828,32 @@ def original_destination(sock):
     return "%s:%d" % (socket.inet_ntoa(raw[4:8]), port)
 
 
+def dns_question(query):
+    """Returns the lower-case name and type of a query's question and where the question ends, or None when malformed."""
+    labels, i = [], 12
+    while i < len(query):
+        n = query[i]
+        if n == 0:
+            break
+        if n & 0xC0 or i + 1 + n > len(query):
+            return None
+        labels.append(query[i + 1:i + 1 + n].decode("ascii", "replace"))
+        i += 1 + n
+    if i + 5 > len(query):
+        return None
+    qtype, = struct.unpack("!H", query[i + 1:i + 3])
+    return ".".join(labels).lower(), qtype, i + 5
+
+
+def synthetic_reply(query, end, qtype, addr):
+    """Answers a query for an allow-listed external hostname: its synthetic IPv4 address for A, no records otherwise."""
+    answers = qtype in (1, 255)
+    reply = query[:2] + bytes([0x84 | query[2] & 0x79, 0x80]) + struct.pack("!HHHH", 1, int(answers), 0, 0) + query[12:end]
+    if answers:
+        reply += b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, SYNTHETIC_TTL, 4) + socket.inet_aton(addr)
+    return reply
+
+
 def dns_exchange(upstream, query):
     with socket.socket(socket.AF_INET6 if ":" in upstream[0] else socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.settimeout(DNS_TIMEOUT)
@@ -620,7 +863,8 @@ def dns_exchange(upstream, query):
 
 
 class DNSForwarder(asyncio.DatagramProtocol):
-    """UDP DNS forwarder: asks the gateway for cluster names and the VM's resolvers for the rest."""
+    """UDP DNS forwarder: answers allow-listed external hostnames with their synthetic addresses, asks the gateway for
+    cluster names and the VM's resolvers for the rest."""
 
     def __init__(self, domain, upstreams, proxy):
         self.domain = b"".join(bytes([len(l)]) + l.encode() for l in domain.split(".")) + b"\0"
@@ -635,6 +879,10 @@ class DNSForwarder(asyncio.DatagramProtocol):
 
     async def answer(self, query, addr):
         end = query.find(b"\0", 12) + 5
+        question = dns_question(query)
+        if question is not None and question[0] in self.proxy.synthetic_names:
+            self.transport.sendto(synthetic_reply(query, question[2], question[1], self.proxy.synthetic_names[question[0]]), addr)
+            return
         reply, session = b"", self.proxy.session
         if not query[12:end - 4].lower().endswith(self.domain):
             for upstream in self.upstreams:
@@ -644,13 +892,16 @@ class DNSForwarder(asyncio.DatagramProtocol):
                 except OSError as e:
                     log("DNS %s: %s" % (upstream, e))
         elif session is not None:
-            stream = session.open_dns_stream(query)
-            try:
-                await asyncio.wait_for(stream.done.wait(), DNS_TIMEOUT)
-                reply = stream.received
-            except asyncio.TimeoutError:
-                pass
-            session.streams.pop(stream.sid, None)
+            pod = await self.proxy.attribute("udp", addr)
+            session = self.proxy.session
+            if session is not None:
+                stream = session.open_dns_stream(query, pod)
+                try:
+                    await asyncio.wait_for(stream.done.wait(), DNS_TIMEOUT)
+                    reply = stream.received
+                except asyncio.TimeoutError:
+                    pass
+                session.streams.pop(stream.sid, None)
         if len(reply) < 12:  # SERVFAIL
             reply = query[:2] + bytes([0x80 | query[2] & 0x79, 0x82]) + b"\0\1\0\0\0\0\0\0" + query[12:end]
         self.transport.sendto(reply, addr)
@@ -733,6 +984,7 @@ async def connect_once(cfg):
         if resp.get("status") != "ok":
             raise RuntimeError("handshake rejected: %s" % resp.get("error", "no response"))
         log("connected to %s" % cfg["endpoint"])
+        cfg["proxy"].set_destinations(resp.get("syntheticHosts"), resp.get("externalAddresses"))
         session = Session(reader, writer, cfg["runner_addr"])
         session.open_log_stream(cfg["collector"])
         cfg["proxy"].session = session
@@ -758,9 +1010,11 @@ def main():
             parse_log_files(os.environ.get("CLOUDVM_LOG_FILES", DEFAULT_LOG_FILES)),
             os.environ.get("CLOUDVM_CONTAINER_LOGS", "1") != "0" and shutil.which(container_cli) and container_cli),
     }
+    proc_root = os.environ.get("CLOUDVM_PROC_ROOT", "/proc")
     cfg["proxy"] = TCPProxy(
         parse_networks(os.environ.get("CLOUDVM_DIRECT_CIDRS", "")),
-        parse_networks(os.environ.get("CLOUDVM_TUNNEL_CIDRS", "")))
+        parse_networks(os.environ.get("CLOUDVM_TUNNEL_CIDRS", "")),
+        PodResolver(proc_root) if os.path.exists(os.path.join(proc_root, "net", "tcp")) else None)
     max_backoff = float(os.environ.get("CLOUDVM_TUNNEL_MAX_BACKOFF", "30"))
     backoff = 0.5
     loop = asyncio.new_event_loop()

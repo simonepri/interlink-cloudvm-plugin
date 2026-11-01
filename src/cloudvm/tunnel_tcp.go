@@ -1,5 +1,5 @@
 // Bridges plain TCP connections over worker tunnel sessions, so processes on worker VMs and in the cluster can reach each
-// other, and refuses every connection whose two ends belong to different Kubernetes namespaces.
+// other, and refuses every connection whose two ends belong to different Kubernetes namespaces unless configuration allows it.
 package main
 
 import (
@@ -42,6 +42,9 @@ type PodNamespaces interface {
 // WorkerNamespaceResolver maps a worker's instance ID to the one namespace whose pods it runs.
 type WorkerNamespaceResolver func(instanceID string) (string, bool)
 
+// PodNamespaceOnWorkerResolver maps a pod UID to the pod's namespace when the plugin placed that pod on the worker.
+type PodNamespaceOnWorkerResolver func(instanceID, podUID string) (string, bool)
+
 // tcpRefusalLogInterval bounds how often the gateway logs refusals that share a reason.
 const tcpRefusalLogInterval = 10 * time.Second
 
@@ -58,23 +61,28 @@ func refuse(reason, format string, args ...any) error {
 }
 
 // serveWorkerTCP bridges a worker-opened tcp stream to its target: another worker VM when the target is one of their
-// addresses, otherwise a direct connection from the gateway to a Service ClusterIP that allowService permits or to a
-// pod address that allowDirect permits. Both ends must share a namespace, unless the target is a shared Service.
-func (g *TunnelGateway) serveWorkerTCP(instanceID string, reader *bufio.Reader, stream *yamux.Stream, target string) {
+// addresses, otherwise a direct connection from the gateway to a Service ClusterIP that allowService permits, to an
+// external host the source namespace's destinations list, or to a pod address that allowDirect permits. Both ends must
+// share a namespace, unless the target is a shared Service or one the source namespace's destinations list.
+func (g *TunnelGateway) serveWorkerTCP(instanceID, pod string, reader *bufio.Reader, stream *yamux.Stream, target string) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		return
 	}
-	upstream, err := g.dialFromWorker(instanceID, host, port, target)
+	upstream, err := g.dialFromWorker(instanceID, pod, host, port, target)
 	if err != nil {
-		g.logTCPError(instanceID, target, err)
+		source := instanceID
+		if pod != "" {
+			source += " pod " + pod
+		}
+		g.logTCPError(source, target, err)
 		return
 	}
 	bridge(reader, stream, upstream)
 }
 
-func (g *TunnelGateway) dialFromWorker(instanceID, host, port, target string) (net.Conn, error) {
-	source, err := g.workerNamespaceOf(instanceID, "unknown_source")
+func (g *TunnelGateway) dialFromWorker(instanceID, pod, host, port, target string) (net.Conn, error) {
+	source, err := g.streamNamespaceOf(instanceID, pod)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +102,9 @@ func (g *TunnelGateway) dialFromWorker(instanceID, host, port, target string) (n
 		}
 		return (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
 	}
+	if g.destinations.AllowsHost(source, host, port) {
+		return g.dialExternal(target)
+	}
 	if err := g.allowDirect(host, port); err != nil {
 		return nil, refuse("direct_forbidden", "%v", err)
 	}
@@ -105,6 +116,27 @@ func (g *TunnelGateway) dialFromWorker(instanceID, host, port, target string) (n
 		return nil, err
 	}
 	return (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
+}
+
+// dialExternal connects the gateway to an allow-listed external host:port, resolving a hostname with the plugin's own
+// resolver.
+func (g *TunnelGateway) dialExternal(target string) (net.Conn, error) {
+	if g.externalDialer != nil {
+		return g.externalDialer(target)
+	}
+	return (&net.Dialer{Timeout: tcpDialTimeout}).Dial("tcp", target)
+}
+
+// streamNamespaceOf returns the namespace a worker's stream acts for: that of the pod the stream names, which must run
+// on the worker, or the worker's namespace for a stream that names none, such as one from a process of the VM itself.
+func (g *TunnelGateway) streamNamespaceOf(instanceID, pod string) (string, error) {
+	if pod == "" || g.podOnWorker == nil {
+		return g.workerNamespaceOf(instanceID, "unknown_source")
+	}
+	if namespace, ok := g.podOnWorker(instanceID, pod); ok {
+		return namespace, nil
+	}
+	return "", refuse("foreign_pod", "pod %s does not run on worker %s", pod, instanceID)
 }
 
 // workerNamespaceOf returns the namespace of a worker's pods, or a refusal with unknownReason when it has none.
@@ -142,9 +174,9 @@ func (g *TunnelGateway) inServiceNetworks(host string) bool {
 	return false
 }
 
-// allowService refuses a stream from a worker of namespace source to a Service ClusterIP unless the Service lies in
-// source, among the shared Services, or is one that a Service of source stands in for, and exposes port. Unlike pod addresses, Services may expose ports below 1024: a
-// ClusterIP reaches only the Service's own endpoints.
+// allowService refuses a stream from a pod of namespace source to a Service ClusterIP unless the Service lies in source,
+// among the shared Services or the destinations of source, or is one that a Service of source stands in for, and exposes
+// port. Unlike pod addresses, Services may expose ports below 1024: a ClusterIP reaches only the Service's own endpoints.
 func (g *TunnelGateway) allowService(source, host, port string) error {
 	if g.services == nil || !g.services.HasSynced() {
 		return refuse("unsynced", "the service watch has not synced")
@@ -154,6 +186,7 @@ func (g *TunnelGateway) allowService(source, host, port string) error {
 		return refuse("unknown_target", "no service holds %s", host)
 	}
 	if svc.Namespace != source && !g.sharedServices[svc.Namespace+"/"+svc.Name] &&
+		!g.destinations.AllowsService(source, svc.Namespace, svc.Name) &&
 		(g.regionalServices == nil || !g.regionalServices.StandsInFor(source, svc.Namespace, svc.Name)) {
 		return refuse("namespace_mismatch", "namespace %s may not reach service %s/%s", source, svc.Namespace, svc.Name)
 	}

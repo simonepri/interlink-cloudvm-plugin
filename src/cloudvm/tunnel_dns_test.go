@@ -122,10 +122,15 @@ func (r *fakeResolver) wasAsked(name string) bool {
 
 func packDNSQuery(t *testing.T, name string) []byte {
 	t.Helper()
+	return packDNSQueryType(t, name, dnsmessage.TypeA)
+}
+
+func packDNSQueryType(t *testing.T, name string, qtype dnsmessage.Type) []byte {
+	t.Helper()
 	msg := dnsmessage.Message{
 		Header: dnsmessage.Header{ID: 0x5151, RecursionDesired: true},
 		Questions: []dnsmessage.Question{
-			{Name: dnsmessage.MustNewName(name), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+			{Name: dnsmessage.MustNewName(name), Type: qtype, Class: dnsmessage.ClassINET},
 		},
 	}
 	query, err := msg.Pack()
@@ -138,13 +143,19 @@ func packDNSQuery(t *testing.T, name string) []byte {
 // queryDNS asks the resolver at addr for the A records of name over UDP.
 func queryDNS(t *testing.T, addr, name string) dnsmessage.Message {
 	t.Helper()
+	return queryDNSType(t, addr, name, dnsmessage.TypeA)
+}
+
+// queryDNSType asks the resolver at addr for the qtype records of name over UDP.
+func queryDNSType(t *testing.T, addr, name string, qtype dnsmessage.Type) dnsmessage.Message {
+	t.Helper()
 	conn, err := net.DialTimeout("udp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial %s: %v", addr, err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	if _, err := conn.Write(packDNSQuery(t, name)); err != nil {
+	if _, err := conn.Write(packDNSQueryType(t, name, qtype)); err != nil {
 		t.Fatalf("write query: %v", err)
 	}
 	buf := make([]byte, maxDNSReply)

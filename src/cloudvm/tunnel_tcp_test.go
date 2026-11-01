@@ -509,10 +509,10 @@ func TestTunnelTCP_GatewayRefusesWorkersWithoutOneNamespace(t *testing.T) {
 	capacity, _ := NewResourceVector("4", "16Gi", 0, 0)
 	np.RegisterNode(NewCloudVMNode("i-empty", ProviderMock, "eu-west-1", "10.0.0.1", capacity))
 	g := &TunnelGateway{workerNamespace: np.InstanceNamespace}
-	if _, err := g.dialFromWorker("i-empty", "10.0.0.2", "6379", "10.0.0.2:6379"); !isRefusal(err, "unknown_source") {
+	if _, err := g.dialFromWorker("i-empty", "", "10.0.0.2", "6379", "10.0.0.2:6379"); !isRefusal(err, "unknown_source") {
 		t.Fatalf("stream from a worker without pods: %v, want unknown_source", err)
 	}
-	if _, err := (&TunnelGateway{}).dialFromWorker("i-empty", "10.0.0.2", "6379", "10.0.0.2:6379"); !isRefusal(err, "unknown_source") {
+	if _, err := (&TunnelGateway{}).dialFromWorker("i-empty", "", "10.0.0.2", "6379", "10.0.0.2:6379"); !isRefusal(err, "unknown_source") {
 		t.Fatalf("stream without a worker namespace resolver: %v, want unknown_source", err)
 	}
 }

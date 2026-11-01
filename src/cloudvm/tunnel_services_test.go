@@ -43,7 +43,7 @@ func TestTunnelTCP_WorkerReachesServicesOfItsNamespaceAndSharedOnes(t *testing.T
 	shared, _ := ParseSharedServices("s3-system/s3-gateway")
 	services := &fakeServices{synced: true}
 	g := &TunnelGateway{workerNamespace: np.InstanceNamespace, serviceNetworks: networks, services: services, sharedServices: shared}
-	dial := func() (net.Conn, error) { return g.dialFromWorker("i-team-a", "127.0.0.1", rawPort, echo) }
+	dial := func() (net.Conn, error) { return g.dialFromWorker("i-team-a", "", "127.0.0.1", rawPort, echo) }
 	expect := func(t *testing.T, reason string) {
 		t.Helper()
 		conn, err := dial()
@@ -136,9 +136,10 @@ func TestTunnelAgent_TunnelsRedirectedConnectionsToTheirOriginalDestination(t *t
 	out := runAgentPython(t, `
 import asyncio, socket, struct
 class Sock:
+    dest = "172.20.0.10"
     def getsockopt(self, level, opt, size):
         assert (level, opt, size) == (socket.SOL_IP, agent.SO_ORIGINAL_DST, 16)
-        return struct.pack("!HH4s8x", socket.AF_INET, 80, socket.inet_aton("172.20.0.10"))
+        return struct.pack("!HH4s8x", socket.AF_INET, 80, socket.inet_aton(Sock.dest))
 class Writer:
     closed = False
     def get_extra_info(self, name):
@@ -149,8 +150,8 @@ class Stream:
     async def run(self):
         pass
 class Session:
-    def open_tcp_stream(self, target, reader, writer):
-        print("tunnel", target)
+    def open_tcp_stream(self, target, reader, writer, pod):
+        print("tunnel", target, repr(pod))
         return Stream()
 async def main():
     proxy = agent.TCPProxy()
@@ -159,10 +160,13 @@ async def main():
     print("closed without a session", writer.closed)
     proxy.session = Session()
     await proxy.handle_redirected(None, Writer())
+    proxy.set_destinations({"profiles.example.com": "198.18.7.9"}, [])
+    Sock.dest = "198.18.7.9"
+    await proxy.handle_redirected(None, Writer())
     await asyncio.sleep(0)
 asyncio.run(main())
 `)
-	if want := "closed without a session True\ntunnel 172.20.0.10:80\n"; out != want {
+	if want := "closed without a session True\ntunnel 172.20.0.10:80 ''\ntunnel profiles.example.com:80 ''\n"; out != want {
 		t.Fatalf("agent printed %q, want %q", out, want)
 	}
 }

@@ -51,6 +51,7 @@ type CloudInitConfig struct {
 	TunnelDirectCIDRs      []string
 	TunnelCIDRs            []string
 	TunnelServiceCIDRs     []string
+	TunnelRedirects        []TunnelRedirect
 	RunnerDirectHTTP       bool
 	Region                 string
 	InstanceType           string
@@ -139,6 +140,11 @@ func (c *CloudInitConfig) SpotWatcherScriptSHA256() string {
 // TunnelCIDRList returns the comma-separated networks the worker's agent sends through the tunnel.
 func (c *CloudInitConfig) TunnelCIDRList() string {
 	return strings.Join(c.TunnelCIDRs, ",")
+}
+
+// TransparentProxy reports whether the bootstrap redirects connections into the agent's transparent port.
+func (c *CloudInitConfig) TransparentProxy() bool {
+	return len(c.TunnelServiceCIDRs) > 0 || len(c.TunnelRedirects) > 0
 }
 
 // TransparentProxyPort is the loopback port where the worker's agent accepts the connections the bootstrap redirects
@@ -755,16 +761,18 @@ cloudvm_fetch_script {{.SpotWatcherScriptSHA256}} /usr/local/bin/cloudvm-spot-wa
 CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" nohup python3 /usr/local/bin/cloudvm-spot-watcher.py >> {{.SpotWatcherLogPath}} 2>&1 < /dev/null &
 cloudvm_fetch_script {{.TunnelAgentScriptSHA256}} /usr/local/bin/cloudvm-tunnel-agent.py
 chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
-{{if .TunnelServiceCIDRs}}
-# Connections to cluster Services enter the agent, which tunnels them, so clients need no proxy; the gateway stays direct.
+{{if .TransparentProxy}}
+# Connections to cluster Services and allow-listed external hosts enter the agent, which tunnels them, so clients need no
+# proxy; the gateway stays direct.
 iptables -t nat -N CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -F CLOUDVM_SERVICES || cloudvm_bootstrap_failed "cannot create the Service redirect chain"
 {{if .TunnelGatewayIP}}iptables -t nat -A CLOUDVM_SERVICES -d {{.TunnelGatewayIP}} -j RETURN || cloudvm_bootstrap_failed "cannot exempt the tunnel gateway from the Service redirect"
 {{end}}{{range .TunnelServiceCIDRs}}iptables -t nat -A CLOUDVM_SERVICES -p tcp -d {{.}} -j REDIRECT --to-ports {{$.TransparentProxyPort}} || cloudvm_bootstrap_failed "cannot redirect Service network {{.}} into the tunnel agent"
+{{end}}{{range .TunnelRedirects}}iptables -t nat -A CLOUDVM_SERVICES -p tcp -d {{.Network}}{{if .Port}} --dport {{.Port}}{{end}} -j REDIRECT --to-ports {{$.TransparentProxyPort}} || cloudvm_bootstrap_failed "cannot redirect {{.Network}} into the tunnel agent"
 {{end}}iptables -t nat -C OUTPUT -j CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -A OUTPUT -j CLOUDVM_SERVICES || cloudvm_bootstrap_failed "cannot hook the Service redirect into OUTPUT"
 {{end}}
 CLOUDVM_CONTAINER_CLI="nerdctl" CLOUDVM_TUNNEL_ENDPOINT="{{.TunnelEndpoint}}" CLOUDVM_INSTANCE_ID="$TUNNEL_INSTANCE_ID" CLOUDVM_PLATFORM="$TUNNEL_PLATFORM" \
   CLOUDVM_DIRECT_CIDRS="{{.DirectCIDRList}}" CLOUDVM_TUNNEL_CIDRS="{{.TunnelCIDRList}}" \
-  CLOUDVM_TRANSPARENT_PORT="{{if .TunnelServiceCIDRs}}{{.TransparentProxyPort}}{{else}}0{{end}}" CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1" \
+  CLOUDVM_TRANSPARENT_PORT="{{if .TransparentProxy}}{{.TransparentProxyPort}}{{else}}0{{end}}" CLOUDVM_DNS_LISTEN="127.0.0.153:53" CLOUDVM_DNS_TAKEOVER="1" \
   CLOUDVM_LOG_FILES="bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log,{{.SpotWatcherLogFile}}" \
   nohup python3 /usr/local/bin/cloudvm-tunnel-agent.py 2>&1 < /dev/null | cloudvm_mirror /var/log/cloudvm-tunnel-agent.log &
 {{end}}

@@ -66,6 +66,11 @@ func (r *TunnelHandshakeRequest) BootMarks() []BootMark {
 type TunnelHandshakeResponse struct {
 	Status string `json:"status"` // "ok" or "error"
 	Error  string `json:"error,omitempty"`
+	// SyntheticHosts maps each allow-listed external hostname to the address the worker's agent answers it with and
+	// maps back to the hostname in the tcp streams it opens.
+	SyntheticHosts map[string]string `json:"syntheticHosts,omitempty"`
+	// ExternalAddresses lists the allow-listed IPv4 host:port destinations, which the agent's CONNECT proxy tunnels.
+	ExternalAddresses []string `json:"externalAddresses,omitempty"`
 }
 
 // lostSessionMemory is how long the registry remembers when an instance's session closed.
@@ -232,6 +237,9 @@ type TunnelGateway struct {
 	services            ClusterServices
 	sharedServices      map[string]bool
 	workerNamespace     WorkerNamespaceResolver
+	podOnWorker         PodNamespaceOnWorkerResolver
+	destinations        *NamespaceDestinations
+	externalDialer      func(target string) (net.Conn, error)
 	workerRegion        func(instanceID string) (string, bool)
 	regionalServices    RegionalServices
 	onTCPRefusal        func(reason string)
@@ -276,6 +284,12 @@ type TunnelGatewayConfig struct {
 	SharedServices map[string]bool
 	// WorkerNamespace maps a worker to the namespace of its pods; every tcp stream is refused when nil.
 	WorkerNamespace WorkerNamespaceResolver
+	// PodNamespaceOnWorker maps a pod a worker's stream names to its namespace, when the plugin placed the pod on that
+	// worker; streams are attributed to the worker's namespace, whatever pod they name, when nil.
+	PodNamespaceOnWorker PodNamespaceOnWorkerResolver
+	// Destinations lists the Services and external hosts that pods of each namespace may reach besides their own
+	// namespace's Services and SharedServices.
+	Destinations *NamespaceDestinations
 	// WorkerRegion maps a worker to the region it runs in; no stand-in answers its DNS queries when nil.
 	WorkerRegion func(instanceID string) (string, bool)
 	// RegionalServices finds the stand-ins of regional namespaces; workers see only the real Services when nil.
@@ -303,6 +317,9 @@ type WorkerStreamHeader struct {
 	Version int    `json:"version"`
 	// Target is the host:port a tcp stream connects to.
 	Target string `json:"target,omitempty"`
+	// Pod is the UID of the pod whose process opened the connection a tcp or dns stream carries; empty for a process
+	// of the VM itself and for agents that do not attribute connections.
+	Pod string `json:"pod,omitempty"`
 }
 
 // NewTunnelGateway creates a new TunnelGateway.
@@ -348,6 +365,8 @@ func NewTunnelGateway(cfg TunnelGatewayConfig) (*TunnelGateway, error) {
 		services:            cfg.Services,
 		sharedServices:      cfg.SharedServices,
 		workerNamespace:     cfg.WorkerNamespace,
+		podOnWorker:         cfg.PodNamespaceOnWorker,
+		destinations:        cfg.Destinations,
 		workerRegion:        cfg.WorkerRegion,
 		regionalServices:    cfg.RegionalServices,
 		onTCPRefusal:        cfg.OnTCPRefusal,
@@ -497,9 +516,9 @@ func (g *TunnelGateway) serveWorkerStream(instanceID string, stream *yamux.Strea
 	case header.Stream == WorkerLogStreamKind && g.logSink != nil:
 		g.logSink.ConsumeWorkerLogs(instanceID, reader)
 	case header.Stream == WorkerTCPStreamKind:
-		g.serveWorkerTCP(instanceID, reader, stream, header.Target)
+		g.serveWorkerTCP(instanceID, header.Pod, reader, stream, header.Target)
 	case header.Stream == WorkerDNSStreamKind:
-		g.serveWorkerDNS(instanceID, reader, stream)
+		g.serveWorkerDNS(instanceID, header.Pod, reader, stream)
 	}
 }
 
@@ -545,6 +564,9 @@ func (g *TunnelGateway) sendHandshakeResponse(w io.Writer, status, errMsg string
 	resp := TunnelHandshakeResponse{
 		Status: status,
 		Error:  errMsg,
+	}
+	if status == "ok" && g.destinations != nil {
+		resp.SyntheticHosts, resp.ExternalAddresses = g.destinations.SyntheticHosts(), g.destinations.ExternalAddresses()
 	}
 	data, _ := json.Marshal(resp)
 	data = append(data, '\n')

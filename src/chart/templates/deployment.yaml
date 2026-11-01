@@ -143,6 +143,10 @@ spec:
               value: "{{ .Values.tunnel.directFallback }}"
             - name: TAILSCALE_TAGS
               value: {{ .Values.tunnel.tailscaleTags | quote }}
+            {{- if .Values.tunnel.namespaceDestinations }}
+            - name: TUNNEL_NAMESPACE_DESTINATIONS
+              value: {{ toJson .Values.tunnel.namespaceDestinations | quote }}
+            {{- end }}
             {{- if .Values.tunnel.authKeySecret.name }}
             - name: TAILSCALE_AUTHKEY
               valueFrom:
