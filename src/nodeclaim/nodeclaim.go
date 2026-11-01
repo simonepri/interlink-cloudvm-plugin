@@ -240,6 +240,44 @@ type InstanceType struct {
 // Catalog is the response of GET /v1/catalog.
 type Catalog struct {
 	InstanceTypes []InstanceType `json:"instanceTypes"`
+	// Transfer prices data transfer between the catalog regions and the cluster's home region; plugins without a
+	// configured home region send none.
+	Transfer *CatalogTransfer `json:"transfer,omitempty"`
+}
+
+// CatalogTransfer holds what an offering's data transfer costs: list rates between each catalog region and the home
+// region, and the traffic the plugin measured on each NodePool's VMs outside the home region.
+type CatalogTransfer struct {
+	HomeProvider string             `json:"homeProvider"`
+	HomeRegion   string             `json:"homeRegion"`
+	Regions      []RegionTransfer   `json:"regions,omitempty"`
+	NodePools    []NodePoolTransfer `json:"nodePools,omitempty"`
+}
+
+// RegionTransfer is the USD per GB the sender pays between one region and the home region; a nil rate is unknown.
+type RegionTransfer struct {
+	Provider string `json:"provider"`
+	Region   string `json:"region"`
+	// FromHomeUSDPerGB is the home region's rate for bytes it sends to the region, such as image pulls.
+	FromHomeUSDPerGB *float64 `json:"fromHomeUSDPerGB,omitempty"`
+	// ToHomeUSDPerGB is the region's rate for bytes its VMs send to the home region.
+	ToHomeUSDPerGB *float64 `json:"toHomeUSDPerGB,omitempty"`
+}
+
+// NodePoolTransfer is the traffic between a NodePool's VMs outside the home region and the home region, measured by
+// their traffic meters.
+type NodePoolTransfer struct {
+	NodePool string `json:"nodePool"`
+	// VMs is how many VMs the averages come from.
+	VMs int `json:"vms"`
+	// ImagePullGBPerVM is the GB of images an average VM pulled from the home region.
+	ImagePullGBPerVM float64 `json:"imagePullGBPerVM"`
+	// HomeTransmitGBPerHour and HomeReceiveGBPerHour are the GB an average VM sent to and received from the home
+	// region per hour, besides image pulls, directly or through the tunnel.
+	HomeTransmitGBPerHour float64 `json:"homeTransmitGBPerHour"`
+	HomeReceiveGBPerHour  float64 `json:"homeReceiveGBPerHour"`
+	// LifetimeHours is how long the NodePool's VMs that stopped reporting ran on average; 0 before any did.
+	LifetimeHours float64 `json:"lifetimeHours,omitempty"`
 }
 
 // ErrorResponse is the JSON body of every non-2xx response.

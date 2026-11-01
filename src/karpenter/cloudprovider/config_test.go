@@ -44,11 +44,17 @@ gpuClasses:
     memoryGB: 40
   - class: a10g
     models: [a10g, "A10G 24GB"]
+transferCost:
+  default:
+    imagePullGB: 40
+    expectedLifetime: 6h
+  nodePools:
+    batch:
+      homeTransmitGBPerHour: 2.5
+  minMeasuredVMs: 5
 dataCost:
   homeRegion: us-east-1
   defaultUSDPerHour: 0.02
-  perRegionUSDPerHour:
-    ap-south-1: 0.15
 catalogTTL: 30s
 offeringSpread:
   priceTolerance: 0.15
@@ -81,10 +87,18 @@ nodePoolSelector:
 			t.Errorf("GPUClassFor(%q, %d) = %q, want %q", tc.model, tc.memoryGB, got, tc.want)
 		}
 	}
-	for region, want := range map[string]float64{"us-east-1": 0, "ap-south-1": 0.15, "eu-west-1": 0.02} {
-		if got := cfg.DataCostFor(region); got != want {
-			t.Errorf("DataCostFor(%s) = %v, want %v", region, got, want)
-		}
+	if got := cfg.TransferProfileFor("gpu"); got.ImagePullGB != 40 || got.ExpectedLifetime.Duration != 6*time.Hour {
+		t.Errorf("default transfer profile = %+v", got)
+	}
+	if got := cfg.TransferProfileFor("batch"); got.HomeTransmitGBPerHour != 2.5 || got.ImagePullGB != 0 {
+		t.Errorf("batch transfer profile = %+v, want its own entry in place of the default", got)
+	}
+	if cfg.TransferCost.MinMeasuredVMs != 5 {
+		t.Errorf("minMeasuredVMs = %d", cfg.TransferCost.MinMeasuredVMs)
+	}
+	// The flat dataCost adder is ignored, but an old config that sets it still loads.
+	if !cfg.DeprecatedDataCost() {
+		t.Error("the deprecated dataCost is not reported")
 	}
 }
 
@@ -92,7 +106,9 @@ func TestLoadConfigRejectsInvalid(t *testing.T) {
 	for name, body := range map[string]string{
 		"conflicting model": "gpuClasses: [{class: a, models: [L4]}, {class: b, models: [l4]}]",
 		"negative memory":   "gpuClasses: [{class: a, models: [l4], memoryGB: -1}]",
-		"negative cost":     "dataCost: {homeRegion: x, perRegionUSDPerHour: {y: -1}}",
+		"negative pulls":    "transferCost: {default: {imagePullGB: -1}}",
+		"negative rate":     "transferCost: {nodePools: {a: {homeReceiveGBPerHour: -1}}}",
+		"negative measured": "transferCost: {minMeasuredVMs: -1}",
 		"unknown field":     "gpuClass: []",
 		"bad duration":      "catalogTTL: soon",
 		"bad selector":      `nodePoolSelector: {"bad key!": x}`,
@@ -105,13 +121,6 @@ func TestLoadConfigRejectsInvalid(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
-	}
-}
-
-func TestDataCostWithoutHomeRegionIsZero(t *testing.T) {
-	cfg := &Config{DataCost: DataCost{DefaultUSDPerHour: 1}}
-	if got := cfg.DataCostFor("anywhere"); got != 0 {
-		t.Fatalf("got %v, want 0 when no home region is set", got)
 	}
 }
 

@@ -111,10 +111,11 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 		}
 		return nil, err
 	}
-	return c.instanceTypesFor(ctx, nodeClass)
+	return c.instanceTypesFor(ctx, nodeClass, nodePool.Name)
 }
 
-func (c *CloudProvider) instanceTypesFor(ctx context.Context, nodeClass *v1alpha1.CloudVMNodeClass) ([]*cloudprovider.InstanceType, error) {
+// instanceTypesFor returns the instance types of a NodeClass, priced with the transfer profile of nodePool.
+func (c *CloudProvider) instanceTypesFor(ctx context.Context, nodeClass *v1alpha1.CloudVMNodeClass, nodePool string) ([]*cloudprovider.InstanceType, error) {
 	regions := make([]string, 0, len(nodeClass.Spec.Footprint))
 	for _, r := range nodeClass.Spec.Footprint {
 		regions = append(regions, r.Region)
@@ -123,7 +124,7 @@ func (c *CloudProvider) instanceTypesFor(ctx context.Context, nodeClass *v1alpha
 	if err != nil {
 		return nil, err
 	}
-	return c.instanceTypes(catalog, nodeClass)
+	return c.instanceTypes(catalog, nodeClass, nodePool)
 }
 
 // Create launches one VM for a launchable offering compatible with the NodeClaim, spread among the cheapest ones. When
@@ -143,7 +144,7 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *
 	if ready := nodeClass.StatusConditions().Get(status.ConditionReady); ready.IsFalse() {
 		return nil, cloudprovider.NewNodeClassNotReadyError(errors.New(ready.Message))
 	}
-	its, err := c.instanceTypesFor(ctx, nodeClass)
+	its, err := c.instanceTypesFor(ctx, nodeClass, nc.Labels[karpv1.NodePoolLabelKey])
 	if err != nil {
 		return nil, err
 	}

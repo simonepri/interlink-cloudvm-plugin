@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -192,8 +193,8 @@ func NewObservabilityMetrics() *ObservabilityMetrics {
 
 		spendPerHour: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_spend_usd_per_hour",
-			Help: "Current run-rate spend in USD per hour computed from fulfilled instance prices",
-		}, fleetLabels),
+			Help: "Current run-rate spend in USD per hour: component compute from fulfilled instance prices, and component transfer from the estimated data transfer cost of the last 15 minutes",
+		}, append(slices.Clone(fleetLabels), "component")),
 
 		podsRunning: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cloudvm_pods_running",
@@ -523,7 +524,7 @@ func (m *ObservabilityMetrics) SetFleetGauges(provider, region, accelerator, ins
 	m.memoryGiBRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(memGiB)
 	m.gpusRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(gpus)
 	m.vramGBRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(vramGB)
-	m.spendPerHour.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(spendPerHour)
+	m.spendPerHour.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType, spendComponentCompute).Set(spendPerHour)
 	if len(extras) > 0 {
 		m.podsRunning.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType).Set(extras[0])
 	}
@@ -677,4 +678,24 @@ func (m *ObservabilityMetrics) AddPodTransfer(namespace, pod, podUID, provider, 
 func (m *ObservabilityMetrics) DeletePodTransfer(podUID string) {
 	m.podTransferBytes.DeletePartialMatch(prometheus.Labels{"pod_uid": podUID})
 	m.podTransferCost.DeletePartialMatch(prometheus.Labels{"pod_uid": podUID})
+}
+
+// Components of the spend gauge.
+const (
+	spendComponentCompute  = "compute"
+	spendComponentTransfer = "transfer"
+)
+
+// SetTransferSpend sets the run-rate data transfer spend of a fleet group, next to its compute spend.
+func (m *ObservabilityMetrics) SetTransferSpend(provider, region, accelerator, instanceType, gpuModel, capacityType string, usdPerHour float64) {
+	if accelerator == "" {
+		accelerator = "none"
+	}
+	if instanceType == "" {
+		instanceType = "none"
+	}
+	if gpuModel == "" {
+		gpuModel = "none"
+	}
+	m.spendPerHour.WithLabelValues(provider, region, accelerator, instanceType, gpuModel, capacityType, spendComponentTransfer).Set(usdPerHour)
 }

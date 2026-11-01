@@ -322,6 +322,7 @@ cloudvm_spot_placement_score"]:::central
   - `cloudvm_transfer_cost_usd_total{provider, region, direction, peer, path, charged_provider, charged_region}`: Estimated USD at list rates, labeled with the region that pays.
   - `cloudvm_image_pull_receive_bytes_total{provider, region, instance_type, peer}`: Bytes received for image pulls.
   - `cloudvm_pod_network_transfer_bytes_total{namespace, pod, pod_uid, provider, region, direction, peer}` and `cloudvm_pod_transfer_cost_usd_total{...}`: The same per pod; a pod's series go away 15 minutes after its last report.
+  - `cloudvm_spend_usd_per_hour{..., component="transfer"}`: Each fleet group's estimated transfer spend over the last 15 minutes, next to its `component="compute"` instance spend.
 
 ---
 
@@ -490,7 +491,7 @@ helm upgrade --install cloudvm-ticker \
 
 ### Karpenter Controller Chart (VM per NodeClaim)
 
-`cloudvm-karpenter` runs a second Karpenter controller (core v1.15.0) next to the cluster's existing one. Karpenter splits work by NodeClass kind, so this controller manages only NodePools whose `nodeClassRef` is a `CloudVMNodeClass` and never touches the other controller's NodePools, NodeClaims, or Nodes. It launches one VM per NodeClaim through the plugin's NodeClaim API. Offerings cover every (region, zone, capacity type) in the NodeClass footprint, priced from the plugin's ticker plus an optional cross-region data cost, so Karpenter's cheapest-offering choice also picks the region.
+`cloudvm-karpenter` runs a second Karpenter controller (core v1.15.0) next to the cluster's existing one. Karpenter splits work by NodeClass kind, so this controller manages only NodePools whose `nodeClassRef` is a `CloudVMNodeClass` and never touches the other controller's NodePools, NodeClaims, or Nodes. It launches one VM per NodeClaim through the plugin's NodeClaim API. Offerings cover every (region, zone, capacity type) in the NodeClass footprint, priced from the plugin's ticker plus the offering's expected data transfer with the cluster's home region, so Karpenter's cheapest-offering choice and its consolidation also pick the region. That transfer cost is per NodePool (`config.transferCost`): a VM's image pulls from the home region, billed at the home region's rate and spread over the VM's expected lifetime, plus its steady traffic with the home region per hour, at the rate of the side that sends it. The rates come from the plugin's catalog, which prices each region against the plugin's `transferCost` values. Once the plugin has measured enough of a NodePool's VMs outside the home region, their image pulls and steady traffic replace the configured values. Offerings within `offeringSpread.priceTolerance` of the cheapest adjusted price still spread.
 
 The controller authenticates every plugin call with a projected service account token bound to the audience `plugin.tokenAudience` (default `cloudvm-plugin`). The plugin verifies it with a TokenReview, so set the plugin chart's `nodeClaimAPI.audience` to the same audience and add the controller's service account, `system:serviceaccount:<release namespace>:<service account name>`, to `nodeClaimAPI.allowedUsers` (`NODECLAIM_API_ALLOWED_USERS`); the plugin refuses every call from anyone else, and the controller refuses to start without its token. The chart installs only the `CloudVMNodeClass` CRD. The `karpenter.sh` CRDs must come from the cluster's other Karpenter release, which must run the same core minor version.
 
@@ -501,7 +502,7 @@ helm upgrade --install cloudvm-karpenter \
   --set plugin.url=http://interlink-cloudvm-plugin.interlink.svc:4040 \
   --set plugin.tokenAudience=cloudvm-plugin \
   --set-json 'config.gpuClasses=[{"class":"l4","models":["l4"]},{"class":"a100-80gb","models":["a100"],"memoryGB":80}]' \
-  --set-json 'config.dataCost={"homeRegion":"us-east-1","defaultUSDPerHour":0.05}'
+  --set-json 'config.transferCost={"default":{"imagePullGB":40,"expectedLifetime":"6h","homeTransmitGBPerHour":1},"minMeasuredVMs":5}'
 ```
 
 Partition pods so each one fits only one controller's NodePools: the two controllers cannot see each other's in-flight NodeClaims, so a pod that fits both gets two launches. Give CloudVM NodePools a taint and a template label that only CloudVM workloads tolerate and select:

@@ -30,6 +30,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+	if cfg.DeprecatedDataCost() {
+		fmt.Fprintln(os.Stderr, "config: dataCost is ignored; transferCost prices offerings by their data transfer instead")
+	}
 	api, err := pluginclient.New(pluginURL, os.Getenv("CLOUDVM_PLUGIN_TOKEN_FILE"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

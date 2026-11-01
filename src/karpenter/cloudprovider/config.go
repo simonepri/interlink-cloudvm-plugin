@@ -1,8 +1,9 @@
-// Controller configuration: GPU class mapping, data cost, offering spread, launch fallback, NodePool scope and caching.
+// Controller configuration: GPU class mapping, transfer cost, offering spread, launch fallback, NodePool scope and caching.
 
 package cloudprovider
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -17,9 +18,11 @@ import (
 type Config struct {
 	// GPUClasses maps GPU models to the gpu-class label value the cluster's GPU classes use.
 	GPUClasses []GPUClass `json:"gpuClasses,omitempty"`
-	// DataCost adds a per-hour cost to offerings outside the home region, so cheapest-offering selection accounts
-	// for cross-region data transfer.
-	DataCost DataCost `json:"dataCost,omitzero"`
+	// TransferCost adds each offering's expected data transfer with the home region to its price, so Karpenter ranks
+	// and consolidates offerings by what they cost with their transfer.
+	TransferCost TransferCost `json:"transferCost,omitzero"`
+	// DataCost is the flat per-hour adder TransferCost replaced; it is accepted so older configs load, and ignored.
+	DataCost json.RawMessage `json:"dataCost,omitempty"`
 	// NodePoolSelector restricts the provider to NodePools whose labels match; empty matches every CloudVM NodePool.
 	NodePoolSelector map[string]string `json:"nodePoolSelector,omitempty"`
 	// CatalogTTL is how long a fetched catalog is reused before the plugin is asked again.
@@ -74,14 +77,41 @@ type LaunchFallback struct {
 	Timeout Duration `json:"timeout,omitzero"`
 }
 
-// DataCost holds the per-hour cost added to offerings outside the home region.
-type DataCost struct {
-	// HomeRegion is the region the cluster runs in; its offerings carry no adder.
-	HomeRegion string `json:"homeRegion,omitempty"`
-	// DefaultUSDPerHour is the adder for remote regions missing from PerRegionUSDPerHour.
-	DefaultUSDPerHour float64 `json:"defaultUSDPerHour,omitempty"`
-	// PerRegionUSDPerHour is the adder for each remote region.
-	PerRegionUSDPerHour map[string]float64 `json:"perRegionUSDPerHour,omitempty"`
+// TransferCost holds the traffic each NodePool's VMs exchange with the home region. An offering in a region costs its
+// instance price plus the region's share of a VM's one-time image pulls, amortized over its expected lifetime, plus its
+// steady traffic per hour, each priced at the catalog's rate for the side that sends it.
+type TransferCost struct {
+	// Default is the profile of NodePools that NodePools does not list.
+	Default TransferProfile `json:"default,omitzero"`
+	// NodePools holds the profile of each named NodePool; an entry replaces Default for that NodePool.
+	NodePools map[string]TransferProfile `json:"nodePools,omitempty"`
+	// MinMeasuredVMs is how many VMs outside the home region the plugin must have measured for a NodePool before its
+	// measured image pulls and steady traffic replace the configured ones; 0 keeps the configured profile.
+	MinMeasuredVMs int `json:"minMeasuredVMs,omitempty"`
+}
+
+// TransferProfile is what one VM of a NodePool is expected to exchange with the home region.
+type TransferProfile struct {
+	// ImagePullGB is the GB of images a VM pulls from the home region once, after it boots.
+	ImagePullGB float64 `json:"imagePullGB,omitempty"`
+	// ExpectedLifetime is how long a VM is expected to run, over which its image pulls are amortized.
+	ExpectedLifetime Duration `json:"expectedLifetime,omitzero"`
+	// HomeTransmitGBPerHour and HomeReceiveGBPerHour are the GB a VM sends to and receives from the home region per
+	// hour besides image pulls, directly or through the tunnel.
+	HomeTransmitGBPerHour float64 `json:"homeTransmitGBPerHour,omitempty"`
+	HomeReceiveGBPerHour  float64 `json:"homeReceiveGBPerHour,omitempty"`
+}
+
+func (p TransferProfile) validate(field string) error {
+	switch {
+	case p.ImagePullGB < 0:
+		return fmt.Errorf("%s.imagePullGB: must not be negative", field)
+	case p.ExpectedLifetime.Duration < 0:
+		return fmt.Errorf("%s.expectedLifetime: must not be negative", field)
+	case p.HomeTransmitGBPerHour < 0 || p.HomeReceiveGBPerHour < 0:
+		return fmt.Errorf("%s: GB per hour must not be negative", field)
+	}
+	return nil
 }
 
 // Duration is a time.Duration that reads from a YAML string such as "60s".
@@ -110,6 +140,7 @@ const (
 	DefaultLaunchFallbackTimeout  = time.Minute
 	DefaultMaxPods                = 110
 	DefaultEphemeralStorage       = "100Gi"
+	DefaultVMLifetime             = 4 * time.Hour
 )
 
 // LoadConfig reads a Config from a YAML file; an empty path returns the defaults.
@@ -192,13 +223,16 @@ func (c *Config) complete() error {
 			seen[key] = gc.Class
 		}
 	}
-	for region, v := range c.DataCost.PerRegionUSDPerHour {
-		if v < 0 {
-			return fmt.Errorf("dataCost.perRegionUSDPerHour[%s]: must not be negative", region)
+	if err := c.TransferCost.Default.validate("transferCost.default"); err != nil {
+		return err
+	}
+	for name, p := range c.TransferCost.NodePools {
+		if err := p.validate("transferCost.nodePools[" + name + "]"); err != nil {
+			return err
 		}
 	}
-	if c.DataCost.DefaultUSDPerHour < 0 {
-		return fmt.Errorf("dataCost.defaultUSDPerHour: must not be negative")
+	if c.TransferCost.MinMeasuredVMs < 0 {
+		return fmt.Errorf("transferCost.minMeasuredVMs: must not be negative")
 	}
 	return nil
 }
@@ -224,15 +258,18 @@ func (c *Config) GPUClassFor(model string, memoryGB int) string {
 	return anySize
 }
 
-// DataCostFor returns the per-hour adder for an offering in a region.
-func (c *Config) DataCostFor(region string) float64 {
-	if c.DataCost.HomeRegion == "" || region == c.DataCost.HomeRegion {
-		return 0
+// TransferProfileFor returns the configured profile of a NodePool.
+func (c *Config) TransferProfileFor(nodePool string) TransferProfile {
+	if p, ok := c.TransferCost.NodePools[nodePool]; ok {
+		return p
 	}
-	if v, ok := c.DataCost.PerRegionUSDPerHour[region]; ok {
-		return v
-	}
-	return c.DataCost.DefaultUSDPerHour
+	return c.TransferCost.Default
+}
+
+// DeprecatedDataCost reports whether the config sets the ignored dataCost field.
+func (c *Config) DeprecatedDataCost() bool {
+	trimmed := strings.TrimSpace(string(c.DataCost))
+	return trimmed != "" && trimmed != "{}" && trimmed != "null"
 }
 
 func normalizeModel(m string) string {

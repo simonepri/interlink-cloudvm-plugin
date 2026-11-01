@@ -22,6 +22,8 @@ type FleetTracker struct {
 	defaultRegion   string
 	spotPrices      func(region, zone, instanceType string) (float64, bool)
 	quotaInUse      map[string]float64 // quotaKey -> vCPUs of live instances
+	// transferSpend returns an instance's recent data transfer spend per hour, or nil to report compute spend only.
+	transferSpend func(instanceID string) float64
 }
 
 // GlobalFleetTracker is the singleton instance of the fleet tracker.
@@ -178,6 +180,7 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 	gpuCounts := make(map[fleetKey]int)
 	vramGBCounts := make(map[fleetKey]int)
 	spendRates := make(map[fleetKey]float64)
+	transferRates := make(map[fleetKey]float64)
 	podCounts := make(map[fleetKey]int)
 	spendBaselineRates := make(map[fleetKey]float64)
 
@@ -306,6 +309,9 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 		gpuCounts[key] += gpuCount
 		vramGBCounts[key] += vramGB
 		spendRates[key] += hourlyPrice
+		if f.transferSpend != nil {
+			transferRates[key] += f.transferSpend(inst.ID)
+		}
 		podCounts[key] += podCountsByInstance[inst.ID]
 		spendBaselineRates[key] += ondemandBaseline
 
@@ -350,6 +356,9 @@ func (f *FleetTracker) UpdateLiveFleet(instances []*Instance, activePods ...map[
 	} else {
 		for k, count := range instanceCounts {
 			f.metrics.SetFleetGauges(k.provider, k.region, k.accelerator, k.instanceType, k.gpuModel, k.capacityType, float64(count), float64(vcpuCounts[k]), float64(memGiBCounts[k]), float64(gpuCounts[k]), float64(vramGBCounts[k]), spendRates[k], float64(podCounts[k]), spendBaselineRates[k])
+			if f.transferSpend != nil {
+				f.metrics.SetTransferSpend(k.provider, k.region, k.accelerator, k.instanceType, k.gpuModel, k.capacityType, transferRates[k])
+			}
 		}
 	}
 }

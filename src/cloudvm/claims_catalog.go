@@ -157,6 +157,13 @@ func (s *Server) buildCatalog(ctx context.Context, ticker *SpotPriceTicker, regi
 			out.InstanceTypes = append(out.InstanceTypes, it)
 		}
 	}
+	offered := make(map[string][]string)
+	for _, it := range out.InstanceTypes {
+		for _, o := range it.Offerings {
+			offered[it.Provider] = append(offered[it.Provider], o.Region)
+		}
+	}
+	out.Transfer = GlobalTransferMeter.CatalogTransfer(offered)
 	return out
 }
 

@@ -57,12 +57,24 @@ config:
   #   memoryGB: 80
   # - class: l4
   #   models: [l4]
-  # dataCost adds a per-hour cost to offerings outside homeRegion.
-  dataCost: {}
-  #   homeRegion: us-east-1
-  #   defaultUSDPerHour: 0.0
-  #   perRegionUSDPerHour:
-  #     eu-west-1: 0.05
+  # transferCost adds each offering's data transfer with the cluster's home region to its price, so Karpenter ranks
+  # and consolidates offerings with it. The plugin's catalog gives the USD per GB rates between each region and the
+  # home region (its transferCost values). Per VM, an offering adds imagePullGB at the home region's rate, spread over
+  # expectedLifetime, plus homeTransmitGBPerHour at its own region's rate and homeReceiveGBPerHour at the home
+  # region's. A nodePools entry replaces default for that NodePool. Once the plugin has measured minMeasuredVMs VMs
+  # of a NodePool outside the home region, their image pulls and steady traffic replace the configured ones, and the
+  # measured lifetime of finished VMs applies when expectedLifetime is unset (else 4h).
+  transferCost:
+    default:
+      imagePullGB: 0
+      homeTransmitGBPerHour: 0
+      homeReceiveGBPerHour: 0
+    nodePools: {}
+    #   cloudvm-gpu:
+    #     imagePullGB: 40
+    #     expectedLifetime: 6h
+    #     homeTransmitGBPerHour: 1
+    minMeasuredVMs: 5
   # nodePoolSelector limits this controller to CloudVM NodePools with these labels; empty serves them all.
   nodePoolSelector: {}
   # offeringSpread lets each claim of a scale-up launch with one of the maxOfferings cheapest compatible offerings

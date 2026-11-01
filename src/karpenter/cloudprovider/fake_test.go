@@ -49,7 +49,7 @@ func (f *fakeAPI) Catalog(_ context.Context, regions []string) (*nodeclaim.Catal
 	for _, r := range regions {
 		want[r] = true
 	}
-	out := &nodeclaim.Catalog{}
+	out := &nodeclaim.Catalog{Transfer: f.catalog.Transfer}
 	for _, it := range f.catalog.InstanceTypes {
 		cp := it
 		cp.Offerings = nil
