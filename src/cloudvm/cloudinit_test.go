@@ -46,6 +46,7 @@ func TestCloudInitGeneration(t *testing.T) {
 func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	testToken := fmt.Sprintf("auth-token-%d", time.Now().UnixNano())
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:       "tunnel.example.internal:443",
 		PodName:              "bin-packed-pod",
 		PodNamespace:         "ai-workloads",
 		PodUID:               "pod-uid-456",
@@ -80,13 +81,13 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	if !bytes.Contains([]byte(script), []byte(fmt.Sprintf(`echo -n "%s" > /etc/cloudvm/runner-token`, testToken))) {
 		t.Errorf("cloud-init missing runner auth token configuration in /etc/cloudvm/runner-token")
 	}
-	if !bytes.Contains([]byte(script), []byte("ThreadingHTTPServer")) {
+	if !bytes.Contains([]byte(runnerScript), []byte("ThreadingHTTPServer")) {
 		t.Errorf("cloud-init runner should use ThreadingHTTPServer for concurrent requests")
 	}
 	if cfg.GPUFlag() != `--gpus '"device=0,1"'` {
 		t.Errorf("cloud-init missing discrete device slicing flags with CSV quotes, got: %s", cfg.GPUFlag())
 	}
-	if !bytes.Contains([]byte(script), []byte("--shm-size=16g")) {
+	if !bytes.Contains([]byte(runnerScript), []byte("--shm-size=16g")) {
 		t.Errorf("cloud-init missing shared memory limit for PyTorch DataLoader")
 	}
 	// Verify initial container is not launched via cloud-init to prevent credential and spec leakage
@@ -144,6 +145,7 @@ func TestPodToInstanceSpec_PriceCapAndEgress(t *testing.T) {
 
 func TestCloudInit_EgressRateLimiting(t *testing.T) {
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:  "tunnel.example.internal:443",
 		PodName:         "rate-limited-pod",
 		PodNamespace:    "default",
 		EgressBandwidth: "250Mbps",
@@ -213,6 +215,7 @@ func TestPodToInstanceSpec_MaxEgressRateDollarConversion(t *testing.T) {
 
 func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:       "tunnel.example.internal:443",
 		PodName:              "syntax-test",
 		PodNamespace:         "default",
 		PodUID:               "uid-syntax-1",
@@ -227,7 +230,7 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	}
 
 	// Verify Python runner imports time and threading
-	if !strings.Contains(script, "import time") || !strings.Contains(script, "import threading") {
+	if !strings.Contains(runnerScript, "import time") || !strings.Contains(runnerScript, "import threading") {
 		t.Fatalf("cloud-init runner missing import time or import threading")
 	}
 
@@ -247,12 +250,12 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	}
 
 	// Verify runner concurrency throttle and shutdown check
-	if !strings.Contains(script, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") ||
+	if !strings.Contains(runnerScript, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") ||
 		!strings.Contains(script, `CLOUDVM_RUNNER_CONCURRENCY=""`) ||
-		!strings.Contains(script, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+		!strings.Contains(runnerScript, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
 		t.Fatalf("cloud-init runner missing CONTAINER_SEMAPHORE definition")
 	}
-	if !strings.Contains(script, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
+	if !strings.Contains(runnerScript, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
 		t.Fatalf("cloud-init runner missing shutting-down check")
 	}
 }
@@ -310,6 +313,7 @@ func TestPodToInstanceSpec_LimitsOnly(t *testing.T) {
 func TestCloudInit_RegistryMirrors(t *testing.T) {
 	t.Run("configured mirrors", func(t *testing.T) {
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:  "tunnel.example.internal:443",
 			PodName:         "mirror-pod",
 			PodNamespace:    "default",
 			RunnerAuthToken: "token-1",
@@ -343,6 +347,7 @@ func TestCloudInit_RegistryMirrors(t *testing.T) {
 
 	t.Run("omitted when empty", func(t *testing.T) {
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:  "tunnel.example.internal:443",
 			PodName:         "no-mirror-pod",
 			PodNamespace:    "default",
 			RunnerAuthToken: "token-2",
@@ -363,6 +368,7 @@ func TestCloudInit_CustomBootstrapScript(t *testing.T) {
 	t.Run("appends custom script at end of user-data", func(t *testing.T) {
 		customCode := "echo 'custom bootstrap running' >> /var/log/custom.log\ninstall -d /opt/custom\n"
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:        "tunnel.example.internal:443",
 			PodName:               "custom-script-pod",
 			PodNamespace:          "default",
 			RunnerAuthToken:       "token-7",
@@ -387,6 +393,7 @@ func TestCloudInit_CustomBootstrapScript(t *testing.T) {
 
 	t.Run("omitted when empty", func(t *testing.T) {
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:  "tunnel.example.internal:443",
 			PodName:         "no-custom-pod",
 			PodNamespace:    "default",
 			RunnerAuthToken: "token-8",
@@ -406,6 +413,7 @@ func TestCloudInit_CustomBootstrapScript(t *testing.T) {
 func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
 	customCode := "echo 'all features combined' > /etc/combined-test.txt"
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:       "tunnel.example.internal:443",
 		PodName:              "combined-pod",
 		PodNamespace:         "prod-ml",
 		PodUID:               "uid-combined-999",
@@ -447,6 +455,7 @@ func TestCloudInit_GenericRuntimeAndDaemonOptionsCombined(t *testing.T) {
 
 func TestCloudInit_ContainerRuntimeAndHeartbeatBootstrap(t *testing.T) {
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:  "tunnel.example.internal:443",
 		PodName:         "boot-test-pod",
 		PodNamespace:    "default",
 		RunnerAuthToken: "token-boot-123",
@@ -486,6 +495,7 @@ func TestCloudInit_ContainerRuntimeAndHeartbeatBootstrap(t *testing.T) {
 func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 	t.Run("default_when_zero", func(t *testing.T) {
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:  "tunnel.example.internal:443",
 			PodName:         "idle-default-pod",
 			PodNamespace:    "default",
 			RunnerAuthToken: "token-idle-1", //nolint:gosec // test mock token
@@ -510,6 +520,7 @@ func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 
 	t.Run("custom_grace_period", func(t *testing.T) {
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:         "tunnel.example.internal:443",
 			PodName:                "idle-custom-pod",
 			PodNamespace:           "default",
 			RunnerAuthToken:        fmt.Sprintf("token-idle-%d", 2),
@@ -535,6 +546,7 @@ func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 
 	t.Run("default_when_negative", func(t *testing.T) {
 		cfg := &CloudInitConfig{
+			TunnelEndpoint:         "tunnel.example.internal:443",
 			PodName:                "idle-neg-pod",
 			PodNamespace:           "default",
 			RunnerAuthToken:        fmt.Sprintf("token-idle-%d", 3),
@@ -556,6 +568,7 @@ func TestCloudInit_IdleGracePeriodSeconds(t *testing.T) {
 func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	// 1. Default behavior (RunnerConcurrency = 0) renders DEFAULT_RUNNER_CONCURRENCY and threading.Semaphore(RUNNER_CONCURRENCY)
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:  "tunnel.example.internal:443",
 		PodName:         "concurrency-pod",
 		PodNamespace:    "default",
 		RunnerAuthToken: "token-conc-1", //nolint:gosec // test mock token
@@ -565,21 +578,22 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 		t.Fatalf("GenerateCloudInit failed: %v", err)
 	}
 
-	if !strings.Contains(script, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") {
+	if !strings.Contains(runnerScript, "DEFAULT_RUNNER_CONCURRENCY = max(4, os.cpu_count() or 4)") {
 		t.Errorf("cloud-init runner missing DEFAULT_RUNNER_CONCURRENCY definition")
 	}
 	if !strings.Contains(script, `CLOUDVM_RUNNER_CONCURRENCY=""`) {
 		t.Errorf("cloud-init runner missing default RUNNER_CONCURRENCY assignment")
 	}
-	if !strings.Contains(script, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+	if !strings.Contains(runnerScript, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
 		t.Errorf("cloud-init runner missing CONTAINER_SEMAPHORE definition with RUNNER_CONCURRENCY")
 	}
-	if !strings.Contains(script, "with CONTAINER_SEMAPHORE:") {
+	if !strings.Contains(runnerScript, "with CONTAINER_SEMAPHORE:") {
 		t.Errorf("cloud-init runner missing with CONTAINER_SEMAPHORE acquisition around container launch")
 	}
 
 	// 2. Explicit positive RunnerConcurrency renders the exact integer in RUNNER_CONCURRENCY = <val>
 	cfgExplicit := &CloudInitConfig{
+		TunnelEndpoint:    "tunnel.example.internal:443",
 		PodName:           "concurrency-pod-explicit",
 		PodNamespace:      "default",
 		RunnerConcurrency: 16,
@@ -591,12 +605,13 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	if !strings.Contains(scriptExplicit, `CLOUDVM_RUNNER_CONCURRENCY="16"`) {
 		t.Errorf("cloud-init runner missing explicit RUNNER_CONCURRENCY = 16")
 	}
-	if !strings.Contains(scriptExplicit, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
+	if !strings.Contains(runnerScript, "CONTAINER_SEMAPHORE = threading.Semaphore(RUNNER_CONCURRENCY)") {
 		t.Errorf("cloud-init runner missing CONTAINER_SEMAPHORE definition with RUNNER_CONCURRENCY")
 	}
 
 	// 3. Negative RunnerConcurrency resets to 0 in Validate() and renders default
 	cfgNegative := &CloudInitConfig{
+		TunnelEndpoint:    "tunnel.example.internal:443",
 		PodName:           "concurrency-pod-neg",
 		PodNamespace:      "default",
 		RunnerConcurrency: -5,
@@ -613,43 +628,14 @@ func TestCloudInit_RunnerConcurrencyAndShutdown(t *testing.T) {
 	}
 
 	// Verify shutdown fail-fast check
-	if !strings.Contains(script, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
+	if !strings.Contains(runnerScript, "if os.path.exists('/tmp/cloudvm-shutting-down'):") {
 		t.Errorf("cloud-init runner missing /tmp/cloudvm-shutting-down check")
 	}
-	if !strings.Contains(script, "self.reply(503, ") {
+	if !strings.Contains(runnerScript, "self.reply(503, ") {
 		t.Errorf("cloud-init runner missing 503 response on shutting-down check")
 	}
-	if !strings.Contains(script, `{"error": "node is shutting down"}`) {
+	if !strings.Contains(runnerScript, `{"error": "node is shutting down"}`) {
 		t.Errorf("cloud-init runner missing shutdown error payload")
-	}
-}
-
-func TestCloudInit_NetworkMetricsScript(t *testing.T) {
-	cfg := &CloudInitConfig{
-		PodName:         "net-test-pod",
-		PodNamespace:    "default",
-		RunnerAuthToken: "token-net-123",
-	}
-
-	script, err := GenerateCloudInit(cfg)
-	if err != nil {
-		t.Fatalf("GenerateCloudInit failed: %v", err)
-	}
-
-	if !strings.Contains(script, "def get_network_bytes():") {
-		t.Errorf("cloud-init runner missing get_network_bytes function")
-	}
-	if !strings.Contains(script, "/proc/net/dev") {
-		t.Errorf("cloud-init runner missing /proc/net/dev file check")
-	}
-	if !strings.Contains(script, "networkRxBytes") {
-		t.Errorf("cloud-init runner missing networkRxBytes field")
-	}
-	if !strings.Contains(script, "networkTxBytes") {
-		t.Errorf("cloud-init runner missing networkTxBytes field")
-	}
-	if !strings.Contains(script, "/host/stats") {
-		t.Errorf("cloud-init runner missing /host/stats endpoint")
 	}
 }
 
@@ -791,24 +777,8 @@ func TestRenderCloudInit_ImageMirrorsAndContainerCLI(t *testing.T) {
 	assertBashSyntax(t, script)
 }
 
-func TestStrippedPythonScriptsStillCompile(t *testing.T) {
-	cfg := &CloudInitConfig{}
-	for name, src := range map[string]string{"runner.py": cfg.RunnerScript()} {
-		if len(src) >= len(runnerScript) {
-			t.Errorf("%s was not stripped", name)
-		}
-		path := filepath.Join(t.TempDir(), name)
-		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if out, err := exec.Command("python3", "-I", "-c", "import ast,sys; ast.parse(open(sys.argv[1]).read())", path).CombinedOutput(); err != nil { //nolint:gosec // test-controlled path
-			t.Errorf("stripped %s does not parse: %v\n%s", name, err, out)
-		}
-	}
-}
-
 func TestRenderCloudInit_InstallsECRCredentialHelper(t *testing.T) {
-	cfg := CloudInitConfig{PodName: "ecr", Region: "eu-west-1", TargetContainerImage: "alpine"}
+	cfg := CloudInitConfig{TunnelEndpoint: "tunnel.example.internal:443", PodName: "ecr", Region: "eu-west-1", TargetContainerImage: "alpine"}
 	script, err := RenderCloudInit(&cfg)
 	if err != nil {
 		t.Fatalf("render: %v", err)
@@ -910,7 +880,7 @@ func TestRenderCloudInit_FailsTheBootstrapWithoutTheMetadataGuard(t *testing.T) 
 	if err != nil {
 		t.Skip("bash not available")
 	}
-	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", Region: "us-east-1", RunnerAuthToken: "tok", TargetContainerImage: "alpine"})
+	script, err := RenderCloudInit(&CloudInitConfig{TunnelEndpoint: "tunnel.example.internal:443", PodName: "p", Region: "us-east-1", RunnerAuthToken: "tok", TargetContainerImage: "alpine"})
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}

@@ -34,26 +34,6 @@ case "$1" in
 esac
 `
 
-// extractRunnerScript returns the runner Python source rendered into the cloud-init script.
-func extractRunnerScript(t *testing.T) string {
-	t.Helper()
-	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", PodUID: "uid", RunnerAuthToken: "tok"})
-	if err != nil {
-		t.Fatalf("render cloud-init: %v", err)
-	}
-	const begin = "cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py\n"
-	start := strings.Index(script, begin)
-	if start < 0 {
-		t.Fatal("runner script not found in cloud-init")
-	}
-	body := script[start+len(begin):]
-	end := strings.Index(body, "\nRUNNER_EOF\n")
-	if end < 0 {
-		t.Fatal("runner script terminator not found in cloud-init")
-	}
-	return body[:end]
-}
-
 type runnerHarness struct {
 	t      *testing.T
 	url    string
@@ -90,7 +70,7 @@ func newRunnerHarness(t *testing.T) *runnerHarness {
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
 
-	src := extractRunnerScript(t)
+	src := runnerScript
 	src = strings.Replace(src, "PORT = 9090", fmt.Sprintf("PORT = %d", port), 1)
 	src = strings.ReplaceAll(src, "/etc/cloudvm/runner-token", tokenPath)
 	src = strings.ReplaceAll(src, "/tmp/cloudvm-heartbeat", filepath.Join(dir, "heartbeat"))

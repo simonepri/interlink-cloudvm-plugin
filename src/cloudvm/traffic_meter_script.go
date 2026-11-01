@@ -1,4 +1,4 @@
-// Embeds the in-VM traffic meter, which tunnel workers fetch next to the runner, and its bootstrap settings.
+// Embeds the in-VM traffic meter, which workers fetch next to the runner at boot, and its bootstrap settings.
 package main
 
 import (
@@ -11,7 +11,7 @@ import (
 //go:embed traffic_meter.py
 var trafficMeterScript string
 
-// TrafficMeterScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the traffic meter by.
+// TrafficMeterScriptSHA256 returns the hex sha256 a worker fetches and verifies the traffic meter by.
 func (c *CloudInitConfig) TrafficMeterScriptSHA256() string {
 	return scriptSHA256(trafficMeterScript)
 }

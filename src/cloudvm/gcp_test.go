@@ -104,6 +104,7 @@ func TestGCPProvider_Launch_Spot(t *testing.T) {
 	p.SetClient(mockClient)
 
 	spec := &InstanceSpec{
+		TunnelEndpoint:  "tunnel.example.internal:443",
 		PodName:         "test-pod",
 		PodNamespace:    "default",
 		PodUID:          "uid-12345-67890",
@@ -209,6 +210,7 @@ func TestGCPProvider_Launch_OnDemand(t *testing.T) {
 	p.SetClient(mockClient)
 
 	spec := &InstanceSpec{
+		TunnelEndpoint:  "tunnel.example.internal:443",
 		PodName:         "ondemand-pod",
 		PodNamespace:    "prod",
 		PodUID:          "uid-ondemand",
@@ -255,6 +257,7 @@ func TestGCPProvider_Launch_CustomSubnetAndServiceAccount(t *testing.T) {
 	p.SetClient(mockClient)
 
 	spec := &InstanceSpec{
+		TunnelEndpoint:      "tunnel.example.internal:443",
 		PodName:             "subnet-pod",
 		PodNamespace:        "default",
 		PodUID:              "uid-sub",
@@ -306,13 +309,14 @@ func TestGCPProvider_Launch_Accelerators_NVIDIA(t *testing.T) {
 		{
 			name: "NVIDIA T4 via GPUType and NumGPUs",
 			spec: &InstanceSpec{
-				PodName:      "gpu-pod-t4",
-				PodNamespace: "default",
-				PodUID:       "uid-t4",
-				InstanceType: "n1-standard-4",
-				GPUType:      "nvidia-tesla-t4",
-				NumGPUs:      2,
-				MarketType:   "on-demand",
+				TunnelEndpoint: "tunnel.example.internal:443",
+				PodName:        "gpu-pod-t4",
+				PodNamespace:   "default",
+				PodUID:         "uid-t4",
+				InstanceType:   "n1-standard-4",
+				GPUType:        "nvidia-tesla-t4",
+				NumGPUs:        2,
+				MarketType:     "on-demand",
 			},
 			expectedAccelType: "zones/us-central1-a/acceleratorTypes/nvidia-tesla-t4",
 			expectedCount:     2,
@@ -320,12 +324,13 @@ func TestGCPProvider_Launch_Accelerators_NVIDIA(t *testing.T) {
 		{
 			name: "NVIDIA A100 via alias on custom shape",
 			spec: &InstanceSpec{
-				PodName:      "gpu-pod-a100",
-				PodNamespace: "default",
-				PodUID:       "uid-a100",
-				InstanceType: "n1-standard-8",
-				GPUType:      "a100",
-				NumGPUs:      1,
+				TunnelEndpoint: "tunnel.example.internal:443",
+				PodName:        "gpu-pod-a100",
+				PodNamespace:   "default",
+				PodUID:         "uid-a100",
+				InstanceType:   "n1-standard-8",
+				GPUType:        "a100",
+				NumGPUs:        1,
 			},
 			expectedAccelType: "zones/us-central1-a/acceleratorTypes/nvidia-tesla-a100",
 			expectedCount:     1,
@@ -333,12 +338,13 @@ func TestGCPProvider_Launch_Accelerators_NVIDIA(t *testing.T) {
 		{
 			name: "NVIDIA V100 via alias on custom shape",
 			spec: &InstanceSpec{
-				PodName:      "gpu-pod-v100",
-				PodNamespace: "default",
-				PodUID:       "uid-v100",
-				InstanceType: "n1-standard-16",
-				GPUType:      "v100",
-				NumGPUs:      2,
+				TunnelEndpoint: "tunnel.example.internal:443",
+				PodName:        "gpu-pod-v100",
+				PodNamespace:   "default",
+				PodUID:         "uid-v100",
+				InstanceType:   "n1-standard-16",
+				GPUType:        "v100",
+				NumGPUs:        2,
 			},
 			expectedAccelType: "zones/us-central1-a/acceleratorTypes/nvidia-tesla-v100",
 			expectedCount:     2,
@@ -399,9 +405,10 @@ func TestGCPProvider_Launch_CustomBootImage(t *testing.T) {
 
 	customImg := "projects/my-ml-images/global/images/cuda-v1"
 	spec := &InstanceSpec{
-		PodName:      "custom-image-pod",
-		PodNamespace: "default",
-		PodUID:       "uid-img",
+		TunnelEndpoint: "tunnel.example.internal:443",
+		PodName:        "custom-image-pod",
+		PodNamespace:   "default",
+		PodUID:         "uid-img",
 		RegionalAMI: map[string]string{
 			"us-central1": customImg,
 		},
@@ -428,10 +435,11 @@ func TestGCPProvider_Terminate(t *testing.T) {
 	p.SetClient(mockClient)
 
 	spec := &InstanceSpec{
-		PodName:      "term-pod",
-		PodNamespace: "default",
-		PodUID:       "uid-term",
-		Region:       "us-central1-b",
+		TunnelEndpoint: "tunnel.example.internal:443",
+		PodName:        "term-pod",
+		PodNamespace:   "default",
+		PodUID:         "uid-term",
+		Region:         "us-central1-b",
 	}
 
 	inst, err := p.Launch(context.Background(), spec)

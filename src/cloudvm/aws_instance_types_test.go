@@ -336,6 +336,7 @@ func TestLaunch_GroupsCandidatesByTemplate(t *testing.T) {
 	}
 	spec := derivationSpec(t, gpuPod(1, "2", "8Gi"))
 	spec.PodUID = "uid-arm"
+	spec.TunnelEndpoint = "tunnel.example.internal:443"
 
 	_, _ = p.Launch(context.Background(), spec)
 

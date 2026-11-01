@@ -393,6 +393,7 @@ func TestPodToInstanceSpec_ZeroAnnotationLeakage(t *testing.T) {
 
 func TestCloudInit_DockerAuth(t *testing.T) {
 	cfg := &CloudInitConfig{
+		TunnelEndpoint:       "tunnel.example.internal:443",
 		PodName:              "auth-pod",
 		PodNamespace:         "default",
 		PodUID:               "pod-uid-101",
@@ -401,39 +402,25 @@ func TestCloudInit_DockerAuth(t *testing.T) {
 	}
 
 	// Generate cloud-init script and verify zero credential leakage
-	script, err := GenerateCloudInit(cfg)
-	if err != nil {
+	if _, err := GenerateCloudInit(cfg); err != nil {
 		t.Fatalf("GenerateCloudInit failed: %v", err)
 	}
 
 	// Verify Python runner isolates credentials in ephemeral directory with 0600 mode
-	if !strings.Contains(script, "dockerConfigJSON") {
+	if !strings.Contains(runnerScript, "dockerConfigJSON") {
 		t.Errorf("cloud-init runner missing dockerConfigJSON parameter handling")
 	}
-	if !strings.Contains(script, "tempfile.mkdtemp") {
+	if !strings.Contains(runnerScript, "tempfile.mkdtemp") {
 		t.Errorf("cloud-init runner missing isolated ephemeral directory creation")
 	}
-	if !strings.Contains(script, "0o600") {
+	if !strings.Contains(runnerScript, "0o600") {
 		t.Errorf("cloud-init runner missing 0600 file permission enforcement")
 	}
 	// 3. Verify Python script syntax
 	tmpDir := t.TempDir()
 	runnerPyPath := filepath.Join(tmpDir, "runner.py")
 
-	// Extract the python runner script from the template
-	startMarker := "cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py\n"
-	startIdx := strings.Index(script, "cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py")
-	if startIdx == -1 {
-		t.Fatalf("runner script heredoc start not found in generated cloud-init")
-	}
-	startIdx += len(startMarker)
-	endIdx := strings.Index(script[startIdx:], "RUNNER_EOF")
-	if endIdx == -1 {
-		t.Fatalf("runner script heredoc end not found in generated cloud-init")
-	}
-	pyCode := script[startIdx : startIdx+endIdx]
-
-	if err := os.WriteFile(runnerPyPath, []byte(pyCode), 0o600); err != nil {
+	if err := os.WriteFile(runnerPyPath, []byte(runnerScript), 0o600); err != nil {
 		t.Fatalf("failed to write runner.py to temp dir: %v", err)
 	}
 

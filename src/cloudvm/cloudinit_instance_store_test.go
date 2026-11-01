@@ -33,7 +33,7 @@ const (
 // extractInstanceStoreFunction returns the cloudvm_instance_store function of a container mode boot script.
 func extractInstanceStoreFunction(t *testing.T) string {
 	t.Helper()
-	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", PodUID: "uid", RunnerAuthToken: "tok"})
+	script, err := RenderCloudInit(&CloudInitConfig{TunnelEndpoint: "tunnel.example.internal:443", PodName: "p", PodUID: "uid", RunnerAuthToken: "tok"})
 	if err != nil {
 		t.Fatalf("render cloud-init: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestCloudInitInstanceStore(t *testing.T) {
 }
 
 func TestCloudInitInstanceStoreRunsBeforeContainerdStarts(t *testing.T) {
-	script, err := RenderCloudInit(&CloudInitConfig{PodName: "p", PodUID: "uid", RunnerAuthToken: "tok"})
+	script, err := RenderCloudInit(&CloudInitConfig{TunnelEndpoint: "tunnel.example.internal:443", PodName: "p", PodUID: "uid", RunnerAuthToken: "tok"})
 	if err != nil {
 		t.Fatalf("render cloud-init: %v", err)
 	}

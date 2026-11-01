@@ -575,7 +575,7 @@ def get_network_bytes():
     return rx_bytes, tx_bytes
 
 class NoTrafficMeter:
-    """Stands in for the traffic meter on workers that did not receive it."""
+    """Stands in for the traffic meter when the runner starts without it."""
 
     def run(self):
         pass
@@ -589,7 +589,7 @@ class NoTrafficMeter:
     def remove_pod(self, uid):
         pass
 
-# Tunnel workers fetch the traffic meter next to the runner; others count only NIC totals.
+# Workers fetch the traffic meter next to the runner; a runner started without it counts only NIC totals.
 try:
     import cloudvm_traffic_meter
     traffic_meter = cloudvm_traffic_meter.TrafficMeter()

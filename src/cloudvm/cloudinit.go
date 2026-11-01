@@ -95,6 +95,9 @@ func (c *CloudInitConfig) Validate() error {
 	if c.IsKMSEncrypted() && c.KMSCiphertext == "" {
 		return fmt.Errorf("KMS token encryption is enabled but KMSCiphertext is empty")
 	}
+	if !c.UseNativeDLAMI && c.TunnelEndpoint == "" {
+		return fmt.Errorf("worker %q has no tunnel endpoint to fetch its runner and traffic meter from at boot", c.PodName)
+	}
 	if c.TunnelTransport == string(TunnelTransportRouter) && net.ParseIP(c.TunnelGatewayIP) == nil {
 		return fmt.Errorf("router tunnel transport needs a gateway IP, got %q", c.TunnelGatewayIP)
 	}
@@ -125,18 +128,12 @@ func (c *CloudInitConfig) TunnelHost() string {
 	return tunnelHost(c.TunnelEndpoint)
 }
 
-// RunnerScript returns the in-VM container runner source with blank and comment-only lines stripped, which workers
-// without a tunnel endpoint receive in their user data.
-func (c *CloudInitConfig) RunnerScript() string {
-	return stripPythonComments(runnerScript)
-}
-
-// RunnerScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the runner by.
+// RunnerScriptSHA256 returns the hex sha256 a worker fetches and verifies the runner by.
 func (c *CloudInitConfig) RunnerScriptSHA256() string {
 	return scriptSHA256(runnerScript)
 }
 
-// SpotWatcherScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the spot watcher by.
+// SpotWatcherScriptSHA256 returns the hex sha256 a worker fetches and verifies the spot watcher by.
 func (c *CloudInitConfig) SpotWatcherScriptSHA256() string {
 	return scriptSHA256(spotWatcherScript)
 }
@@ -176,54 +173,9 @@ func (c *CloudInitConfig) TransparentProxyPort() int {
 	return transparentProxyPort
 }
 
-// TunnelAgentScriptSHA256 returns the hex sha256 a tunnel worker fetches and verifies the tunnel agent by.
+// TunnelAgentScriptSHA256 returns the hex sha256 a worker fetches and verifies the tunnel agent by.
 func (c *CloudInitConfig) TunnelAgentScriptSHA256() string {
 	return scriptSHA256(tunnelAgentScript)
-}
-
-// stripPythonComments drops blank and comment-only lines, drops docstrings, shortening one that is the only statement of
-// its body to "", and indents by one space per level instead of four, to keep the user data under the EC2 size limit.
-// It keeps the shebang and encoding lines and every line inside any other triple-quoted string as written.
-func stripPythonComments(src string) string {
-	var kept []string
-	inString, inDoc := false, false
-	// docIndent is the indentation of a dropped docstring, which needs a "" in its place unless a statement follows it.
-	docIndent := ""
-	pendingDoc := false
-	for i, line := range strings.Split(src, "\n") {
-		trimmed := strings.TrimSpace(line)
-		toggles := strings.Count(line, `"""`)%2 == 1 || strings.Count(line, "'''")%2 == 1
-		if inDoc {
-			inDoc = !toggles
-			continue
-		}
-		code := strings.TrimLeft(line, " ")
-		indent := strings.Repeat(" ", (len(line)-len(code))/4)
-		afterHeader := len(kept) == 0 || strings.HasSuffix(strings.TrimSpace(kept[len(kept)-1]), ":")
-		if !inString && afterHeader && (strings.HasPrefix(trimmed, `"""`) || strings.HasPrefix(trimmed, "'''")) {
-			kept = append(kept, indent+`""`)
-			docIndent, pendingDoc = indent, true
-			inDoc = toggles
-			continue
-		}
-		header := i < 2 && (strings.HasPrefix(trimmed, "#!") || strings.Contains(trimmed, "coding"))
-		keep := inString || header || (trimmed != "" && !strings.HasPrefix(trimmed, "#"))
-		if !inString && !header {
-			line = indent + code
-		}
-		if toggles {
-			inString = !inString
-			keep = true
-		}
-		if keep {
-			if pendingDoc && len(line)-len(strings.TrimLeft(line, " ")) == len(docIndent) {
-				kept = kept[:len(kept)-1] // the statement after the docstring keeps the body non-empty
-			}
-			pendingDoc = false
-			kept = append(kept, line)
-		}
-	}
-	return strings.Join(kept, "\n")
 }
 
 // RunnerBindAddress returns the interface the in-VM runner listens on: loopback when only the tunnel agent may reach it.
@@ -773,7 +725,6 @@ cat << 'IMAGE_MIRRORS_EOF' > /etc/cloudvm/image-mirrors.json
 IMAGE_MIRRORS_EOF
 chmod 600 /etc/cloudvm/image-mirrors.json
 
-{{if .TunnelEndpoint}}
 # cloudvm_fetch_script downloads the script with sha256 $1 from the tunnel gateway to $2, reaching the gateway host the way the
 # tunnel agent does, and fails the bootstrap when the download fails or its hash differs.
 cloudvm_fetch_script() {
@@ -788,11 +739,6 @@ cloudvm_fetch_script() {
 }
 cloudvm_fetch_script {{.RunnerScriptSHA256}} /usr/local/bin/cloudvm-runner.py
 cloudvm_fetch_script {{.TrafficMeterScriptSHA256}} /usr/local/bin/cloudvm_traffic_meter.py
-{{else}}
-cat << 'RUNNER_EOF' > /usr/local/bin/cloudvm-runner.py
-{{.RunnerScript}}
-RUNNER_EOF
-{{end}}
 chmod 700 /usr/local/bin/cloudvm-runner.py
 if command -v python3 >/dev/null 2>&1; then
   CLOUDVM_RUNNER_BIND="{{.RunnerBindAddress}}" CLOUDVM_RUNNER_CONCURRENCY="{{if .RunnerConcurrency}}{{.RunnerConcurrency}}{{end}}" \
