@@ -475,6 +475,9 @@ func (s *Server) launchClaim(ctx context.Context, req *nodeclaim.CreateRequest) 
 			}
 			return nil, refusal
 		}
+		if errors.Is(err, errUserDataTooLarge) {
+			return nil, apiError(http.StatusBadRequest, nodeclaim.ReasonUserDataTooLarge, err.Error())
+		}
 		if errors.Is(err, errNamespaceFirewallMissing) || errors.Is(err, errNoInstanceTypeFits) {
 			return nil, apiError(http.StatusBadRequest, nodeclaim.ReasonInvalidRequest, err.Error())
 		}

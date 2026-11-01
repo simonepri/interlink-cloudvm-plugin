@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/apis/v1alpha1"
@@ -63,6 +64,8 @@ type CloudProvider struct {
 	poolFilter  labels.Selector
 	clock       clock.Clock
 	tracer      trace.Tracer
+	// recorder posts the events of launches the plugin refuses for good; nil posts none.
+	recorder events.Recorder
 }
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -182,6 +185,13 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (out *
 	}
 }
 
+// ReasonUserDataTooLarge is the event and Launched condition reason of a NodeClaim whose VM boot script the cloud would
+// reject for its size.
+const ReasonUserDataTooLarge = "UserDataTooLarge"
+
+// SetEventRecorder sets where the provider posts NodeClaim events.
+func (c *CloudProvider) SetEventRecorder(r events.Recorder) { c.recorder = r }
+
 // launch asks the plugin for a VM of the chosen offering for the NodeClaim.
 func (c *CloudProvider) launch(ctx context.Context, nc *karpv1.NodeClaim, nodeClass *v1alpha1.CloudVMNodeClass, chosen candidate) (*karpv1.NodeClaim, error) {
 	it, offering := chosen.it, chosen.offering
@@ -206,7 +216,15 @@ func (c *CloudProvider) launch(ctx context.Context, nc *karpv1.NodeClaim, nodeCl
 	}
 	created, err := c.api.Create(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("launching %s in %s (%s): %w", it.Name, zone, capacityType, err)
+		err = fmt.Errorf("launching %s in %s (%s): %w", it.Name, zone, capacityType, err)
+		if nodeclaim.IsUserDataTooLarge(err) {
+			if c.recorder != nil {
+				c.recorder.Publish(events.Event{InvolvedObject: nc, Type: corev1.EventTypeWarning, Reason: ReasonUserDataTooLarge,
+					Message: err.Error(), DedupeValues: []string{string(nc.UID)}})
+			}
+			return nil, cloudprovider.NewCreateError(err, ReasonUserDataTooLarge, err.Error())
+		}
+		return nil, err
 	}
 	log.FromContext(ctx).V(1).Info("launched cloudvm instance", "instance-type", it.Name, "zone", zone, "capacity-type", capacityType, "price", offering.Price, "provider-id", created.ProviderID)
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -368,6 +369,15 @@ func TestClaimQuotaRefusalCarriesTheQuotaCause(t *testing.T) {
 	_, client, _ := newClaimServer(t, prov)
 	if _, err := client.Create(context.Background(), claimRequest("nc-q", "g5.xlarge")); !nodeclaim.IsQuotaExceeded(err) {
 		t.Fatalf("Create error = %v, want insufficient capacity with the quota cause", err)
+	}
+}
+
+func TestClaimWhoseUserDataIsTooLargeIsRefusedWithItsReason(t *testing.T) {
+	prov := &capacityProvider{MockProvider: NewMockProvider(), err: fmt.Errorf("%w: the boot script of nc-u compresses to 17000 bytes", errUserDataTooLarge)}
+	_, client, _ := newClaimServer(t, prov)
+	_, err := client.Create(context.Background(), claimRequest("nc-u", "g5.xlarge"))
+	if !nodeclaim.IsUserDataTooLarge(err) || nodeclaim.IsInsufficientCapacity(err) || !strings.Contains(err.Error(), "17000 bytes") {
+		t.Fatalf("Create error = %v, want a UserDataTooLarge refusal with the size", err)
 	}
 }
 

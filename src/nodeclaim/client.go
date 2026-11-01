@@ -38,6 +38,10 @@ func hasReason(err error, reason string) bool {
 // IsNotFound reports whether err says the claim does not exist.
 func IsNotFound(err error) bool { return hasReason(err, ReasonNotFound) }
 
+// IsUserDataTooLarge reports whether err says the VM's boot script is larger than the cloud accepts, which no other
+// offering changes.
+func IsUserDataTooLarge(err error) bool { return hasReason(err, ReasonUserDataTooLarge) }
+
 // IsInsufficientCapacity reports whether err says the cloud had no capacity or quota for the requested offering.
 func IsInsufficientCapacity(err error) bool { return hasReason(err, ReasonInsufficientCapacity) }
 

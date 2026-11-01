@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"github.com/simonepri/interlink-cloudvm-plugin/karpenter/apis/v1alpha1"
@@ -447,6 +449,29 @@ func TestCreatePluginErrorIsNotCapacity(t *testing.T) {
 	}
 	if len(h.api.creates) != 1 {
 		t.Fatalf("plugin creates = %d, want no other offering tried after an error that is not about capacity", len(h.api.creates))
+	}
+}
+
+type recordedEvents []events.Event
+
+func (r *recordedEvents) Publish(evts ...events.Event) { *r = append(*r, evts...) }
+
+func TestCreateUserDataTooLargeIsReportedOnTheNodeClaim(t *testing.T) {
+	h := newHarness(t, nil)
+	var recorded recordedEvents
+	h.cp.SetEventRecorder(&recorded)
+	h.api.createErr = &nodeclaim.APIError{Status: 400, Reason: nodeclaim.ReasonUserDataTooLarge, Message: "user data exceeds the EC2 limit of 16384 bytes"}
+	nc := testNodeClaim(req(corev1.LabelInstanceTypeStable, "g6.2xlarge"))
+	_, err := h.cp.Create(context.Background(), nc)
+	var createErr *cloudprovider.CreateError
+	if !errors.As(err, &createErr) || createErr.ConditionReason != ReasonUserDataTooLarge || !strings.Contains(createErr.ConditionMessage, "16384 bytes") {
+		t.Fatalf("err = %v, want a CreateError that names the size limit", err)
+	}
+	if len(recorded) != 1 || recorded[0].Reason != ReasonUserDataTooLarge || recorded[0].Type != corev1.EventTypeWarning || recorded[0].InvolvedObject != nc {
+		t.Fatalf("events = %+v, want one warning on the NodeClaim", recorded)
+	}
+	if len(h.api.creates) != 1 {
+		t.Fatalf("plugin creates = %d, want no other offering tried", len(h.api.creates))
 	}
 }
 

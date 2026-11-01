@@ -1097,8 +1097,17 @@ func renderFleetUserData(spec *InstanceSpec, region string) (string, error) {
 	if err := gz.Close(); err != nil {
 		return "", fmt.Errorf("failed to finalize gzip compression: %w", err)
 	}
+	if buf.Len() > maxUserDataBytes {
+		return "", fmt.Errorf("%w: the boot script of %s compresses to %d bytes", errUserDataTooLarge, spec.PodName, buf.Len())
+	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
+
+// maxUserDataBytes is EC2's limit on user data before base64 encoding.
+const maxUserDataBytes = 16384
+
+// errUserDataTooLarge refuses a launch whose boot script EC2 would reject; no region or offering can take it.
+var errUserDataTooLarge = fmt.Errorf("user data exceeds the EC2 limit of %d bytes", maxUserDataBytes)
 
 func (p *AWSProvider) Terminate(ctx context.Context, instanceID string) error {
 	p.mu.RLock()
