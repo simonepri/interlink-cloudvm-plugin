@@ -769,7 +769,34 @@ chmod 700 /usr/local/bin/cloudvm-tunnel-agent.py
 # would take several round trips across regions instead of one.
 sysctl -qw net.ipv4.tcp_slow_start_after_idle=0 || echo "[cloudvm-bootstrap] WARNING: cannot keep the tunnel's congestion window across idle periods"
 {{if .TransparentProxy}}
-# Connections to cluster Services and allow-listed external hosts enter the agent, which tunnels them, so clients need no
+{{if .TunnelServiceCIDRs}}# Images that start Docker, such as the AWS Deep Learning AMIs, give its bridge docker0 172.17.0.1/16 unless configured
+# otherwise, which can lie inside a cluster Service network. A connection to the bridge's own address then leaves from
+# it, and Docker's masquerade rule rewrites its source on the way into the agent, so the agent cannot find the client's
+# socket and its pod. Workers run containers through nerdctl, so the bootstrap stops Docker and removes the bridge.
+CLOUDVM_DOCKER_BRIDGE=$(python3 - {{range .TunnelServiceCIDRs}}{{printf "%q" .}} {{end}}<< 'DOCKER_BRIDGE_EOF'
+import ipaddress, json, subprocess, sys
+try:
+    shown = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", "docker0"], capture_output=True, text=True).stdout.split()
+    bridge = shown[shown.index("inet") + 1] if "inet" in shown else ""
+    if not bridge and subprocess.run(["systemctl", "cat", "docker.service"], capture_output=True).returncode == 0:
+        try:
+            bridge = json.load(open("/etc/docker/daemon.json")).get("bip") or "172.17.0.1/16"
+        except (OSError, ValueError):
+            bridge = "172.17.0.1/16"
+    network = ipaddress.ip_interface(bridge).network if bridge else None
+    if network and any(network.overlaps(ipaddress.ip_network(n, strict=False)) for n in sys.argv[1:]):
+        print(network)
+except (ValueError, IndexError):
+    pass
+DOCKER_BRIDGE_EOF
+)
+if [ -n "$CLOUDVM_DOCKER_BRIDGE" ]; then
+  echo "[cloudvm-bootstrap] Docker's bridge network $CLOUDVM_DOCKER_BRIDGE overlaps the cluster Service networks; stopping Docker and removing docker0"
+  systemctl disable --now docker.socket docker.service 2>/dev/null || true
+  ip link delete docker0 2>/dev/null || true
+  while iptables -t nat -D POSTROUTING -s "$CLOUDVM_DOCKER_BRIDGE" ! -o docker0 -j MASQUERADE 2>/dev/null; do :; done
+fi
+{{end}}# Connections to cluster Services and allow-listed external hosts enter the agent, which tunnels them, so clients need no
 # proxy; the gateway stays direct.
 iptables -t nat -N CLOUDVM_SERVICES 2>/dev/null || iptables -t nat -F CLOUDVM_SERVICES || cloudvm_bootstrap_failed "cannot create the Service redirect chain"
 {{if .TunnelGatewayIP}}iptables -t nat -A CLOUDVM_SERVICES -d {{.TunnelGatewayIP}} -j RETURN || cloudvm_bootstrap_failed "cannot exempt the tunnel gateway from the Service redirect"
