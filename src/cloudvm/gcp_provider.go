@@ -376,6 +376,7 @@ func (p *GCPProvider) Launch(ctx context.Context, spec *InstanceSpec) (*Instance
 		ImageMirrors:          spec.ImageMirrors,
 		RunnerDirectHTTP:      spec.RunnerDirectHTTP,
 		Region:                region,
+		Provider:              "gcp",
 		InstanceType:          spec.InstanceType,
 		EgressBandwidth:       spec.EgressBandwidth,
 		EgressBurst:           spec.EgressBurst,

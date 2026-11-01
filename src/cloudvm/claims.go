@@ -761,10 +761,13 @@ func (s *Server) SyncClaims(ctx context.Context) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			probeCtx, cancel := context.WithTimeout(ctx, reuseProbeTimeout)
-			_, err := s.runner.GetHostStats(probeCtx, node)
+			stats, err := s.runner.GetHostStats(probeCtx, node)
 			cancel()
 			if err != nil {
 				return
+			}
+			if stats != nil {
+				GlobalTransferMeter.Record(TransferVM{Provider: string(node.Provider), Region: node.Region, InstanceType: node.InstanceType, InstanceID: node.InstanceID}, stats.Traffic)
 			}
 			s.claims.mu.Lock()
 			s.claims.heartbeats[rec.InstanceID] = time.Now()

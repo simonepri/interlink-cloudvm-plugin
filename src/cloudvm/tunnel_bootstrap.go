@@ -20,7 +20,7 @@ const bootstrapPathPrefix = "/bootstrap/"
 // user data pins is the only check a worker needs.
 var bootstrapScripts = func() map[string]string {
 	scripts := make(map[string]string)
-	for _, src := range []string{runnerScript, tunnelAgentScript, spotWatcherScript} {
+	for _, src := range []string{runnerScript, tunnelAgentScript, spotWatcherScript, trafficMeterScript} {
 		scripts[scriptSHA256(src)] = src
 	}
 	return scripts

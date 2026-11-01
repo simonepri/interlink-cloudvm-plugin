@@ -154,6 +154,8 @@ spec:
                   name: {{ .Values.tunnel.authKeySecret.name }}
                   key: {{ .Values.tunnel.authKeySecret.key }}
             {{- end }}
+            - name: TRANSFER_COST_CONFIG
+              value: {{ .Values.transferCost | toJson | quote }}
             {{- if .Values.registryMirrors }}
             - name: REGISTRY_MIRRORS
               value: {{ join "," .Values.registryMirrors | quote }}

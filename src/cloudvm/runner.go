@@ -60,6 +60,9 @@ type ContainerStatusResult struct {
 	NetworkTxBytes int64     `json:"networkTxBytes,omitempty"`
 	// Timings tells when the runner reached each step of the container's start; older runners send none.
 	Timings *RunnerTimings `json:"timings,omitempty"`
+	// Traffic is the VM's traffic meter reading with only this pod's and the image pulls' owners; runners without a
+	// meter send none.
+	Traffic *TrafficReport `json:"traffic,omitempty"`
 }
 
 // RunnerTimings are the runner's clock times of a container's start steps; a step not reached yet is zero.
@@ -78,6 +81,8 @@ type RunnerTimings struct {
 type HostStatsResult struct {
 	NetworkRxBytes int64 `json:"networkRxBytes"`
 	NetworkTxBytes int64 `json:"networkTxBytes"`
+	// Traffic is the VM's traffic meter reading with every owner; runners without a meter send none.
+	Traffic *TrafficReport `json:"traffic,omitempty"`
 }
 
 // ContainerRunner abstracts remote container lifecycle execution on a warm cloud node.

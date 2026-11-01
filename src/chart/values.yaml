@@ -73,6 +73,54 @@ tunnel:
     name: ""
     key: TAILSCALE_AUTHKEY
 
+# Data transfer cost estimates for the cloudvm_transfer_cost_usd_total and cloudvm_pod_transfer_cost_usd_total metrics.
+# Clouds bill the sender: a VM's transmit at its own region's rate, and bytes it receives from the home region at the
+# home region's rate. Rates are USD per GB (Google Cloud's GiB), first paid volume tier, and the first matching rule
+# wins; from and to are region patterns such as "eu-*". A route no rule covers falls back to the AWS Price List API for
+# AWS and is otherwise left unpriced. Override a provider's rates by replacing its entry.
+transferCost:
+  # Provider and region the cluster runs in; an empty AWS region is provider.eksClusterRegion, else awsRegion.
+  homeProvider: aws
+  homeRegion: ""
+  rates:
+    # AWS: read 2026-11-01 from the AWS Price List bulk API, offer AWSDataTransfer, publication 2026-09-16
+    # (https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AWSDataTransfer/current/<region>/index.json).
+    # sameRegionUSDPerGB is 0 because the meter cannot tell zones apart: the same zone is free, and crossing zones
+    # (IntraRegion) costs 0.01 in each direction.
+    aws:
+      sameRegionUSDPerGB: 0
+      crossRegion:
+        - {from: "us-east-1", to: "us-east-2", usdPerGB: 0.01}
+        - {from: "us-east-2", to: "us-east-1", usdPerGB: 0.01}
+        - {from: "eu-*", to: "ca-west-1", usdPerGB: 0.05}
+        - {from: "eu-*", to: "mx-central-1", usdPerGB: 0.05}
+        - {from: "eu-*", to: "*", usdPerGB: 0.02}
+        - {from: "us-east-*", to: "*", usdPerGB: 0.02}
+        - {from: "us-west-*", to: "*", usdPerGB: 0.02}
+        - {from: "ca-central-1", to: "*", usdPerGB: 0.02}
+      internet:
+        - {from: "eu-*", usdPerGB: 0.09}
+        - {from: "us-east-*", usdPerGB: 0.09}
+        - {from: "us-west-*", usdPerGB: 0.09}
+        - {from: "ca-*", usdPerGB: 0.09}
+    # Google Cloud: read 2026-11-01 from https://cloud.google.com/vpc/network-pricing, "VM-VM data transfer pricing
+    # within Google Cloud" (inter-region, by continent) and Premium Tier internet data transfer out at 1 to 1,024 GiB,
+    # which the page lists for us-central1 only. Inter-zone transfer costs 0.01; the same zone is free.
+    gcp:
+      sameRegionUSDPerGB: 0
+      crossRegion:
+        - {from: "us-*", to: "us-*", usdPerGB: 0.02}
+        - {from: "us-*", to: "northamerica-*", usdPerGB: 0.02}
+        - {from: "northamerica-*", to: "us-*", usdPerGB: 0.02}
+        - {from: "northamerica-*", to: "northamerica-*", usdPerGB: 0.02}
+        - {from: "europe-*", to: "europe-*", usdPerGB: 0.02}
+        - {from: "us-*", to: "europe-*", usdPerGB: 0.05}
+        - {from: "northamerica-*", to: "europe-*", usdPerGB: 0.05}
+        - {from: "europe-*", to: "us-*", usdPerGB: 0.05}
+        - {from: "europe-*", to: "northamerica-*", usdPerGB: 0.05}
+      internet:
+        - {from: "us-central1", usdPerGB: 0.12}
+
 registryMirrors: []
 # OTLP/HTTP collector URL that receives worker bootstrap, runner, and container logs; empty disables forwarding.
 otlpLogsEndpoint: ""

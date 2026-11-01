@@ -101,6 +101,26 @@ func configureAWSMarketAPIs(ctx context.Context, spotTicker *SpotPriceTicker, la
 	}
 }
 
+// configureTransferCostFromEnv loads TRANSFER_COST_CONFIG into the transfer cost model; an AWS home without a region
+// is the EKS cluster's region, or awsRegion.
+func configureTransferCostFromEnv(awsRegion string) error {
+	cfg, err := ParseTransferCostConfig(os.Getenv("TRANSFER_COST_CONFIG"))
+	if err != nil {
+		return err
+	}
+	if cfg.HomeProvider == "aws" && cfg.HomeRegion == "" {
+		cfg.HomeRegion = os.Getenv("EKS_CLUSTER_REGION")
+		if cfg.HomeRegion == "" {
+			cfg.HomeRegion = awsRegion
+		}
+	}
+	GlobalTransferCost.Configure(cfg)
+	if home, ok := GlobalTransferCost.Home(); ok {
+		log.Printf("[cloudvm] Pricing data transfer against home region %s", sanitizeLog(home.Key())) //nolint:gosec // sanitized
+	}
+	return nil
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("[cloudvm] %v", err)
@@ -144,6 +164,9 @@ func run() error {
 		}
 	}
 	ConfigureAWSLaunchPacingFromEnv()
+	if err := configureTransferCostFromEnv(awsRegion); err != nil {
+		return err
+	}
 	awsProv := NewAWSProvider(awsRegion, additionalRegions...)
 
 	// Standalone spot price ticker microservice mode

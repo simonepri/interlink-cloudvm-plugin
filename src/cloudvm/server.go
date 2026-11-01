@@ -1828,7 +1828,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 									if !cResult.Running {
 										s.forgetRunning(tgt.uid)
 									}
-									if cResult.NetworkRxBytes > 0 || cResult.NetworkTxBytes > 0 {
+									if cResult.NetworkRxBytes > 0 || cResult.NetworkTxBytes > 0 || cResult.Traffic != nil {
 										prov := string(node.Provider)
 										if prov == "" && tgt.inst != nil {
 											prov = string(tgt.inst.Provider)
@@ -1846,6 +1846,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 											instID = tgt.inst.ID
 										}
 										GlobalFleetTracker.RecordNetworkTraffic(prov, reg, itype, instID, cResult.NetworkRxBytes, cResult.NetworkTxBytes)
+										GlobalTransferMeter.Record(TransferVM{Provider: prov, Region: reg, InstanceType: itype, InstanceID: instID}, cResult.Traffic)
 									}
 									switch {
 									case cResult.Running:
