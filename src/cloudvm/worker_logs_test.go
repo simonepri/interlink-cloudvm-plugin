@@ -135,13 +135,13 @@ func TestWorkerLogs_DialerStreamReachesCollectorAndKubectlLogs(t *testing.T) {
 
 	waitFor(t, "container record at collector", func() bool { _, n := collector.find("hello from the container"); return n == 1 })
 	rec, _ := collector.find("hello from the container")
-	want := map[string]string{"cloudvm.instance_id": id, "cloudvm.region": "eu-west-1", "k8s.pod.name": "job-1", "k8s.namespace.name": "team-a"}
+	want := map[string]string{"cloudvm.instance_id": id, "cloudvm.region": "eu-west-1", "k8s.pod.name": "job-1", "k8s.namespace.name": "team-a", "k8s.pod.uid": "uid-1"}
 	for k, v := range want {
 		if rec.resource[k] != v {
 			t.Errorf("resource %s = %q, want %q", k, rec.resource[k], v)
 		}
 	}
-	if rec.attrs["log.iostream"] != "stderr" || rec.attrs["cloudvm.log.source"] != "container" || rec.attrs["k8s.pod.uid"] != "uid-1" {
+	if rec.attrs["log.iostream"] != "stderr" || rec.attrs["cloudvm.log.source"] != "container" || rec.resource["k8s.container.name"] != "" {
 		t.Errorf("record attributes = %v", rec.attrs)
 	}
 	host, n := collector.find("bootstrap step 1")
@@ -159,8 +159,132 @@ func TestWorkerLogs_DialerStreamReachesCollectorAndKubectlLogs(t *testing.T) {
 	if out := getLogs(t, f.server, GetLogsRequest{PodUID: "uid-1", ContainerName: "wait-gcs-ready"}); out != "waiting for GCS\n" {
 		t.Errorf("kubectl logs -c wait-gcs-ready = %q, want the init container's output", out)
 	}
-	if rec, _ := collector.find("waiting for GCS"); rec.attrs["k8s.container.name"] != "wait-gcs-ready" || rec.attrs["k8s.pod.uid"] != "uid-1" {
-		t.Errorf("init container record attributes = %v", rec.attrs)
+	if rec, _ := collector.find("waiting for GCS"); rec.resource["k8s.container.name"] != "wait-gcs-ready" || rec.resource["k8s.pod.uid"] != "uid-1" {
+		t.Errorf("init container record resource = %v", rec.resource)
+	}
+}
+
+func TestWorkerLogs_DeletedPodsLateLinesKeepTheirPod(t *testing.T) {
+	f := newTunnelFixture(t, time.Minute)
+	collector := withCollector(t, f)
+	const id, token = "i-late", "late-token"
+	f.addNodeWithPod(id, "eu-west-1", token, "uid-gone", "team-a", "job-gone")
+	f.addNodeWithPod("i-other", "eu-west-1", "other-token", "uid-elsewhere", "team-b", "job-elsewhere")
+
+	// The pod's first lines on this stream arrive after the plugin released it, as after a reconnect while it stopped.
+	released := make(chan struct{})
+	d := f.dialer(t, id, token)
+	d.cfg.LogSource = func(ctx context.Context, w io.Writer) error {
+		<-released
+		enc := json.NewEncoder(w)
+		_ = enc.Encode(WorkerLogRecord{Source: WorkerLogSourceContainer, PodUID: "uid-gone", Stream: "stderr", Message: "last words"})
+		_ = enc.Encode(WorkerLogRecord{Source: WorkerLogSourceContainer, PodUID: "uid-elsewhere", Stream: "stdout", Message: "claims another node's pod"})
+		<-ctx.Done()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = d.Run(ctx, NewRunnerHTTPMux(&RunnerHandlerAdapter{Runner: NewMockContainerRunner()}, token))
+	}()
+	waitFor(t, "session", func() bool { return f.registry.Has(id) })
+	f.server.NodePool().Release("uid-gone")
+	close(released)
+
+	waitFor(t, "late record at collector", func() bool { _, n := collector.find("claims another node's pod"); return n == 1 })
+	rec, _ := collector.find("last words")
+	for k, v := range map[string]string{"k8s.pod.name": "job-gone", "k8s.namespace.name": "team-a", "k8s.pod.uid": "uid-gone"} {
+		if rec.resource[k] != v {
+			t.Errorf("deleted pod's record: resource %s = %q, want %q", k, rec.resource[k], v)
+		}
+	}
+	if foreign, _ := collector.find("claims another node's pod"); foreign.resource["k8s.pod.name"] != "" || foreign.resource["k8s.namespace.name"] != "" || foreign.resource["k8s.pod.uid"] != "" {
+		t.Errorf("a worker must not name a pod of another node: resource = %v", foreign.resource)
+	}
+}
+
+func TestTunnelAgent_ContainerOutputSurvivesASessionDropAfterItExits(t *testing.T) {
+	dir := t.TempDir()
+	cli := filepath.Join(dir, "nerdctl")
+	// The fake CLI lists every file in containers/ with the ID in ids/ and prints a stopped container's whole output.
+	script := "#!/usr/bin/env bash\ncase \"$1\" in\n" +
+		"  ps) for n in $(ls \"$FAKE_STATE/containers\"); do echo \"$(cat \"$FAKE_STATE/ids/$n\") $n\"; done ;;\n" +
+		"  logs) cat \"$FAKE_STATE/containers/${@: -1}\" ;;\nesac\n"
+	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_STATE", dir)
+	out := runAgentPython(t, fmt.Sprintf(`
+import asyncio, json, os
+state, cli = %q, %q
+os.makedirs(os.path.join(state, "containers"))
+os.makedirs(os.path.join(state, "ids"))
+name = "cloudvm-uid-1"
+
+def create(container_id):
+    with open(os.path.join(state, "ids", name), "w") as f:
+        f.write(container_id)
+drain = os.path.join(state, "drain")
+agent.CONTAINER_POLL_SECONDS = 0.05
+
+def write_output(first, last):
+    with open(os.path.join(state, "containers", name), "a") as f:
+        for i in range(first, last + 1):
+            f.write("2026-01-01T00:00:%%02d.000000000Z line %%d\n" %% (i, i))
+
+class Stream(object):
+    def __init__(self, fail_after=None):
+        self.lines, self.fail_after = [], fail_after
+    async def write(self, data):
+        if self.fail_after is not None and len(self.lines) > self.fail_after:
+            await asyncio.sleep(0.3)  # every record is queued by now
+            raise EOFError("gateway closed the log stream")
+        self.lines.append(data)
+
+def messages(stream):
+    return [json.loads(l)["msg"] for l in stream.lines[1:]]
+
+async def ship_until(collector, stream, done):
+    task = asyncio.ensure_future(collector.ship(stream))
+    for _ in range(200):
+        if done() or task.done():
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.wait([task])
+
+async def main():
+    collector = agent.LogCollector([], cli, drain)
+    create("id-1")
+    write_output(1, 5)
+    dropped = Stream(fail_after=2)
+    await ship_until(collector, dropped, lambda: False)
+    print("drain file kept after the drop:", os.path.exists(os.path.join(drain, name)))
+    resumed = Stream()
+    await ship_until(collector, resumed, lambda: not os.path.exists(os.path.join(drain, name)))
+    print("delivered:", messages(dropped) + messages(resumed))
+    print("drain file removed:", not os.path.exists(os.path.join(drain, name)))
+    # The runner runs a retried init container again under the same name, as a new container.
+    create("id-2")
+    write_output(6, 6)
+    rerun = Stream()
+    await ship_until(collector, rerun, lambda: messages(rerun) and not os.path.exists(os.path.join(drain, name)))
+    print("rerun delivered:", messages(rerun))
+
+asyncio.new_event_loop().run_until_complete(main())
+`, dir, cli))
+	want := "drain file kept after the drop: True\n" +
+		"delivered: ['line 1', 'line 2', 'line 3', 'line 4', 'line 5']\n" +
+		"drain file removed: True\n" +
+		"rerun delivered: ['line 6']\n"
+	var got strings.Builder
+	for _, line := range strings.SplitAfter(out, "\n") {
+		if !strings.HasPrefix(line, "[cloudvm-tunnel-agent]") {
+			got.WriteString(line)
+		}
+	}
+	if got.String() != want {
+		t.Fatalf("agent output:\n%s\nwant:\n%s", out, want)
 	}
 }
 

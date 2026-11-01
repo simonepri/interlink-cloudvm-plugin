@@ -181,12 +181,15 @@ func (c *CloudInitConfig) TunnelAgentScriptSHA256() string {
 	return scriptSHA256(tunnelAgentScript)
 }
 
-// stripPythonComments drops blank and comment-only lines, shortens docstrings to "" and indents by one space per level
-// instead of four, to keep the user data under the EC2 size limit. It keeps the shebang and encoding lines and every
-// line inside any other triple-quoted string as written.
+// stripPythonComments drops blank and comment-only lines, drops docstrings, shortening one that is the only statement of
+// its body to "", and indents by one space per level instead of four, to keep the user data under the EC2 size limit.
+// It keeps the shebang and encoding lines and every line inside any other triple-quoted string as written.
 func stripPythonComments(src string) string {
 	var kept []string
 	inString, inDoc := false, false
+	// docIndent is the indentation of a dropped docstring, which needs a "" in its place unless a statement follows it.
+	docIndent := ""
+	pendingDoc := false
 	for i, line := range strings.Split(src, "\n") {
 		trimmed := strings.TrimSpace(line)
 		toggles := strings.Count(line, `"""`)%2 == 1 || strings.Count(line, "'''")%2 == 1
@@ -199,6 +202,7 @@ func stripPythonComments(src string) string {
 		afterHeader := len(kept) == 0 || strings.HasSuffix(strings.TrimSpace(kept[len(kept)-1]), ":")
 		if !inString && afterHeader && (strings.HasPrefix(trimmed, `"""`) || strings.HasPrefix(trimmed, "'''")) {
 			kept = append(kept, indent+`""`)
+			docIndent, pendingDoc = indent, true
 			inDoc = toggles
 			continue
 		}
@@ -212,6 +216,10 @@ func stripPythonComments(src string) string {
 			keep = true
 		}
 		if keep {
+			if pendingDoc && len(line)-len(strings.TrimLeft(line, " ")) == len(docIndent) {
+				kept = kept[:len(kept)-1] // the statement after the docstring keeps the body non-empty
+			}
+			pendingDoc = false
 			kept = append(kept, line)
 		}
 	}

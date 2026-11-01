@@ -108,7 +108,7 @@ func (s *Server) recordWorkerLog(forwarder *OTLPLogForwarder, instanceID string,
 	if rec.PodUID != "" {
 		alloc, ok := pods[rec.PodUID]
 		if !ok {
-			if _, found, exists := s.nodePool.FindPodNode(rec.PodUID); exists {
+			if found, known := s.nodePool.PodIdentity(instanceID, rec.PodUID); known {
 				alloc = found
 				pods[rec.PodUID] = alloc
 			}
@@ -127,19 +127,19 @@ func (s *Server) recordWorkerLog(forwarder *OTLPLogForwarder, instanceID string,
 	if rec.Stream != "" {
 		attrs["log.iostream"] = rec.Stream
 	}
-	if rec.PodUID != "" {
+	resource := LogResource{InstanceID: instanceID, Region: s.nodeRegion(instanceID), PodName: pod.PodName, Namespace: pod.PodNamespace}
+	if pod.PodUID != "" {
+		// Only a pod the plugin placed on this worker names the resource, which a collector could otherwise match to
+		// any pod in the cluster by UID.
+		resource.PodUID, resource.Container = pod.PodUID, rec.Container
+	} else if rec.PodUID != "" {
 		attrs["k8s.pod.uid"] = rec.PodUID
-	}
-	if rec.Container != "" {
-		attrs["k8s.container.name"] = rec.Container
+		if rec.Container != "" {
+			attrs["k8s.container.name"] = rec.Container
+		}
 	}
 	forwarder.Enqueue(LogEntry{
-		Resource: LogResource{
-			InstanceID: instanceID,
-			Region:     s.nodeRegion(instanceID),
-			PodName:    pod.PodName,
-			Namespace:  pod.PodNamespace,
-		},
+		Resource:   resource,
 		Time:       ts,
 		Body:       rec.Message,
 		Attributes: attrs,

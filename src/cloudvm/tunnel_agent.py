@@ -49,6 +49,9 @@ CONTAINER_PREFIX = "cloudvm-"
 DEFAULT_LOG_FILES = "bootstrap=/var/log/cloudvm-bootstrap.log,runner=/var/log/cloudvm-runner.log,tunnel=/var/log/cloudvm-tunnel-agent.log"
 # The bootstrap appends "<phase> <epoch seconds>" here as each boot phase ends.
 DEFAULT_BOOT_MARKS = "/run/cloudvm/boot-marks"
+# Holds one file per container the agent follows until it has shipped the container's output in full; removing a
+# container deletes its output, so the runner's stop waits for the file to go first.
+DEFAULT_LOG_DRAIN_DIR = "/run/cloudvm/log-drain"
 MAX_BOOT_MARKS = 16
 # A process in a pod runs in the pod's cgroup, /kubepods/<qos>/pod<uid>/<container> or its systemd-slice spelling.
 POD_CGROUP = re.compile(
@@ -677,14 +680,45 @@ class LogCollector(object):
 
     Progress advances only after a record is written to a session, so records queued when a session drops are resent on the next.
     The files and Docker's own log store are the buffer; the in-memory queue stays small and producers wait when it is full.
+    A container counts as finished, and its file in drain_dir is removed, only once its last record is written. Containers
+    are told apart by ID, so a retried init container, which reuses its name, is followed again.
     """
 
-    def __init__(self, files, container_cli):
+    def __init__(self, files, container_cli, drain_dir=None):
         self.files = files
         self.container_cli = container_cli
+        self.drain_dir = drain_dir
         self.offsets = {}
         self.container_since = {}
         self.finished = set()
+        if container_cli and drain_dir:
+            try:
+                os.makedirs(drain_dir, exist_ok=True)
+            except OSError as e:
+                log("cannot create %s; the runner will not wait for container output: %s" % (drain_dir, e))
+                self.drain_dir = None
+
+    def mark_draining(self, name, draining):
+        """Creates or removes the container's file in drain_dir."""
+        if not self.drain_dir:
+            return
+        path = os.path.join(self.drain_dir, name)
+        try:
+            if draining:
+                open(path, "a").close()
+            else:
+                os.remove(path)
+        except OSError:
+            pass
+
+    def forget_removed(self, names):
+        """Removes the drain files of containers that no longer exist, such as one removed while no session was up."""
+        try:
+            stale = [n for n in os.listdir(self.drain_dir) if n not in names] if self.drain_dir else []
+        except OSError:
+            stale = []
+        for name in stale:
+            self.mark_draining(name, False)
 
     async def ship(self, stream):
         queue = asyncio.Queue(maxsize=256)
@@ -695,7 +729,8 @@ class LogCollector(object):
             await stream.write(LOG_STREAM_HEADER)
             while True:
                 record, commit = await queue.get()
-                await stream.write(record)
+                if record:
+                    await stream.write(record)
                 commit()
         except EOFError as e:
             log("log stream ended: %s" % e)
@@ -740,11 +775,17 @@ class LogCollector(object):
         followers = {}
         try:
             while True:
-                for name in await list_containers(self.container_cli):
-                    if name not in followers and name not in self.finished:
-                        followers[name] = asyncio.ensure_future(self.follow_container(name, queue))
-                for name in [n for n, t in followers.items() if t.done()]:
-                    del followers[name]
+                listed = await list_containers(self.container_cli)
+                if listed is None:
+                    await asyncio.sleep(CONTAINER_POLL_SECONDS)
+                    continue
+                self.finished &= set(listed)  # a removed container never comes back under its ID
+                self.forget_removed({name for _, name in listed})
+                for key in listed:
+                    if key not in followers and key not in self.finished:
+                        followers[key] = asyncio.ensure_future(self.follow_container(key, queue))
+                for key in [k for k, t in followers.items() if t.done()]:
+                    del followers[key]
                 await asyncio.sleep(CONTAINER_POLL_SECONDS)
         finally:
             for task in followers.values():
@@ -755,7 +796,16 @@ class LogCollector(object):
             self.container_since[name] = ts
         return commit
 
-    async def follow_container(self, name, queue):
+    def commit_finished(self, key):
+        def commit():
+            self.finished.add(key)
+            self.mark_draining(key[1], False)
+        return commit
+
+    async def follow_container(self, key, queue):
+        """Ships the output of the container key, an (ID, name) pair, from where the last session stopped."""
+        name = key[1]
+        self.mark_draining(name, True)
         since = self.container_since.get(name)
         cmd = [self.container_cli, "logs", "--follow", "--timestamps"]
         if since:
@@ -770,7 +820,9 @@ class LogCollector(object):
                 self.pipe_container(proc.stdout, name, pod, container, "stdout", since, queue),
                 self.pipe_container(proc.stderr, name, pod, container, "stderr", since, queue))
             if await proc.wait() == 0:
-                self.finished.add(name)  # the container exited and its output is complete
+                # The container exited and its output is complete; it is finished once every record before this marker
+                # is written, so a session that drops first leaves it to be followed again.
+                await queue.put((b"", self.commit_finished(key)))
         finally:
             if proc.returncode is None:
                 proc.kill()
@@ -796,14 +848,18 @@ def log_time_key(ts):
 
 
 async def list_containers(cli):
+    """Returns the (ID, name) pair of every runtime container the runner made, or None when the CLI fails."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            cli, "ps", "--all", "--filter", "name=" + CONTAINER_PREFIX, "--format", "{{.Names}}",
+            cli, "ps", "--all", "--filter", "name=" + CONTAINER_PREFIX, "--format", "{{.ID}} {{.Names}}",
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         out, _ = await proc.communicate()
     except OSError:
-        return []
-    return [n for n in out.decode().split() if n.startswith(CONTAINER_PREFIX)]
+        return None
+    if proc.returncode != 0:
+        return None
+    pairs = [tuple(line.split()) for line in out.decode().splitlines()]
+    return [p for p in pairs if len(p) == 2 and p[1].startswith(CONTAINER_PREFIX)]
 
 
 def boot_marks(path, uptime_path="/proc/uptime"):
@@ -1248,7 +1304,8 @@ def main():
         "ca_file": os.environ.get("CLOUDVM_TUNNEL_CA_FILE") or None,
         "collector": LogCollector(
             parse_log_files(os.environ.get("CLOUDVM_LOG_FILES", DEFAULT_LOG_FILES)),
-            os.environ.get("CLOUDVM_CONTAINER_LOGS", "1") != "0" and shutil.which(container_cli) and container_cli),
+            os.environ.get("CLOUDVM_CONTAINER_LOGS", "1") != "0" and shutil.which(container_cli) and container_cli,
+            os.environ.get("CLOUDVM_LOG_DRAIN_DIR", DEFAULT_LOG_DRAIN_DIR)),
     }
     proc_root = os.environ.get("CLOUDVM_PROC_ROOT", "/proc")
     cfg["proxy"] = TCPProxy(

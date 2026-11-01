@@ -848,14 +848,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                             continue
                         parts = line.split('\t')
                         if len(parts) >= 2 and '-init-' not in parts[1]:
-                            name = parts[1]
-                            state = 'running'
-                            uid = name.removeprefix('cloudvm-')
-                            results.append({
-                                "podUID": uid,
-                                "running": True,
-                                "reason": state,
-                            })
+                            results.append({"podUID": parts[1].removeprefix('cloudvm-'), "running": True, "reason": 'running'})
             except Exception:
                 pass
             self.reply(200, json.dumps(results))
@@ -986,6 +979,12 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 container_name = f"cloudvm-{pod_uid}"
                 try:
                     subprocess.run([CONTAINER_CLI, 'stop', container_name], capture_output=True)
+                    # Removing the container deletes its output, so wait up to 10 seconds for the tunnel agent to ship it:
+                    # the agent keeps a file in /run/cloudvm/log-drain for each container whose output it has not shipped.
+                    for _ in range(100):
+                        if not os.path.exists('/run/cloudvm/log-drain/' + container_name):
+                            break
+                        time.sleep(0.1)
                     subprocess.run([CONTAINER_CLI, 'rm', '-f', container_name], capture_output=True)
                     listed = subprocess.run([CONTAINER_CLI, 'ps', '-a', '--filter', f"name={container_name}-init-", '--format', '{{.Names}}'],
                                             capture_output=True, text=True)
