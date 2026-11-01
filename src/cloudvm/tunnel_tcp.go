@@ -318,10 +318,18 @@ func (g *TunnelGateway) dialFromCluster(client, host, target string) (net.Conn, 
 	return g.openWorkerTCP(peer, target)
 }
 
+// A worker whose session closed less than workerReconnectWindow ago is reconnecting, as every worker behind a gateway
+// replica does when that replica stops; a stream to it waits up to workerReconnectWait for the new session instead of
+// failing, since a refused connection makes clients such as Ray back off for far longer than the agent takes to return.
+const (
+	workerReconnectWindow = time.Minute
+	workerReconnectWait   = 10 * time.Second
+)
+
 // openWorkerTCP opens a stream on the worker's session that its agent connects to target, an address of the worker
 // itself, so a process listening only on the worker's private IP is reachable too.
 func (g *TunnelGateway) openWorkerTCP(instanceID, target string) (net.Conn, error) {
-	session, ok := g.registry.Get(instanceID)
+	session, ok := g.registry.Await(instanceID, workerReconnectWindow, workerReconnectWait)
 	if !ok {
 		return nil, fmt.Errorf("no active tunnel session for instance %s", instanceID)
 	}

@@ -366,3 +366,47 @@ func TestTunnelStopOutlivesTheDispatchTimeout(t *testing.T) {
 		t.Fatalf("StopContainer failed although it finished within the stop timeout: %v", err)
 	}
 }
+
+func TestSessionRegistry_AwaitWaitsForAReconnectingWorker(t *testing.T) {
+	newSession := func() *yamux.Session {
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+		go func() { _, _ = yamux.Server(server, nil) }()
+		s, err := yamux.Client(client, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	reg := NewSessionRegistry()
+	if _, ok := reg.Await("i-never", time.Minute, 5*time.Second); ok {
+		t.Fatal("a worker that never connected has no session to wait for")
+	}
+
+	reg.Register("i-reconnects", newSession())
+	_ = reg.Close("i-reconnects")
+	replacement := newSession()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		reg.Register("i-reconnects", replacement)
+	}()
+	start := time.Now()
+	if s, ok := reg.Await("i-reconnects", time.Minute, 5*time.Second); !ok || s != replacement {
+		t.Fatalf("Await returned %v %v, want the session the worker reconnected with", s, ok)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("Await took %s to see the reconnect", waited)
+	}
+
+	_ = reg.Close("i-reconnects")
+	start = time.Now()
+	if _, ok := reg.Await("i-reconnects", time.Minute, 100*time.Millisecond); ok {
+		t.Fatal("Await returned a session although the worker never came back")
+	}
+	if waited := time.Since(start); waited < 100*time.Millisecond {
+		t.Fatalf("Await gave up after %s, before its wait ended", waited)
+	}
+	if _, ok := reg.Await("i-reconnects", 0, 5*time.Second); ok {
+		t.Fatal("a session lost longer ago than recentLoss is not waited for")
+	}
+}

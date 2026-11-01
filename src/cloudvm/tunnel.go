@@ -83,14 +83,17 @@ type SessionRegistry struct {
 	sessions map[string]*yamux.Session
 	lost     map[string]time.Time
 	started  time.Time
+	// registered is closed and replaced whenever a session registers, waking every Await.
+	registered chan struct{}
 }
 
 // NewSessionRegistry initializes an empty session registry.
 func NewSessionRegistry() *SessionRegistry {
 	return &SessionRegistry{
-		sessions: make(map[string]*yamux.Session),
-		lost:     make(map[string]time.Time),
-		started:  time.Now(),
+		sessions:   make(map[string]*yamux.Session),
+		lost:       make(map[string]time.Time),
+		started:    time.Now(),
+		registered: make(chan struct{}),
 	}
 }
 
@@ -134,6 +137,8 @@ func (r *SessionRegistry) Register(instanceID string, session *yamux.Session) {
 	}
 	r.sessions[instanceID] = session
 	delete(r.lost, instanceID)
+	close(r.registered)
+	r.registered = make(chan struct{})
 }
 
 // Unregister removes an instance ID from the session registry and records when its session closed.
@@ -153,6 +158,29 @@ func (r *SessionRegistry) Get(instanceID string) (*yamux.Session, bool) {
 		return nil, false
 	}
 	return s, true
+}
+
+// Await returns the instance's active session; when it has none but lost one within recentLoss, it waits up to wait
+// for the worker to reconnect, so a caller arriving during a reconnect gets the new session instead of a failure.
+func (r *SessionRegistry) Await(instanceID string, recentLoss, wait time.Duration) (*yamux.Session, bool) {
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	for {
+		r.mu.RLock()
+		registered := r.registered
+		r.mu.RUnlock()
+		if s, ok := r.Get(instanceID); ok {
+			return s, true
+		}
+		if at, ok := r.LostAt(instanceID); !ok || time.Since(at) > recentLoss {
+			return nil, false
+		}
+		select {
+		case <-registered:
+		case <-deadline.C:
+			return r.Get(instanceID)
+		}
+	}
 }
 
 // Has checks whether an active session exists for the given instance ID.
