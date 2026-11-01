@@ -61,6 +61,7 @@ func (p *PodProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if !p.nodes.Serves(pod.Spec.NodeName) {
 		return fmt.Errorf("node %s is not served by this agent", pod.Spec.NodeName)
 	}
+	pod = p.withHostIPFieldRefs(pod)
 	secrets := imagePullSecrets(ctx, p.kube, pod)
 	err := p.plugin.Create(ctx, pod, secrets)
 	if isRefusal(err) {
@@ -241,12 +242,64 @@ func (p *PodProvider) PollStatus(ctx context.Context) {
 	}
 }
 
-// statusRef is the part of a pod the plugin's /status reads: identity, containers and service account.
+// hostIPFields are the pod fields that hold the address a worker's containers share, which the pod has no value for
+// when it is created.
+var hostIPFields = map[string]bool{"status.podIP": true, "status.hostIP": true, "status.podIPs": true, "status.hostIPs": true}
+
+// withHostIPFieldRefs returns the pod with the fieldRefs to its pod and host IP that the pod controller resolved to
+// empty values put back from the pod informer's copy, so the plugin sets them to the worker's address.
+func (p *PodProvider) withHostIPFieldRefs(pod *corev1.Pod) *corev1.Pod {
+	p.mu.Lock()
+	bound := p.bound
+	p.mu.Unlock()
+	if bound == nil {
+		return pod
+	}
+	orig, err := bound.Pods(pod.Namespace).Get(pod.Name)
+	if err != nil || orig.UID != pod.UID {
+		return pod
+	}
+	out := pod.DeepCopy()
+	restore := func(from []corev1.Container, to []corev1.Container) {
+		for i := range to {
+			if i >= len(from) {
+				return
+			}
+			for _, e := range from[i].Env {
+				if e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || !hostIPFields[e.ValueFrom.FieldRef.FieldPath] {
+					continue
+				}
+				found := false
+				for j := range to[i].Env {
+					if to[i].Env[j].Name == e.Name {
+						to[i].Env[j] = *e.DeepCopy()
+						found = true
+					}
+				}
+				if !found {
+					to[i].Env = append(to[i].Env, *e.DeepCopy())
+				}
+			}
+		}
+	}
+	restore(orig.Spec.InitContainers, out.Spec.InitContainers)
+	restore(orig.Spec.Containers, out.Spec.Containers)
+	return out
+}
+
+// statusRef is the part of a pod the plugin's /status reads: identity, containers, service account, and the volumes
+// whose service account tokens the plugin keeps refreshing.
 func statusRef(pod *corev1.Pod) *corev1.Pod {
 	ref := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID}}
 	ref.Spec.ServiceAccountName = pod.Spec.ServiceAccountName
+	ref.Spec.AutomountServiceAccountToken = pod.Spec.AutomountServiceAccountToken
+	for _, v := range pod.Spec.Volumes {
+		if v.Projected != nil {
+			ref.Spec.Volumes = append(ref.Spec.Volumes, v)
+		}
+	}
 	for _, c := range pod.Spec.Containers {
-		ref.Spec.Containers = append(ref.Spec.Containers, corev1.Container{Name: c.Name, Image: c.Image, Env: c.Env})
+		ref.Spec.Containers = append(ref.Spec.Containers, corev1.Container{Name: c.Name, Image: c.Image, Env: c.Env, VolumeMounts: c.VolumeMounts})
 	}
 	for _, c := range pod.Spec.InitContainers {
 		ref.Spec.InitContainers = append(ref.Spec.InitContainers, corev1.Container{Name: c.Name, Image: c.Image})
@@ -292,7 +345,13 @@ func applyStatus(pod *corev1.Pod, st *PodStatus) corev1.PodStatus {
 	if allReady && out.Phase == corev1.PodRunning {
 		ready = corev1.ConditionTrue
 	}
-	setCondition(&out, corev1.PodInitialized, corev1.ConditionTrue)
+	initialized := corev1.ConditionTrue
+	for _, c := range out.InitContainerStatuses {
+		if c.State.Terminated == nil || c.State.Terminated.ExitCode != 0 {
+			initialized = corev1.ConditionFalse
+		}
+	}
+	setCondition(&out, corev1.PodInitialized, initialized)
 	setCondition(&out, corev1.ContainersReady, ready)
 	setCondition(&out, corev1.PodReady, ready)
 	return out
@@ -318,14 +377,16 @@ func convertContainers(in []ContainerStatus, prev []corev1.ContainerStatus) []co
 	}
 	out := make([]corev1.ContainerStatus, 0, len(in))
 	for _, c := range in {
-		cs := corev1.ContainerStatus{Name: c.Name, Image: c.Image, Ready: c.Ready}
+		cs := corev1.ContainerStatus{Name: c.Name, Image: c.Image, Ready: c.Ready, ContainerID: c.ContainerID}
 		switch s := c.State; {
 		case s.Terminated != nil:
 			cs.State.Terminated = &corev1.ContainerStateTerminated{
 				ExitCode: s.Terminated.ExitCode, Reason: s.Terminated.Reason, Message: s.Terminated.Message,
 				FinishedAt: metav1.NewTime(s.Terminated.FinishedAt), ContainerID: s.Terminated.ContainerID,
 			}
-			cs.ContainerID = s.Terminated.ContainerID
+			if cs.ContainerID == "" {
+				cs.ContainerID = s.Terminated.ContainerID
+			}
 		case s.Running != nil:
 			cs.State.Running = &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(s.Running.StartedAt)}
 			started := true
@@ -339,6 +400,9 @@ func convertContainers(in []ContainerStatus, prev []corev1.ContainerStatus) []co
 			if p.Name == c.Name {
 				cs.RestartCount = p.RestartCount
 			}
+		}
+		if c.RestartCount > cs.RestartCount {
+			cs.RestartCount = c.RestartCount
 		}
 		out = append(out, cs)
 	}

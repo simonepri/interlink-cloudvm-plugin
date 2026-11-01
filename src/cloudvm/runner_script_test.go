@@ -307,7 +307,11 @@ func TestRunnerScript_ECRPullUsesCredentialHelper(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 	waitStatus(t, h, "plain", func(r ContainerStatusResult) bool { return r.Running })
-	waitStatus(t, h, "secret", func(r ContainerStatusResult) bool { return r.Running })
+	// Both pods share the fake's container state, so wait for the second pull itself.
+	waitStatus(t, h, "secret", func(ContainerStatusResult) bool {
+		pulls, _ := os.ReadFile(filepath.Join(state, "pulls")) //nolint:gosec // test-controlled path
+		return strings.Count(string(pulls), "\n") >= 2
+	})
 
 	hostCfg, _ := os.ReadFile(filepath.Join(filepath.Dir(h.script), "docker", "config.json"))
 	if !strings.Contains(string(hostCfg), `"123456789012.dkr.ecr.eu-west-1.amazonaws.com": "ecr-login"`) && !strings.Contains(string(hostCfg), `"123456789012.dkr.ecr.eu-west-1.amazonaws.com":"ecr-login"`) {

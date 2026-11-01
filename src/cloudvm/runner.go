@@ -44,6 +44,36 @@ type StartContainerRequest struct {
 	SecretVolumes    []SecretVolume    `json:"secretVolumes,omitempty"`
 	// AWSCredentials is set when the pod's service account has an IAM role; the runner then serves its credentials.
 	AWSCredentials *PodAWSCredentials `json:"awsCredentials,omitempty"`
+	// Volumes are the pod's volumes. A runner that reads them ignores SecretVolumes, which older runners mount.
+	Volumes []PodVolume `json:"volumes,omitempty"`
+	// Mounts, Security and HostIPEnv describe the main container like the fields of ContainerRun.
+	Mounts    []ContainerMount   `json:"mounts,omitempty"`
+	Security  *ContainerSecurity `json:"security,omitempty"`
+	HostIPEnv []string           `json:"hostIPEnv,omitempty"`
+	// InitContainers run in order, each to completion, before the main container.
+	InitContainers []ContainerRun `json:"initContainers,omitempty"`
+	// CgroupParent is the pod's cgroup, /kubepods/<qos>/pod<uid>, that every container of the pod runs under.
+	CgroupParent string `json:"cgroupParent,omitempty"`
+	HostPID      bool   `json:"hostPID,omitempty"`
+	HostIPC      bool   `json:"hostIPC,omitempty"`
+	// RestartPolicy Never fails the pod when an init container fails; otherwise the runner retries it with back-off.
+	RestartPolicy string `json:"restartPolicy,omitempty"`
+	// FSGroup owns the pod's emptyDir and file volumes.
+	FSGroup *int64 `json:"fsGroup,omitempty"`
+}
+
+// ContainerRun is a container the runner runs besides the main one.
+type ContainerRun struct {
+	Name          string             `json:"name"`
+	Image         string             `json:"image"`
+	Command       []string           `json:"command,omitempty"`
+	Args          []string           `json:"args,omitempty"`
+	Env           map[string]string  `json:"env,omitempty"`
+	HostIPEnv     []string           `json:"hostIPEnv,omitempty"`
+	CPUMillicores int64              `json:"cpuMillicores,omitempty"`
+	MemoryBytes   int64              `json:"memoryBytes,omitempty"`
+	Mounts        []ContainerMount   `json:"mounts,omitempty"`
+	Security      *ContainerSecurity `json:"security,omitempty"`
 }
 
 // ContainerStatusResult encapsulates container execution telemetry from the in-VM runner.
@@ -63,6 +93,24 @@ type ContainerStatusResult struct {
 	// Traffic is the VM's traffic meter reading with only this pod's and the image pulls' owners; runners without a
 	// meter send none.
 	Traffic *TrafficReport `json:"traffic,omitempty"`
+	// ContainerID is the main container's containerd://<id>, once it exists.
+	ContainerID string `json:"containerID,omitempty"`
+	// InitContainers report the init containers the runner has started, in order.
+	InitContainers []InitContainerResult `json:"initContainers,omitempty"`
+}
+
+// InitContainerResult is the state of one init container.
+type InitContainerResult struct {
+	Name         string    `json:"name"`
+	ContainerID  string    `json:"containerID,omitempty"`
+	Running      bool      `json:"running"`
+	Done         bool      `json:"done"`
+	ExitCode     int32     `json:"exitCode"`
+	Reason       string    `json:"reason,omitempty"`
+	Message      string    `json:"message,omitempty"`
+	StartedAt    time.Time `json:"startedAt,omitzero"`
+	FinishedAt   time.Time `json:"finishedAt,omitzero"`
+	RestartCount int32     `json:"restartCount,omitempty"`
 }
 
 // RunnerTimings are the runner's clock times of a container's start steps; a step not reached yet is zero.
@@ -127,14 +175,6 @@ func (h *HTTPContainerRunner) endpoint(node *CloudVMNode, path string) (string, 
 }
 
 func (h *HTTPContainerRunner) StartContainer(ctx context.Context, node *CloudVMNode, req *StartContainerRequest) error {
-	if req != nil {
-		if req.RunAsUser != nil && *req.RunAsUser == 0 {
-			return fmt.Errorf("cloudvm provider enforces non-root containers; runAsUser 0 is forbidden on host network")
-		}
-		if req.RunAsGroup != nil && *req.RunAsGroup == 0 {
-			return fmt.Errorf("cloudvm provider enforces non-root containers; runAsGroup 0 is forbidden on host network")
-		}
-	}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -282,6 +322,7 @@ type MockContainerRunner struct {
 	hostStats  *HostStatsResult
 
 	pushedCredentials map[string][]PodAWSCredentials
+	pushedVolumeFiles map[string][]VolumeFile
 }
 
 // NewMockContainerRunner initializes an in-memory mock container runner.

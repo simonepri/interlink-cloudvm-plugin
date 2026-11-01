@@ -20,11 +20,15 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+  # Reads the ConfigMaps and ServiceAccounts a pod's environment and volumes name, as the kubelet does.
+  - apiGroups: [""]
+    resources: ["configmaps", "serviceaccounts"]
+    verbs: ["get"]
   # Reads the topology.kubernetes.io/region label of the node each pod is bound to.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
-  # Mints the projected tokens of the pods it runs, which it exchanges for their service account's IAM role credentials.
+  # Mints the projected service account tokens of the pods it runs, including those it exchanges for IAM role credentials.
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
@@ -32,6 +36,11 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
+  # Reads the API server address that every container gets in KUBERNETES_SERVICE_HOST.
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["kubernetes"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -49,7 +58,8 @@ subjects:
     name: {{ include "interlink-cloudvm-plugin.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- else }}
-# Nodes and token reviews are cluster-scoped, so they need a ClusterRole even when the other rules stay namespaced.
+# Nodes, token reviews and the default/kubernetes Service lie outside the tenant namespaces, so they need a ClusterRole
+# even when the other rules stay namespaced.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -65,6 +75,11 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
+  # Reads the API server address that every container gets in KUBERNETES_SERVICE_HOST.
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["kubernetes"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -107,7 +122,11 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
-  # Mints the projected tokens of the pods it runs, which it exchanges for their service account's IAM role credentials.
+  # Reads the ConfigMaps and ServiceAccounts a pod's environment and volumes name, as the kubelet does.
+  - apiGroups: [""]
+    resources: ["configmaps", "serviceaccounts"]
+    verbs: ["get"]
+  # Mints the projected service account tokens of the pods it runs, including those it exchanges for IAM role credentials.
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]

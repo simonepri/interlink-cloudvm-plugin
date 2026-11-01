@@ -178,6 +178,8 @@ type InstanceSpec struct {
 	DisableLazyPulls bool `json:"disableLazyPulls,omitempty"`
 	// StargzConfig is TOML that opens the stargz snapshotter config, ahead of the Docker Hub mirrors the plugin adds.
 	StargzConfig string `json:"stargzConfig,omitempty"`
+	// Runtime is how the runner runs the pod's containers, volumes and init containers included.
+	Runtime *PodRuntime `json:"-"`
 }
 
 // Instance represents an active or terminating cloud VM instance.
@@ -267,17 +269,11 @@ type ContainerResourceRequirements struct {
 	Requests map[string]string `json:"requests,omitempty"`
 }
 
-// SecurityContext specifies privilege and user settings for a container.
-type SecurityContext struct {
-	RunAsUser  *int64 `json:"runAsUser,omitempty"`
-	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
-}
+// SecurityContext is a container's Kubernetes security context.
+type SecurityContext = corev1.SecurityContext
 
-// PodSecurityContext specifies privilege and user settings at the pod level.
-type PodSecurityContext struct {
-	RunAsUser  *int64 `json:"runAsUser,omitempty"`
-	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
-}
+// PodSecurityContext is a pod's Kubernetes security context.
+type PodSecurityContext = corev1.PodSecurityContext
 
 type ContainerSpec struct {
 	Name            string                        `json:"name"`
@@ -285,20 +281,29 @@ type ContainerSpec struct {
 	Command         []string                      `json:"command,omitempty"`
 	Args            []string                      `json:"args,omitempty"`
 	Env             []EnvVar                      `json:"env,omitempty"`
+	EnvFrom         []corev1.EnvFromSource        `json:"envFrom,omitempty"`
 	Resources       ContainerResourceRequirements `json:"resources,omitempty"`
 	SecurityContext *SecurityContext              `json:"securityContext,omitempty"`
 	VolumeMounts    []corev1.VolumeMount          `json:"volumeMounts,omitempty"`
+	// RestartPolicy set to Always on an init container makes it a sidecar.
+	RestartPolicy *corev1.ContainerRestartPolicy `json:"restartPolicy,omitempty"`
 }
 
 type PodSpecWrapper struct {
-	NodeName           string                        `json:"nodeName,omitempty"`
-	ServiceAccountName string                        `json:"serviceAccountName,omitempty"`
-	NodeSelector       map[string]string             `json:"nodeSelector,omitempty"`
-	Affinity           *corev1.Affinity              `json:"affinity,omitempty"`
-	Containers         []ContainerSpec               `json:"containers"`
-	SecurityContext    *PodSecurityContext           `json:"securityContext,omitempty"`
-	ImagePullSecrets   []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-	Volumes            []corev1.Volume               `json:"volumes,omitempty"`
+	NodeName           string               `json:"nodeName,omitempty"`
+	ServiceAccountName string               `json:"serviceAccountName,omitempty"`
+	NodeSelector       map[string]string    `json:"nodeSelector,omitempty"`
+	Affinity           *corev1.Affinity     `json:"affinity,omitempty"`
+	InitContainers     []ContainerSpec      `json:"initContainers,omitempty"`
+	Containers         []ContainerSpec      `json:"containers"`
+	SecurityContext    *PodSecurityContext  `json:"securityContext,omitempty"`
+	RestartPolicy      corev1.RestartPolicy `json:"restartPolicy,omitempty"`
+	HostPID            bool                 `json:"hostPID,omitempty"`
+	HostIPC            bool                 `json:"hostIPC,omitempty"`
+	// AutomountServiceAccountToken false keeps the service account token out of the pod's containers.
+	AutomountServiceAccountToken *bool                         `json:"automountServiceAccountToken,omitempty"`
+	ImagePullSecrets             []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	Volumes                      []corev1.Volume               `json:"volumes,omitempty"`
 }
 
 // Pod represents the incoming pod definition from InterLink.
@@ -340,6 +345,10 @@ type ContainerStatus struct {
 	Image string               `json:"image,omitempty"`
 	State ContainerStatusState `json:"state"`
 	Ready bool                 `json:"ready"`
+	// ContainerID is the runtime's ID of the container, as containerd://<64 hex digits>.
+	ContainerID string `json:"containerID,omitempty"`
+	// RestartCount counts the runs of an init container that failed before this one.
+	RestartCount int32 `json:"restartCount,omitempty"`
 }
 
 // CreateStruct represents the response contract sent back to InterLink for /create.

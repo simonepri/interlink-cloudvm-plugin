@@ -1,4 +1,5 @@
-// Delivery of pod role credentials to the in-VM runner, over the reverse tunnel or directly over the mesh.
+// Delivery of pod role credentials and refreshed volume files, such as service account tokens, to the in-VM runner,
+// over the reverse tunnel or directly over the mesh.
 package main
 
 import (
@@ -17,8 +18,13 @@ type PodCredentialsPusher interface {
 	PushPodCredentials(ctx context.Context, node *CloudVMNode, podUID string, creds *PodAWSCredentials) error
 }
 
-func postPodCredentials(ctx context.Context, client *http.Client, url, runnerToken string, creds *PodAWSCredentials) error {
-	payload, err := json.Marshal(creds) //nolint:gosec // the runner needs the credentials; the channel is authenticated
+// PodVolumeFilesPusher is a ContainerRunner that can replace files of a running pod's file volumes.
+type PodVolumeFilesPusher interface {
+	PushPodVolumeFiles(ctx context.Context, node *CloudVMNode, podUID string, files []VolumeFile) error
+}
+
+func postRunnerJSON(ctx context.Context, client *http.Client, url, runnerToken string, body any) error {
+	payload, err := json.Marshal(body) //nolint:gosec // the runner needs the credentials; the channel is authenticated
 	if err != nil {
 		return err
 	}
@@ -48,7 +54,7 @@ func (h *HTTPContainerRunner) PushPodCredentials(ctx context.Context, node *Clou
 	if err != nil {
 		return err
 	}
-	return postPodCredentials(ctx, h.client, url, node.RunnerAuthToken, creds)
+	return postRunnerJSON(ctx, h.client, url, node.RunnerAuthToken, creds)
 }
 
 // PushPodCredentials sends the pod's role credentials down the worker's reverse tunnel session.
@@ -63,7 +69,7 @@ func (t *TunnelContainerRunner) PushPodCredentials(ctx context.Context, node *Cl
 		}
 		return fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
 	}
-	return postPodCredentials(ctx, t.clientForSession(session), "http://clvm-tunnel"+podCredentialsPath(podUID), node.RunnerAuthToken, creds)
+	return postRunnerJSON(ctx, t.clientForSession(session), "http://clvm-tunnel"+podCredentialsPath(podUID), node.RunnerAuthToken, creds)
 }
 
 // PushPodCredentials records the credentials pushed for the pod.
@@ -82,4 +88,46 @@ func (m *MockContainerRunner) PushedCredentials(podUID string) []PodAWSCredentia
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return append([]PodAWSCredentials(nil), m.pushedCredentials[podUID]...)
+}
+
+// PushPodVolumeFiles sends replacement volume files to the runner over the mesh.
+func (h *HTTPContainerRunner) PushPodVolumeFiles(ctx context.Context, node *CloudVMNode, podUID string, files []VolumeFile) error {
+	url, err := h.endpoint(node, podVolumeFilesPath(podUID))
+	if err != nil {
+		return err
+	}
+	return postRunnerJSON(ctx, h.client, url, node.RunnerAuthToken, files)
+}
+
+// PushPodVolumeFiles sends replacement volume files down the worker's reverse tunnel session.
+func (t *TunnelContainerRunner) PushPodVolumeFiles(ctx context.Context, node *CloudVMNode, podUID string, files []VolumeFile) error {
+	if node == nil || node.InstanceID == "" {
+		return errors.New("node or instanceID is missing")
+	}
+	session, ok := t.registry.Get(node.InstanceID)
+	if !ok {
+		if pusher, isPusher := t.fallback.(PodVolumeFilesPusher); isPusher {
+			return pusher.PushPodVolumeFiles(ctx, node, podUID, files)
+		}
+		return fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
+	}
+	return postRunnerJSON(ctx, t.clientForSession(session), "http://clvm-tunnel"+podVolumeFilesPath(podUID), node.RunnerAuthToken, files)
+}
+
+// PushPodVolumeFiles records the volume files pushed for the pod.
+func (m *MockContainerRunner) PushPodVolumeFiles(_ context.Context, _ *CloudVMNode, podUID string, files []VolumeFile) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pushedVolumeFiles == nil {
+		m.pushedVolumeFiles = make(map[string][]VolumeFile)
+	}
+	m.pushedVolumeFiles[podUID] = append(m.pushedVolumeFiles[podUID], files...)
+	return nil
+}
+
+// PushedVolumeFiles returns the volume files pushed for the pod, oldest first.
+func (m *MockContainerRunner) PushedVolumeFiles(podUID string) []VolumeFile {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]VolumeFile(nil), m.pushedVolumeFiles[podUID]...)
 }

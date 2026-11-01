@@ -325,3 +325,31 @@ func TestStatusContract_UnrecognizedRunnerStatusWaitsWithAReason(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusContract_ReportsContainerIDsAndInitContainers(t *testing.T) {
+	const uid = "uid-contract-ids"
+	const id = "containerd://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	runner := NewMockContainerRunner()
+	ts := newStatusContractServerWithRunner(t, uid, runner)
+	pod := contractPod(uid)
+
+	runner.SetStatus(uid, &ContainerStatusResult{Status: "created", Reason: "PodInitializing", Message: "running init container setup",
+		InitContainers: []InitContainerResult{{Name: "setup", ContainerID: id, Running: true, RestartCount: 1, StartedAt: time.Now()}}})
+	st := queryInterLinkStatus(t, ts, pod)
+	if w := st.Containers[0].State.Waiting; w == nil || w.Reason != "PodInitializing" {
+		t.Errorf("while init containers run the workload waits in PodInitializing, got %+v", st.Containers[0].State)
+	}
+	if ic := st.InitContainers[0]; ic.State.Running == nil || ic.ContainerID != id || ic.RestartCount != 1 {
+		t.Errorf("init container status = %+v", ic)
+	}
+
+	runner.SetStatus(uid, &ContainerStatusResult{Running: true, Status: "running", StartedAt: time.Now(), ContainerID: id,
+		InitContainers: []InitContainerResult{{Name: "setup", ContainerID: id, Done: true, Reason: "Completed", FinishedAt: time.Now()}}})
+	st = queryInterLinkStatus(t, ts, pod)
+	if st.Containers[0].ContainerID != id || st.Containers[1].ContainerID != "" {
+		t.Errorf("only the container the VM runs carries its ID, got %q and %q", st.Containers[0].ContainerID, st.Containers[1].ContainerID)
+	}
+	if ic := st.InitContainers[0]; ic.State.Terminated == nil || ic.State.Terminated.ContainerID != id || ic.ContainerID != id {
+		t.Errorf("init container status = %+v", ic)
+	}
+}

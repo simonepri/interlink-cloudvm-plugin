@@ -104,7 +104,7 @@ var allDiskTools = []string{"lsblk", "mdadm", "mkfs.xfs", "mkfs.ext4", "mkdir", 
 // bindCalls are the calls that move the runtime state below base, after containerd stopped.
 func bindCalls(base string) []string {
 	out := []string{"systemctl stop containerd stargz-snapshotter"}
-	for _, dir := range []string{"containerd", "containerd-stargz-grpc", "nerdctl"} {
+	for _, dir := range []string{"containerd", "containerd-stargz-grpc", "nerdctl", "kubelet"} {
 		out = append(out,
 			"mkdir -p "+base+"/cloudvm/"+dir+" /var/lib/"+dir,
 			"mount --bind "+base+"/cloudvm/"+dir+" /var/lib/"+dir)

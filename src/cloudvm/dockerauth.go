@@ -25,7 +25,8 @@ type SecretResolver interface {
 
 // KubeSecretResolver implements SecretResolver by querying Kubernetes secrets via client-go.
 type KubeSecretResolver struct {
-	client kubernetes.Interface
+	client    kubernetes.Interface
+	apiServer apiServerServiceCache
 }
 
 // NewKubeSecretResolver creates a new KubeSecretResolver with the given Kubernetes client.

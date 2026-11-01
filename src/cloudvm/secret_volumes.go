@@ -69,31 +69,40 @@ func ResolveSecretVolumes(ctx context.Context, pod *Pod, provided []corev1.Secre
 }
 
 func secretVolumeFiles(ctx context.Context, provided []corev1.Secret, resolver SecretResolver, namespace string, source *corev1.SecretVolumeSource) ([]SecretFile, error) {
-	optional := source.Optional != nil && *source.Optional
 	data, err := pullSecretData(ctx, provided, resolver, namespace, source.SecretName)
 	if err != nil {
-		if optional {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("secret %s/%s: %w", namespace, source.SecretName, err)
+		err = fmt.Errorf("secret %s/%s: %w", namespace, source.SecretName, err)
 	}
 	mode := int32(defaultSecretFileMode)
 	if source.DefaultMode != nil {
 		mode = *source.DefaultMode
 	}
+	return keyFiles(data, err, source.Items, mode, source.Optional, "secret "+namespace+"/"+source.SecretName)
+}
+
+// keyFiles returns the files a Secret or ConfigMap volume source projects from data, which lookupErr says could not
+// be read: every key, or only items, at mode unless an item sets its own. An optional source tolerates missing data.
+func keyFiles(data map[string][]byte, lookupErr error, items []corev1.KeyToPath, mode int32, optionalRef *bool, what string) ([]SecretFile, error) {
+	optional := optionalRef != nil && *optionalRef
+	if lookupErr != nil {
+		if optional {
+			return nil, nil
+		}
+		return nil, lookupErr
+	}
 	var files []SecretFile
-	if len(source.Items) == 0 {
+	if len(items) == 0 {
 		for key, value := range data {
 			files = append(files, SecretFile{Path: key, Data: value, Mode: mode})
 		}
 	}
-	for _, item := range source.Items {
+	for _, item := range items {
 		value, ok := data[item.Key]
 		if !ok {
 			if optional {
 				continue
 			}
-			return nil, fmt.Errorf("secret %s/%s has no key %q", namespace, source.SecretName, item.Key)
+			return nil, fmt.Errorf("%s has no key %q", what, item.Key)
 		}
 		itemMode := mode
 		if item.Mode != nil {
@@ -103,7 +112,7 @@ func secretVolumeFiles(ctx context.Context, provided []corev1.Secret, resolver S
 	}
 	for _, f := range files {
 		if err := validateRelativePath(f.Path, false); err != nil {
-			return nil, fmt.Errorf("secret %s/%s: file %q: %w", namespace, source.SecretName, f.Path, err)
+			return nil, fmt.Errorf("%s: file %q: %w", what, f.Path, err)
 		}
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })

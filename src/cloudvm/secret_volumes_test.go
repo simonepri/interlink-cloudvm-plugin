@@ -1,5 +1,5 @@
-// Tests how Secret volumes of the workload container resolve into runner files, and that the runner writes them and
-// mounts them read-only into the container.
+// Tests how Secret volumes of the workload container resolve into the files older runners mount, and that the runner
+// writes file volumes and mounts them read-only into the container.
 package main
 
 import (
@@ -111,16 +111,19 @@ func TestRunnerScript_MountsSecretVolumesReadOnly(t *testing.T) {
 	h.env = append(h.env, "CLOUDVM_SECRET_VOLUMES_DIR="+volumesDir)
 	defer h.start()()
 
-	start := func(volumes []SecretVolume) *http.Response {
+	start := func(volumes []PodVolume, mounts []ContainerMount) *http.Response {
 		t.Helper()
-		body, err := json.Marshal(StartContainerRequest{PodUID: "uid-1", Image: "busybox", SecretVolumes: volumes})
+		body, err := json.Marshal(StartContainerRequest{PodUID: "uid-1", Image: "busybox", Volumes: volumes, Mounts: mounts})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return h.do(http.MethodPost, "/containers/start", string(body))
 	}
 
-	resp := start([]SecretVolume{{MountPath: "/s3", SubPath: "aws", Files: []SecretFile{{Path: "aws/credentials", Data: []byte("key"), Mode: 0o400}}}, {MountPath: "/empty"}})
+	resp := start([]PodVolume{
+		{Name: "s3", Kind: VolumeKindFiles, Files: []SecretFile{{Path: "aws/credentials", Data: []byte("key"), Mode: 0o400}}},
+		{Name: "empty", Kind: VolumeKindFiles},
+	}, []ContainerMount{{Name: "s3", MountPath: "/s3", SubPath: "aws", ReadOnly: true}, {Name: "empty", MountPath: "/empty", ReadOnly: true}})
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("start returned HTTP %d", resp.StatusCode)
@@ -132,12 +135,12 @@ func TestRunnerScript_MountsSecretVolumesReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	podDir := filepath.Join(volumesDir, "uid-1")
-	for _, want := range []string{"-v\n" + filepath.Join(podDir, "0", "aws") + ":/s3:ro\n", "-v\n" + filepath.Join(podDir, "1") + ":/empty:ro\n"} {
+	for _, want := range []string{"-v\n" + filepath.Join(podDir, "s3", "aws") + ":/s3:ro\n", "-v\n" + filepath.Join(podDir, "empty") + ":/empty:ro\n"} {
 		if !strings.Contains(string(args), want) {
 			t.Errorf("run args lack %q:\n%s", want, args)
 		}
 	}
-	file := filepath.Join(podDir, "0", "aws", "credentials")
+	file := filepath.Join(podDir, "s3", "aws", "credentials")
 	data, err := os.ReadFile(file) //nolint:gosec // test-controlled path
 	if err != nil || string(data) != "key" {
 		t.Fatalf("secret file = %q, %v", data, err)
@@ -152,7 +155,7 @@ func TestRunnerScript_MountsSecretVolumesReadOnly(t *testing.T) {
 		t.Fatalf("stop must remove the pod's secret files, stat: %v", err)
 	}
 
-	resp = start([]SecretVolume{{MountPath: "/s3", Files: []SecretFile{{Path: "../escape", Data: []byte("x"), Mode: 0o644}}}})
+	resp = start([]PodVolume{{Name: "s3", Kind: VolumeKindFiles, Files: []SecretFile{{Path: "../escape", Data: []byte("x"), Mode: 0o644}}}}, nil)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("a file path that leaves its volume returned HTTP %d, want 400", resp.StatusCode)

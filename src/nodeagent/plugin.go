@@ -73,6 +73,9 @@ type ContainerStatus struct {
 	Image string         `json:"image,omitempty"`
 	State ContainerState `json:"state"`
 	Ready bool           `json:"ready"`
+	// ContainerID is the runtime's containerd://<id>, which node agents match against the host's cgroup paths.
+	ContainerID  string `json:"containerID,omitempty"`
+	RestartCount int32  `json:"restartCount,omitempty"`
 }
 
 // PodStatus mirrors one entry of a /status response.
