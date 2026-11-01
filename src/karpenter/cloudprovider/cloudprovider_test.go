@@ -147,6 +147,7 @@ func TestGetInstanceTypesFiltersFootprintAndDerivesLabels(t *testing.T) {
 		LabelInstanceGPUManufacturer:   "nvidia",
 		LabelInstanceGPUCount:          "1",
 		LabelInstanceGPUMemory:         "24576",
+		LabelNVIDIAGPUPresent:          "true",
 	}
 	for k, v := range wantLabels {
 		if got := g6.Requirements.Get(k); !got.Has(v) || got.Len() != 1 {
@@ -174,10 +175,18 @@ func TestGetInstanceTypesFiltersFootprintAndDerivesLabels(t *testing.T) {
 	}
 
 	m7 := findType(t, its, "m7i.xlarge")
-	for _, k := range []string{LabelGPUClass, LabelInstanceGPUName, LabelInstanceGPUCount} {
+	for _, k := range []string{LabelGPUClass, LabelInstanceGPUName, LabelInstanceGPUCount, LabelNVIDIAGPUPresent} {
 		if op := m7.Requirements.Get(k).Operator(); op != corev1.NodeSelectorOpDoesNotExist {
 			t.Errorf("m7i requirement %s operator = %s, want DoesNotExist", k, op)
 		}
+	}
+	// A DaemonSet that selects NVIDIA GPU nodes by the GPU feature discovery label fits the GPU type only.
+	gpuDaemon := scheduling.NewRequirements(scheduling.NewRequirement(LabelNVIDIAGPUPresent, corev1.NodeSelectorOpIn, "true"))
+	if err := g6.Requirements.Compatible(gpuDaemon, scheduling.AllowUndefinedWellKnownLabels); err != nil {
+		t.Errorf("a DaemonSet selecting NVIDIA GPU nodes does not fit g6: %v", err)
+	}
+	if err := m7.Requirements.Compatible(gpuDaemon, scheduling.AllowUndefinedWellKnownLabels); err == nil {
+		t.Error("a DaemonSet selecting NVIDIA GPU nodes fits m7i")
 	}
 	if got := m7.Requirements.Get(LabelInstanceSize).Any(); got != "xlarge" {
 		t.Errorf("m7i size = %q, want xlarge from the name", got)
@@ -311,7 +320,7 @@ func TestCreateChoosesCheapestCompatibleOffering(t *testing.T) {
 	if _, ok := sent.Annotations["cloudvm.vk.io/aws-launch-template-name"]; ok {
 		t.Errorf("gcp launch carries an AWS launch template: %v", sent.Annotations)
 	}
-	if sent.Labels["team"] != "ml" || sent.Labels[LabelGPUClass] != "l4" || sent.Labels[corev1.LabelHostname] != nc.Name {
+	if sent.Labels["team"] != "ml" || sent.Labels[LabelGPUClass] != "l4" || sent.Labels[LabelNVIDIAGPUPresent] != "true" || sent.Labels[corev1.LabelHostname] != nc.Name {
 		t.Errorf("node labels = %v", sent.Labels)
 	}
 	if len(sent.Taints) != 2 {

@@ -26,6 +26,10 @@ const (
 	LabelInstanceGPUManufacturer = "karpenter.k8s.aws/instance-gpu-manufacturer"
 	LabelInstanceGPUCount        = "karpenter.k8s.aws/instance-gpu-count"
 	LabelInstanceGPUMemory       = "karpenter.k8s.aws/instance-gpu-memory"
+
+	// LabelNVIDIAGPUPresent is "true" on types with NVIDIA GPUs, the label NVIDIA's GPU feature discovery sets on GPU
+	// nodes, so DaemonSets that select GPU nodes by it, such as GPU exporters, also select CloudVM GPU Nodes.
+	LabelNVIDIAGPUPresent = "nvidia.com/gpu.present"
 )
 
 // AnnotationNodeClassHash records the launch-settings hash of the NodeClass a NodeClaim launched with.
@@ -45,6 +49,7 @@ var derivedLabels = []string{
 	LabelInstanceGPUManufacturer,
 	LabelInstanceGPUCount,
 	LabelInstanceGPUMemory,
+	LabelNVIDIAGPUPresent,
 }
 
 func init() {

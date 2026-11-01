@@ -22,6 +22,9 @@ type PodAllocation struct {
 	ExitCode     int32          `json:"exitCode,omitempty"`
 	Reason       string         `json:"reason,omitempty"`
 	Message      string         `json:"message,omitempty"`
+	// DaemonSet marks a pod a DaemonSet owns: it shares the VM with pods of any namespace, never binds the VM's
+	// namespace, and does not keep the VM from being idle.
+	DaemonSet bool `json:"daemonSet,omitempty"`
 }
 
 // CloudVMNode represents a live ephemeral cloud VM capable of hosting one or more pods.
@@ -200,11 +203,14 @@ func (node *CloudVMNode) FitsAndScores(req ResourceVector) (bool, []int, []int, 
 	return true, assignedGPUs, assignedTPUs, score
 }
 
-// ownerNamespace returns the namespace of the node and its pod allocations, empty when it has neither; false when they
-// disagree.
+// ownerNamespace returns the namespace of the node and its workload pod allocations, empty when it has neither; false
+// when they disagree. DaemonSet pods, which may come from any namespace, do not count.
 func (node *CloudVMNode) ownerNamespace() (string, bool) {
 	namespace := node.Namespace
 	for _, alloc := range node.ActivePods {
+		if alloc.DaemonSet {
+			continue
+		}
 		if namespace == "" {
 			namespace = alloc.PodNamespace
 		}
@@ -226,7 +232,9 @@ func (node *CloudVMNode) AssignPod(alloc *PodAllocation) {
 	for _, tpu := range alloc.AssignedTPUs {
 		node.TPUSlots[tpu] = alloc.PodUID
 	}
-	node.IdleSince = nil
+	if !alloc.DaemonSet {
+		node.IdleSince = nil
+	}
 }
 
 // ActivePodCount returns the count of running (non-completed) pods on the node.
@@ -234,6 +242,18 @@ func (node *CloudVMNode) ActivePodCount() int {
 	count := 0
 	for _, p := range node.ActivePods {
 		if !p.Completed {
+			count++
+		}
+	}
+	return count
+}
+
+// workloadPodCount returns the count of running (non-completed) pods on the node that no DaemonSet owns. A node whose
+// only running pods are DaemonSet pods is idle, as Karpenter's emptiness ignores DaemonSet pods.
+func (node *CloudVMNode) workloadPodCount() int {
+	count := 0
+	for _, p := range node.ActivePods {
+		if !p.Completed && !p.DaemonSet {
 			count++
 		}
 	}
@@ -271,7 +291,7 @@ func (node *CloudVMNode) MarkPodCompleted(podUID string, exitCode int32, reason,
 		}
 	}
 
-	if node.ActivePodCount() == 0 {
+	if !alloc.DaemonSet && node.workloadPodCount() == 0 {
 		now := time.Now()
 		node.IdleSince = &now
 	}
@@ -301,7 +321,7 @@ func (node *CloudVMNode) ReleasePod(podUID string) bool {
 		}
 	}
 
-	if node.ActivePodCount() == 0 {
+	if !alloc.DaemonSet && node.workloadPodCount() == 0 {
 		now := time.Now()
 		node.IdleSince = &now
 	}
@@ -396,6 +416,8 @@ type AllocationRequest struct {
 	Accepts func(*CloudVMNode) bool
 	// ClaimName places the pod on the VM of that NodeClaim and nowhere else; empty places it on a VM of no claim.
 	ClaimName string
+	// DaemonSet places a DaemonSet pod, which shares a VM with pods of any namespace and never binds its namespace.
+	DaemonSet bool
 }
 
 // Allocation is the node and devices a pod was bin-packed into.
@@ -431,8 +453,12 @@ func (np *NodePool) AllocatePod(a AllocationRequest) (*Allocation, error) {
 			continue
 		}
 		// A node never mixes namespaces, so the tunnel gateway can attribute its traffic to one and the node carries only
-		// that namespace's firewall; a pod without a namespace never shares a node.
-		if owner, ok := node.ownerNamespace(); !ok || namespace == "" || (owner != "" && owner != namespace) {
+		// that namespace's firewall; a pod without a namespace never shares a node. A DaemonSet pod is the node's own
+		// agent, so it joins a node of any namespace.
+		if namespace == "" {
+			continue
+		}
+		if owner, ok := node.ownerNamespace(); !a.DaemonSet && (!ok || (owner != "" && owner != namespace)) {
 			continue
 		}
 		if np.maxPodsPerNode > 0 && node.ActivePodCount() >= np.maxPodsPerNode {
@@ -460,7 +486,9 @@ func (np *NodePool) AllocatePod(a AllocationRequest) (*Allocation, error) {
 	}
 
 	reused := bestNode.isIdle()
-	bestNode.Namespace = namespace
+	if !a.DaemonSet {
+		bestNode.Namespace = namespace
+	}
 	bestNode.AssignPod(&PodAllocation{
 		PodUID:       a.PodUID,
 		PodNamespace: namespace,
@@ -469,6 +497,7 @@ func (np *NodePool) AllocatePod(a AllocationRequest) (*Allocation, error) {
 		AssignedGPUs: bestGPUs,
 		AssignedTPUs: bestTPUs,
 		StartedAt:    now,
+		DaemonSet:    a.DaemonSet,
 	})
 	return &Allocation{Node: bestNode, GPUs: bestGPUs, TPUs: bestTPUs, Reused: reused}, nil
 }
@@ -599,7 +628,7 @@ func (np *NodePool) CollectExpiredIdleNodes() []*CloudVMNode {
 	now := time.Now()
 
 	for id, node := range np.nodes {
-		if node.ActivePodCount() != 0 || node.ClaimName != "" {
+		if node.workloadPodCount() != 0 || node.ClaimName != "" {
 			node.idleHoldLogged = false
 			continue
 		}
@@ -643,7 +672,7 @@ func (np *NodePool) ClaimForTermination(instanceID string) bool {
 	if !ok || node == nil {
 		return true
 	}
-	if node.ActivePodCount() > 0 || node.UnknownCoTenants || node.ClaimName != "" {
+	if node.workloadPodCount() > 0 || node.UnknownCoTenants || node.ClaimName != "" {
 		return false
 	}
 	if !node.Cordoned && node.IdleSince != nil && np.idleGracePeriod > 0 && time.Since(*node.IdleSince) <= np.idleGracePeriod {
@@ -662,13 +691,13 @@ func (np *NodePool) ReturnUnterminated(node *CloudVMNode) {
 	np.nodes[node.InstanceID] = node
 }
 
-// IdleNodeCount returns how many tracked nodes have no active pods.
+// IdleNodeCount returns how many tracked nodes have no active pods other than DaemonSet pods.
 func (np *NodePool) IdleNodeCount() int {
 	np.mu.RLock()
 	defer np.mu.RUnlock()
 	count := 0
 	for _, node := range np.nodes {
-		if node.ActivePodCount() == 0 {
+		if node.workloadPodCount() == 0 {
 			count++
 		}
 	}
@@ -690,8 +719,8 @@ func (np *NodePool) InstanceByIP(ip string) (string, bool) {
 	return "", false
 }
 
-// InstanceNamespace returns the one namespace of the node and the pods allocated to it; false when the node is unknown,
-// has no namespace, or its pods disagree.
+// InstanceNamespace returns the one namespace of the node and the workload pods allocated to it, ignoring DaemonSet
+// pods; false when the node is unknown, has no namespace, or its pods disagree.
 func (np *NodePool) InstanceNamespace(instanceID string) (string, bool) {
 	np.mu.RLock()
 	defer np.mu.RUnlock()
@@ -701,6 +730,32 @@ func (np *NodePool) InstanceNamespace(instanceID string) (string, bool) {
 	}
 	namespace, ok := node.ownerNamespace()
 	return namespace, ok && namespace != ""
+}
+
+// PodNamespace returns the namespace of a pod allocated to the node, DaemonSet pods included; false when the node is
+// unknown or holds no such pod.
+func (np *NodePool) PodNamespace(instanceID, podUID string) (string, bool) {
+	np.mu.RLock()
+	defer np.mu.RUnlock()
+	node, found := np.nodes[instanceID]
+	if !found || node == nil {
+		return "", false
+	}
+	alloc, ok := node.ActivePods[podUID]
+	if !ok {
+		return "", false
+	}
+	return alloc.PodNamespace, true
+}
+
+// PodNamespaceOnWorker returns the namespace of a pod a worker VM runs, DaemonSet pods included, so a stream a pod
+// opens can be attributed to that pod's namespace; false when the worker holds no such pod.
+func (s *Server) PodNamespaceOnWorker(instanceID, podUID string) (string, bool) {
+	np := s.NodePool()
+	if np == nil {
+		return "", false
+	}
+	return np.PodNamespace(instanceID, podUID)
 }
 
 // ActiveNodes returns a slice of all active nodes currently tracked in the pool.

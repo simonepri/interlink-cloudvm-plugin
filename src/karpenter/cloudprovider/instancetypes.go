@@ -165,7 +165,7 @@ func (c *CloudProvider) requirements(src *nodeclaim.InstanceType, capacity corev
 	reqs.Add(pick(size != "", in(LabelInstanceSize, size), absent(LabelInstanceSize)))
 
 	if src.GPUCount == 0 {
-		for _, k := range []string{LabelInstanceGPUName, LabelInstanceGPUManufacturer, LabelInstanceGPUCount, LabelInstanceGPUMemory, LabelGPUClass} {
+		for _, k := range []string{LabelInstanceGPUName, LabelInstanceGPUManufacturer, LabelInstanceGPUCount, LabelInstanceGPUMemory, LabelGPUClass, LabelNVIDIAGPUPresent} {
 			reqs.Add(absent(k))
 		}
 		return reqs
@@ -173,6 +173,7 @@ func (c *CloudProvider) requirements(src *nodeclaim.InstanceType, capacity corev
 	reqs.Add(in(LabelInstanceGPUCount, strconv.Itoa(src.GPUCount)))
 	reqs.Add(pick(src.GPUModel != "", in(LabelInstanceGPUName, gpuName(src.GPUModel)), absent(LabelInstanceGPUName)))
 	reqs.Add(pick(src.GPUManufacturer != "", in(LabelInstanceGPUManufacturer, strings.ToLower(src.GPUManufacturer)), absent(LabelInstanceGPUManufacturer)))
+	reqs.Add(pick(strings.EqualFold(src.GPUManufacturer, "nvidia"), in(LabelNVIDIAGPUPresent, "true"), absent(LabelNVIDIAGPUPresent)))
 	reqs.Add(pick(src.GPUMemoryGB > 0, in(LabelInstanceGPUMemory, strconv.Itoa(src.GPUMemoryGB*1024)), absent(LabelInstanceGPUMemory)))
 	class := c.config.GPUClassFor(src.GPUModel, src.GPUMemoryGB)
 	reqs.Add(pick(class != "", in(LabelGPUClass, class), absent(LabelGPUClass)))

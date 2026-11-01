@@ -596,3 +596,113 @@ func TestNodePool_NodeKeepsOneNamespace(t *testing.T) {
 		t.Fatal("an unknown node has a namespace")
 	}
 }
+
+func TestNodePool_DaemonSetPodsNeitherBindNorHoldTheNode(t *testing.T) {
+	pool := NewNodePool(time.Minute)
+	capacity, _ := NewResourceVector("8", "32Gi", 0, 0)
+	req, _ := NewResourceVector("1", "1Gi", 0, 0)
+	node := NewCloudVMNode("i-ds", ProviderAWS, "eu-west-1", "10.0.0.6", capacity)
+	pool.RegisterNode(node)
+	daemon := func(uid, namespace string) error {
+		_, err := pool.AllocatePod(AllocationRequest{Resources: req, Region: "eu-west-1", PodUID: uid, Namespace: namespace, PodName: uid, DaemonSet: true})
+		return err
+	}
+
+	if err := daemon("uid-proxy", "system"); err != nil {
+		t.Fatalf("DaemonSet pod on an unbound node: %v", err)
+	}
+	if ns, ok := pool.InstanceNamespace("i-ds"); ok || node.Namespace != "" {
+		t.Fatalf("a DaemonSet pod bound the node to %q", ns)
+	}
+	if node.isIdle() || node.IdleSince != nil {
+		t.Fatal("a node that ran only DaemonSet pods is idle")
+	}
+	if _, _, err := allocate(pool, req, "eu-west-1", "uid-w1", "team-a"); err != nil {
+		t.Fatalf("workload pod: %v", err)
+	}
+	if err := daemon("uid-exporter", "monitoring"); err != nil {
+		t.Fatalf("DaemonSet pod of another namespace on a bound node: %v", err)
+	}
+	if ns, ok := pool.InstanceNamespace("i-ds"); !ok || ns != "team-a" {
+		t.Fatalf("InstanceNamespace = %q, %v; want team-a", ns, ok)
+	}
+	if _, _, err := allocate(pool, req, "eu-west-1", "uid-w2", "team-b"); err == nil {
+		t.Fatal("a workload pod of another namespace joined the node")
+	}
+	if !node.Allocated.CPU.Equal(resource.MustParse("3")) {
+		t.Fatalf("allocated CPU = %s, want 3 counting the DaemonSet pods", node.Allocated.CPU.String())
+	}
+
+	// With only DaemonSet pods left, the node is idle; the pool keeps the DaemonSet pods and reuses the node for the
+	// namespace it is bound to.
+	pool.Release("uid-w1")
+	if !node.isIdle() || pool.IdleNodeCount() != 1 || node.ActivePodCount() != 2 {
+		t.Fatalf("after the workload left: idle %v, idle nodes %d, active pods %d", node.isIdle(), pool.IdleNodeCount(), node.ActivePodCount())
+	}
+	idleSince := *node.IdleSince
+	pool.Release("uid-proxy")
+	if !node.IdleSince.Equal(idleSince) {
+		t.Fatal("a DaemonSet pod leaving restarted the idle grace period")
+	}
+	if _, _, err := allocate(pool, req, "eu-west-1", "uid-w3", "team-b"); err == nil {
+		t.Fatal("an idle node bound to team-a took a team-b workload pod")
+	}
+	if got, _, err := allocate(pool, req, "eu-west-1", "uid-w3", "team-a"); err != nil || got.InstanceID != "i-ds" {
+		t.Fatalf("reuse of the idle node: %v", err)
+	}
+	if node.isIdle() {
+		t.Fatal("a reused node is still idle")
+	}
+}
+
+func TestNodePool_CollectsNodesWithOnlyDaemonSetPods(t *testing.T) {
+	pool := NewNodePool(0)
+	capacity, _ := NewResourceVector("8", "32Gi", 0, 0)
+	req, _ := NewResourceVector("1", "1Gi", 0, 0)
+	pool.RegisterNode(NewCloudVMNode("i-ds", ProviderAWS, "eu-west-1", "10.0.0.6", capacity))
+	if _, _, err := allocate(pool, req, "eu-west-1", "uid-w1", "team-a"); err != nil {
+		t.Fatalf("workload pod: %v", err)
+	}
+	if _, err := pool.AllocatePod(AllocationRequest{Resources: req, Region: "eu-west-1", PodUID: "uid-proxy", Namespace: "system", PodName: "proxy", DaemonSet: true}); err != nil {
+		t.Fatalf("DaemonSet pod: %v", err)
+	}
+	if expired := pool.CollectExpiredIdleNodes(); len(expired) != 0 {
+		t.Fatalf("collected a node with a workload pod: %d", len(expired))
+	}
+	pool.Release("uid-w1")
+	time.Sleep(time.Millisecond)
+	if expired := pool.CollectExpiredIdleNodes(); len(expired) != 1 {
+		t.Fatalf("collected %d nodes, want the one with only a DaemonSet pod", len(expired))
+	}
+}
+
+func TestServer_PodNamespaceOnWorker(t *testing.T) {
+	s := NewServer(NewMockProvider(), "pod-namespace")
+	capacity, _ := NewResourceVector("8", "32Gi", 0, 0)
+	req, _ := NewResourceVector("1", "1Gi", 0, 0)
+	s.nodePool.RegisterNode(NewCloudVMNode("i-w", ProviderAWS, "eu-west-1", "10.0.0.7", capacity))
+	s.nodePool.RegisterNode(NewCloudVMNode("i-other", ProviderAWS, "us-east-1", "10.0.0.8", capacity))
+	if _, _, err := allocate(s.nodePool, req, "eu-west-1", "uid-w", "team-a"); err != nil {
+		t.Fatalf("workload pod: %v", err)
+	}
+	if _, err := s.nodePool.AllocatePod(AllocationRequest{Resources: req, Region: "eu-west-1", PodUID: "uid-ds", Namespace: "monitoring", PodName: "exporter", DaemonSet: true}); err != nil {
+		t.Fatalf("DaemonSet pod: %v", err)
+	}
+	for _, tc := range []struct {
+		instance, uid, want string
+		ok                  bool
+	}{
+		{"i-w", "uid-w", "team-a", true},
+		{"i-w", "uid-ds", "monitoring", true},
+		{"i-other", "uid-w", "", false},
+		{"i-w", "uid-missing", "", false},
+		{"i-missing", "uid-w", "", false},
+	} {
+		if got, ok := s.PodNamespaceOnWorker(tc.instance, tc.uid); got != tc.want || ok != tc.ok {
+			t.Errorf("PodNamespaceOnWorker(%s, %s) = %q, %v; want %q, %v", tc.instance, tc.uid, got, ok, tc.want, tc.ok)
+		}
+	}
+	if ns, ok := s.WorkerNamespace("i-w"); !ok || ns != "team-a" {
+		t.Errorf("WorkerNamespace = %q, %v; want the workload's team-a", ns, ok)
+	}
+}
