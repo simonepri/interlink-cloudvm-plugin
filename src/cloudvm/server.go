@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,6 +87,7 @@ type Server struct {
 	podLogs               *PodLogBuffer                        // recent container output served to kubectl logs
 	logForwarder          *OTLPLogForwarder                    // optional OTLP export of worker logs
 	podCredentials        *PodCredentials                      // optional AWS credentials for pods whose service account has a role
+	podTokens             *PodTokens                           // refreshes the projected service account tokens of running pods
 	claims                *claimRegistry                       // VMs launched for Karpenter NodeClaims
 	claimAuth             *claimAuthenticator                  // verifies NodeClaim API callers; nil refuses them all
 	podExistence          PodExistence                         // optional pod watch that frees claim VM pods whose pod is gone
@@ -166,6 +166,7 @@ func NewServer(defaultProvider Provider, clusterTag string) *Server {
 	}
 	if sr, err := NewKubeSecretResolverFromConfig(); err == nil {
 		s.secretResolver = sr
+		s.podTokens = NewPodTokens(sr)
 	}
 	if er, err := NewInClusterPodEventRecorder(); err == nil {
 		s.eventRecorder = er
@@ -528,16 +529,9 @@ func (s *Server) RunPodCredentials(ctx context.Context) {
 // deliverPodCredentials pushes the pod's role credentials to the runner of its node, and reports
 // errPodCredentialsGone once the pod finished or was deleted.
 func (s *Server) deliverPodCredentials(ctx context.Context, podUID string, creds *PodAWSCredentials) error {
-	s.mu.RLock()
-	gone := s.isTombstonedLocked(podUID) || s.completedPods[podUID] != nil
-	runner := s.runner
-	s.mu.RUnlock()
-	node, alloc, found := s.nodePool.FindPodNode(podUID)
-	if gone || (found && alloc.Completed) {
-		return errPodCredentialsGone
-	}
-	if !found {
-		return fmt.Errorf("pod %s is not placed on a node", podUID)
+	node, runner, err := s.runningPodNode(podUID)
+	if err != nil {
+		return err
 	}
 	pusher, ok := runner.(PodCredentialsPusher)
 	if !ok {
@@ -546,6 +540,76 @@ func (s *Server) deliverPodCredentials(ctx context.Context, podUID string, creds
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	return pusher.PushPodCredentials(ctx, node, podUID, creds)
+}
+
+// podSources are where a pod being created reads its environment and volumes from: the create request's Secrets and
+// the Kubernetes API, which also supplies the API server Service variables every container gets.
+func (s *Server) podSources(ctx context.Context, provided []corev1.Secret) *PodSources {
+	s.mu.RLock()
+	resolver := s.secretResolver
+	s.mu.RUnlock()
+	src := &PodSources{Provided: provided, Secrets: resolver}
+	src.ConfigMaps, _ = resolver.(ConfigMapResolver)
+	src.Tokens, _ = resolver.(ServiceAccountTokenIssuer)
+	if api, ok := resolver.(APIServerService); ok {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if host, port, err := api.APIServerService(ctx); err == nil {
+			src.Base = APIServerEnv(host, port)
+		} else {
+			log.Printf("[cloudvm] Containers get no KUBERNETES_SERVICE_HOST: %v", err)
+		}
+	}
+	return src
+}
+
+// SetPodTokens sets how the projected service account tokens of running pods are refreshed.
+func (s *Server) SetPodTokens(pt *PodTokens) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.podTokens = pt
+}
+
+// RunPodTokens refreshes the projected service account tokens of running pods until ctx ends.
+func (s *Server) RunPodTokens(ctx context.Context) {
+	s.mu.RLock()
+	pt := s.podTokens
+	s.mu.RUnlock()
+	if pt != nil {
+		pt.Run(ctx, podCredentialRefreshInterval, s.deliverPodVolumeFiles)
+	}
+}
+
+// deliverPodVolumeFiles pushes replacement volume files to the runner of the pod's node, and reports
+// errPodCredentialsGone once the pod finished or was deleted.
+func (s *Server) deliverPodVolumeFiles(ctx context.Context, podUID string, files []VolumeFile) error {
+	node, runner, err := s.runningPodNode(podUID)
+	if err != nil {
+		return err
+	}
+	pusher, ok := runner.(PodVolumeFilesPusher)
+	if !ok {
+		return fmt.Errorf("container runner %T cannot deliver volume files", runner)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return pusher.PushPodVolumeFiles(ctx, node, podUID, files)
+}
+
+// runningPodNode returns the node and runner of a pod that still runs, or errPodCredentialsGone.
+func (s *Server) runningPodNode(podUID string) (*CloudVMNode, ContainerRunner, error) {
+	s.mu.RLock()
+	gone := s.isTombstonedLocked(podUID) || s.completedPods[podUID] != nil
+	runner := s.runner
+	s.mu.RUnlock()
+	node, alloc, found := s.nodePool.FindPodNode(podUID)
+	if gone || (found && alloc.Completed) {
+		return nil, nil, errPodCredentialsGone
+	}
+	if !found {
+		return nil, nil, fmt.Errorf("pod %s is not placed on a node", podUID)
+	}
+	return node, runner, nil
 }
 
 func (s *Server) SetContainerRunner(r ContainerRunner) {
@@ -811,25 +875,23 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	// The EKS webhook points the pod's SDKs at in-cluster credential sources a VM lacks; the runner serves its own.
 	podEnv := spec.Env
-	if DetectPodAWSRole(podEnv) != nil {
-		spec.Env = stripWebhookCredentialEnv(podEnv)
-	}
 
-	s.mu.RLock()
-	envResolver := s.secretResolver
-	s.mu.RUnlock()
-	envValues, err := ResolveEnvSources(r.Context(), pod, parseSecretsFromPayload(body), envResolver)
+	src := s.podSources(r.Context(), parseSecretsFromPayload(body))
+	automount, _ := src.Secrets.(ServiceAccountAutomount)
+	if err := AddServiceAccountVolume(r.Context(), pod, automount); err != nil {
+		log.Printf("[cloudvm] Pod %s/%s gets no service account token volume: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), err) //nolint:gosec // sanitized
+	}
+	runtime, mainEnv, podTokens, err := BuildPodRuntime(r.Context(), pod, spec.PodUID, src)
 	if err != nil {
 		finalErr = err
 		log.Printf("[cloudvm] Refusing pod %s/%s: %v", sanitizeLog(spec.PodNamespace), sanitizeLog(spec.PodName), err) //nolint:gosec // sanitized
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(envValues) > 0 {
-		if spec.Env == nil {
-			spec.Env = map[string]string{}
-		}
-		maps.Copy(spec.Env, envValues)
+	spec.Runtime = runtime
+	spec.Env, spec.Command, spec.Args = mainEnv.Vars, mainEnv.Command, mainEnv.Args
+	if DetectPodAWSRole(podEnv) != nil {
+		spec.Env = stripWebhookCredentialEnv(spec.Env)
 	}
 
 	if len(pod.Spec.ImagePullSecrets) > 0 {
@@ -955,6 +1017,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}, podEnv, true)
 	}
 
+	if s.podTokens != nil {
+		s.podTokens.Track(podRefOf(pod), podTokens)
+	}
+
 	prov := s.selectProvider(spec)
 	reqVec := ResourceVectorFromPod(pod)
 
@@ -1061,29 +1127,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	gpus, tpus := s.nodePool.RegisterAndAllocate(newNode, reqVec, spec.PodUID, spec.PodNamespace, spec.PodName)
 
-	cName := defaultContainerName
-	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
-		cName = pod.Spec.Containers[0].Name
-	}
-	startReq := &StartContainerRequest{
-		PodUID:           spec.PodUID,
-		Namespace:        spec.PodNamespace,
-		PodName:          spec.PodName,
-		ContainerName:    cName,
-		Image:            spec.TargetContainerImage,
-		Command:          spec.Command,
-		Args:             spec.Args,
-		Env:              spec.Env,
-		CPUMillicores:    reqVec.CPU.MilliValue(),
-		MemoryBytes:      reqVec.Memory.Value(),
-		AssignedGPUs:     gpus,
-		AssignedTPUs:     tpus,
-		RunAsUser:        spec.RunAsUser,
-		RunAsGroup:       spec.RunAsGroup,
-		DockerConfigJSON: spec.DockerConfigJSON,
-		SecretVolumes:    spec.SecretVolumes,
-		AWSCredentials:   awsCreds,
-	}
+	startReq := newStartRequest(spec, pod, gpus, tpus, awsCreds, reqVec.CPU.MilliValue(), reqVec.Memory.Value())
 	startErr := s.runner.StartContainer(r.Context(), newNode, startReq)
 	if startErr != nil {
 		log.Printf("[cloudvm] Initial StartContainer call returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
@@ -1194,15 +1238,13 @@ func (s *Server) prepareLaunch(ctx context.Context, spec *InstanceSpec, prov Pro
 	return nil
 }
 
-// startOnNode starts the pod's container on a node it was allocated to, retrying in the background while the VM
-// boots, and records the pod's instance.
-func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus []int, spec *InstanceSpec, pod *Pod, awsCreds *PodAWSCredentials, cpuLimitMilli, memLimitBytes int64) *CreateStruct {
-	// Start container via runner
+// newStartRequest is the runner start request of the pod's containers on a node it was given GPUs and TPUs of.
+func newStartRequest(spec *InstanceSpec, pod *Pod, gpus, tpus []int, awsCreds *PodAWSCredentials, cpuMilli, memBytes int64) *StartContainerRequest {
 	cName := defaultContainerName
 	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Name != "" {
 		cName = pod.Spec.Containers[0].Name
 	}
-	startReq := &StartContainerRequest{
+	req := &StartContainerRequest{
 		PodUID:           spec.PodUID,
 		Namespace:        spec.PodNamespace,
 		PodName:          spec.PodName,
@@ -1211,8 +1253,8 @@ func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus 
 		Command:          spec.Command,
 		Args:             spec.Args,
 		Env:              spec.Env,
-		CPUMillicores:    cpuLimitMilli,
-		MemoryBytes:      memLimitBytes,
+		CPUMillicores:    cpuMilli,
+		MemoryBytes:      memBytes,
 		AssignedGPUs:     gpus,
 		AssignedTPUs:     tpus,
 		RunAsUser:        spec.RunAsUser,
@@ -1221,6 +1263,14 @@ func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus 
 		SecretVolumes:    spec.SecretVolumes,
 		AWSCredentials:   awsCreds,
 	}
+	spec.Runtime.apply(req)
+	return req
+}
+
+// startOnNode starts the pod's container on a node it was allocated to, retrying in the background while the VM
+// boots, and records the pod's instance.
+func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus []int, spec *InstanceSpec, pod *Pod, awsCreds *PodAWSCredentials, cpuLimitMilli, memLimitBytes int64) *CreateStruct {
+	startReq := newStartRequest(spec, pod, gpus, tpus, awsCreds, cpuLimitMilli, memLimitBytes)
 	startErr := s.runner.StartContainer(ctx, node, startReq)
 	if startErr != nil {
 		log.Printf("[cloudvm] Initial StartContainer call for bin-pack slice returned error (VM may still be booting): %v. Launching background worker to retry until runner is up...", startErr)
@@ -1375,6 +1425,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		podCredentials.Forget(uid)
 		podCredentials.Forget(pod.Metadata.UID)
 	}
+	if s.podTokens != nil {
+		s.podTokens.Forget(uid)
+		s.podTokens.Forget(pod.Metadata.UID)
+	}
 
 	// Release resources from NodePool
 	remainingPods := 0
@@ -1457,15 +1511,18 @@ type statusPodMetadata struct {
 }
 
 type statusContainerSpec struct {
-	Name  string   `json:"name"`
-	Image string   `json:"image"`
-	Env   []EnvVar `json:"env,omitempty"`
+	Name         string               `json:"name"`
+	Image        string               `json:"image"`
+	Env          []EnvVar             `json:"env,omitempty"`
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 }
 
 type statusPodSpec struct {
-	Containers         []statusContainerSpec `json:"containers"`
-	InitContainers     []statusContainerSpec `json:"initContainers"`
-	ServiceAccountName string                `json:"serviceAccountName,omitempty"`
+	Containers                   []statusContainerSpec `json:"containers"`
+	InitContainers               []statusContainerSpec `json:"initContainers"`
+	ServiceAccountName           string                `json:"serviceAccountName,omitempty"`
+	Volumes                      []corev1.Volume       `json:"volumes,omitempty"`
+	AutomountServiceAccountToken *bool                 `json:"automountServiceAccountToken,omitempty"`
 }
 
 type statusPodItem struct {
@@ -1582,6 +1639,46 @@ func (s *Server) resumePodCredentials(ctx context.Context, pods []*statusPodRef)
 	}
 }
 
+// resumePodTokens tracks the service account tokens of running pods that nobody refreshes, such as after a plugin
+// restart; the refresher mints and delivers fresh ones on its next round.
+func (s *Server) resumePodTokens(ctx context.Context, pods []*statusPodRef) {
+	s.mu.RLock()
+	pt, resolver := s.podTokens, s.secretResolver
+	s.mu.RUnlock()
+	if pt == nil {
+		return
+	}
+	automount, _ := resolver.(ServiceAccountAutomount)
+	for _, p := range pods {
+		if p.UID == "" || pt.Tracked(p.UID) {
+			continue
+		}
+		if _, alloc, found := s.nodePool.FindPodNode(p.UID); !found || alloc.Completed {
+			continue
+		}
+		pod := &Pod{
+			Metadata: PodMeta{Name: p.Name, Namespace: p.Namespace, UID: p.UID},
+			Spec: PodSpecWrapper{
+				ServiceAccountName: p.Spec.ServiceAccountName, Volumes: p.Spec.Volumes,
+				AutomountServiceAccountToken: p.Spec.AutomountServiceAccountToken,
+			},
+		}
+		for _, list := range []struct {
+			from []statusContainerSpec
+			to   *[]ContainerSpec
+		}{{p.Spec.InitContainers, &pod.Spec.InitContainers}, {p.Spec.Containers, &pod.Spec.Containers}} {
+			for _, c := range list.from {
+				*list.to = append(*list.to, ContainerSpec{Name: c.Name, Image: c.Image, VolumeMounts: c.VolumeMounts})
+			}
+		}
+		if err := AddServiceAccountVolume(ctx, pod, automount); err != nil {
+			log.Printf("[cloudvm] Cannot resume the service account tokens of pod %s: %v", sanitizeLog(p.UID), err) //nolint:gosec // sanitized
+			continue
+		}
+		pt.Track(podRefOf(pod), PodTokenProjections(pod))
+	}
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1617,6 +1714,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 	s.resumePodCredentials(r.Context(), pods)
+	s.resumePodTokens(r.Context(), pods)
 
 	type statusTarget struct {
 		name          string
@@ -1754,6 +1852,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					tgt := targets[idx]
 
 					var status ContainerStatus
+					var runnerResult *ContainerStatusResult
 
 					completedTerm := tgt.completedTerm
 					if completedTerm == nil && tgt.uid != "" && s.completedStore != nil {
@@ -1780,6 +1879,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					case completedTerm != nil:
 						status.Ready = false
 						status.State.Terminated = completedTerm
+						status.ContainerID = completedTerm.ContainerID
 					case alloc != nil && alloc.Completed:
 						status.Ready = false
 						finishedAt := time.Now()
@@ -1825,6 +1925,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 										Message: fmt.Sprintf("Waiting for runner daemon on %s (%s)...", node.InstanceID, node.GetMeshIP()),
 									})
 								} else if cResult != nil {
+									runnerResult = cResult
 									if !cResult.Running {
 										s.forgetRunning(tgt.uid)
 									}
@@ -1851,6 +1952,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 									switch {
 									case cResult.Running:
 										status.Ready = true
+										status.ContainerID = cResult.ContainerID
 										status.State.Running = &ContainerRunningState{
 											StartedAt: cResult.StartedAt,
 										}
@@ -1865,11 +1967,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 									case cResult.Reason == "StartError":
 										s.recordRunnerTermination(tgt.uid, tgt.jid, cResult, &status)
 									case cResult.Status == "created" || cResult.Status == "starting":
-										status.Ready = false
-										status.State.Waiting = &ContainerWaitingState{
-											Reason:  "ContainerCreating",
-											Message: "Container created, starting up...",
+										// The runner names the step it waits on, such as PodInitializing while init containers run.
+										waiting := ContainerWaitingState{Reason: "ContainerCreating", Message: "Container created, starting up..."}
+										if cResult.Reason != "" && cResult.Reason != "ContainerCreating" {
+											waiting = ContainerWaitingState{Reason: cResult.Reason, Message: cResult.Message}
 										}
+										status.Ready = false
+										status.State.Waiting = &waiting
 									case cResult.Status == "restarting" || cResult.Status == "paused" || cResult.Status == "removing":
 										status.Ready = false
 										status.State.Waiting = &ContainerWaitingState{
@@ -1922,7 +2026,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 
-					containers, initContainers := specContainerStatuses(tgt.spec, status)
+					containers, initContainers := specContainerStatuses(tgt.spec, status, runnerResult)
 					var podIP string
 					var podIPs []string
 					if ip := node.GetInternalIP(); ip != "" {
@@ -1950,34 +2054,65 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // specContainerStatuses reports the workload status under the name of every container in the pod spec, because interLink
 // matches remote statuses to in-cluster statuses by container name and appends any name it does not know.
-// The VM runs the pod as one workload, so every regular container mirrors its state; init containers are not
-// executed and are reported as terminated successfully so interLink does not hold the pod in PodInitializing.
-func specContainerStatuses(spec statusPodSpec, workload ContainerStatus) (containers, initContainers []ContainerStatus) {
+// The VM runs the first container as the pod's workload, and every other regular container mirrors its state without
+// a container ID. Init containers report what the runner reported for them; without a report they are waiting while
+// the workload waits, and completed otherwise.
+func specContainerStatuses(spec statusPodSpec, workload ContainerStatus, runner *ContainerStatusResult) (containers, initContainers []ContainerStatus) {
 	specContainers := spec.Containers
 	if len(specContainers) == 0 {
 		specContainers = []statusContainerSpec{{Name: defaultContainerName}}
 	}
 	containers = make([]ContainerStatus, 0, len(specContainers))
-	for _, c := range specContainers {
+	for i, c := range specContainers {
 		st := workload
 		st.Name = c.Name
 		st.Image = c.Image
+		if i > 0 {
+			st.ContainerID = ""
+		}
 		containers = append(containers, st)
+	}
+	reported := map[string]InitContainerResult{}
+	if runner != nil {
+		for _, ic := range runner.InitContainers {
+			reported[ic.Name] = ic
+		}
 	}
 	initContainers = make([]ContainerStatus, 0, len(spec.InitContainers))
 	for _, c := range spec.InitContainers {
-		initContainers = append(initContainers, ContainerStatus{
-			Name:  c.Name,
-			Image: c.Image,
-			State: ContainerStatusState{Terminated: &ContainerTerminatedState{
-				ExitCode:   0,
-				Reason:     "Completed",
-				Message:    "The CloudVM plugin does not run init containers",
-				FinishedAt: time.Now(),
-			}},
-		})
+		st := ContainerStatus{Name: c.Name, Image: c.Image}
+		ic, ok := reported[c.Name]
+		switch {
+		case ok:
+			st = initContainerStatus(c, ic)
+		case workload.State.Waiting != nil:
+			st.State.Waiting = &ContainerWaitingState{Reason: "PodInitializing"}
+		default:
+			st.State.Terminated = &ContainerTerminatedState{ExitCode: 0, Reason: "Completed", FinishedAt: time.Now()}
+		}
+		initContainers = append(initContainers, st)
 	}
 	return containers, initContainers
+}
+
+// initContainerStatus converts the runner's report of an init container to its status.
+func initContainerStatus(c statusContainerSpec, ic InitContainerResult) ContainerStatus {
+	st := ContainerStatus{Name: c.Name, Image: c.Image, ContainerID: ic.ContainerID, RestartCount: ic.RestartCount}
+	switch {
+	case ic.Running:
+		st.State.Running = &ContainerRunningState{StartedAt: ic.StartedAt}
+	case ic.Done:
+		finished := ic.FinishedAt
+		if finished.IsZero() {
+			finished = time.Now()
+		}
+		st.State.Terminated = &ContainerTerminatedState{
+			ExitCode: ic.ExitCode, Reason: ic.Reason, Message: ic.Message, FinishedAt: finished, ContainerID: ic.ContainerID,
+		}
+	default:
+		st.State.Waiting = &ContainerWaitingState{Reason: ic.Reason, Message: ic.Message}
+	}
+	return st
 }
 
 // statusErrLogInterval spaces repeated runner status error logs of one pod.
@@ -2043,12 +2178,14 @@ func (s *Server) recordRunnerTermination(uid, jid string, cResult *ContainerStat
 		exitCode = 1
 	}
 	term := &ContainerTerminatedState{
-		ExitCode:   exitCode,
-		Reason:     cResult.Reason,
-		Message:    cResult.Message,
-		FinishedAt: finAt,
+		ExitCode:    exitCode,
+		Reason:      cResult.Reason,
+		Message:     cResult.Message,
+		FinishedAt:  finAt,
+		ContainerID: cResult.ContainerID,
 	}
 	status.State.Terminated = term
+	status.ContainerID = cResult.ContainerID
 	s.nodePool.MarkPodCompleted(uid, exitCode, cResult.Reason, cResult.Message, finAt)
 	s.mu.Lock()
 	if uid != "" {

@@ -37,24 +37,8 @@ func EgressRateToBandwidth(dollarPerHour float64, provider string) string {
 
 // PodToInstanceSpec converts an incoming InterLink Pod into an InstanceSpec.
 func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...string) (*InstanceSpec, error) {
-	// Enforce non-root containers on host network: reject runAsUser 0 or runAsGroup 0
-	for _, c := range pod.Spec.Containers {
-		if c.SecurityContext != nil {
-			if c.SecurityContext.RunAsUser != nil && *c.SecurityContext.RunAsUser == 0 {
-				return nil, fmt.Errorf("cloudvm provider enforces non-root containers; container %q specifies runAsUser 0 which is forbidden on host network", c.Name)
-			}
-			if c.SecurityContext.RunAsGroup != nil && *c.SecurityContext.RunAsGroup == 0 {
-				return nil, fmt.Errorf("cloudvm provider enforces non-root containers; container %q specifies runAsGroup 0 which is forbidden on host network", c.Name)
-			}
-		}
-	}
-	if pod.Spec.SecurityContext != nil {
-		if pod.Spec.SecurityContext.RunAsUser != nil && *pod.Spec.SecurityContext.RunAsUser == 0 {
-			return nil, fmt.Errorf("cloudvm provider enforces non-root containers; pod securityContext specifies runAsUser 0 which is forbidden on host network")
-		}
-		if pod.Spec.SecurityContext.RunAsGroup != nil && *pod.Spec.SecurityContext.RunAsGroup == 0 {
-			return nil, fmt.Errorf("cloudvm provider enforces non-root containers; pod securityContext specifies runAsGroup 0 which is forbidden on host network")
-		}
+	if err := ValidatePodRuntime(pod); err != nil {
+		return nil, err
 	}
 	ns := pod.Metadata.Namespace
 	if ns == "" {
@@ -250,18 +234,10 @@ func PodToInstanceSpec(pod *Pod, defaultClusterTag string, defaultRegion ...stri
 		}
 	}
 
-	var runAsUser *int64
-	var runAsGroup *int64
+	var runAsUser, runAsGroup *int64
 	if len(pod.Spec.Containers) > 0 {
-		c := pod.Spec.Containers[0]
-		if c.SecurityContext != nil && c.SecurityContext.RunAsUser != nil {
-			runAsUser = c.SecurityContext.RunAsUser
-			runAsGroup = c.SecurityContext.RunAsGroup
-		}
-	}
-	if runAsUser == nil && pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.RunAsUser != nil {
-		runAsUser = pod.Spec.SecurityContext.RunAsUser
-		runAsGroup = pod.Spec.SecurityContext.RunAsGroup
+		sec := EffectiveSecurity(pod, &pod.Spec.Containers[0])
+		runAsUser, runAsGroup = sec.RunAsUser, sec.RunAsGroup
 	}
 
 	var cpuMillicores int64

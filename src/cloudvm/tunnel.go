@@ -697,15 +697,6 @@ func (t *TunnelContainerRunner) StartContainer(ctx context.Context, node *CloudV
 		return fmt.Errorf("no active reverse tunnel session for instance %s", node.InstanceID)
 	}
 
-	if req != nil {
-		if req.RunAsUser != nil && *req.RunAsUser == 0 {
-			return fmt.Errorf("cloudvm provider enforces non-root containers; runAsUser 0 is forbidden on host network")
-		}
-		if req.RunAsGroup != nil && *req.RunAsGroup == 0 {
-			return fmt.Errorf("cloudvm provider enforces non-root containers; runAsGroup 0 is forbidden on host network")
-		}
-	}
-
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return err

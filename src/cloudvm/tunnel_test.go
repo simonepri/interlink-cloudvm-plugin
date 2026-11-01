@@ -96,23 +96,6 @@ func TestComputeJitter(t *testing.T) {
 	}
 }
 
-func TestTunnelContainerRunner_NonRootValidation(t *testing.T) {
-	reg := NewSessionRegistry()
-	runner := NewTunnelContainerRunner(reg)
-	node := &CloudVMNode{InstanceID: "i-inst-1"}
-
-	zero := int64(0)
-	reqUser := &StartContainerRequest{PodUID: "pod-1", RunAsUser: &zero}
-	if err := runner.StartContainer(context.Background(), node, reqUser); err == nil {
-		t.Error("expected error for runAsUser 0")
-	}
-
-	reqGroup := &StartContainerRequest{PodUID: "pod-1", RunAsGroup: &zero}
-	if err := runner.StartContainer(context.Background(), node, reqGroup); err == nil {
-		t.Error("expected error for runAsGroup 0")
-	}
-}
-
 func TestTunnelContainerRunner_Fallback(t *testing.T) {
 	reg := NewSessionRegistry()
 	runner := NewTunnelContainerRunner(reg)

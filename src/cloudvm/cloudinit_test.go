@@ -72,7 +72,9 @@ func TestCloudInit_ContainerModeWithMicroRunner(t *testing.T) {
 	if bytes.Contains([]byte(script), []byte("shell=True")) {
 		t.Errorf("cloud-init runner must not execute commands with shell=True")
 	}
-	if bytes.Contains([]byte(script), []byte("--pid=host")) || bytes.Contains([]byte(script), []byte("--ipc=host")) {
+	// The runner shares the host's PID and IPC namespaces only with a pod that asks for them, which its tests cover.
+	bootScript, _, _ := strings.Cut(script, "RUNNER_EOF")
+	if strings.Contains(bootScript, "--pid=host") || strings.Contains(bootScript, "--ipc=host") {
 		t.Errorf("cloud-init containers must not share pid or ipc namespace with host")
 	}
 	if !bytes.Contains([]byte(script), []byte(fmt.Sprintf(`echo -n "%s" > /etc/cloudvm/runner-token`, testToken))) {
@@ -239,9 +241,9 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 		t.Fatalf("cloud-init missing IMDS or runner port firewall rules")
 	}
 
-	// Verify container capability isolation
-	if !strings.Contains(script, "--cap-drop=SETUID") || !strings.Contains(script, "--security-opt=no-new-privileges") || !strings.Contains(script, "--user=65532:65532") {
-		t.Fatalf("cloud-init missing container privilege isolation flags")
+	// Pod containers, which may run as root, are kept away from the metadata service by their cgroup.
+	if !strings.Contains(script, "-d 169.254.169.254 -m cgroup --path kubepods -j DROP") {
+		t.Fatalf("cloud-init missing the IMDS block for pod containers")
 	}
 
 	// Verify runner concurrency throttle and shutdown check
@@ -255,34 +257,21 @@ func TestCloudInit_RunnerPythonSyntaxAndImports(t *testing.T) {
 	}
 }
 
-func TestPodToInstanceSpec_RootUIDRejected(t *testing.T) {
+func TestPodToInstanceSpec_RootUIDAllowed(t *testing.T) {
 	rootUID := int64(0)
 	pod := &Pod{
 		Metadata: PodMeta{Name: "root-pod", Namespace: "default"},
 		Spec: PodSpecWrapper{
-			SecurityContext: &PodSecurityContext{
-				RunAsUser: &rootUID,
-			},
-			Containers: []ContainerSpec{
-				{Name: "main", Image: "alpine"},
-			},
+			SecurityContext: &PodSecurityContext{RunAsUser: &rootUID},
+			Containers:      []ContainerSpec{{Name: "main", Image: "alpine"}},
 		},
 	}
-
-	_, err := PodToInstanceSpec(pod, "test-cluster")
-	if err == nil {
-		t.Fatal("expected error when pod specifies runAsUser: 0, got nil")
+	spec, err := PodToInstanceSpec(pod, "test-cluster")
+	if err != nil {
+		t.Fatalf("admission decides whether a pod may run as root, got %v", err)
 	}
-
-	nonRootUID := int64(1000)
-	pod.Spec.SecurityContext.RunAsUser = &nonRootUID
-	pod.Spec.Containers[0].SecurityContext = &SecurityContext{
-		RunAsUser: &rootUID,
-	}
-
-	_, err = PodToInstanceSpec(pod, "test-cluster")
-	if err == nil {
-		t.Fatal("expected error when container specifies runAsUser: 0, got nil")
+	if spec.RunAsUser == nil || *spec.RunAsUser != 0 {
+		t.Fatalf("RunAsUser = %v, want 0", spec.RunAsUser)
 	}
 }
 
@@ -934,7 +923,8 @@ func TestRenderCloudInit_FailsTheBootstrapWithoutTheMetadataGuard(t *testing.T) 
 	}{
 		{"an image without iptables whose package manager installs it", map[string]string{
 			"dnf": "#!/bin/sh\ncp \"$STATE/iptables\" \"$BIN/iptables\"\n",
-		}, true, "-I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP"},
+		}, true, "-I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP\nmkdir -p /sys/fs/cgroup/kubepods\n" +
+			"-C OUTPUT -d 169.254.169.254 -m cgroup --path kubepods -j DROP\n-I OUTPUT 1 -d 169.254.169.254 -m cgroup --path kubepods -j DROP\n"},
 		{"an image without iptables that cannot install it", map[string]string{
 			"dnf": "#!/bin/sh\nexit 1\n", "yum": "#!/bin/sh\nexit 1\n", "apt-get": "#!/bin/sh\nexit 1\n",
 		}, false, "FATAL: no iptables"},
@@ -950,6 +940,10 @@ func TestRenderCloudInit_FailsTheBootstrapWithoutTheMetadataGuard(t *testing.T) 
 			}
 			fakeIPTables := "#!/bin/sh\necho \"$*\" >> \"$STATE/rules\"\n[ \"$1\" != -C ]\n"
 			if err := os.WriteFile(filepath.Join(state, "iptables"), []byte(fakeIPTables), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+				t.Fatal(err)
+			}
+			// The guard creates the /kubepods cgroup the pod container rule matches, which a test host has no permission for.
+			if err := os.WriteFile(filepath.Join(bin, "mkdir"), []byte("#!/bin/sh\necho \"mkdir $*\" >> \"$STATE/rules\"\n"), 0o755); err != nil { //nolint:gosec // test fixture must be executable
 				t.Fatal(err)
 			}
 			for name, body := range tc.tools {

@@ -295,6 +295,7 @@ func run() error {
 		server.Lifecycle().SetTracerProvider(tp)
 		log.Printf("[cloudvm] Exporting pod and VM lifecycle traces to %s", endpoint) //nolint:gosec // configuration value
 	}
+	go server.RunPodTokens(ctx)
 	if pc, err := NewPodCredentialsFromEnv(ctx, awsRegion); err == nil {
 		server.SetPodCredentials(pc)
 		go server.RunPodCredentials(ctx)

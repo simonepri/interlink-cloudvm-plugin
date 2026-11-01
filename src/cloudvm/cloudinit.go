@@ -181,16 +181,33 @@ func (c *CloudInitConfig) TunnelAgentScriptSHA256() string {
 	return scriptSHA256(tunnelAgentScript)
 }
 
-// stripPythonComments drops blank and comment-only lines to keep the user data under the EC2 size limit. It keeps the
-// shebang and encoding lines and every line inside a triple-quoted string.
+// stripPythonComments drops blank and comment-only lines, shortens docstrings to "" and indents by one space per level
+// instead of four, to keep the user data under the EC2 size limit. It keeps the shebang and encoding lines and every
+// line inside any other triple-quoted string as written.
 func stripPythonComments(src string) string {
 	var kept []string
-	inString := false
+	inString, inDoc := false, false
 	for i, line := range strings.Split(src, "\n") {
 		trimmed := strings.TrimSpace(line)
+		toggles := strings.Count(line, `"""`)%2 == 1 || strings.Count(line, "'''")%2 == 1
+		if inDoc {
+			inDoc = !toggles
+			continue
+		}
+		code := strings.TrimLeft(line, " ")
+		indent := strings.Repeat(" ", (len(line)-len(code))/4)
+		afterHeader := len(kept) == 0 || strings.HasSuffix(strings.TrimSpace(kept[len(kept)-1]), ":")
+		if !inString && afterHeader && (strings.HasPrefix(trimmed, `"""`) || strings.HasPrefix(trimmed, "'''")) {
+			kept = append(kept, indent+`""`)
+			inDoc = toggles
+			continue
+		}
 		header := i < 2 && (strings.HasPrefix(trimmed, "#!") || strings.Contains(trimmed, "coding"))
 		keep := inString || header || (trimmed != "" && !strings.HasPrefix(trimmed, "#"))
-		if strings.Count(line, `"""`)%2 == 1 || strings.Count(line, "'''")%2 == 1 {
+		if !inString && !header {
+			line = indent + code
+		}
+		if toggles {
 			inString = !inString
 			keep = true
 		}
@@ -379,6 +396,9 @@ command -v iptables >/dev/null 2>&1 || cloudvm_bootstrap_failed "no iptables to 
 
 # Prevent non-root container workloads from accessing cloud metadata services (IMDS)
 iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m owner ! --uid-owner root -j DROP || cloudvm_bootstrap_failed "cannot block the instance metadata service for non-root users"
+# Nor may pod containers, root ones included, which run under /kubepods
+mkdir -p /sys/fs/cgroup/kubepods || cloudvm_bootstrap_failed "cannot create the /kubepods cgroup"
+iptables -C OUTPUT -d 169.254.169.254 -m cgroup --path kubepods -j DROP 2>/dev/null || iptables -I OUTPUT 1 -d 169.254.169.254 -m cgroup --path kubepods -j DROP || cloudvm_bootstrap_failed "cannot block the instance metadata service for pod containers"
 
 # Runner port 9090 dedicated firewall chain inserted at head of INPUT
 iptables -N CLOUDVM_RUNNER 2>/dev/null || true
@@ -566,8 +586,8 @@ if ! command -v containerd >/dev/null 2>&1; then
   echo "[cloudvm-bootstrap] Error: containerd installation failed" >&2
   exit 1
 fi
-# cloudvm_instance_store moves the containerd, stargz and nerdctl state onto the NVMe instance store, striping several
-# disks with mdadm when the image has it, because the root EBS volume caps image unpacking at its throughput.
+# cloudvm_instance_store moves the containerd, stargz, nerdctl and kubelet (emptyDir) state onto the NVMe instance store,
+# striping several disks with mdadm when the image has it, because the root EBS volume caps image unpacking at its throughput.
 cloudvm_instance_store() {
   local devs base target dir
   devs=$(lsblk -dnpPo NAME,MODEL | awk -F'"' '/MODEL="Amazon EC2 NVMe Instance Storage/ {print $2}')
@@ -590,7 +610,7 @@ cloudvm_instance_store() {
     fi
   fi
   systemctl stop containerd stargz-snapshotter 2>/dev/null || true
-  for dir in containerd containerd-stargz-grpc nerdctl; do
+  for dir in containerd containerd-stargz-grpc nerdctl kubelet; do
     mkdir -p "$base/cloudvm/$dir" "/var/lib/$dir" && mount --bind "$base/cloudvm/$dir" "/var/lib/$dir" || echo "[cloudvm-bootstrap] Warning: /var/lib/$dir stays on the root volume" >&2
   done
   echo "[cloudvm-bootstrap] Container storage on instance store $base (${devs//$'\n'/ })"

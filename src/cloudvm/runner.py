@@ -2,7 +2,9 @@
 
 The bootstrap sets CLOUDVM_RUNNER_BIND and CLOUDVM_RUNNER_CONCURRENCY; the plugin reaches it through the tunnel agent.
 Status and host stats carry the readings of the traffic meter (cloudvm_traffic_meter.py) when the bootstrap installed it.
-It also serves each pod whose service account has an IAM role the credentials the plugin sends for it on a loopback endpoint.
+It runs a pod the way the kubelet would: its init containers in order, then its first container, all under the pod's
+/kubepods/<qos>/pod<uid> cgroup, with its volumes and security settings. It also serves each pod whose service account
+has an IAM role the credentials the plugin sends for it on a loopback endpoint.
 """
 import base64
 import datetime
@@ -14,6 +16,8 @@ import os
 import re
 import secrets
 import shutil
+import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -40,7 +44,7 @@ pod_locks = {}
 pod_locks_guard = threading.Lock()
 starting_pods = set()
 start_failures = {}
-pull_failures = {}
+waiting_reasons = {}
 # pod_timings holds when each pod's start reached acceptedAt, pullStartedAt and pullFinishedAt, for the plugin's traces.
 pod_timings = {}
 pod_timings_guard = threading.Lock()
@@ -56,6 +60,31 @@ pod_credentials = {}
 pod_credentials_guard = threading.Lock()
 # Secret volume files stay on tmpfs, as the kubelet keeps them, and each pod's tree is removed with its container.
 SECRET_VOLUMES_DIR = os.environ.get("CLOUDVM_SECRET_VOLUMES_DIR", '/run/cloudvm/volumes')
+# emptyDir volumes live where the kubelet keeps them, on the disk that holds container storage.
+POD_DIRS = os.environ.get("CLOUDVM_POD_DIRS", '/var/lib/kubelet/pods')
+RESTART_BACKOFF_START = float(os.environ.get("CLOUDVM_RESTART_BACKOFF_START") or 10)
+RESTART_BACKOFF_MAX = float(os.environ.get("CLOUDVM_RESTART_BACKOFF_MAX") or 300)
+# init_states holds each pod's init container reports, in order, for the status endpoint.
+init_states = {}
+init_states_guard = threading.Lock()
+# pod_fs_groups holds the fsGroup that owns each pod's volume files, for files the plugin replaces later.
+pod_fs_groups = {}
+CGROUP_PARENT_RE = re.compile(r'^/kubepods/(besteffort|burstable)/pod[A-Za-z0-9_.-]+$')
+VOLUME_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+def is_kind(test):
+    return lambda p: os.path.exists(p) and test(os.stat(p).st_mode)
+HOST_PATH_CHECKS = {
+    'Directory': os.path.isdir,
+    'DirectoryOrCreate': os.path.isdir,
+    'File': os.path.isfile,
+    'FileOrCreate': os.path.isfile,
+    'Socket': is_kind(stat.S_ISSOCK),
+    'CharDevice': is_kind(stat.S_ISCHR),
+    'BlockDevice': is_kind(stat.S_ISBLK),
+}
+
+class ConfigError(Exception):
+    """A pod spec setting the runner cannot apply, reported as CreateContainerConfigError like the kubelet's."""
 HOST_RESOLV_CONF = os.environ.get("CLOUDVM_RESOLV_CONF", '/etc/resolv.conf')
 
 def safe_relpath(path):
@@ -67,33 +96,318 @@ def safe_relpath(path):
 def pod_volumes_dir(pod_uid):
     return os.path.join(SECRET_VOLUMES_DIR, re.sub(r'[^A-Za-z0-9_.-]', '_', pod_uid))
 
-def write_secret_volumes(pod_uid, volumes):
-    """Writes a pod's Secret volumes below its own root-only directory and returns the read-only mount flags."""
+def safe_volume_name(name):
+    if not isinstance(name, str) or not VOLUME_NAME_RE.match(name):
+        raise ValueError(f"invalid volume name {name!r}")
+    return name
+
+def safe_mount_path(path):
+    path = str(path or '')
+    if not path.startswith('/') or ':' in path or ',' in path:
+        raise ValueError(f"invalid path {path!r}")
+    return path
+
+def empty_dir_path(pod_uid, name):
+    return os.path.join(POD_DIRS, re.sub(r'[^A-Za-z0-9_.-]', '_', pod_uid), 'volumes', 'kubernetes.io~empty-dir', name)
+
+def write_volume_file(vol_dir, f, fs_group):
+    """Writes one file of a file volume, replacing an existing one atomically so a container never reads half of it."""
+    rel = safe_relpath(f.get('path'))
+    dest = os.path.join(vol_dir, rel)
+    os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
+    mode = int(f.get('mode') or 0o644) & 0o777
+    tmp = os.path.join(os.path.dirname(dest), '.' + os.path.basename(dest) + '.tmp')
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(base64.b64decode(f.get('data') or ''))
+    os.chmod(tmp, mode)
+    if fs_group is not None:
+        os.chown(tmp, -1, fs_group)
+    os.replace(tmp, dest)
+
+def check_host_path(path, kind):
+    """Creates or checks a hostPath the way the kubelet does for its type."""
+    if kind == 'DirectoryOrCreate' and not os.path.exists(path):
+        os.makedirs(path, mode=0o755)
+    if kind == 'FileOrCreate' and not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        with open(path, 'a'):
+            pass
+        os.chmod(path, 0o644)
+    check = HOST_PATH_CHECKS.get(kind)
+    if kind and check is None:
+        raise ConfigError(f"hostPath type {kind!r} is not supported")
+    if check is not None and not check(path):
+        raise ConfigError(f"hostPath {path} is not a {kind}")
+
+def prepare_volumes(pod_uid, volumes, fs_group):
+    """Materializes the pod's volumes and returns each volume's host path and kind by name."""
+    paths = {}
+    files_root = pod_volumes_dir(pod_uid)
+    shutil.rmtree(files_root, ignore_errors=True)
+    for vol in volumes:
+        name = safe_volume_name(vol.get('name'))
+        kind = vol.get('kind')
+        if kind == 'emptyDir':
+            path = empty_dir_path(pod_uid, name)
+            os.makedirs(path, exist_ok=True)
+            if vol.get('medium') == 'Memory' and not os.path.ismount(path):
+                opts = 'size=%d' % int(vol['sizeLimitBytes']) if vol.get('sizeLimitBytes') else 'mode=0777'
+                res = subprocess.run(['mount', '-t', 'tmpfs', '-o', opts, 'tmpfs', path], capture_output=True, text=True)
+                if res.returncode != 0:
+                    raise ConfigError(f"cannot mount tmpfs for emptyDir {name}: {res.stderr.strip()}")
+            # The kubelet makes emptyDir world-writable, and with an fsGroup group-owned by it with the setgid bit.
+            os.chmod(path, 0o777)
+            if fs_group is not None:
+                os.chown(path, -1, fs_group)
+                os.chmod(path, 0o2777)
+        elif kind == 'hostPath':
+            path = safe_mount_path(vol.get('path'))
+            check_host_path(path, vol.get('type') or '')
+        elif kind == 'files':
+            os.makedirs(files_root, mode=0o700, exist_ok=True)
+            path = os.path.join(files_root, name)
+            os.makedirs(path, mode=0o755)
+            for f in vol.get('files') or []:
+                write_volume_file(path, f, fs_group)
+            if fs_group is not None:
+                os.chown(path, -1, fs_group)
+        else:
+            raise ValueError(f"volume {name} has unknown kind {kind!r}")
+        paths[name] = (path, kind)
+    return paths
+
+def remove_pod_volumes(pod_uid):
+    """Unmounts the pod's memory-backed emptyDirs and removes every volume directory the runner made for it."""
+    pod_dir = os.path.join(POD_DIRS, re.sub(r'[^A-Za-z0-9_.-]', '_', pod_uid))
+    empty_dirs = os.path.join(pod_dir, 'volumes', 'kubernetes.io~empty-dir')
+    for name in (os.listdir(empty_dirs) if os.path.isdir(empty_dirs) else []):
+        path = os.path.join(empty_dirs, name)
+        if os.path.ismount(path):
+            subprocess.run(['umount', path], capture_output=True)
+    shutil.rmtree(pod_dir, ignore_errors=True)
+    shutil.rmtree(pod_volumes_dir(pod_uid), ignore_errors=True)
+
+def mount_flags(mounts, paths):
+    """Returns the -v flags of a container's volume mounts, creating a missing subPath in a writable volume."""
     flags = []
-    if not volumes:
-        return flags
-    root = pod_volumes_dir(pod_uid)
-    shutil.rmtree(root, ignore_errors=True)
-    os.makedirs(root, mode=0o700)
-    for i, vol in enumerate(volumes):
-        vol_dir = os.path.join(root, str(i))
-        os.makedirs(vol_dir, mode=0o755)
-        for f in vol.get('files') or []:
-            dest = os.path.join(vol_dir, safe_relpath(f.get('path')))
-            os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
-            mode = int(f.get('mode') or 0o644) & 0o777
-            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-            with os.fdopen(fd, 'wb') as out:
-                out.write(base64.b64decode(f.get('data') or ''))
-            os.chmod(dest, mode)
-        source = vol_dir
-        if vol.get('subPath'):
-            source = os.path.join(vol_dir, safe_relpath(vol['subPath']))
-        mount_path = str(vol.get('mountPath', ''))
-        if not mount_path.startswith('/') or ':' in mount_path or ',' in mount_path:
-            raise ValueError(f"invalid mountPath {mount_path!r}")
-        flags.extend(['-v', f"{source}:{mount_path}:ro"])
+    for m in mounts or []:
+        name = m.get('name')
+        if name not in paths:
+            raise ValueError(f"volume mount {name!r} names no volume")
+        source, kind = paths[name]
+        if m.get('subPath'):
+            source = os.path.join(source, safe_relpath(m['subPath']))
+            if kind in ('emptyDir', 'hostPath') and not os.path.exists(source):
+                os.makedirs(source, mode=0o755)
+        opts = ['ro' if m.get('readOnly') else 'rw']
+        if m.get('propagation') in ('rslave', 'rshared'):
+            opts.append(m['propagation'])
+        flags.extend(['-v', f"{safe_mount_path(source)}:{safe_mount_path(m.get('mountPath'))}:{','.join(opts)}"])
     return flags
+
+def image_user(img):
+    """Returns the user the image's config names, empty for root."""
+    res = subprocess.run([CONTAINER_CLI, 'image', 'inspect', '--format', '{{.Config.User}}', img], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise ConfigError(f"cannot read the user of image {img}: {res.stderr.strip()}")
+    return res.stdout.strip()
+
+def user_flags(sec, img):
+    """Returns the --user flag, which runs the image's own user unless the spec sets one, and enforces runAsNonRoot
+    with the kubelet's checks and messages."""
+    uid, gid = sec.get('runAsUser'), sec.get('runAsGroup')
+    if uid is not None:
+        if sec.get('runAsNonRoot') and int(uid) == 0:
+            raise ConfigError(f"container's runAsUser breaks non-root policy")
+        return [f"--user={int(uid)}" + (f":{int(gid)}" if gid is not None else '')]
+    if gid is None and not sec.get('runAsNonRoot'):
+        return []
+    user = image_user(img).split(':')[0]
+    if sec.get('runAsNonRoot'):
+        if user in ('', '0', 'root'):
+            raise ConfigError(f"container has runAsNonRoot and image will run as root")
+        if not user.isdigit():
+            raise ConfigError(f"container has runAsNonRoot and image has non-numeric user ({user}), cannot verify user is non-root")
+    return [f"--user={user or '0'}:{int(gid)}"] if gid is not None else []
+
+def security_flags(sec):
+    """Returns the flags of a container's privileges. A privileged container shares the host's cgroup namespace, as
+    containerd's CRI plugin does, so node agents in it read the host's cgroup paths."""
+    flags = []
+    if sec.get('privileged'):
+        flags.extend(['--privileged', '--cgroupns=host'])
+    for flag, caps in (('--cap-drop', sec.get('capDrop')), ('--cap-add', sec.get('capAdd'))):
+        flags.extend(f"{flag}={cap}" for cap in caps or [])
+    if sec.get('noNewPrivileges'):
+        flags.append('--security-opt=no-new-privileges')
+    if sec.get('readOnlyRootFilesystem'):
+        flags.append('--read-only')
+    if sec.get('seccompUnconfined'):
+        flags.append('--security-opt=seccomp=unconfined')
+    if sec.get('appArmorUnconfined'):
+        flags.append('--security-opt=apparmor=unconfined')
+    for gid in sec.get('supplementalGroups') or []:
+        flags.append(f"--group-add={int(gid)}")
+    return flags
+
+def host_ip():
+    """Returns the worker's primary address, which every container shares as its pod IP and host IP."""
+    if os.environ.get("CLOUDVM_HOST_IP"):
+        return os.environ["CLOUDVM_HOST_IP"]
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(('10.255.255.255', 1))
+            return sock.getsockname()[0]
+    except OSError:
+        return '127.0.0.1'
+
+def fill_host_ip(names, env, args):
+    """Sets the variables the plugin left for the worker's address and expands their $(NAME) references."""
+    if not names:
+        return args
+    ip = host_ip()
+    def expand(value):
+        for name in names:
+            value = value.replace(f"$({name})", ip)
+        return value
+    for key in list(env):
+        env[key] = ip if key in names else expand(str(env[key]))
+    return [expand(str(a)) for a in args]
+
+def pod_cgroup_flags(req):
+    """Returns the global and run flags that put a container under the pod's cgroup and host namespaces."""
+    global_flags, run_flags = [], ['--net=host']
+    parent = str(req.get('cgroupParent') or '')
+    if parent:
+        if not CGROUP_PARENT_RE.match(parent):
+            raise ValueError(f"invalid cgroupParent {parent!r}")
+        # The cgroupfs manager puts the container at <parent>/<64-hex container id>, the kubelet's cgroupfs layout.
+        global_flags.append('--cgroup-manager=cgroupfs')
+        run_flags.append(f"--cgroup-parent={parent}")
+    if req.get('hostPID'):
+        run_flags.append('--pid=host')
+    if req.get('hostIPC'):
+        run_flags.append('--ipc=host')
+    return global_flags, run_flags
+
+def container_id(name):
+    """Returns the runtime ID of the named container as containerd://<id>, or an empty string."""
+    try:
+        res = subprocess.run([CONTAINER_CLI, 'inspect', name], capture_output=True, text=True)
+        if res.returncode == 0:
+            cid = json.loads(res.stdout)[0].get('Id') or ''
+            return 'containerd://' + cid if cid else ''
+    except Exception:
+        pass
+    return ''
+
+def init_container_name(pod_uid, index):
+    return f"cloudvm-{pod_uid}-init-{index}"
+
+def pod_init_states(pod_uid):
+    with init_states_guard:
+        return [dict(s) for s in init_states.get(pod_uid) or []]
+
+def set_init_state(pod_uid, index, **fields):
+    with init_states_guard:
+        states = init_states.get(pod_uid)
+        if states is not None and index < len(states):
+            states[index].update(fields)
+
+def pull_with_backoff(uid, imgs, auth_cfg, timed):
+    """Pulls the first of imgs that succeeds, backing off exponentially while the pod stays Pending, and returns the
+    reference pulled and whether the stargz snapshotter serves it, or None when the pod was stopped meanwhile."""
+    delay = PULL_BACKOFF_START
+    lazy = True
+    attempts = 0
+    while True:
+        err_msg = "image pull failed"
+        for img in imgs:
+            attempts += 1
+            err = pull_image(img, auth_cfg, lazy)
+            if err and lazy and re.search(r'unpack|snapshotter', err, re.I):
+                print(f"[cloudvm-runner] lazy pull of {img} for {uid} failed, retrying with the default snapshotter: {err}", flush=True)
+                lazy = False
+                attempts += 1
+                err = pull_image(img, auth_cfg, lazy)
+            if err is None:
+                remote, layers = remote_layer_count(img) if lazy and snapshotter_args() else (0, 0)
+                if timed:
+                    record_timing(uid, pullFinishedAt=now_iso(), image=img, pullAttempts=attempts, lazyPull=remote > 0)
+                print(f"[cloudvm-runner] pulled {img} for {uid}" + (" (mirror failed, used upstream)" if img != imgs[0] else "")
+                      + (f"; {remote} of {layers} layers mounted remotely" if lazy and snapshotter_args() else ""), flush=True)
+                return img, lazy
+            print(f"[cloudvm-runner] pull of {img} for {uid} failed: {err}", flush=True)
+            err_msg = err
+        with get_pod_lock(uid):
+            if uid not in starting_pods:
+                return None
+            waiting_reasons[uid] = ("ErrImagePull", err_msg)
+        if not sleep_while_starting(uid, delay):
+            return None
+        with get_pod_lock(uid):
+            waiting_reasons[uid] = ("ImagePullBackOff", err_msg)
+        delay = min(delay * 2, PULL_BACKOFF_MAX)
+
+def sleep_while_starting(uid, delay):
+    """Sleeps for delay seconds and reports whether the pod is still starting."""
+    deadline = time.time() + delay
+    while time.time() < deadline:
+        time.sleep(min(1, delay))
+        with get_pod_lock(uid):
+            if uid not in starting_pods:
+                waiting_reasons.pop(uid, None)
+                return False
+    return True
+
+def run_init_containers(uid, req, cmds):
+    """Runs each init container to completion in order. A failed one fails the pod under restartPolicy Never and is
+    otherwise run again after an exponential back-off, as the kubelet does. Returns whether every one succeeded."""
+    for i, cmd in enumerate(cmds):
+        name = init_container_name(uid, i)
+        delay = RESTART_BACKOFF_START
+        restarts = 0
+        while True:
+            with get_pod_lock(uid):
+                if uid not in starting_pods:
+                    return False
+                waiting_reasons[uid] = ("PodInitializing", "")
+            subprocess.run([CONTAINER_CLI, 'rm', '-f', name], capture_output=True)
+            with CONTAINER_SEMAPHORE:
+                res = subprocess.run(cmd, capture_output=True, text=True)
+            exit_code, reason, message = 0, 'Completed', ''
+            if res.returncode != 0:
+                exit_code, reason = 128, 'StartError'
+                message = res.stderr.strip() or res.stdout.strip() or "container start failed"
+            else:
+                set_init_state(uid, i, running=True, containerID=container_id(name), startedAt=now_iso(), reason='', restartCount=restarts)
+                waited = subprocess.run([CONTAINER_CLI, 'wait', name], capture_output=True, text=True)
+                try:
+                    exit_code = int(waited.stdout.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    exit_code = 1
+                    message = waited.stderr.strip()
+                if exit_code != 0:
+                    reason = 'Error'
+            set_init_state(uid, i, running=False, done=True, exitCode=exit_code, reason=reason, message=message,
+                           finishedAt=now_iso(), restartCount=restarts)
+            if exit_code == 0:
+                break
+            if req.get('restartPolicy') == 'Never':
+                with get_pod_lock(uid):
+                    if uid not in starting_pods:
+                        return False
+                    starting_pods.discard(uid)
+                    start_failures[uid] = ("Init:Error", f"init container {req['initContainers'][i].get('name')} exited with code {exit_code}")
+                return False
+            if not sleep_while_starting(uid, delay):
+                return False
+            delay = min(delay * 2, RESTART_BACKOFF_MAX)
+            restarts += 1
+    return True
 
 def snapshotter_args():
     # Lazy pulls need the stargz snapshotter; without it containerd's default snapshotter pulls in full.
@@ -364,6 +678,102 @@ def serve_credentials():
             print(f"[cloudvm-runner] credential endpoint on {CREDENTIALS_ADDR} failed: {e}", flush=True)
         time.sleep(5)
 
+def shm_flag(mem_bytes):
+    if mem_bytes and mem_bytes > 0:
+        return f"--shm-size={min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)}"
+    try:
+        with open('/proc/meminfo') as mf:
+            for line in mf:
+                if line.startswith('MemTotal:'):
+                    return f"--shm-size={min(int(line.split()[1]) * 1024 // 4, 16 * 1024 * 1024 * 1024)}"
+    except Exception:
+        pass
+    return '--shm-size=16g'
+
+def container_plan(pod_uid, req, c, name, paths, main):
+    """Returns how to run one container: its images to try, and a function that builds its run command once the
+    image is pulled."""
+    original_image = str(c.get('image', ''))
+    image = rewrite_image(original_image)
+    env = {str(k): str(v) for k, v in (c.get('env') or {}).items()}
+    if isinstance(req.get('awsCredentials'), dict):
+        env.update(credentials_env(set_pod_credentials(pod_uid, req['awsCredentials'])))
+    args = fill_host_ip(c.get('hostIPEnv') or [], env, [str(a) for a in (c.get('command') or [])] + [str(a) for a in (c.get('args') or [])])
+    global_flags, pod_flags = pod_cgroup_flags(req)
+    sec = c.get('security') or {'runAsUser': c.get('runAsUser'), 'runAsGroup': c.get('runAsGroup')}
+    flags = [*pod_flags, *security_flags(sec)]
+    if not req.get('hostIPC'):
+        flags.append(shm_flag(c.get('memoryBytes', 0)))
+    for domain in cluster_dns_search(str(req.get('namespace') or '')):
+        flags.extend(['--dns-search', domain])
+    cpu_milli, mem_bytes = c.get('cpuMillicores', 0), c.get('memoryBytes', 0)
+    if cpu_milli and cpu_milli > 0:
+        flags.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
+    if mem_bytes and mem_bytes > 0:
+        flags.extend(['--memory', str(mem_bytes)])
+    if main and req.get('assignedGPUs'):
+        flags.extend(['--gpus', '"device=%s"' % ','.join(str(g) for g in req['assignedGPUs'])])
+    for k, v in env.items():
+        flags.extend(['-e', f"{k}={v}"])
+    flags.extend(mount_flags(c.get('mounts'), paths))
+
+    def build(img, lazy):
+        user = user_flags(sec, img)
+        return [CONTAINER_CLI, *global_flags, *(snapshotter_args() if lazy else []), 'run', '-d', '--name', name,
+                *flags, *user, img, *args]
+    return [image] + ([original_image] if original_image != image else []), build
+
+def plan_pod(pod_uid, req):
+    """Prepares the pod's volumes and returns the plan of each init container and of the main container."""
+    fs_group = req.get('fsGroup')
+    paths = prepare_volumes(pod_uid, req.get('volumes') or [], int(fs_group) if fs_group is not None else None)
+    with get_pod_lock(pod_uid):
+        pod_fs_groups[pod_uid] = fs_group
+    inits = req.get('initContainers') or []
+    plans = [container_plan(pod_uid, req, c, init_container_name(pod_uid, i), paths, False) for i, c in enumerate(inits)]
+    with init_states_guard:
+        init_states[pod_uid] = [{'name': str(c.get('name') or ''), 'reason': 'PodInitializing'} for c in inits]
+    plans.append(container_plan(pod_uid, req, req, f"cloudvm-{pod_uid}", paths, True))
+    return plans
+
+def start_pod(uid, req, plans):
+    """Pulls every image, runs the init containers in order, then starts the main container."""
+    auth_cfg = req.get('dockerConfigJSON')
+    record_timing(uid, pullStartedAt=now_iso())
+    cmds = []
+    try:
+        for i, (imgs, build) in enumerate(plans):
+            pulled = pull_with_backoff(uid, imgs, auth_cfg, timed=i == len(plans) - 1)
+            if pulled is None:
+                return
+            cmds.append(build(*pulled))
+    except (ConfigError, ValueError) as e:
+        with get_pod_lock(uid):
+            starting_pods.discard(uid)
+            start_failures[uid] = ("CreateContainerConfigError", str(e))
+        return
+    with get_pod_lock(uid):
+        waiting_reasons.pop(uid, None)
+    if not run_init_containers(uid, req, cmds[:-1]):
+        return
+    with get_pod_lock(uid):
+        if uid not in starting_pods:
+            return
+    try:
+        with CONTAINER_SEMAPHORE:
+            res = subprocess.run(cmds[-1], capture_output=True, text=True)
+        with get_pod_lock(uid):
+            starting_pods.discard(uid)
+            waiting_reasons.pop(uid, None)
+            if res.returncode != 0:
+                start_failures[uid] = ("StartError", res.stderr.strip() or res.stdout.strip() or "container start failed")
+        if res.returncode == 0:
+            traffic_meter.add_pod(uid, str(req.get('namespace') or ''), str(req.get('podName') or ''))
+    except Exception as e:
+        with get_pod_lock(uid):
+            starting_pods.discard(uid)
+            start_failures[uid] = ("StartError", str(e))
+
 class RunnerHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -427,7 +837,7 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                         if not line:
                             continue
                         parts = line.split('\t')
-                        if len(parts) >= 2:
+                        if len(parts) >= 2 and '-init-' not in parts[1]:
                             name = parts[1]
                             state = 'running'
                             uid = name.removeprefix('cloudvm-')
@@ -447,26 +857,21 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             container_name = f"cloudvm-{pod_uid}"
             rx_bytes, tx_bytes = get_network_bytes()
             traffic = traffic_meter.report(pod_uid)
-            # A recorded start failure wins over inspect: a failed run can leave the container in "created".
-            with get_pod_lock(pod_uid):
-                failure = start_failures.get(pod_uid)
-            if failure is not None:
-                reason_val, err_val = failure
-                resp = {
-                    "podUID": pod_uid,
-                    "running": False,
-                    "status": "dead",
-                    "exitCode": 1,
-                    "reason": reason_val,
-                    "message": err_val,
-                    "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "networkRxBytes": rx_bytes,
-                    "networkTxBytes": tx_bytes,
-                    "timings": pod_timing(pod_uid),
-                }
+            def reply_status(**fields):
+                resp = dict(fields, podUID=pod_uid, networkRxBytes=rx_bytes, networkTxBytes=tx_bytes,
+                            timings=pod_timing(pod_uid), initContainers=pod_init_states(pod_uid))
                 if traffic is not None:
                     resp["traffic"] = traffic
                 self.reply(200, json.dumps(resp))
+            # A recorded start failure wins over inspect: a failed run can leave the container in "created".
+            def reply_failure():
+                with get_pod_lock(pod_uid):
+                    failure = start_failures.get(pod_uid)
+                if failure is not None:
+                    reply_status(running=False, status="dead", exitCode=1, reason=failure[0], message=failure[1],
+                                 finishedAt=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                return failure is not None
+            if reply_failure():
                 return
             try:
                 res = subprocess.run([CONTAINER_CLI, 'inspect', container_name], capture_output=True, text=True)
@@ -492,22 +897,9 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                                 ("Completed" if exit_code == 0 else "Error") if status_str in ("exited", "stopped", "dead") else status_str.capitalize()
                             )
                         )
-                    resp = {
-                        "podUID": pod_uid,
-                        "running": running,
-                        "status": status_str,
-                        "exitCode": exit_code,
-                        "reason": reason,
-                        "message": message,
-                        "startedAt": started_at,
-                        "finishedAt": finished_at,
-                        "networkRxBytes": rx_bytes,
-                        "networkTxBytes": tx_bytes,
-                        "timings": pod_timing(pod_uid),
-                    }
-                    if traffic is not None:
-                        resp["traffic"] = traffic
-                    self.reply(200, json.dumps(resp))
+                    reply_status(running=running, status=status_str, exitCode=exit_code, reason=reason, message=message,
+                                 startedAt=started_at, finishedAt=finished_at,
+                                 containerID='containerd://' + data['Id'] if data.get('Id') else '')
                     return
             except Exception:
                 pass
@@ -515,23 +907,12 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             plock = get_pod_lock(pod_uid)
             with plock:
                 if pod_uid in starting_pods:
-                    pull_reason, pull_error = pull_failures.get(pod_uid, ("ContainerCreating", "Pulling container image or initializing..."))
-                    resp = {
-                        "podUID": pod_uid,
-                        "running": False,
-                        "status": "created",
-                        "exitCode": 0,
-                        "reason": pull_reason,
-                        "message": pull_error,
-                        "networkRxBytes": rx_bytes,
-                        "networkTxBytes": tx_bytes,
-                        "timings": pod_timing(pod_uid),
-                    }
-                    if traffic is not None:
-                        resp["traffic"] = traffic
-                    self.reply(200, json.dumps(resp))
+                    pull_reason, pull_error = waiting_reasons.get(pod_uid, ("ContainerCreating", "Pulling container image or initializing..."))
+                    reply_status(running=False, status="created", exitCode=0, reason=pull_reason, message=pull_error)
                     return
-
+            # The start may have failed while inspect ran.
+            if reply_failure():
+                return
             self.send_response(404)
             self.end_headers()
             return
@@ -557,6 +938,24 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
             self.reply(200, b'{"status":"ok"}')
             return
 
+        if parsed.path == '/containers/volume-files':
+            pod_uid = urllib.parse.parse_qs(parsed.query).get('podUID', [''])[0]
+            try:
+                files = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8'))
+                with get_pod_lock(pod_uid):
+                    fs_group = pod_fs_groups.get(pod_uid)
+                for f in files:
+                    vol_dir = os.path.join(pod_volumes_dir(pod_uid), safe_volume_name(f.get('volume')))
+                    if not pod_uid or not os.path.isdir(vol_dir):
+                        self.reply(404, b'{"error":"unknown pod volume"}')
+                        return
+                    write_volume_file(vol_dir, f, int(fs_group) if fs_group is not None else None)
+            except (OSError, ValueError, TypeError, AttributeError) as e:
+                self.reply(400, json.dumps({"error": f"cannot replace volume files: {e}"}))
+                return
+            self.reply(200, b'{"status":"ok"}')
+            return
+
         if parsed.path == '/containers/stop':
             # Removing the container drops its writable layer and logs, so a later pod on this VM finds only the image cache.
             params = urllib.parse.parse_qs(parsed.query)
@@ -568,20 +967,27 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
                 with plock:
                     starting_pods.discard(pod_uid)
                     start_failures.pop(pod_uid, None)
-                    pull_failures.pop(pod_uid, None)
+                    waiting_reasons.pop(pod_uid, None)
                     with pod_timings_guard:
                         pod_timings.pop(pod_uid, None)
+                    with init_states_guard:
+                        init_states.pop(pod_uid, None)
+                    pod_fs_groups.pop(pod_uid, None)
                 container_name = f"cloudvm-{pod_uid}"
                 try:
                     subprocess.run([CONTAINER_CLI, 'stop', container_name], capture_output=True)
                     subprocess.run([CONTAINER_CLI, 'rm', '-f', container_name], capture_output=True)
+                    listed = subprocess.run([CONTAINER_CLI, 'ps', '-a', '--filter', f"name={container_name}-init-", '--format', '{{.Names}}'],
+                                            capture_output=True, text=True)
+                    for init_name in listed.stdout.split() if listed.returncode == 0 else []:
+                        subprocess.run([CONTAINER_CLI, 'rm', '-f', init_name], capture_output=True)
                     remains = subprocess.run([CONTAINER_CLI, 'inspect', container_name], capture_output=True).returncode == 0
                 except Exception:
                     remains = True
                 if remains:
                     self.reply(500, b'{"error":"container was not removed"}')
                     return
-                shutil.rmtree(pod_volumes_dir(pod_uid), ignore_errors=True)
+                remove_pod_volumes(pod_uid)
             self.send_response(200)
             self.end_headers()
             return
@@ -602,21 +1008,10 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
             pod_uid = str(req.get('podUID', 'unknown'))
             container_name = f"cloudvm-{pod_uid}"
-
-            ids = {}
             for field in ('runAsUser', 'runAsGroup'):
-                if req.get(field) is None:
-                    continue
-                try:
-                    ids[field] = int(req[field])
-                except (ValueError, TypeError):
+                if req.get(field) is not None and not isinstance(req.get(field), int):
                     self.reply(400, json.dumps({"error": f"invalid {field}"}))
                     return
-                if ids[field] == 0:
-                    self.reply(400, json.dumps({"error": f"{field} 0 is forbidden on host network"}))
-                    return
-            user_val = ids.get('runAsUser')
-            group_val = ids.get('runAsGroup')
 
             plock = get_pod_lock(pod_uid)
             with plock:
@@ -634,148 +1029,20 @@ class RunnerHandler(http.server.BaseHTTPRequestHandler):
 
                 starting_pods.add(pod_uid)
                 start_failures.pop(pod_uid, None)
-                pull_failures.pop(pod_uid, None)
+                waiting_reasons.pop(pod_uid, None)
                 with pod_timings_guard:
                     pod_timings[pod_uid] = {"acceptedAt": now_iso()}
 
-            original_image = str(req.get('image', ''))
-            image = rewrite_image(original_image)
-            gpus = req.get('assignedGPUs', [])
-            env = dict(req.get('env') or {})
-            if isinstance(req.get('awsCredentials'), dict):
-                env.update(credentials_env(set_pod_credentials(pod_uid, req['awsCredentials'])))
-            cmd = req.get('command', [])
-            args = req.get('args', [])
-            cpu_milli = req.get('cpuMillicores', 0)
-            mem_bytes = req.get('memoryBytes', 0)
-
-            shm_flag = '--shm-size=16g'
-            if mem_bytes and mem_bytes > 0:
-                shm_bytes = min(mem_bytes // 2, 64 * 1024 * 1024 * 1024)
-                shm_flag = f"--shm-size={shm_bytes}"
-            else:
-                try:
-                    with open('/proc/meminfo') as mf:
-                        for line in mf:
-                            if line.startswith('MemTotal:'):
-                                total_kb = int(line.split()[1])
-                                host_shm = min(total_kb * 1024 // 4, 16 * 1024 * 1024 * 1024)
-                                shm_flag = f"--shm-size={host_shm}"
-                                break
-                except Exception:
-                    shm_flag = '--shm-size=16g'
-
-            if user_val is not None:
-                grp = group_val if group_val is not None else user_val
-                user_flag = f"--user={user_val}:{grp}"
-            else:
-                user_flag = "--user=65532:65532"
-
-            run_cmd = [
-                CONTAINER_CLI, *snapshotter_args(), 'run', '-d',
-                '--name', container_name,
-                '--net=host',
-                '--cap-drop=SETUID',
-                '--cap-drop=SETGID',
-                '--security-opt=no-new-privileges',
-                user_flag,
-                shm_flag,
-            ]
-            for domain in cluster_dns_search(str(req.get('namespace') or '')):
-                run_cmd.extend(['--dns-search', domain])
-            if cpu_milli and cpu_milli > 0:
-                run_cmd.extend(['--cpus', f"{cpu_milli / 1000.0:.2f}"])
-            if mem_bytes and mem_bytes > 0:
-                run_cmd.extend(['--memory', str(mem_bytes)])
-            if gpus:
-                gpu_devs = ','.join(str(g) for g in gpus)
-                gpu_spec = f'"device={gpu_devs}"'
-                run_cmd.extend(['--gpus', gpu_spec])
-            for k, v in env.items():
-                run_cmd.extend(['-e', f"{k}={v}"])
             try:
-                run_cmd.extend(write_secret_volumes(pod_uid, req.get('secretVolumes') or []))
-            except (OSError, ValueError, TypeError) as e:
-                shutil.rmtree(pod_volumes_dir(pod_uid), ignore_errors=True)
+                plan = plan_pod(pod_uid, req)
+            except (OSError, ValueError, TypeError, KeyError, ConfigError) as e:
+                remove_pod_volumes(pod_uid)
                 with plock:
                     starting_pods.discard(pod_uid)
-                self.reply(400, json.dumps({"error": f"cannot write secret volumes: {e}"}))
+                self.reply(400, json.dumps({"error": f"cannot prepare the pod: {e}"}))
                 return
-            image_index = len(run_cmd)
-            run_cmd.append(image)
-            if isinstance(cmd, list):
-                run_cmd.extend(cmd)
-            if isinstance(args, list):
-                run_cmd.extend(args)
 
-            docker_cfg = req.get('dockerConfigJSON')
-            pod_namespace = str(req.get('namespace') or '')
-            pod_name = str(req.get('podName') or '')
-
-            def run_async(uid, imgs, c, idx, auth_cfg):
-                # 1. Pull: try the mirrored reference, then the original, and back off exponentially while the pod stays Pending
-                delay = PULL_BACKOFF_START
-                lazy = True
-                attempts = 0
-                record_timing(uid, pullStartedAt=now_iso())
-                while True:
-                    err_msg = "image pull failed"
-                    for img in imgs:
-                        attempts += 1
-                        err = pull_image(img, auth_cfg, lazy)
-                        if err and lazy and re.search(r'unpack|snapshotter', err, re.I):
-                            print(f"[cloudvm-runner] lazy pull of {img} for {uid} failed, retrying with the default snapshotter: {err}", flush=True)
-                            lazy = False
-                            attempts += 1
-                            err = pull_image(img, auth_cfg, lazy)
-                        if err is None:
-                            remote, layers = remote_layer_count(img) if lazy and snapshotter_args() else (0, 0)
-                            record_timing(uid, pullFinishedAt=now_iso(), image=img, pullAttempts=attempts, lazyPull=remote > 0)
-                            print(f"[cloudvm-runner] pulled {img} for {uid}" + (" (mirror failed, used upstream)" if img != imgs[0] else "")
-                                  + (f"; {remote} of {layers} layers mounted remotely" if lazy and snapshotter_args() else ""), flush=True)
-                            c[idx] = img
-                            if not lazy and c[1] == '--snapshotter=stargz':
-                                del c[1]
-                            break
-                        print(f"[cloudvm-runner] pull of {img} for {uid} failed: {err}", flush=True)
-                        err_msg = err
-                    else:
-                        with get_pod_lock(uid):
-                            if uid not in starting_pods:
-                                return
-                            pull_failures[uid] = ("ErrImagePull", err_msg)
-                        deadline = time.time() + delay
-                        while time.time() < deadline:
-                            time.sleep(min(1, PULL_BACKOFF_START))
-                            with get_pod_lock(uid):
-                                if uid not in starting_pods:
-                                    pull_failures.pop(uid, None)
-                                    return
-                        with get_pod_lock(uid):
-                            pull_failures[uid] = ("ImagePullBackOff", err_msg)
-                        delay = min(delay * 2, PULL_BACKOFF_MAX)
-                        continue
-                    break
-                with get_pod_lock(uid):
-                    pull_failures.pop(uid, None)
-
-                # 2. Run container
-                try:
-                    with CONTAINER_SEMAPHORE:
-                        res = subprocess.run(c, capture_output=True, text=True)
-                    with get_pod_lock(uid):
-                        starting_pods.discard(uid)
-                        if res.returncode != 0:
-                            err_msg = res.stderr.strip() or res.stdout.strip() or "container start failed"
-                            start_failures[uid] = ("StartError", err_msg)
-                    if res.returncode == 0:
-                        traffic_meter.add_pod(uid, pod_namespace, pod_name)
-                except Exception as e:
-                    with get_pod_lock(uid):
-                        starting_pods.discard(uid)
-                        start_failures[uid] = ("StartError", str(e))
-
-            threading.Thread(target=run_async, args=(pod_uid, [image] + ([original_image] if original_image != image else []), run_cmd, image_index, docker_cfg), daemon=True).start()
+            threading.Thread(target=start_pod, args=(pod_uid, req, plan), daemon=True).start()
 
             self.reply(200, b'{"status":"starting"}')
             return
