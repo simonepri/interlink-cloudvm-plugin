@@ -27,8 +27,8 @@ func TestDefaultYamuxConfig(t *testing.T) {
 	if cfg.ConnectionWriteTimeout != 60*time.Second {
 		t.Errorf("expected ConnectionWriteTimeout 60s, got %v", cfg.ConnectionWriteTimeout)
 	}
-	if cfg.MaxStreamWindowSize != 2*1024*1024 {
-		t.Errorf("expected MaxStreamWindowSize 2 MiB, got %d", cfg.MaxStreamWindowSize)
+	if cfg.MaxStreamWindowSize != 8*1024*1024 {
+		t.Errorf("expected MaxStreamWindowSize 8 MiB, got %d", cfg.MaxStreamWindowSize)
 	}
 }
 

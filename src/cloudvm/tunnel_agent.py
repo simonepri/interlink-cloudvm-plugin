@@ -26,8 +26,8 @@ T_DATA, T_WINDOW, T_PING, T_GOAWAY = 0, 1, 2, 3
 F_SYN, F_ACK, F_FIN, F_RST = 1, 2, 4, 8
 HEADER = struct.Struct(">BBHII")
 INITIAL_WINDOW = 256 * 1024
-# Each stream grants its peer this much room when it opens; at about 130ms between continents it allows roughly 15 MB/s.
-STREAM_WINDOW = 2 * 1024 * 1024
+# Each stream grants its peer this much room when it opens; at about 130ms between continents it allows roughly 60 MB/s.
+STREAM_WINDOW = 8 * 1024 * 1024
 MAX_FRAME = 16 * 1024
 # The gateway pings every 30s; a link that stays silent for this long is treated as dead.
 READ_IDLE_TIMEOUT = 90
