@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -312,5 +313,67 @@ func TestRunnerScript_RefusesAHostPathOfTheWrongType(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !os.IsNotExist(err) {
 		t.Fatalf("type Directory must not create the path: %v", err)
+	}
+}
+
+// TestRunnerScript_RunsTheKubeletProcessOfEachContainer checks that a command replaces the image's ENTRYPOINT and
+// args replace its CMD, for a DaemonSet-style host pod whose arguments reference the node's address and for a plain
+// pod, in both its init and its main container.
+func TestRunnerScript_RunsTheKubeletProcessOfEachContainer(t *testing.T) {
+	const image = "registry.example/app:1"
+	for _, pod := range []struct {
+		name      string
+		hostIPEnv []string
+		hostPID   bool
+		arg, want string
+	}{
+		{"daemonset", []string{"NODE_IP"}, true, "--addr=$(NODE_IP)", "--addr=192.0.2.10"},
+		{"regular", nil, false, "--addr=x", "--addr=x"},
+	} {
+		for _, tc := range []struct {
+			name           string
+			command, args  []string
+			wantEntrypoint string
+			wantArgs       []string
+		}{
+			{"neither keeps the image's ENTRYPOINT and CMD", nil, nil, "", nil},
+			{"args replace the CMD", nil, []string{pod.arg, "-v"}, "", []string{pod.want, "-v"}},
+			{"a command replaces the ENTRYPOINT and drops the CMD", []string{"/bin/tool", pod.arg}, nil, "--entrypoint=/bin/tool", []string{pod.want}},
+			{"a command and args run together", []string{"/bin/tool"}, []string{pod.arg}, "--entrypoint=/bin/tool", []string{pod.want}},
+		} {
+			t.Run(pod.name+"/"+tc.name, func(t *testing.T) {
+				p := newPodRunnerHarness(t)
+				defer p.start()()
+				env := map[string]string{}
+				for _, n := range pod.hostIPEnv {
+					env[n] = ""
+				}
+				req := &StartContainerRequest{
+					PodUID: "u", Image: image, Command: tc.command, Args: tc.args, Env: env, HostIPEnv: pod.hostIPEnv, HostPID: pod.hostPID,
+					CgroupParent:   "/kubepods/besteffort/podu",
+					InitContainers: []ContainerRun{{Name: "setup", Image: image, Command: tc.command, Args: tc.args, Env: env, HostIPEnv: pod.hostIPEnv}},
+				}
+				if code := p.startPod(req); code != http.StatusOK {
+					t.Fatalf("start returned HTTP %d", code)
+				}
+				waitStatus(t, p.runnerHarness, "u", func(r ContainerStatusResult) bool { return r.Running })
+				for _, name := range []string{"cloudvm-u-init-0-setup", "cloudvm-u"} {
+					run := p.runArgs(name)
+					at := slices.Index(run, image)
+					if at < 0 {
+						t.Fatalf("%s run lacks the image: %v", name, run)
+					}
+					var entrypoint []string
+					for _, a := range run[:at] {
+						if strings.HasPrefix(a, "--entrypoint") {
+							entrypoint = append(entrypoint, a)
+						}
+					}
+					if strings.Join(entrypoint, " ") != tc.wantEntrypoint || !slices.Equal(run[at+1:], tc.wantArgs) {
+						t.Errorf("%s runs with %v %s %v, want %q %s %v", name, entrypoint, image, run[at+1:], tc.wantEntrypoint, image, tc.wantArgs)
+					}
+				}
+			})
+		}
 	}
 }
