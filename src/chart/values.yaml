@@ -65,6 +65,10 @@ tunnel:
   connectTimeout: "10m"
   directFallback: false  # Also try the worker's private IP for same-VPC workers
   tailscaleTags: "tag:clvm-worker"
+  # Per-namespace destinations, beyond the namespace's own Services, that worker pods reach through the tunnel:
+  # "namespace/service" cluster Services and "host:port" external hosts, such as
+  # {"profiler": ["monitoring/parca", "profiles.example.com:443"]}.
+  namespaceDestinations: {}
   authKeySecret:
     name: ""
     key: TAILSCALE_AUTHKEY

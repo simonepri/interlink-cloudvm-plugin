@@ -38,7 +38,7 @@ const (
 
 // serveWorkerDNS answers the one query a worker-opened dns stream carries; it closes the stream without a reply when
 // the query is malformed or no cluster resolver answers, and the agent then answers its client with SERVFAIL.
-func (g *TunnelGateway) serveWorkerDNS(instanceID string, reader *bufio.Reader, stream *yamux.Stream) {
+func (g *TunnelGateway) serveWorkerDNS(instanceID, pod string, reader *bufio.Reader, stream *yamux.Stream) {
 	if err := stream.SetDeadline(time.Now().Add(dnsStreamTimeout)); err != nil {
 		return
 	}
@@ -46,7 +46,7 @@ func (g *TunnelGateway) serveWorkerDNS(instanceID string, reader *bufio.Reader, 
 	if err != nil || len(query) > maxDNSQuery {
 		return
 	}
-	reply, err := g.answerWorkerDNS(instanceID, query)
+	reply, err := g.answerWorkerDNS(instanceID, pod, query)
 	if err != nil {
 		log.Printf("[cloudvm-tunnel] Cannot answer dns query from %s: %v", sanitizeLog(instanceID), err) //nolint:gosec // sanitized
 		return
@@ -54,19 +54,19 @@ func (g *TunnelGateway) serveWorkerDNS(instanceID string, reader *bufio.Reader, 
 	_, _ = stream.Write(reply)
 }
 
-// answerWorkerDNS answers a worker's query with the endpoints of a regional stand-in when one serves the worker's
-// region and has endpoints, and otherwise as answerClusterDNS does.
-func (g *TunnelGateway) answerWorkerDNS(instanceID string, query []byte) ([]byte, error) {
-	if reply, ok := g.answerFromStandIn(instanceID, query); ok {
+// answerWorkerDNS answers a query from a process of a worker, of pod when set, with the endpoints of a regional stand-in
+// when one serves the worker's region and has endpoints, and otherwise as answerClusterDNS does.
+func (g *TunnelGateway) answerWorkerDNS(instanceID, pod string, query []byte) ([]byte, error) {
+	if reply, ok := g.answerFromStandIn(instanceID, pod, query); ok {
 		return reply, nil
 	}
 	return g.answerClusterDNS(query)
 }
 
-// answerFromStandIn answers an A query for <service>.<namespace>.svc.<domain> from a worker whose pods are in
-// namespace with the addresses of the stand-in for that Service in the worker's region. It reports false, so the
+// answerFromStandIn answers an A query for <service>.<namespace>.svc.<domain> from a process of a worker that acts for
+// namespace, as streamNamespaceOf attributes it, with the addresses of the stand-in for that Service in the worker's region. It reports false, so the
 // query goes to the real Service, when there is no stand-in or the stand-in has no ready endpoint.
-func (g *TunnelGateway) answerFromStandIn(instanceID string, query []byte) ([]byte, bool) {
+func (g *TunnelGateway) answerFromStandIn(instanceID, pod string, query []byte) ([]byte, bool) {
 	if g.regionalServices == nil || g.workerRegion == nil || g.workerNamespace == nil {
 		return nil, false
 	}
@@ -78,7 +78,7 @@ func (g *TunnelGateway) answerFromStandIn(instanceID string, query []byte) ([]by
 	if !ok {
 		return nil, false
 	}
-	if workerNamespace, ok := g.workerNamespace(instanceID); !ok || workerNamespace != namespace {
+	if source, err := g.streamNamespaceOf(instanceID, pod); err != nil || source != namespace {
 		return nil, false
 	}
 	region, ok := g.workerRegion(instanceID)

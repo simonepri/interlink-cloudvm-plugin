@@ -507,6 +507,13 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 	if err != nil {
 		return nil, err
 	}
+	destinations, err := ParseNamespaceDestinations(os.Getenv("TUNNEL_NAMESPACE_DESTINATIONS"))
+	if err != nil {
+		return nil, err
+	}
+	if destinations.HasServices() && len(serviceNetworks) == 0 {
+		return nil, fmt.Errorf("TUNNEL_NAMESPACE_DESTINATIONS lists Services, which workers reach only with TUNNEL_TCP_SERVICE_CIDRS")
+	}
 	regionalNamespaces, err := ParseRegionalNamespaces(os.Getenv("REGIONAL_NAMESPACES"))
 	if err != nil {
 		return nil, err
@@ -517,6 +524,7 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 		DirectCIDRs:    directCIDRs,
 		ClusterCIDRs:   splitCIDRList(os.Getenv("TUNNEL_TCP_DIRECT_CIDRS") + "," + os.Getenv("TUNNEL_TCP_SERVICE_CIDRS")),
 		ServiceCIDRs:   splitCIDRList(os.Getenv("TUNNEL_TCP_SERVICE_CIDRS")),
+		Redirects:      destinations.Redirects(),
 		ImageMirrors:   imageMirrors,
 		GatewayIP:      strings.TrimSpace(os.Getenv("TUNNEL_GATEWAY_IP")),
 		PublicEndpoint: strings.TrimSpace(os.Getenv("TUNNEL_PUBLIC_ENDPOINT")),
@@ -558,18 +566,20 @@ func startTunnelGateway(ctx context.Context, server *Server, podWatch *PodWatch)
 		return nil, err
 	}
 	config := TunnelGatewayConfig{
-		Listener:           listener,
-		Registry:           registry,
-		TokenValidator:     server.ValidateTunnelToken,
-		IdentityValidator:  server.ValidateTunnelIdentity,
-		OnReject:           metrics.RecordRejection,
-		OnBootstrapRequest: metrics.RecordBootstrapRequest,
-		OnConnect:          server.Lifecycle().WorkerConnected,
-		LogSink:            server,
-		Resolver:           server.ResolveInstanceAddress,
-		DirectTCPNetworks:  directTCPNetworks,
-		WorkerNamespace:    server.WorkerNamespace,
-		OnTCPRefusal:       metrics.RecordTCPRefusal,
+		Listener:             listener,
+		Registry:             registry,
+		TokenValidator:       server.ValidateTunnelToken,
+		IdentityValidator:    server.ValidateTunnelIdentity,
+		OnReject:             metrics.RecordRejection,
+		OnBootstrapRequest:   metrics.RecordBootstrapRequest,
+		OnConnect:            server.Lifecycle().WorkerConnected,
+		LogSink:              server,
+		Resolver:             server.ResolveInstanceAddress,
+		DirectTCPNetworks:    directTCPNetworks,
+		WorkerNamespace:      server.WorkerNamespace,
+		PodNamespaceOnWorker: server.PodNamespaceOnWorker,
+		Destinations:         destinations,
+		OnTCPRefusal:         metrics.RecordTCPRefusal,
 	}
 	if podWatch != nil {
 		config.PodNamespaces = podWatch

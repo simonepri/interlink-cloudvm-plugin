@@ -124,6 +124,8 @@ type InstanceSpec struct {
 	TunnelCIDRs []string `json:"tunnelCidrs,omitempty"`
 	// TunnelServiceCIDRs are the Service networks the worker's agent intercepts every connection to and tunnels.
 	TunnelServiceCIDRs []string `json:"tunnelServiceCidrs,omitempty"`
+	// TunnelRedirects are the external destinations the worker's agent intercepts every connection to and tunnels.
+	TunnelRedirects []TunnelRedirect `json:"tunnelRedirects,omitempty"`
 	// ImageMirrors maps an upstream registry host to the mirror reference prefix the worker's runner pulls from instead.
 	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
 	// TunnelRoutes holds the tunnel route of every region this launch may use; the Tunnel* fields hold the pinned region's.

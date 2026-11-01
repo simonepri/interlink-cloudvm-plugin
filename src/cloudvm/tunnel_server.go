@@ -40,6 +40,9 @@ type TunnelSettings struct {
 	// ServiceCIDRs are the Service ClusterIP networks, which workers' agents carry through the tunnel even for clients
 	// that use no proxy; ClusterCIDRs lists them too.
 	ServiceCIDRs []string
+	// Redirects are the external destinations whose connections workers' agents carry through the tunnel even for
+	// clients that use no proxy.
+	Redirects []TunnelRedirect
 	// ImageMirrors maps each region to the registry mirrors its workers pull images from.
 	ImageMirrors map[string]map[string]string
 	// GatewayIP is the gateway ClusterIP router workers pin the Endpoint host to.
@@ -135,6 +138,8 @@ type TunnelRoute struct {
 	TunnelCIDRs []string `json:"tunnelCidrs,omitempty"`
 	// ServiceCIDRs are the Service networks a worker's agent intercepts every connection to and sends through the tunnel.
 	ServiceCIDRs []string `json:"serviceCidrs,omitempty"`
+	// Redirects are the external destinations a worker's agent intercepts every connection to and sends through the tunnel.
+	Redirects []TunnelRedirect `json:"redirects,omitempty"`
 	// ImageMirrors maps an upstream registry host to the mirror reference prefix workers of the region pull from.
 	ImageMirrors map[string]string `json:"imageMirrors,omitempty"`
 }
@@ -165,7 +170,7 @@ func (t *tunnelState) tunnelCIDRs(region string) []string {
 // route resolves the tunnel route of workers launched in region, failing when a setting its transport needs is unset.
 func (t *tunnelState) route(region, meshKey string) (TunnelRoute, error) {
 	transport := t.Transports.For(region)
-	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region], TunnelCIDRs: t.tunnelCIDRs(region), ServiceCIDRs: t.ServiceCIDRs, ImageMirrors: t.ImageMirrors[region]}
+	route := TunnelRoute{Transport: string(transport), Endpoint: t.Endpoint, DirectCIDRs: t.DirectCIDRs[region], TunnelCIDRs: t.tunnelCIDRs(region), ServiceCIDRs: t.ServiceCIDRs, Redirects: t.Redirects, ImageMirrors: t.ImageMirrors[region]}
 	if transport == TunnelTransportPublic {
 		route.Endpoint = t.PublicEndpoint
 		return route, nil
@@ -233,6 +238,7 @@ func (spec *InstanceSpec) applyTunnelRoute(route TunnelRoute) {
 	spec.TunnelDirectCIDRs = route.DirectCIDRs
 	spec.TunnelCIDRs = route.TunnelCIDRs
 	spec.TunnelServiceCIDRs = route.ServiceCIDRs
+	spec.TunnelRedirects = route.Redirects
 	spec.ImageMirrors = route.ImageMirrors
 }
 

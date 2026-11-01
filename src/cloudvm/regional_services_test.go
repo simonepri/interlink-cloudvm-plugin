@@ -117,7 +117,7 @@ func TestTunnelDNS_StandInAnswersItsRegionsWorkersAndFallsBack(t *testing.T) {
 		{"a worker of another namespace gets the Service it asked for", "i-team-b", "cache.team-a.svc.cluster.local.", "10.96.0.10", 30},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reply, err := g.answerWorkerDNS(tc.instance, packDNSQuery(t, tc.query))
+			reply, err := g.answerWorkerDNS(tc.instance, "", packDNSQuery(t, tc.query))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -165,13 +165,13 @@ func TestTunnelTCP_StandInPodsReachTheServiceTheyStandInFor(t *testing.T) {
 		regionalServices: fakeRegionalServices{standIns: map[string]ClusterService{"team-a/cache|us-east-1": {Namespace: "regional", Name: "cache-us-east-1"}}}}
 
 	services.byIP["127.0.0.1"] = ClusterService{Namespace: "team-a", Name: "cache", Ports: []int32{int32(parsed)}}
-	conn, err := g.dialFromWorker("i-regional", "127.0.0.1", rawPort, echo)
+	conn, err := g.dialFromWorker("i-regional", "", "127.0.0.1", rawPort, echo)
 	if err != nil {
 		t.Fatalf("the stand-in's pods must reach the Service they stand in for: %v", err)
 	}
 	_ = conn.Close()
 	services.byIP["127.0.0.1"] = ClusterService{Namespace: "team-a", Name: "api", Ports: []int32{int32(parsed)}}
-	if _, err := g.dialFromWorker("i-regional", "127.0.0.1", rawPort, echo); !isRefusal(err, "namespace_mismatch") {
+	if _, err := g.dialFromWorker("i-regional", "", "127.0.0.1", rawPort, echo); !isRefusal(err, "namespace_mismatch") {
 		t.Fatalf("dial to another Service of the namespace: %v, want namespace_mismatch", err)
 	}
 }

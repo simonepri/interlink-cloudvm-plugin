@@ -887,6 +887,20 @@ func TestRenderCloudInit_RedirectsServiceNetworksToTheAgent(t *testing.T) {
 	if strings.Contains(script, "CLOUDVM_SERVICES") || !strings.Contains(script, `CLOUDVM_TRANSPARENT_PORT="0"`) {
 		t.Error("a worker without service networks must not redirect connections")
 	}
+	cfg.TunnelRedirects = []TunnelRedirect{{Network: "198.18.0.0/15"}, {Network: "203.0.113.7/32", Port: 4317}}
+	if script, err = RenderCloudInit(&cfg); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{
+		"iptables -t nat -A CLOUDVM_SERVICES -p tcp -d 198.18.0.0/15 -j REDIRECT --to-ports 13129 || cloudvm_bootstrap_failed",
+		"iptables -t nat -A CLOUDVM_SERVICES -p tcp -d 203.0.113.7/32 --dport 4317 -j REDIRECT --to-ports 13129 || cloudvm_bootstrap_failed",
+		`CLOUDVM_TRANSPARENT_PORT="13129"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("a worker with external destinations misses %q", want)
+		}
+	}
+	assertBashSyntax(t, script)
 }
 
 // metadataGuard returns the bootstrap's failure helper and its iptables and metadata guard, which every worker runs.
