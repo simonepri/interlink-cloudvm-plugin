@@ -152,6 +152,7 @@ func TestGetInstanceTypesFiltersFootprintAndDerivesLabels(t *testing.T) {
 		LabelInstanceGPUCount:          "1",
 		LabelInstanceGPUMemory:         "24576",
 		LabelNVIDIAGPUPresent:          "true",
+		LabelNVIDIAPCIPresent:          "true",
 	}
 	for k, v := range wantLabels {
 		if got := g6.Requirements.Get(k); !got.Has(v) || got.Len() != 1 {
@@ -179,7 +180,7 @@ func TestGetInstanceTypesFiltersFootprintAndDerivesLabels(t *testing.T) {
 	}
 
 	m7 := findType(t, its, "m7i.xlarge")
-	for _, k := range []string{LabelGPUClass, LabelInstanceGPUName, LabelInstanceGPUCount, LabelNVIDIAGPUPresent} {
+	for _, k := range []string{LabelGPUClass, LabelInstanceGPUName, LabelInstanceGPUCount, LabelNVIDIAGPUPresent, LabelNVIDIAPCIPresent} {
 		if op := m7.Requirements.Get(k).Operator(); op != corev1.NodeSelectorOpDoesNotExist {
 			t.Errorf("m7i requirement %s operator = %s, want DoesNotExist", k, op)
 		}
@@ -324,7 +325,7 @@ func TestCreateChoosesCheapestCompatibleOffering(t *testing.T) {
 	if _, ok := sent.Annotations["cloudvm.vk.io/aws-launch-template-name"]; ok {
 		t.Errorf("gcp launch carries an AWS launch template: %v", sent.Annotations)
 	}
-	if sent.Labels["team"] != "ml" || sent.Labels[LabelGPUClass] != "l4" || sent.Labels[LabelNVIDIAGPUPresent] != "true" || sent.Labels[corev1.LabelHostname] != nc.Name {
+	if sent.Labels["team"] != "ml" || sent.Labels[LabelGPUClass] != "l4" || sent.Labels[LabelNVIDIAGPUPresent] != "true" || sent.Labels[LabelNVIDIAPCIPresent] != "true" || sent.Labels[corev1.LabelHostname] != nc.Name {
 		t.Errorf("node labels = %v", sent.Labels)
 	}
 	if len(sent.Taints) != 2 {
