@@ -165,6 +165,8 @@ func startPythonAgentBehind(t *testing.T, f *tunnelFixture, backend, instanceID,
 		"CLOUDVM_RUNNER_TOKEN_FILE="+tokenFile,
 		"CLOUDVM_ATTESTATION_FILE="+filepath.Join(dir, "absent"),
 		"CLOUDVM_CONTAINER_LOGS=0",
+		// Fixture /proc trees attribute sockets; the host's cgroups would attribute the test's sockets to the host.
+		"CLOUDVM_CGROUP_ROOT="+filepath.Join(dir, "absent"),
 	), env...)
 	cmd.Stderr = &agentLog
 	if err := cmd.Start(); err != nil {

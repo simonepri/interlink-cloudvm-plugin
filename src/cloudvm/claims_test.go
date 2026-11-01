@@ -936,3 +936,50 @@ func TestClaimPodGetsResolvedEnvSources(t *testing.T) {
 		t.Fatalf("a pod whose required env secret is missing: HTTP %d, want 400", code)
 	}
 }
+
+// scriptedStopRunner fails each stop with the next error of errs, or with the caller's context error once it ends,
+// the way an HTTP request through the tunnel does.
+type scriptedStopRunner struct {
+	*MockContainerRunner
+	errs  []error
+	calls int
+}
+
+func (r *scriptedStopRunner) StopContainer(ctx context.Context, node *CloudVMNode, uid string) error {
+	r.calls++
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("Post \"http://clvm-tunnel/containers/stop?podUID=%s\": %w", uid, err)
+	}
+	if r.calls <= len(r.errs) {
+		return r.errs[r.calls-1]
+	}
+	return r.MockContainerRunner.StopContainer(ctx, node, uid)
+}
+
+func TestStopContainerOutlivesTheRequestThatAskedForIt(t *testing.T) {
+	s := NewServer(NewMockProvider(), "test-cluster")
+	s.stopRetryDelay = time.Millisecond
+	node := &CloudVMNode{InstanceID: "i-stop"}
+	refused := fmt.Errorf("%w (500) stopping container u", errRunnerRefused)
+	for _, tc := range []struct {
+		name      string
+		errs      []error
+		wantErr   bool
+		wantCalls int
+	}{
+		{"a canceled request", nil, false, 1},
+		{"a stop the runner refuses", []error{refused, refused, refused, refused}, true, stopRunnerAttempts},
+		{"a stop that keeps failing on the way", slices.Repeat([]error{errors.New("stream reset")}, stopAttempts), true, stopAttempts},
+		{"a stop that fails on the way, then succeeds", []error{errors.New("stream reset"), refused}, false, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &scriptedStopRunner{MockContainerRunner: NewMockContainerRunner(), errs: tc.errs}
+			s.SetContainerRunner(runner)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // the virtual kubelet stopped waiting for its delete call
+			if err := s.stopContainerWithRetry(ctx, node, "u"); (err != nil) != tc.wantErr || runner.calls != tc.wantCalls {
+				t.Fatalf("stop = %v after %d attempts, want error %v after %d", err, runner.calls, tc.wantErr, tc.wantCalls)
+			}
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1316,25 +1317,38 @@ func (s *Server) startOnNode(ctx context.Context, node *CloudVMNode, gpus, tpus 
 	return &CreateStruct{PodUID: spec.PodUID, PodJID: podJID}
 }
 
+// A container stop that the in-VM runner itself refuses is retried stopRunnerAttempts times; one that fails on the
+// way, such as a dropped tunnel stream or a timeout, is retried up to stopAttempts times within stopBudget, with a
+// back-off that doubles from the retry delay up to stopMaxRetryDelay.
 const (
-	stopAttempts          = 3
+	stopRunnerAttempts    = 3
+	stopAttempts          = 8
+	stopBudget            = 5 * time.Minute
 	defaultStopRetryDelay = 5 * time.Second
+	stopMaxRetryDelay     = 30 * time.Second
 )
 
 // stopContainerWithRetry removes a pod's container, retrying a failed attempt because stopping is idempotent and a
-// slow or briefly unreachable runner usually succeeds on the next try.
+// slow or briefly unreachable runner usually succeeds on the next try. It runs on a context of its own, so the end of
+// the request that asked for the stop, such as a virtual kubelet that stopped waiting, cannot fail the cleanup.
 func (s *Server) stopContainerWithRetry(ctx context.Context, node *CloudVMNode, uid string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopBudget)
+	defer cancel()
 	delay := s.stopRetryDelay
 	if delay <= 0 {
 		delay = defaultStopRetryDelay
 	}
+	refused := 0
 	var err error
 	for attempt := 1; attempt <= stopAttempts; attempt++ {
 		if err = s.runner.StopContainer(ctx, node, uid); err == nil {
 			return nil
 		}
+		if errors.Is(err, errRunnerRefused) {
+			refused++
+		}
 		log.Printf("[cloudvm] Removing the container of pod %s from node %s failed (attempt %d of %d): %v", sanitizeLog(uid), sanitizeLog(node.InstanceID), attempt, stopAttempts, err) //nolint:gosec // sanitized
-		if attempt == stopAttempts {
+		if refused >= stopRunnerAttempts || attempt == stopAttempts {
 			break
 		}
 		select {
@@ -1342,6 +1356,7 @@ func (s *Server) stopContainerWithRetry(ctx context.Context, node *CloudVMNode, 
 			return err
 		case <-time.After(delay):
 		}
+		delay = min(delay*2, stopMaxRetryDelay)
 	}
 	return err
 }

@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -277,7 +278,7 @@ limited("other", "other kind")
 
 agent.log_failure = agent.FailureLog()
 class Unknown(object):
-    def pod_of(self, proto, peer):
+    def pod_of(self, proto, peer, remote=None):
         return None
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -421,7 +422,7 @@ func TestTunnelAgent_ResolvesConnectHostnamesAsTheClientsPod(t *testing.T) {
 import asyncio, socket, struct
 calls = []
 class Pods(object):
-    def pod_of(self, proto, peer):
+    def pod_of(self, proto, peer, remote=None):
         calls.append(proto)
         return "uid-a"
 class Session(object):
@@ -448,5 +449,100 @@ asyncio.run(main())
 `)
 	if want := "dns stream for pod uid-a after 1 attribution\n(True, '[10.1.2.3]:6379')\n"; out != want {
 		t.Errorf("route =\n%s\nwant\n%s", out, want)
+	}
+}
+
+func TestTunnelAgent_ReadsTheSocketsCgroupFromSockDiagReplies(t *testing.T) {
+	out := runAgentPython(t, `
+import struct
+attrs = struct.pack("=HH", 8, 5) + b"\x00" * 4 + struct.pack("=HHQ", 12, agent.INET_DIAG_CGROUP_ID, 4026531835)
+body = b"\x00" * agent.INET_DIAG_MSG_SIZE + attrs
+print(agent.parse_diag_cgroup_id(struct.pack("=IHHII", 16 + len(body), agent.SOCK_DIAG_BY_FAMILY, 0, 1, 0) + body))
+old = b"\x00" * agent.INET_DIAG_MSG_SIZE
+print(agent.parse_diag_cgroup_id(struct.pack("=IHHII", 16 + len(old), agent.SOCK_DIAG_BY_FAMILY, 0, 1, 0) + old))
+try:
+    agent.parse_diag_cgroup_id(struct.pack("=IHHIIi", 36, agent.NLMSG_ERROR, 0, 1, 0, -2) + b"\x00" * 16)
+except LookupError as e:
+    print("gone:", e)
+`)
+	if want := "4026531835\nNone\ngone: no such socket\n"; out != want {
+		t.Errorf("parsed =\n%s\nwant\n%s", out, want)
+	}
+}
+
+// The kernel names the cgroup that created a socket, so attribution needs no process lookup and stays correct after the
+// client process exits. The test times it against the /proc scan it replaces on a VM with many busy processes.
+func TestTunnelAgent_AttributesSocketsByCgroupIDFasterThanAProcScan(t *testing.T) {
+	out := runAgentPython(t, fmt.Sprintf(`
+import os, statistics, tempfile, time
+cg = tempfile.mkdtemp()
+open(os.path.join(cg, "cgroup.controllers"), "w").close()
+container = os.path.join(cg, "kubepods", "burstable", "pod%[1]s", "ab" * 32)
+os.makedirs(container)
+os.makedirs(os.path.join(cg, "system.slice", "sshd.service"))
+proc = tempfile.mkdtemp()
+os.makedirs(os.path.join(proc, "net"))
+for name in ("tcp6", "udp", "udp6"):
+    open(os.path.join(proc, "net", name), "w").write("header\n")
+with open(os.path.join(proc, "net", "tcp"), "w") as f:
+    f.write("header\n   0: 0100007F:9C40 0100007F:3348 01 00000000:00000000 00:00000000 00000000  1000        0 999999 1 0\n")
+for pid in range(1000, 1300):
+    os.makedirs(os.path.join(proc, str(pid), "fd"))
+    for fd in range(100):
+        os.symlink("socket:[%%d]" %% (pid * 1000 + fd), os.path.join(proc, str(pid), "fd", str(fd)))
+    open(os.path.join(proc, str(pid), "cgroup"), "w").write("0::/system.slice/sshd.service\n")
+os.symlink("socket:[999999]", os.path.join(proc, "1299", "fd", "100"))
+open(os.path.join(proc, "1299", "cgroup"), "w").write("0::/kubepods/burstable/pod%[1]s/" + "ab" * 32 + "\n")
+ids = {("127.0.0.1", 40000): os.stat(container).st_ino, ("127.0.0.1", 40001): os.stat(os.path.join(cg, "system.slice", "sshd.service")).st_ino}
+def diag(proto, local, remote):
+    return ids[local]
+by_cgroup = agent.PodResolver(proc, cg, diag)
+by_scan = agent.PodResolver(proc, cg, None)
+print("cgroup", by_cgroup.pod_of("tcp", ("127.0.0.1", 40000), ("127.0.0.1", 13128)))
+print("vm", repr(by_cgroup.pod_of("tcp", ("127.0.0.1", 40001), ("127.0.0.1", 13128))))
+print("scan", by_scan.pod_of("tcp", ("127.0.0.1", 40000), ("127.0.0.1", 13128)))
+def timed(resolver):
+    samples = []
+    for _ in range(20):
+        resolver.by_inode.clear(); resolver.by_pid.clear(); resolver.hot.clear()
+        start = time.perf_counter()
+        resolver.pod_of("tcp", ("127.0.0.1", 40000), ("127.0.0.1", 13128))
+        samples.append(time.perf_counter() - start)
+    return statistics.median(samples) * 1000
+print("ms %%.3f %%.3f" %% (timed(by_cgroup), timed(by_scan)))
+`, burstablePod))
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 4 || lines[0] != "cgroup "+burstablePod || lines[1] != "vm ''" || lines[2] != "scan "+burstablePod {
+		t.Fatalf("attribution =\n%s", out)
+	}
+	var byCgroup, byScan float64
+	if _, err := fmt.Sscanf(lines[3], "ms %f %f", &byCgroup, &byScan); err != nil {
+		t.Fatalf("timings %q: %v", lines[3], err)
+	}
+	t.Logf("median attribution latency over 30000 descriptors: %.3f ms by cgroup ID, %.3f ms by /proc scan", byCgroup, byScan)
+	if byCgroup > 50 || byCgroup*5 > byScan {
+		t.Errorf("attribution by cgroup ID took %.3f ms, want under 50 ms and a fifth of the scan's %.3f ms", byCgroup, byScan)
+	}
+}
+
+// On Linux the agent asks the running kernel which cgroup created a live TCP and UDP socket of this test.
+func TestTunnelAgent_FindsLiveSocketsCgroupThroughTheKernel(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("sock_diag is Linux only")
+	}
+	out := runAgentPython(t, `
+import os, socket
+own = [l for l in open("/proc/self/cgroup").read().splitlines() if l.startswith("0::")][0][3:]
+want = os.stat("/sys/fs/cgroup" + own).st_ino
+server = socket.socket(); server.bind(("127.0.0.1", 0)); server.listen(1)
+client = socket.create_connection(server.getsockname())
+print("tcp", agent.diag_cgroup_id("tcp", client.getsockname(), server.getsockname()) == want)
+receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); receiver.bind(("127.0.0.1", 0))
+sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sender.sendto(b"q", receiver.getsockname())
+_, source = receiver.recvfrom(16)
+print("udp", agent.diag_cgroup_id("udp", source, receiver.getsockname()) == want)
+`)
+	if want := "tcp True\nudp True\n"; out != want {
+		t.Errorf("kernel lookups =\n%s\nwant\n%s", out, want)
 	}
 }
